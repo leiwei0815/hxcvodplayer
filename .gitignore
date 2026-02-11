@@ -1,0 +1,53 @@
+# 构建目录
+build/
+cmake-build-*/
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Qt 生成文件
+*.pro.user
+*.pro.user.*
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# 编译输出
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# 测试文件
+*.mp4
+*.mkv
+*.avi
+*.flv
+test_videos/
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# Android
+*.iml
+.gradle/
+local.properties
+.externalNativeBuild/
+.cxx/

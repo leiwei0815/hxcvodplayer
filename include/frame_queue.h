@@ -1,0 +1,169 @@
+/**
+ * @file frame_queue.h
+ * @brief 帧队列管理（参照 ffplay 实现）
+ */
+
+#ifndef YXVODPLAYER_FRAME_QUEUE_H
+#define YXVODPLAYER_FRAME_QUEUE_H
+
+#include "player_types.h"
+#include <mutex>
+#include <condition_variable>
+#include <vector>
+#include <atomic>
+
+namespace yxplayer {
+
+/**
+ * @brief 帧队列
+ * 用于缓存解码后的音视频帧，参照 ffplay 的 FrameQueue 实现
+ */
+template<typename T>
+class FrameQueue {
+public:
+    explicit FrameQueue(int max_size = 16)
+        : max_size_(max_size)
+        , rindex_(0)
+        , windex_(0)
+        , size_(0)
+        , keep_last_(false)
+        , rindex_shown_(0)
+        , abort_(false) {
+        frames_.resize(max_size);
+    }
+    
+    ~FrameQueue() {
+        flush();
+    }
+    
+    // 获取可写帧
+    T* peek_writable() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        
+        while (size_ >= max_size_ && !abort_) {
+            cond_write_.wait(lock);
+        }
+        
+        if (abort_) {
+            return nullptr;
+        }
+        
+        return &frames_[windex_];
+    }
+    
+    // 推入帧
+    void push() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (++windex_ == max_size_) {
+            windex_ = 0;
+        }
+        size_++;
+        cond_read_.notify_one();
+    }
+    
+    // 获取可读帧（当前帧）
+    T* peek_readable() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        
+        while (size_ - rindex_shown_ <= 0 && !abort_) {
+            cond_read_.wait(lock);
+        }
+        
+        if (abort_) {
+            return nullptr;
+        }
+        
+        return &frames_[rindex_];
+    }
+    
+    // 获取下一帧（不移动指针）
+    T* peek_next() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return &frames_[(rindex_ + 1) % max_size_];
+    }
+    
+    // 获取上一帧（不移动指针）
+    T* peek_last() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return &frames_[rindex_];
+    }
+    
+    // 移动到下一帧
+    void next() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (keep_last_ && !rindex_shown_) {
+            rindex_shown_ = 1;
+            return;
+        }
+        
+        if (++rindex_ == max_size_) {
+            rindex_ = 0;
+        }
+        size_--;
+        cond_write_.notify_one();
+    }
+    
+    // 获取队列大小
+    int size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return size_ - rindex_shown_;
+    }
+    
+    // 获取剩余空间
+    int nb_remaining() const {
+        return size();
+    }
+    
+    // 清空队列
+    void flush() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& frame : frames_) {
+            // T 的析构函数会自动释放资源
+        }
+        rindex_ = 0;
+        windex_ = 0;
+        size_ = 0;
+        rindex_shown_ = 0;
+        
+        // ⚠️ 唤醒等待的线程（可能在 peek_writable 中阻塞）
+        cond_write_.notify_all();
+        cond_read_.notify_all();
+    }
+    
+    // 中止队列操作
+    void abort() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        abort_ = true;
+        cond_read_.notify_all();
+        cond_write_.notify_all();
+    }
+    
+    // 重新启动队列
+    void restart() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        abort_ = false;
+    }
+    
+    // 设置是否保留最后一帧
+    void set_keep_last(bool keep) {
+        keep_last_ = keep;
+    }
+
+private:
+    std::vector<T> frames_;
+    int max_size_;
+    int rindex_;                // 读索引
+    int windex_;                // 写索引
+    int size_;                  // 当前大小
+    bool keep_last_;            // 是否保留最后一帧
+    int rindex_shown_;          // 是否已显示
+    std::atomic<bool> abort_;   // 中止标志
+    
+    mutable std::mutex mutex_;
+    std::condition_variable cond_read_;
+    std::condition_variable cond_write_;
+};
+
+} // namespace yxplayer
+
+#endif // YXVODPLAYER_FRAME_QUEUE_H
