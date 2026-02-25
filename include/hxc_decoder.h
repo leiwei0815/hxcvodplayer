@@ -6,8 +6,8 @@
 #ifndef YXVODPLAYER_DECODER_H
 #define YXVODPLAYER_DECODER_H
 
-#include "yx_player_types.h"
-#include "yx_packet_queue.h"
+#include "hxc_player_types.h"
+#include "hxc_packet_queue.h"
 #include <thread>
 #include <atomic>
 #include <functional>
@@ -17,7 +17,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 }
 
-namespace yxplayer {
+namespace hxcplayer {
 
 /**
  * @brief 解码器基类
@@ -82,6 +82,6 @@ public:
     ~AudioDecoder() override = default;
 };
 
-} // namespace yxplayer
+} // namespace hxcplayer
 
 #endif // YXVODPLAYER_DECODER_H

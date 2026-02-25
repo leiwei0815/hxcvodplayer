@@ -6,7 +6,7 @@
 #include "qt_platform_factory.h"
 #include "sdl_renderer.h"
 
-namespace yxplayer {
+namespace hxcplayer {
 
 IVideoRenderer* QtPlatformFactory::create_video_renderer() {
     return new SDLRenderer();
@@ -26,4 +26,4 @@ std::string QtPlatformFactory::get_platform_name() const {
     return "Qt5/Desktop";
 }
 
-} // namespace yxplayer
+} // namespace hxcplayer

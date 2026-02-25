@@ -18,7 +18,7 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
-namespace yxplayer {
+namespace hxcplayer {
 
 // 播放器状态
 enum class PlayerState {
@@ -198,6 +198,6 @@ struct Clock {
     void sync_clock_to_slave(Clock* slave);
 };
 
-} // namespace yxplayer
+} // namespace hxcplayer
 
 #endif // YXVODPLAYER_TYPES_H

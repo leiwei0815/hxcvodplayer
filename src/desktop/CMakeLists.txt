@@ -34,8 +34,8 @@ target_include_directories(YXVodPlayer PRIVATE
 )
 
 target_link_libraries(YXVodPlayer PRIVATE
-    yxplayer_core
-    yxplayer_platform
+    hxcplayer_core
+    hxcplayer_platform
     Qt5::Core
     Qt5::Gui
     Qt5::Widgets

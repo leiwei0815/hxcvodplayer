@@ -31,15 +31,15 @@ MainWindow::MainWindow(QWidget *parent)
     setupUI();
     
     // 创建播放器
-    player_ = std::make_unique<yxplayer::PlayerCore>();
+    player_ = std::make_unique<hxcplayer::PlayerCore>();
     
     // ⚠️ 设置默认配置（可以从 UI 修改）
-    yxplayer::PlayerConfig config;
+    hxcplayer::PlayerConfig config;
     config.start_time = 67.0;  // 默认从头开始，可通过 UI 修改
     player_->set_config(config);
     
     // 设置回调
-    player_->set_state_changed_callback([this](yxplayer::PlayerState state) {
+    player_->set_state_changed_callback([this](hxcplayer::PlayerState state) {
         QMetaObject::invokeMethod(this, [this, state]() {
             onStateChanged(state);
         });
@@ -98,6 +98,9 @@ void MainWindow::setupUI() {
     connect(ui->speedComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), 
             this, &MainWindow::handleSpeedChanged, Qt::UniqueConnection);
     
+    // ⚠️ 显示模式按钮
+    ui->aspectRatioButton->setText("适应");  // 默认适应模式
+    
     // ⚠️ 连接视频显示模式变化信号
     connect(video_widget_, &VideoWidget::aspectRatioModeChanged, 
             this, &MainWindow::onAspectRatioModeChanged);
@@ -128,10 +131,10 @@ void MainWindow::on_playPauseButton_clicked() {
     if (!player_) return;
     
     auto state = player_->get_state();
-    if (state == yxplayer::PlayerState::Playing) {
+    if (state == hxcplayer::PlayerState::Playing) {
         player_->pause();
         ui->playPauseButton->setText("播放");
-    } else if (state == yxplayer::PlayerState::Paused) {
+    } else if (state == hxcplayer::PlayerState::Paused) {
         player_->play();
         ui->playPauseButton->setText("暂停");
     }
@@ -221,7 +224,7 @@ void MainWindow::updateUI() {
     }
     
     auto state = player_->get_state();
-    if (state == yxplayer::PlayerState::Paused) {
+    if (state == hxcplayer::PlayerState::Paused) {
         return;
     }
     
@@ -258,7 +261,7 @@ void MainWindow::refreshVideo() {
     }
     
     auto state = player_->get_state();
-    if (state != yxplayer::PlayerState::Playing) {
+    if (state != hxcplayer::PlayerState::Playing) {
         return;
     }
     
@@ -358,21 +361,21 @@ void MainWindow::refreshVideo() {
     }
 }
 
-void MainWindow::onStateChanged(yxplayer::PlayerState state) {
+void MainWindow::onStateChanged(hxcplayer::PlayerState state) {
     switch (state) {
-        case yxplayer::PlayerState::Playing:
+        case hxcplayer::PlayerState::Playing:
             ui->playPauseButton->setText("暂停");
             ui->playPauseButton->setEnabled(true);
             ui->stopButton->setEnabled(true);
             ui->seekSlider->setEnabled(true);
             break;
             
-        case yxplayer::PlayerState::Paused:
+        case hxcplayer::PlayerState::Paused:
             ui->playPauseButton->setText("播放");
             break;
             
-        case yxplayer::PlayerState::Stopped:
-        case yxplayer::PlayerState::Error:
+        case hxcplayer::PlayerState::Stopped:
+        case hxcplayer::PlayerState::Error:
             ui->playPauseButton->setText("播放");
             ui->playPauseButton->setEnabled(false);
             ui->stopButton->setEnabled(false);
@@ -388,14 +391,21 @@ void MainWindow::onError(const QString& error) {
     QMessageBox::critical(this, "错误", error);
 }
 
-void MainWindow::onAspectRatioModeChanged(yxplayer::AspectRatioMode mode) {
+void MainWindow::onAspectRatioModeChanged(hxcplayer::AspectRatioMode mode) {
     // ⚠️ 同步到核心层
     if (player_) {
         player_->set_aspect_ratio_mode(mode);
     }
     
+    // ⚠️ 更新按钮文本
+    if (mode == hxcplayer::AspectRatioMode::Fit) {
+        ui->aspectRatioButton->setText("适应");
+    } else {
+        ui->aspectRatioButton->setText("填充");
+    }
+    
     // ⚠️ 在状态栏显示当前模式
-    QString modeText = (mode == yxplayer::AspectRatioMode::Fit) ? "适应模式" : "填充模式";
+    QString modeText = (mode == hxcplayer::AspectRatioMode::Fit) ? "适应模式" : "填充模式";
     statusBar()->showMessage("显示模式: " + modeText, 2000);
 }
 
@@ -524,4 +534,30 @@ void MainWindow::handleSpeedChanged(int index) {
     // 验证设置是否成功
     double actual_rate = player_->get_playback_rate();
     qDebug() << "[UI] 实际播放速率:" << actual_rate << "x";
+}
+
+// ⚠️ 显示模式按钮点击处理
+void MainWindow::on_aspectRatioButton_clicked() {
+    if (!video_widget_) {
+        return;
+    }
+    
+    // 获取当前模式
+    hxcplayer::AspectRatioMode current_mode = video_widget_->getAspectRatioMode();
+    
+    // 切换模式
+    hxcplayer::AspectRatioMode new_mode;
+    if (current_mode == hxcplayer::AspectRatioMode::Fit) {
+        new_mode = hxcplayer::AspectRatioMode::Fill;
+        ui->aspectRatioButton->setText("填充");
+    } else {
+        new_mode = hxcplayer::AspectRatioMode::Fit;
+        ui->aspectRatioButton->setText("适应");
+    }
+    
+    // 设置新模式
+    video_widget_->setAspectRatioMode(new_mode);
+    
+    qDebug() << "[UI] 切换显示模式:" 
+             << (new_mode == hxcplayer::AspectRatioMode::Fit ? "适应" : "填充");
 }

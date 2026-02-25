@@ -4,7 +4,7 @@
  */
 
 // ✅ 只包含 C 接口桥接层（不直接包含 FFmpeg 头文件）
-#include "yx_player_core_c_bridge.h"
+#include "hxc_player_core_c_bridge.h"
 
 // 现在可以安全地包含 iOS 框架（没有 FFmpeg 冲突）
 #import "YXPlayerControl.h"

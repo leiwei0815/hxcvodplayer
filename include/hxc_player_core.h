@@ -6,10 +6,10 @@
 #ifndef YXVODPLAYER_PLAYER_CORE_H
 #define YXVODPLAYER_PLAYER_CORE_H
 
-#include "yx_player_types.h"
-#include "yx_packet_queue.h"
-#include "yx_frame_queue.h"
-#include "yx_decoder.h"
+#include "hxc_player_types.h"
+#include "hxc_packet_queue.h"
+#include "hxc_frame_queue.h"
+#include "hxc_decoder.h"
 #include <string>
 #include <memory>
 #include <thread>
@@ -28,7 +28,7 @@ extern "C" {
 #include <soundtouch/SoundTouch.h>
 #endif
 
-namespace yxplayer {
+namespace hxcplayer {
 
 /**
  * @brief 播放器核心类
@@ -197,6 +197,6 @@ private:
     PositionChangedCallback position_changed_callback_;
 };
 
-} // namespace yxplayer
+} // namespace hxcplayer
 
 #endif // YXVODPLAYER_PLAYER_CORE_H

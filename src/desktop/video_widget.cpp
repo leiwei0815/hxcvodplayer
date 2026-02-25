@@ -22,7 +22,7 @@ VideoWidget::VideoWidget(QWidget *parent)
     , sws_ctx_(nullptr)
     , rgb_frame_(nullptr)
     , rgb_buffer_(nullptr)
-    , aspect_ratio_mode_(yxplayer::AspectRatioMode::Fit) {  // ⚠️ 默认 Fit 模式
+    , aspect_ratio_mode_(hxcplayer::AspectRatioMode::Fit) {  // ⚠️ 默认 Fit 模式
     
     setMinimumSize(320, 240);
     setStyleSheet("background-color: black;");
@@ -82,7 +82,7 @@ void VideoWidget::setVideoSize(int width, int height) {
     updateGeometry();
 }
 
-void VideoWidget::updateFrame(yxplayer::FrameQueue<yxplayer::VideoFrame>* video_queue) {
+void VideoWidget::updateFrame(hxcplayer::FrameQueue<hxcplayer::VideoFrame>* video_queue) {
     if (!video_queue) return;
     
     // 检查队列中是否有帧
@@ -141,7 +141,7 @@ QImage VideoWidget::convertFrameToImage(AVFrame* frame) {
     return QImage();
 }
 
-void VideoWidget::setAspectRatioMode(yxplayer::AspectRatioMode mode) {
+void VideoWidget::setAspectRatioMode(hxcplayer::AspectRatioMode mode) {
     if (aspect_ratio_mode_ != mode) {
         aspect_ratio_mode_ = mode;
         update();  // 触发重绘
@@ -159,7 +159,7 @@ QRect VideoWidget::calculateDisplayRect() {
     
     QRect display_rect;
     
-    if (aspect_ratio_mode_ == yxplayer::AspectRatioMode::Fit) {
+    if (aspect_ratio_mode_ == hxcplayer::AspectRatioMode::Fit) {
         // ⚠️ Fit 模式：等比缩放，保持完整画面，可能有黑边
         if (widget_aspect > video_aspect) {
             // 窗口更宽，以高度为准
@@ -217,25 +217,25 @@ void VideoWidget::contextMenuEvent(QContextMenuEvent *event) {
     
     QAction* fitAction = aspectRatioMenu->addAction("适应（Fit）");
     fitAction->setCheckable(true);
-    fitAction->setChecked(aspect_ratio_mode_ == yxplayer::AspectRatioMode::Fit);
-    fitAction->setData(static_cast<int>(yxplayer::AspectRatioMode::Fit));
+    fitAction->setChecked(aspect_ratio_mode_ == hxcplayer::AspectRatioMode::Fit);
+    fitAction->setData(static_cast<int>(hxcplayer::AspectRatioMode::Fit));
     modeGroup->addAction(fitAction);
     
     QAction* fillAction = aspectRatioMenu->addAction("填充（Fill）");
     fillAction->setCheckable(true);
-    fillAction->setChecked(aspect_ratio_mode_ == yxplayer::AspectRatioMode::Fill);
-    fillAction->setData(static_cast<int>(yxplayer::AspectRatioMode::Fill));
+    fillAction->setChecked(aspect_ratio_mode_ == hxcplayer::AspectRatioMode::Fill);
+    fillAction->setData(static_cast<int>(hxcplayer::AspectRatioMode::Fill));
     modeGroup->addAction(fillAction);
     
     // ⚠️ 连接信号
     connect(fitAction, &QAction::triggered, [this]() {
-        setAspectRatioMode(yxplayer::AspectRatioMode::Fit);
-        emit aspectRatioModeChanged(yxplayer::AspectRatioMode::Fit);
+        setAspectRatioMode(hxcplayer::AspectRatioMode::Fit);
+        emit aspectRatioModeChanged(hxcplayer::AspectRatioMode::Fit);
     });
     
     connect(fillAction, &QAction::triggered, [this]() {
-        setAspectRatioMode(yxplayer::AspectRatioMode::Fill);
-        emit aspectRatioModeChanged(yxplayer::AspectRatioMode::Fill);
+        setAspectRatioMode(hxcplayer::AspectRatioMode::Fill);
+        emit aspectRatioModeChanged(hxcplayer::AspectRatioMode::Fill);
     });
     
     menu.exec(event->globalPos());

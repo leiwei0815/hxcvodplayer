@@ -9,8 +9,8 @@
 #include <QWidget>
 #include <QImage>
 #include <memory>
-#include "yx_frame_queue.h"
-#include "yx_player_types.h"
+#include "hxc_frame_queue.h"
+#include "hxc_player_types.h"
 
 extern "C" {
 #include <SDL2/SDL.h>
@@ -24,11 +24,11 @@ public:
     ~VideoWidget();
     
     void setVideoSize(int width, int height);
-    void updateFrame(yxplayer::FrameQueue<yxplayer::VideoFrame>* video_queue);
+    void updateFrame(hxcplayer::FrameQueue<hxcplayer::VideoFrame>* video_queue);
     
     // ⚠️ 设置显示模式（使用核心层的枚举）
-    void setAspectRatioMode(yxplayer::AspectRatioMode mode);
-    yxplayer::AspectRatioMode getAspectRatioMode() const { return aspect_ratio_mode_; }
+    void setAspectRatioMode(hxcplayer::AspectRatioMode mode);
+    hxcplayer::AspectRatioMode getAspectRatioMode() const { return aspect_ratio_mode_; }
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -37,7 +37,7 @@ protected:
     QSize sizeHint() const override;
 
 signals:
-    void aspectRatioModeChanged(yxplayer::AspectRatioMode mode);
+    void aspectRatioModeChanged(hxcplayer::AspectRatioMode mode);
 
 private:
     QImage convertFrameToImage(AVFrame* frame);
@@ -53,7 +53,7 @@ private:
     uint8_t* rgb_buffer_;
     
     // ⚠️ 显示模式（从核心层同步）
-    yxplayer::AspectRatioMode aspect_ratio_mode_;
+    hxcplayer::AspectRatioMode aspect_ratio_mode_;
 };
 
 #endif // VIDEO_WIDGET_H

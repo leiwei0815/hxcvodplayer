@@ -9,7 +9,7 @@
 #include <QMainWindow>
 #include <QTimer>
 #include <memory>
-#include "yx_player_core.h"
+#include "hxc_player_core.h"
 #include "video_widget.h"
 
 QT_BEGIN_NAMESPACE
@@ -29,7 +29,7 @@ private slots:
     void on_stopButton_clicked();
     
     // ⚠️ 显示模式切换
-    void onAspectRatioModeChanged(yxplayer::AspectRatioMode mode);
+    void onAspectRatioModeChanged(hxcplayer::AspectRatioMode mode);
     
     // ⚠️ 重命名避免 Qt 自动连接（去掉 on_ 前缀）
     void handleSeekSliderPressed();
@@ -38,7 +38,7 @@ private slots:
     void handleVolumeChanged(int value);
     
     void updateUI();
-    void onStateChanged(yxplayer::PlayerState state);
+    void onStateChanged(hxcplayer::PlayerState state);
     void onError(const QString& error);
 
 protected:
@@ -59,10 +59,11 @@ private:
 
 private slots:
     void handleSpeedChanged(int index);  // 倍速变化处理
+    void on_aspectRatioButton_clicked();  // 显示模式按钮点击
 
 private:
     Ui::MainWindow *ui;
-    std::unique_ptr<yxplayer::PlayerCore> player_;
+    std::unique_ptr<hxcplayer::PlayerCore> player_;
     VideoWidget* video_widget_;
     QTimer* update_timer_;
     QTimer* refresh_timer_;  // 视频刷新定时器

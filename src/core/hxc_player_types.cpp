@@ -3,7 +3,7 @@
  * @brief 播放器类型实现
  */
 
-#include "yx_player_types.h"
+#include "hxc_player_types.h"
 
 extern "C" {
 #include <libavutil/time.h>
@@ -13,7 +13,7 @@ extern "C" {
 #include <SDL2/SDL.h>
 #endif
 
-namespace yxplayer {
+namespace hxcplayer {
 
 double Clock::get_clock() const {
     if (paused) {
@@ -45,4 +45,4 @@ void Clock::sync_clock_to_slave(Clock* slave) {
     }
 }
 
-} // namespace yxplayer
+} // namespace hxcplayer

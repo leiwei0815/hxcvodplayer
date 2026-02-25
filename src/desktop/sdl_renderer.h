@@ -6,13 +6,13 @@
 #ifndef SDL_RENDERER_H
 #define SDL_RENDERER_H
 
-#include "yx_platform_interface.h"
+#include "hxc_platform_interface.h"
 
 extern "C" {
 #include <SDL2/SDL.h>
 }
 
-namespace yxplayer {
+namespace hxcplayer {
 
 /**
  * @brief SDL2 视频渲染器
@@ -40,6 +40,6 @@ private:
     PixelFormat format_;
 };
 
-} // namespace yxplayer
+} // namespace hxcplayer
 
 #endif // SDL_RENDERER_H

@@ -3,10 +3,10 @@
  * @brief 平台工厂实现
  */
 
-#include "yx_platform_interface.h"
+#include "hxc_platform_interface.h"
 
-namespace yxplayer {
+namespace hxcplayer {
 
 // 平台工厂的具体实现将在各平台目录中实现
 
-} // namespace yxplayer
+} // namespace hxcplayer

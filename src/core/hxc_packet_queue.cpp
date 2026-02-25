@@ -3,10 +3,10 @@
  * @brief 数据包队列实现
  */
 
-#include "yx_packet_queue.h"
+#include "hxc_packet_queue.h"
 
-namespace yxplayer {
+namespace hxcplayer {
 
 // 实现已在头文件中完成（模板类）
 
-} // namespace yxplayer
+} // namespace hxcplayer

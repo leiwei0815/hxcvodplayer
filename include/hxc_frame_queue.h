@@ -6,13 +6,13 @@
 #ifndef YXVODPLAYER_FRAME_QUEUE_H
 #define YXVODPLAYER_FRAME_QUEUE_H
 
-#include "yx_player_types.h"
+#include "hxc_player_types.h"
 #include <mutex>
 #include <condition_variable>
 #include <vector>
 #include <atomic>
 
-namespace yxplayer {
+namespace hxcplayer {
 
 /**
  * @brief 帧队列
@@ -164,6 +164,6 @@ private:
     std::condition_variable cond_write_;
 };
 
-} // namespace yxplayer
+} // namespace hxcplayer
 
 #endif // YXVODPLAYER_FRAME_QUEUE_H

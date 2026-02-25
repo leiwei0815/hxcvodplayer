@@ -9,7 +9,7 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
-namespace yxplayer {
+namespace hxcplayer {
 
 SDLRenderer::SDLRenderer()
     : window_(nullptr)
@@ -140,4 +140,4 @@ void SDLRenderer::destroy() {
     }
 }
 
-} // namespace yxplayer
+} // namespace hxcplayer

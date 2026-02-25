@@ -6,10 +6,10 @@
 #ifndef YXVODPLAYER_PLATFORM_INTERFACE_H
 #define YXVODPLAYER_PLATFORM_INTERFACE_H
 
-#include "yx_player_types.h"
+#include "hxc_player_types.h"
 #include <string>
 
-namespace yxplayer {
+namespace hxcplayer {
 
 /**
  * @brief 视频渲染接口
@@ -103,6 +103,6 @@ public:
     virtual std::string get_platform_name() const = 0;
 };
 
-} // namespace yxplayer
+} // namespace hxcplayer
 
 #endif // YXVODPLAYER_PLATFORM_INTERFACE_H

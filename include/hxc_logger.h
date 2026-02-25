@@ -11,7 +11,7 @@
 #include <string>
 #include <ctime>
 
-namespace yxplayer {
+namespace hxcplayer {
 
 enum class LogLevel {
     DEBUG,
@@ -88,11 +88,11 @@ private:
 };
 
 // 便捷宏
-#define LOG_DEBUG(...) yxplayer::Logger::instance().debug(__VA_ARGS__)
-#define LOG_INFO(...) yxplayer::Logger::instance().info(__VA_ARGS__)
-#define LOG_WARNING(...) yxplayer::Logger::instance().warning(__VA_ARGS__)
-#define LOG_ERROR(...) yxplayer::Logger::instance().error(__VA_ARGS__)
+#define LOG_DEBUG(...) hxcplayer::Logger::instance().debug(__VA_ARGS__)
+#define LOG_INFO(...) hxcplayer::Logger::instance().info(__VA_ARGS__)
+#define LOG_WARNING(...) hxcplayer::Logger::instance().warning(__VA_ARGS__)
+#define LOG_ERROR(...) hxcplayer::Logger::instance().error(__VA_ARGS__)
 
-} // namespace yxplayer
+} // namespace hxcplayer
 
 #endif // YXVODPLAYER_LOGGER_H

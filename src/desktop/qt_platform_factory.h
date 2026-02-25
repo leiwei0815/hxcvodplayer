@@ -6,9 +6,9 @@
 #ifndef QT_PLATFORM_FACTORY_H
 #define QT_PLATFORM_FACTORY_H
 
-#include "yx_platform_interface.h"
+#include "hxc_platform_interface.h"
 
-namespace yxplayer {
+namespace hxcplayer {
 
 class QtPlatformFactory : public IPlatformFactory {
 public:
@@ -21,6 +21,6 @@ public:
     std::string get_platform_name() const override;
 };
 
-} // namespace yxplayer
+} // namespace hxcplayer
 
 #endif // QT_PLATFORM_FACTORY_H

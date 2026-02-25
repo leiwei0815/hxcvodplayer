@@ -3,8 +3,8 @@
  * @brief C 接口桥接层实现
  */
 
-#include "yx_player_core_c_bridge.h"
-#include "yx_player_core.h"
+#include "hxc_player_core_c_bridge.h"
+#include "hxc_player_core.h"
 #include <cstring>
 #include <vector>
 
@@ -14,7 +14,7 @@
 
 // PlayerCoreHandle 结构，包含音频处理所需的状态
 struct PlayerCoreHandle {
-    yxplayer::PlayerCore* core;
+    hxcplayer::PlayerCore* core;
     
     // 音频缓冲（用于 SoundTouch 处理后的数据）
     uint8_t* audio_buf;
@@ -57,13 +57,13 @@ struct PlayerCoreHandle {
 
 PlayerCoreHandle* player_core_create(void) {
     PlayerCoreHandle* handle = new PlayerCoreHandle();
-    handle->core = new yxplayer::PlayerCore();
+    handle->core = new hxcplayer::PlayerCore();
     
     // 配置播放器（iOS 不使用 SDL 音频）
-    yxplayer::PlayerConfig config;
+    hxcplayer::PlayerConfig config;
     config.enable_audio = true;
     config.enable_video = true;
-    config.sync_mode = yxplayer::SyncMode::AudioMaster;
+    config.sync_mode = hxcplayer::SyncMode::AudioMaster;
     handle->core->set_config(config);
     
 #if defined(__APPLE__) || defined(_WIN32)
@@ -136,14 +136,14 @@ void player_core_stop(PlayerCoreHandle* handle) {
 PlayerStateC player_core_get_state(PlayerCoreHandle* handle) {
     if (!handle || !handle->core) return PLAYER_STATE_ERROR;
     
-    yxplayer::PlayerState state = handle->core->get_state();
+    hxcplayer::PlayerState state = handle->core->get_state();
     switch (state) {
-        case yxplayer::PlayerState::Idle: return PLAYER_STATE_IDLE;
-        case yxplayer::PlayerState::Opening: return PLAYER_STATE_OPENING;
-        case yxplayer::PlayerState::Playing: return PLAYER_STATE_PLAYING;
-        case yxplayer::PlayerState::Paused: return PLAYER_STATE_PAUSED;
-        case yxplayer::PlayerState::Stopped: return PLAYER_STATE_STOPPED;
-        case yxplayer::PlayerState::Error: return PLAYER_STATE_ERROR;
+        case hxcplayer::PlayerState::Idle: return PLAYER_STATE_IDLE;
+        case hxcplayer::PlayerState::Opening: return PLAYER_STATE_OPENING;
+        case hxcplayer::PlayerState::Playing: return PLAYER_STATE_PLAYING;
+        case hxcplayer::PlayerState::Paused: return PLAYER_STATE_PAUSED;
+        case hxcplayer::PlayerState::Stopped: return PLAYER_STATE_STOPPED;
+        case hxcplayer::PlayerState::Error: return PLAYER_STATE_ERROR;
         default: return PLAYER_STATE_ERROR;
     }
 }

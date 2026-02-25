@@ -15,7 +15,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 }
 
-namespace yxplayer {
+namespace hxcplayer {
 
 /**
  * @brief 数据包队列
@@ -183,6 +183,6 @@ private:
     std::condition_variable cond_;
 };
 
-} // namespace yxplayer
+} // namespace hxcplayer
 
 #endif // YXVODPLAYER_PACKET_QUEUE_H

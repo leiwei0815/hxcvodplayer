@@ -3,9 +3,9 @@
  * @brief 播放器核心实现（参照 ffplay）
  */
 
-#include "yx_player_core.h"
-#include "yx_logger.h"
-#include "yx_debug_helper.h"
+#include "hxc_player_core.h"
+#include "hxc_logger.h"
+#include "hxc_debug_helper.h"
 #include <iostream>
 #include <cmath>
 #include <chrono>
@@ -23,7 +23,7 @@ extern "C" {
     #define PLAYER_DELAY(ms) std::this_thread::sleep_for(std::chrono::milliseconds(ms))
 #endif
 
-namespace yxplayer {
+namespace hxcplayer {
 
 PlayerCore::PlayerCore()
     : state_(PlayerState::Idle)
@@ -1175,4 +1175,4 @@ void PlayerCore::set_playback_rate(double rate) {
 #endif
 }
 
-} // namespace yxplayer
+} // namespace hxcplayer

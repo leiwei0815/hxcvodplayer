@@ -186,6 +186,19 @@
          </item>
         </widget>
        </item>
+       <item>
+        <widget class="QPushButton" name="aspectRatioButton">
+         <property name="text">
+          <string>适应</string>
+         </property>
+         <property name="minimumWidth">
+          <number>60</number>
+         </property>
+         <property name="toolTip">
+          <string>切换视频显示模式（适应/填充）</string>
+         </property>
+        </widget>
+       </item>
       </layout>
      </item>
     </layout>

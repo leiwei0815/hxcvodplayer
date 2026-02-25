@@ -3,14 +3,14 @@
  * @brief 解码器实现
  */
 
-#include "yx_decoder.h"
+#include "hxc_decoder.h"
 #include <iostream>
 
 extern "C" {
 #include <libavutil/time.h>
 }
 
-namespace yxplayer {
+namespace hxcplayer {
 
 Decoder::Decoder()
     : codec_ctx_(nullptr)
@@ -171,4 +171,4 @@ void Decoder::flush() {
 // - 视频：PlayerCore::video_thread()
 // - 音频：PlayerCore::audio_callback_impl()
 
-} // namespace yxplayer
+} // namespace hxcplayer

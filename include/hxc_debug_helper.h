@@ -18,7 +18,7 @@ extern "C" {
 #include <libavutil/time.h>
 }
 
-namespace yxplayer {
+namespace hxcplayer {
 
 /**
  * @brief 调试辅助类
@@ -218,6 +218,6 @@ private:
     #define DEBUG_PRINT_FRAME(type, frame, pts)
 #endif
 
-} // namespace yxplayer
+} // namespace hxcplayer
 
 #endif // YXVODPLAYER_DEBUG_HELPER_H
