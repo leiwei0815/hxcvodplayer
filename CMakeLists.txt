@@ -52,6 +52,63 @@ pkg_check_modules(FFMPEG REQUIRED
 # SDL2
 pkg_check_modules(SDL2 REQUIRED sdl2)
 
+# SoundTouch（用于倍速播放，仅 macOS 和 Windows）
+if(APPLE OR WIN32)
+    # SoundTouch 不提供标准的 .pc 文件，需要手动查找
+    # 在不同平台上，库名和路径可能不同
+    
+    # 查找头文件
+    find_path(SOUNDTOUCH_INCLUDE_DIR 
+        NAMES soundtouch/SoundTouch.h
+        PATHS 
+            # macOS (Homebrew)
+            /opt/homebrew/include
+            /usr/local/include
+            # Windows (vcpkg)
+            ${CMAKE_PREFIX_PATH}/include
+            $ENV{VCPKG_ROOT}/installed/${VCPKG_TARGET_TRIPLET}/include
+            # 通用路径
+            /usr/include
+    )
+    
+    # 查找库文件
+    find_library(SOUNDTOUCH_LIBRARY
+        NAMES 
+            SoundTouch          # macOS/Linux
+            soundtouch          # 小写变体
+            SoundTouch.lib      # Windows (静态库)
+            SoundTouch_dll.lib  # Windows (动态库)
+        PATHS 
+            # macOS (Homebrew)
+            /opt/homebrew/lib
+            /usr/local/lib
+            # Windows (vcpkg)
+            ${CMAKE_PREFIX_PATH}/lib
+            $ENV{VCPKG_ROOT}/installed/${VCPKG_TARGET_TRIPLET}/lib
+            # 通用路径
+            /usr/lib
+    )
+    
+    if(SOUNDTOUCH_INCLUDE_DIR AND SOUNDTOUCH_LIBRARY)
+        set(SOUNDTOUCH_FOUND TRUE)
+        set(SOUNDTOUCH_INCLUDE_DIRS ${SOUNDTOUCH_INCLUDE_DIR})
+        set(SOUNDTOUCH_LIBRARIES ${SOUNDTOUCH_LIBRARY})
+        message(STATUS "✓ SoundTouch found!")
+        message(STATUS "  Include: ${SOUNDTOUCH_INCLUDE_DIRS}")
+        message(STATUS "  Library: ${SOUNDTOUCH_LIBRARIES}")
+    else()
+        set(SOUNDTOUCH_FOUND FALSE)
+        message(WARNING "✗ SoundTouch not found, playback rate control will be disabled")
+        message(STATUS "  Searched include dir: ${SOUNDTOUCH_INCLUDE_DIR}")
+        message(STATUS "  Searched library: ${SOUNDTOUCH_LIBRARY}")
+        if(APPLE)
+            message(STATUS "  Hint: Install with 'brew install sound-touch'")
+        elseif(WIN32)
+            message(STATUS "  Hint: Install with 'vcpkg install soundtouch'")
+        endif()
+    endif()
+endif()
+
 # 包含目录
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
@@ -59,11 +116,19 @@ include_directories(
     ${SDL2_INCLUDE_DIRS}
 )
 
+if(SOUNDTOUCH_FOUND)
+    include_directories(${SOUNDTOUCH_INCLUDE_DIRS})
+endif()
+
 # 链接目录
 link_directories(
     ${FFMPEG_LIBRARY_DIRS}
     ${SDL2_LIBRARY_DIRS}
 )
+
+if(SOUNDTOUCH_FOUND)
+    link_directories(${SOUNDTOUCH_LIBRARY_DIRS})
+endif()
 
 # 核心库
 add_subdirectory(src/core)

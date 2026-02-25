@@ -1,0 +1,4 @@
+SoundTouch Version: 2.3.3
+Build Date: 2026年 2月 6日 星期五 15时54分40秒 CST
+iOS Min Version: 12.0
+Architectures: arm64 x86_64

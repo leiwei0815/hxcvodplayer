@@ -1,8 +1,8 @@
 set(CORE_SOURCES
-    player_types.cpp
-    packet_queue.cpp
-    decoder.cpp
-    player_core.cpp
+    yx_player_types.cpp
+    yx_packet_queue.cpp
+    yx_decoder.cpp
+    yx_player_core.cpp
 )
 
 add_library(yxplayer_core STATIC ${CORE_SOURCES})
@@ -17,6 +17,12 @@ target_link_libraries(yxplayer_core PUBLIC
     ${FFMPEG_LIBRARIES}
     ${SDL2_LIBRARIES}
 )
+
+# SoundTouch（倍速播放）
+if(SOUNDTOUCH_FOUND)
+    target_link_libraries(yxplayer_core PUBLIC ${SOUNDTOUCH_LIBRARIES})
+    target_compile_definitions(yxplayer_core PUBLIC HAS_SOUNDTOUCH)
+endif()
 
 # 线程库
 find_package(Threads REQUIRED)

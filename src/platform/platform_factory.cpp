@@ -3,7 +3,7 @@
  * @brief 平台工厂实现
  */
 
-#include "platform_interface.h"
+#include "yx_platform_interface.h"
 
 namespace yxplayer {
 

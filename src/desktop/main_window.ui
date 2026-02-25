@@ -142,6 +142,50 @@
          </property>
         </widget>
        </item>
+       <item>
+        <widget class="QLabel" name="speedLabel">
+         <property name="text">
+          <string>速度</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QComboBox" name="speedComboBox">
+         <property name="minimumWidth">
+          <number>70</number>
+         </property>
+         <item>
+          <property name="text">
+           <string>0.5x</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string>0.75x</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string>1.0x</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string>1.25x</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string>1.5x</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string>2.0x</string>
+          </property>
+         </item>
+        </widget>
+       </item>
       </layout>
      </item>
     </layout>

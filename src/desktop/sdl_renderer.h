@@ -6,7 +6,7 @@
 #ifndef SDL_RENDERER_H
 #define SDL_RENDERER_H
 
-#include "platform_interface.h"
+#include "yx_platform_interface.h"
 
 extern "C" {
 #include <SDL2/SDL.h>

@@ -35,7 +35,7 @@ MainWindow::MainWindow(QWidget *parent)
     
     // ⚠️ 设置默认配置（可以从 UI 修改）
     yxplayer::PlayerConfig config;
-    config.start_time = 60.0;  // 默认从头开始，可通过 UI 修改
+    config.start_time = 67.0;  // 默认从头开始，可通过 UI 修改
     player_->set_config(config);
     
     // 设置回调
@@ -93,6 +93,11 @@ void MainWindow::setupUI() {
     // volumeSlider - 只连接 valueChanged
     connect(ui->volumeSlider, &QSlider::valueChanged, this, &MainWindow::handleVolumeChanged, Qt::UniqueConnection);
     
+    // ⚠️ 倍速选择框
+    ui->speedComboBox->setCurrentIndex(2);  // 默认选择 1.0x
+    connect(ui->speedComboBox, QOverload<int>::of(&QComboBox::currentIndexChanged), 
+            this, &MainWindow::handleSpeedChanged, Qt::UniqueConnection);
+    
     // ⚠️ 连接视频显示模式变化信号
     connect(video_widget_, &VideoWidget::aspectRatioModeChanged, 
             this, &MainWindow::onAspectRatioModeChanged);
@@ -105,7 +110,8 @@ void MainWindow::setupUI() {
 }
 
 void MainWindow::on_openButton_clicked() {
-    openFile("https://111453136245362688.tenwiseacademy.cn/f325d6cebae3d4ddcfd73ecb63f1fb23/bd2a08a90684fa70b99d8401415a6ebd.mp4");
+//    openFile("https://111453136245362688.tenwiseacademy.cn/f325d6cebae3d4ddcfd73ecb63f1fb23/bd2a08a90684fa70b99d8401415a6ebd.mp4");
+    openFile("https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4");
 //    QString filename = QFileDialog::getOpenFileName(
 //        this,
 //        "打开视频文件",
@@ -277,30 +283,76 @@ void MainWindow::refreshVideo() {
         return;
     }
     
+    // ⚠️ 获取播放速率
+    double playback_rate = player_->get_playback_rate();
+    
     // ⚠️ 计算帧与主时钟的差值
-    double diff = frame_pts - master_clock;
+    double delay = frame_pts - master_clock;
     
-    // 同步阈值
-    const double SYNC_THRESHOLD_MIN = 0.04;  // 40ms
-    const double SYNC_THRESHOLD_MAX = 0.1;   // 100ms
-    const double NOSYNC_THRESHOLD = 10.0;    // 10s，超过则认为不同步
+    // ⚠️ 参考 ffplay：根据播放速率和帧持续时间调整同步策略
+    // 帧持续时间（下一帧 PTS - 当前帧 PTS）
+    double frame_duration = vf->duration;
     
-    if (std::fabs(diff) < NOSYNC_THRESHOLD) {
-        if (diff <= -SYNC_THRESHOLD_MAX) {
-            // 视频严重落后音频（超过 100ms），丢帧
-            qDebug() << "视频落后，丢帧 diff=" << diff;
-            video_queue->next();
-            last_video_pts_ = frame_pts;
-        } else if (diff >= SYNC_THRESHOLD_MIN) {
-            // 视频领先音频（超过 40ms），等待下次检查
-            // 不做任何操作，下次再检查
+    // ⚠️ 日志：原始帧持续时间
+    static int duration_log_count = 0;
+    if (++duration_log_count % 200 == 0) {
+        qDebug() << "[帧持续] 原始duration:" << frame_duration 
+                 << ", 是否有效:" << (frame_duration > 0 && !std::isnan(frame_duration));
+    }
+    
+    // ⚠️ 修复：如果 duration 无效或太小，使用帧率估算
+    if (frame_duration <= 0 || std::isnan(frame_duration) || frame_duration < 0.001) {
+        // 如果没有 duration，使用帧率估算
+        const auto& media_info = player_->get_media_info();
+        if (media_info.video_fps > 0) {
+            frame_duration = 1.0 / media_info.video_fps;
+            if (duration_log_count % 200 == 0) {
+                qDebug() << "[帧持续] 使用帧率计算:" << frame_duration 
+                         << "秒 (fps=" << media_info.video_fps << ")";
+            }
         } else {
-            // 在合理范围内（-100ms ~ 40ms），显示帧
-            video_widget_->updateFrame(video_queue);
-            last_video_pts_ = frame_pts;
+            frame_duration = 0.04;  // 默认 25fps
+            if (duration_log_count % 200 == 0) {
+                qDebug() << "[帧持续] 使用默认值: 0.04秒 (25fps)";
+            }
         }
+    }
+    
+    // ⚠️ 关键：根据播放速率调整帧持续时间
+    // 2.0x 时，每帧显示时间减半；0.5x 时，每帧显示时间加倍
+    double adjusted_frame_duration = frame_duration / playback_rate;
+    
+    // ⚠️ 同步阈值（参考 ffplay AV_SYNC_THRESHOLD）
+    const double AV_SYNC_THRESHOLD_MIN = 0.04;  // 最小同步阈值 40ms
+    const double AV_SYNC_THRESHOLD_MAX = 0.1;   // 最大同步阈值 100ms
+    double sync_threshold = std::max(AV_SYNC_THRESHOLD_MIN, 
+                                     std::min(AV_SYNC_THRESHOLD_MAX, adjusted_frame_duration));
+    
+    // ⚠️ 日志：视频同步信息
+    static int video_sync_count = 0;
+    if (++video_sync_count % 100 == 0) {
+        qDebug() << "[视频同步] PTS:" << frame_pts 
+                 << ", 主时钟:" << master_clock
+                 << ", 延迟:" << delay
+                 << ", 速率:" << playback_rate << "x"
+                 << ", 帧时长:" << frame_duration
+                 << ", 调整后:" << adjusted_frame_duration
+                 << ", 阈值:" << sync_threshold;
+    }
+    
+    // ⚠️ 判断是否需要丢帧或等待
+    if (delay <= -sync_threshold) {
+        // 视频严重落后音频，丢帧
+        if (video_sync_count % 20 == 0) {
+            qDebug() << "[视频] 丢帧，延迟:" << delay << ", 阈值:" << -sync_threshold;
+        }
+        video_queue->next();
+        last_video_pts_ = frame_pts;
+    } else if (delay > sync_threshold) {
+        // 视频领先音频太多，等待
+        // 不做任何操作，下次再检查
     } else {
-        // 时钟差异太大，可能 seek 了，直接显示
+        // 在同步范围内，显示这一帧
         video_widget_->updateFrame(video_queue);
         last_video_pts_ = frame_pts;
     }
@@ -443,4 +495,33 @@ void MainWindow::dropEvent(QDropEvent *event) {
             openFile(filename);
         }
     }
+}
+
+// ⚠️ 倍速变化处理
+void MainWindow::handleSpeedChanged(int index) {
+    if (!player_) {
+        return;
+    }
+    
+    // 根据选择的索引设置播放速率
+    double rate = 1.0;
+    switch (index) {
+        case 0: rate = 0.5;  break;  // 0.5x
+        case 1: rate = 0.75; break;  // 0.75x
+        case 2: rate = 1.0;  break;  // 1.0x (正常)
+        case 3: rate = 1.25; break;  // 1.25x
+        case 4: rate = 1.5;  break;  // 1.5x
+        case 5: rate = 2.0;  break;  // 2.0x
+        default: rate = 1.0; break;
+    }
+    
+    qDebug() << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+    qDebug() << "[UI] 用户选择播放速率:" << rate << "x (索引:" << index << ")";
+    qDebug() << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+    
+    player_->set_playback_rate(rate);
+    
+    // 验证设置是否成功
+    double actual_rate = player_->get_playback_rate();
+    qDebug() << "[UI] 实际播放速率:" << actual_rate << "x";
 }

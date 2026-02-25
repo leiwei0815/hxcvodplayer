@@ -6,7 +6,7 @@
 #ifndef QT_PLATFORM_FACTORY_H
 #define QT_PLATFORM_FACTORY_H
 
-#include "platform_interface.h"
+#include "yx_platform_interface.h"
 
 namespace yxplayer {
 

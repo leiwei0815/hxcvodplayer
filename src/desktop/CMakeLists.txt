@@ -42,6 +42,11 @@ target_link_libraries(YXVodPlayer PRIVATE
     ${SDL2_LIBRARIES}
 )
 
+# SoundTouch（倍速播放）
+if(SOUNDTOUCH_FOUND)
+    target_link_libraries(YXVodPlayer PRIVATE ${SOUNDTOUCH_LIBRARIES})
+endif()
+
 # 设置输出目录
 set_target_properties(YXVodPlayer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin

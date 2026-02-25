@@ -9,8 +9,8 @@
 #include <QWidget>
 #include <QImage>
 #include <memory>
-#include "frame_queue.h"
-#include "player_types.h"
+#include "yx_frame_queue.h"
+#include "yx_player_types.h"
 
 extern "C" {
 #include <SDL2/SDL.h>

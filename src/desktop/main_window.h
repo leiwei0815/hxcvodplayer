@@ -9,7 +9,7 @@
 #include <QMainWindow>
 #include <QTimer>
 #include <memory>
-#include "player_core.h"
+#include "yx_player_core.h"
 #include "video_widget.h"
 
 QT_BEGIN_NAMESPACE
@@ -55,16 +55,17 @@ public slots:
 private:
     void setupUI();
     QString formatTime(double seconds);
+    void refreshVideo();  // 视频刷新
 
-private:
-    void refreshVideo();  // 新增：精确的视频刷新
+private slots:
+    void handleSpeedChanged(int index);  // 倍速变化处理
 
 private:
     Ui::MainWindow *ui;
     std::unique_ptr<yxplayer::PlayerCore> player_;
     VideoWidget* video_widget_;
     QTimer* update_timer_;
-    QTimer* refresh_timer_;  // 新增：视频刷新定时器
+    QTimer* refresh_timer_;  // 视频刷新定时器
     bool is_seeking_;
     double last_video_pts_;  // 上一帧的 PTS
 };
