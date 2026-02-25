@@ -1,0 +1,5 @@
+# 编译产物
+build/
+*.xcodeproj.user
+*.xcworkspace
+.DS_Store

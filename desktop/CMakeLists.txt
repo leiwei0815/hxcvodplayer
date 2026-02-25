@@ -30,12 +30,11 @@ add_executable(YXVodPlayer
 
 target_include_directories(YXVodPlayer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/core/include
 )
 
 target_link_libraries(YXVodPlayer PRIVATE
     hxcplayer_core
-    hxcplayer_platform
     Qt5::Core
     Qt5::Gui
     Qt5::Widgets

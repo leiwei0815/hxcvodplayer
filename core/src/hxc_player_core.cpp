@@ -100,6 +100,10 @@ int PlayerCore::open(const std::string& filename) {
     }
     
     LOG_INFO("正在打开文件: ", filename);
+    
+    // ⚠️ 重置终止标志（重要！否则之前 close() 设置的 true 会导致新线程立即退出）
+    abort_request_ = false;
+    
     set_state(PlayerState::Opening);
     
     // 打开输入文件
@@ -692,11 +696,26 @@ void PlayerCore::video_thread() {
     double pts;
     double duration;
     int frame_count = 0;
+    int error_count = 0;  // 添加错误计数
+    
+    LOG_INFO("[视频线程] 进入主循环, video_decoder_ exists=", (video_decoder_ != nullptr), ", abort_request_=", abort_request_);
     
     while (!abort_request_) {
         // ⚠️ 检查暂停状态
         while (video_decoder_ && video_decoder_->should_pause() && !abort_request_) {
+            if (error_count == 0) {
+                LOG_INFO("视频解码器暂停中，等待恢复...");
+                error_count++;  // 只打印一次
+            }
             PLAYER_DELAY(10);
+        }
+        
+        // 重置错误计数
+        if (video_decoder_ && !video_decoder_->should_pause()) {
+            if (error_count > 0) {
+                LOG_INFO("视频解码器已恢复，开始解码...");
+            }
+            error_count = 0;
         }
         
         if (abort_request_) {
@@ -708,7 +727,10 @@ void PlayerCore::video_thread() {
         if (ret < 0) {
             // ⚠️ 解码错误，可能是队列为空或其他临时问题
             if (ret != AVERROR(EAGAIN)) {
-                LOG_ERROR("视频解码错误: ", ret);
+                error_count++;
+                if (error_count <= 3 || error_count % 100 == 0) {
+                    LOG_ERROR("视频解码错误: ", ret, " (错误次数: ", error_count, ")");
+                }
             }
             PLAYER_DELAY(10);
             continue;  // 继续尝试
@@ -802,6 +824,8 @@ void PlayerCore::audio_thread() {
     int frame_count = 0;
     int error_count = 0;
     
+    LOG_INFO("[音频线程] 进入主循环, audio_decoder_ exists=", (audio_decoder_ != nullptr), ", audio_packet_queue_ exists=", (audio_packet_queue_ != nullptr));
+    
     while (!abort_request_) {
         // 检查暂停状态
         if (audio_decoder_ && audio_decoder_->should_pause()) {
@@ -816,12 +840,21 @@ void PlayerCore::audio_thread() {
         }
         
         if (abort_request_) {
+            LOG_INFO("[音频线程] 收到终止请求");
             break;
         }
         
         // 检查解码器和队列状态
-        if (!audio_decoder_ || !audio_packet_queue_) {
-            LOG_ERROR("音频解码器或队列为空");
+        if (!audio_decoder_) {
+            LOG_ERROR("[音频线程] audio_decoder_ 为空");
+            break;
+        }
+        if (!audio_packet_queue_) {
+            LOG_ERROR("[音频线程] audio_packet_queue_ 为空");
+            break;
+        }
+        if (!audio_queue_) {
+            LOG_ERROR("[音频线程] audio_queue_ 为空");
             break;
         }
         

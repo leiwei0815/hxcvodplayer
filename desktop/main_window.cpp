@@ -223,12 +223,7 @@ void MainWindow::updateUI() {
         return;  // 用户正在拖动，不做任何更新
     }
     
-    auto state = player_->get_state();
-    if (state == hxcplayer::PlayerState::Paused) {
-        return;
-    }
-    
-    // 更新进度条和时间
+    // 更新进度条和时间（不管是播放还是暂停状态）
     double position = player_->get_position();
     double duration = player_->get_duration();
     

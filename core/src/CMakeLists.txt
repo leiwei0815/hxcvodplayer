@@ -3,12 +3,13 @@ set(CORE_SOURCES
     hxc_packet_queue.cpp
     hxc_decoder.cpp
     hxc_player_core.cpp
+    hxc_player_core_c_bridge.cpp
 )
 
 add_library(hxcplayer_core STATIC ${CORE_SOURCES})
 
 target_include_directories(hxcplayer_core PUBLIC
-    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/core/include
     ${FFMPEG_INCLUDE_DIRS}
     ${SDL2_INCLUDE_DIRS}
 )

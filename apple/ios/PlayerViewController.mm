@@ -4,11 +4,11 @@
  */
 
 #import "PlayerViewController.h"
-#import "YXPlayerControl.h"
+#import "../HXCPlayerControl.h"  // 使用统一的播放器类
 
-@interface PlayerViewController () <YXPlayerControlDelegate>
+@interface PlayerViewController () <HXCPlayerControlDelegate>
 
-@property (nonatomic, strong) YXPlayerControl *player;
+@property (nonatomic, strong) HXCPlayerControl *player;
 @property (nonatomic, strong) UIView *playerContainerView;
 @property (nonatomic, strong) UISlider *progressSlider;
 @property (nonatomic, strong) UIButton *playPauseButton;
@@ -30,7 +30,7 @@
     self.view.backgroundColor = [UIColor blackColor];
     
     // 创建播放器
-    _player = [[YXPlayerControl alloc] init];
+    _player = [[HXCPlayerControl alloc] init];
     _player.startPosition = 67;
     _player.delegate = self;
     
@@ -225,7 +225,7 @@
 #pragma mark - Control Actions
 
 - (void)playPauseButtonTapped:(UIButton *)sender {
-    if (_player.state == YXPlayerStatePlaying) {
+    if (_player.state == HXCPlayerStatePlaying) {
         [_player pause];
         [sender setTitle:@"播放" forState:UIControlStateNormal];
     } else {
@@ -278,11 +278,11 @@
 
 - (void)aspectRatioButtonTapped:(UIButton *)sender {
     // 切换显示模式：Fit（适应）<-> Fill（填充）
-    if (_player.aspectRatioMode == YXAspectRatioModeFit) {
-        _player.aspectRatioMode = YXAspectRatioModeFill;
+    if (_player.aspectRatioMode == HXCAspectRatioModeFit) {
+        _player.aspectRatioMode = HXCAspectRatioModeFill;
         [sender setTitle:@"填充" forState:UIControlStateNormal];
     } else {
-        _player.aspectRatioMode = YXAspectRatioModeFit;
+        _player.aspectRatioMode = HXCAspectRatioModeFit;
         [sender setTitle:@"适应" forState:UIControlStateNormal];
     }
 }
@@ -291,17 +291,17 @@
     _player.volume = sender.value;
 }
 
-#pragma mark - YXPlayerControlDelegate
+#pragma mark - HXCPlayerControlDelegate
 
-- (void)player:(YXPlayerControl *)player didChangeState:(YXPlayerState)state {
+- (void)playerDidChangeState:(HXCPlayerState)state {
     NSLog(@"播放器状态改变: %ld", (long)state);
 }
 
-- (void)player:(YXPlayerControl *)player didEncounterError:(NSString *)error {
-    NSLog(@"播放器错误: %@", error);
+- (void)playerDidEncounterError:(NSError *)error {
+    NSLog(@"播放器错误: %@", error.localizedDescription);
     
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"错误"
-                                                                   message:error
+                                                                   message:error.localizedDescription
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];

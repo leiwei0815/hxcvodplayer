@@ -111,7 +111,7 @@ endif()
 
 # 包含目录
 include_directories(
-    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/core/include
     ${FFMPEG_INCLUDE_DIRS}
     ${SDL2_INCLUDE_DIRS}
 )
@@ -131,15 +131,12 @@ if(SOUNDTOUCH_FOUND)
 endif()
 
 # 核心库
-add_subdirectory(src/core)
-
-# 平台抽象层
-add_subdirectory(src/platform)
+add_subdirectory(core/src)
 
 # 桌面版本
 if(BUILD_DESKTOP AND (PLATFORM_MACOS OR PLATFORM_WINDOWS))
     find_package(Qt5 COMPONENTS Core Gui Widgets REQUIRED)
-    add_subdirectory(src/desktop)
+    add_subdirectory(desktop)
 endif()
 
 # 输出信息
