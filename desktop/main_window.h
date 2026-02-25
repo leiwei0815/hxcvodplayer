@@ -56,6 +56,8 @@ private:
     void setupUI();
     QString formatTime(double seconds);
     void refreshVideo();  // 视频刷新
+    void openLocalFile();  // 打开本地文件
+    void openNetworkURL();  // 打开网络地址
 
 private slots:
     void handleSpeedChanged(int index);  // 倍速变化处理

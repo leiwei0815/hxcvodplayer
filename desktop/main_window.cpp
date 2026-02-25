@@ -7,6 +7,7 @@
 #include "ui_main_window.h"
 #include <QFileDialog>
 #include <QMessageBox>
+#include <QInputDialog>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QMimeData>
@@ -113,18 +114,54 @@ void MainWindow::setupUI() {
 }
 
 void MainWindow::on_openButton_clicked() {
-//    openFile("https://111453136245362688.tenwiseacademy.cn/f325d6cebae3d4ddcfd73ecb63f1fb23/bd2a08a90684fa70b99d8401415a6ebd.mp4");
-    openFile("https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4");
-//    QString filename = QFileDialog::getOpenFileName(
-//        this,
-//        "打开视频文件",
-//        QString(),
-//        "视频文件 (*.mp4 *.mkv *.avi *.flv *.mov *.wmv);;所有文件 (*.*)"
-//    );
-//    
-//    if (!filename.isEmpty()) {
-//        openFile(filename);
-//    }
+    // 创建选择对话框
+    QMessageBox msgBox(this);
+    msgBox.setWindowTitle("打开视频");
+    msgBox.setText("请选择视频来源");
+    QPushButton *localButton = msgBox.addButton("本地文件", QMessageBox::ActionRole);
+    QPushButton *networkButton = msgBox.addButton("网络地址", QMessageBox::ActionRole);
+    msgBox.addButton("取消", QMessageBox::RejectRole);
+    
+    msgBox.exec();
+    
+    if (msgBox.clickedButton() == localButton) {
+        // 本地文件
+        openLocalFile();
+    } else if (msgBox.clickedButton() == networkButton) {
+        // 网络地址
+        openNetworkURL();
+    }
+}
+
+void MainWindow::openLocalFile() {
+    QString filename = QFileDialog::getOpenFileName(
+        this,
+        "选择要播放的视频文件",
+        QString(),
+        "视频文件 (*.mp4 *.mkv *.avi *.flv *.mov *.wmv *.m4v *.3gp *.ts *.m3u8);;所有文件 (*.*)"
+    );
+    
+    if (!filename.isEmpty()) {
+        openFile(filename);
+    }
+}
+
+void MainWindow::openNetworkURL() {
+    bool ok;
+    QString urlString = QInputDialog::getText(
+        this,
+        "输入网络地址",
+        "请输入视频的网络地址（HTTP/HTTPS）:",
+        QLineEdit::Normal,
+        "https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4",
+        &ok
+    );
+    
+    if (ok && !urlString.trimmed().isEmpty()) {
+        openFile(urlString.trimmed());
+    } else if (ok) {
+        QMessageBox::warning(this, "错误", "请输入有效的网络地址");
+    }
 }
 
 void MainWindow::on_playPauseButton_clicked() {

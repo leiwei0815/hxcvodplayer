@@ -269,21 +269,77 @@
 #pragma mark - Actions
 
 - (void)openButtonClicked:(id)sender {
-//    NSOpenPanel *openPanel = [NSOpenPanel openPanel];
-//    openPanel.allowedFileTypes = @[@"mp4", @"mkv", @"avi", @"mov", @"flv", @"wmv"];
-//    openPanel.canChooseFiles = YES;
-//    openPanel.canChooseDirectories = NO;
-//    openPanel.allowsMultipleSelection = NO;
-//    
-//    [openPanel beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse result) {
-//        if (result == NSModalResponseOK) {
-//            NSURL *fileURL = openPanel.URLs.firstObject;
-//            [self openURL:fileURL.path];
-//        }
-//    }];
+    // 创建选择对话框
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"打开视频";
+    alert.informativeText = @"请选择视频来源";
+    [alert addButtonWithTitle:@"本地文件"];
+    [alert addButtonWithTitle:@"网络地址"];
+    [alert addButtonWithTitle:@"取消"];
     
-    // 或者直接打开一个测试 URL
-     [self openURL:@"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4"];
+    NSModalResponse response = [alert runModal];
+    
+    if (response == NSAlertFirstButtonReturn) {
+        // 本地文件
+        [self openLocalFile];
+    } else if (response == NSAlertSecondButtonReturn) {
+        // 网络地址
+        [self openNetworkURL];
+    }
+}
+
+- (void)openLocalFile {
+    NSOpenPanel *openPanel = [NSOpenPanel openPanel];
+    openPanel.allowedFileTypes = @[@"mp4", @"mkv", @"avi", @"mov", @"flv", @"wmv", @"m4v", @"3gp", @"ts", @"m3u8"];
+    openPanel.canChooseFiles = YES;
+    openPanel.canChooseDirectories = NO;
+    openPanel.allowsMultipleSelection = NO;
+    openPanel.message = @"选择要播放的视频文件";
+    
+    [openPanel beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse result) {
+        if (result == NSModalResponseOK) {
+            NSURL *fileURL = openPanel.URLs.firstObject;
+            [self openURL:fileURL.path];
+        }
+    }];
+}
+
+- (void)openNetworkURL {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"输入网络地址";
+    alert.informativeText = @"请输入视频的网络地址（HTTP/HTTPS）";
+    [alert addButtonWithTitle:@"确定"];
+    [alert addButtonWithTitle:@"取消"];
+    
+    // 创建输入框
+    NSTextField *input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 400, 24)];
+    input.placeholderString = @"https://example.com/video.mp4";
+    input.stringValue = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
+    alert.accessoryView = input;
+    
+    // 设置输入框为第一响应者
+    [alert layout];
+    [[alert window] makeFirstResponder:input];
+    
+    NSModalResponse response = [alert runModal];
+    
+    if (response == NSAlertFirstButtonReturn) {
+        NSString *urlString = [input.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (urlString.length > 0) {
+            [self openURL:urlString];
+        } else {
+            [self showErrorAlert:@"请输入有效的网络地址"];
+        }
+    }
+}
+
+- (void)showErrorAlert:(NSString *)message {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"错误";
+    alert.informativeText = message;
+    alert.alertStyle = NSAlertStyleWarning;
+    [alert addButtonWithTitle:@"确定"];
+    [alert runModal];
 }
 
 - (void)playPauseButtonClicked:(id)sender {
