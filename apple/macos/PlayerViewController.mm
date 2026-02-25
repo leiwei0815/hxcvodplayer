@@ -41,7 +41,7 @@
 
 - (void)dealloc {
     [_updateTimer invalidate];
-    [_player close];
+    [_player stop];
 }
 
 #pragma mark - Setup
@@ -346,8 +346,8 @@
 #pragma mark - Player Control
 
 - (void)openURL:(NSString *)urlString {
-    [_player close];
-    
+    [_player stop];
+
     if ([_player prepareToPlay:urlString]) {
         [_player play];
     } else {

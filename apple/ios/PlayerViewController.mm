@@ -163,7 +163,7 @@
 
 - (void)dealloc {
     [_progressTimer invalidate];
-    [_player close];
+    [_player stop];
 }
 
 #pragma mark - Test Video

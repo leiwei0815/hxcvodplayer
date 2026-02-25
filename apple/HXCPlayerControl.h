@@ -70,10 +70,9 @@ typedef NS_ENUM(NSInteger, HXCAspectRatioMode) {
 - (void)play;                                          // 开始播放
 - (void)pause;                                         // 暂停
 - (void)resume;                                        // 恢复播放
-- (void)stop;                                          // 停止播放（等同于 close）
+- (void)stop;                                          // 停止播放并释放资源
 - (void)replay;                                        // 重新播放
 - (void)seekToPosition:(double)position;               // 跳转到指定位置
-- (void)close;                                         // 关闭播放器
 
 @end
 

@@ -106,7 +106,7 @@ static const int kNumberOfBuffers = 3;
 }
 
 - (void)dealloc {
-    [self close];
+    [self stop];
     if (_wrapper) {
         delete _wrapper;
         _wrapper = nullptr;
@@ -120,7 +120,7 @@ static const int kNumberOfBuffers = 3;
         return NO;
     }
     
-    [self close];
+    [self stop];
     _playerUrl = [url copy];
     _state = HXCPlayerStateOpening;
     
@@ -224,11 +224,6 @@ static const int kNumberOfBuffers = 3;
     [self play];
 }
 
-- (void)stop {
-    // stop 是 close 的别名
-    [self close];
-}
-
 - (void)seekToPosition:(double)position {
     player_core_seek(_wrapper->handle(), position);
     
@@ -241,7 +236,7 @@ static const int kNumberOfBuffers = 3;
 #endif
 }
 
-- (void)close {
+- (void)stop {
     [self stopDisplayLink];
     [self teardownAudioQueue];
     
