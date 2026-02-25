@@ -15,6 +15,9 @@
 #import <AppKit/AppKit.h>
 #endif
 
+// 导入播放器视图
+#import "HXCPlayerView.h"
+
 // 播放器状态
 typedef NS_ENUM(NSInteger, HXCPlayerState) {
     HXCPlayerStateIdle = 0,      // 空闲
@@ -59,7 +62,7 @@ typedef NS_ENUM(NSInteger, HXCAspectRatioMode) {
 @property (nonatomic, readonly) HXCPlayerState state;
 @property (nonatomic, readonly) double duration;
 @property (nonatomic, readonly) double position;
-@property (nonatomic, strong, readonly) AVSampleBufferDisplayLayer *videoLayer;
+@property (nonatomic, strong, readonly) HXCPlayerView *videoView;  // 视频视图（自动管理布局）
 
 // 播放控制
 - (BOOL)openURL:(NSString *)url;                      // 打开 URL（不自动播放）

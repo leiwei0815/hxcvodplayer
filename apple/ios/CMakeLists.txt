@@ -73,6 +73,7 @@ set(CORE_HEADERS
 # iOS 源文件（使用统一的播放器类）
 set(IOS_SOURCES
     ${PROJECT_ROOT}/apple/HXCPlayerControl.mm
+    ${PROJECT_ROOT}/apple/HXCPlayerView.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/PlayerViewController.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/AppDelegate.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/main.mm
@@ -81,6 +82,7 @@ set(IOS_SOURCES
 # iOS 头文件
 set(IOS_HEADERS
     ${PROJECT_ROOT}/apple/HXCPlayerControl.h
+    ${PROJECT_ROOT}/apple/HXCPlayerView.h
     ${CMAKE_CURRENT_SOURCE_DIR}/PlayerViewController.h
     ${CMAKE_CURRENT_SOURCE_DIR}/AppDelegate.h
 )
@@ -96,6 +98,7 @@ set_source_files_properties(
 # 为 Objective-C++ 文件设置编译标志（解决 AVMediaType 冲突）
 set_source_files_properties(
     ${PROJECT_ROOT}/apple/HXCPlayerControl.mm
+    ${PROJECT_ROOT}/apple/HXCPlayerView.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/PlayerViewController.mm
     PROPERTIES
     COMPILE_FLAGS "-Wno-ambiguous-macro"

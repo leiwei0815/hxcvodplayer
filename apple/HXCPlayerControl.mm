@@ -5,6 +5,7 @@
 
 #include "hxc_player_core_c_bridge.h"
 #import "HXCPlayerControl.h"
+#import "HXCPlayerView.h"
 #include <AudioToolbox/AudioToolbox.h>
 
 // C++ 播放器包装器
@@ -55,7 +56,7 @@ static const int kNumberOfBuffers = 3;
     int _videoHeight;
 }
 
-@property (nonatomic, strong) AVSampleBufferDisplayLayer *videoLayer;
+@property (nonatomic, strong) HXCPlayerView *videoView;
 @property (nonatomic, strong) dispatch_queue_t renderQueue;
 
 @end
@@ -73,28 +74,23 @@ static const int kNumberOfBuffers = 3;
         _aspectRatioMode = HXCAspectRatioModeFit;
         _audioQueueRunning = NO;
         
-        // 创建视频显示层
-        _videoLayer = [[AVSampleBufferDisplayLayer alloc] init];
-        _videoLayer.videoGravity = AVLayerVideoGravityResizeAspect;
+        // 创建视频视图（自动管理布局）
+        _videoView = [[HXCPlayerView alloc] initWithFrame:CGRectZero];
         
 #if TARGET_OS_IOS
-        // iOS 平台特定初始化
-        _videoLayer.backgroundColor = [[UIColor blackColor] CGColor];
         NSLog(@"[播放器] 初始化 HXCPlayerControl (iOS)");
 #else
-        // macOS 平台特定初始化  
-        _videoLayer.backgroundColor = [[NSColor blackColor] CGColor];
-        
         // macOS 需要设置 controlTimebase
+        AVSampleBufferDisplayLayer *videoLayer = _videoView.videoLayer;
         CMTimebaseRef controlTimebase;
         CMTimebaseCreateWithSourceClock(kCFAllocatorDefault, 
                                        CMClockGetHostTimeClock(), 
                                        &controlTimebase);
-        _videoLayer.controlTimebase = controlTimebase;
+        videoLayer.controlTimebase = controlTimebase;
         CFRelease(controlTimebase);
         
-        CMTimebaseSetTime(_videoLayer.controlTimebase, kCMTimeZero);
-        CMTimebaseSetRate(_videoLayer.controlTimebase, 1.0);
+        CMTimebaseSetTime(videoLayer.controlTimebase, kCMTimeZero);
+        CMTimebaseSetRate(videoLayer.controlTimebase, 1.0);
         
         NSLog(@"[播放器] 初始化 HXCPlayerControl (macOS)");
 #endif
@@ -238,9 +234,9 @@ static const int kNumberOfBuffers = 3;
     
 #if !TARGET_OS_IOS
     // macOS 需要更新 controlTimebase
-    if (_videoLayer && _videoLayer.controlTimebase) {
+    if (_videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
         CMTime newTime = CMTimeMake((int64_t)(position * 1000000), 1000000);
-        CMTimebaseSetTime(_videoLayer.controlTimebase, newTime);
+        CMTimebaseSetTime(_videoView.videoLayer.controlTimebase, newTime);
     }
 #endif
 }
@@ -252,9 +248,9 @@ static const int kNumberOfBuffers = 3;
     if (_wrapper && _wrapper->handle()) {
         player_core_stop(_wrapper->handle());
     }
-    
-    [_videoLayer flushAndRemoveImage];
-    
+
+    [_videoView.videoLayer flushAndRemoveImage];
+
     _state = HXCPlayerStateIdle;
     _duration = 0;
     _position = 0;
@@ -307,9 +303,9 @@ static const int kNumberOfBuffers = 3;
     
     dispatch_async(dispatch_get_main_queue(), ^{
         if (aspectRatioMode == HXCAspectRatioModeFit) {
-            self->_videoLayer.videoGravity = AVLayerVideoGravityResizeAspect;
+            self->_videoView.videoLayer.videoGravity = AVLayerVideoGravityResizeAspect;
         } else {
-            self->_videoLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+            self->_videoView.videoLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
         }
     });
 }
@@ -480,7 +476,7 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 }
 
 - (void)displayVideoFrameData:(VideoFrameDataC *)frameData {
-    if (!frameData || !_videoLayer) {
+    if (!frameData || !_videoView.videoLayer) {
         return;
     }
     
@@ -519,10 +515,10 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     
     if (sampleBuffer) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (self->_videoLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
-                [self->_videoLayer flush];
+            if (self->_videoView.videoLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+                [self->_videoView.videoLayer flush];
             }
-            [self->_videoLayer enqueueSampleBuffer:sampleBuffer];
+            [self->_videoView.videoLayer enqueueSampleBuffer:sampleBuffer];
             CFRelease(sampleBuffer);
         });
     }

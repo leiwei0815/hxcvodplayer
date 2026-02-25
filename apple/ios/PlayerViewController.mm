@@ -49,9 +49,10 @@
     _playerContainerView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_playerContainerView];
     
-    // 添加视频层
-    _player.videoLayer.frame = _playerContainerView.bounds;
-    [_playerContainerView.layer addSublayer:_player.videoLayer];
+    // 添加视频视图
+    _player.videoView.frame = _playerContainerView.bounds;
+    _player.videoView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [_playerContainerView addSubview:_player.videoView];
     
     // 控制栏容器
     UIView *controlBar = [[UIView alloc] init];
@@ -157,7 +158,7 @@
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    _player.videoLayer.frame = _playerContainerView.bounds;
+//    _player.videoLayer.frame = _playerContainerView.bounds;
 }
 
 - (void)dealloc {

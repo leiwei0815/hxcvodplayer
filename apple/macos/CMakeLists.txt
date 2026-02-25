@@ -79,12 +79,12 @@ set(CORE_HEADERS
 # macOS 播放器控制类（使用统一的播放器）
 set(PLAYER_SOURCES
     ${PROJECT_ROOT}/apple/HXCPlayerControl.mm
-    HXCPlayerView.mm
+    ${PROJECT_ROOT}/apple/HXCPlayerView.mm
 )
 
 set(PLAYER_HEADERS
     ${PROJECT_ROOT}/apple/HXCPlayerControl.h
-    HXCPlayerView.h
+    ${PROJECT_ROOT}/apple/HXCPlayerView.h
 )
 
 # macOS 应用源文件

@@ -5,12 +5,10 @@
 
 #import "PlayerViewController.h"
 #import "../HXCPlayerControl.h"  // 使用统一的播放器类
-#import "HXCPlayerView.h"
 
 @interface PlayerViewController () <HXCPlayerControlDelegate>
 
 @property (nonatomic, strong) HXCPlayerControl *player;
-@property (nonatomic, strong) HXCPlayerView *playerView;
 
 // UI 控件
 @property (nonatomic, strong) NSButton *openButton;
@@ -52,20 +50,16 @@
     // 创建播放器
     _player = [[HXCPlayerControl alloc] init];
     _player.delegate = self;
-    
-    // 创建播放器视图
-    NSRect playerFrame = NSMakeRect(0, 100, 1280, 620);
-    _playerView = [[HXCPlayerView alloc] initWithFrame:playerFrame];
-    [_playerView setPlayer:_player];
-    [self.view addSubview:_playerView];
+    // 添加视频视图
+    [self.view addSubview:_player.videoView];
     
     // 设置自动布局
-    _playerView.translatesAutoresizingMaskIntoConstraints = NO;
+    _player.videoView.translatesAutoresizingMaskIntoConstraints = NO;
     [NSLayoutConstraint activateConstraints:@[
-        [_playerView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
-        [_playerView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [_playerView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [_playerView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor constant:-100]
+        [_player.videoView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_player.videoView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_player.videoView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_player.videoView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor constant:-100]
     ]];
 }
 
