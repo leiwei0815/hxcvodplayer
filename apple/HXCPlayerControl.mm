@@ -54,6 +54,9 @@ static const int kNumberOfBuffers = 3;
     HXCAspectRatioMode _aspectRatioMode;
     int _videoWidth;
     int _videoHeight;
+    
+    // 进度更新回调限流
+    CFTimeInterval _lastPositionUpdateTime;
 }
 
 @property (nonatomic, strong) HXCPlayerView *videoView;
@@ -73,6 +76,7 @@ static const int kNumberOfBuffers = 3;
         _startPosition = 0.0;
         _aspectRatioMode = HXCAspectRatioModeFit;
         _audioQueueRunning = NO;
+        _lastPositionUpdateTime = 0;
         
         // 创建视频视图（自动管理布局）
         _videoView = [[HXCPlayerView alloc] initWithFrame:CGRectZero];
@@ -467,6 +471,28 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     } else if (delay <= threshold) {
         [self displayVideoFrameData:&frame_data];
         player_core_consume_video_frame(_wrapper->handle());
+    }
+    
+    // 定期更新播放位置（限制为每 0.1 秒调用一次）
+    CFTimeInterval currentTime = CACurrentMediaTime();
+    if (currentTime - _lastPositionUpdateTime >= 0.1) {
+        _lastPositionUpdateTime = currentTime;
+        [self notifyPositionUpdate];
+    }
+}
+
+- (void)notifyPositionUpdate {
+    if (!_wrapper || !_wrapper->handle()) {
+        return;
+    }
+    
+    double position = player_core_get_position(_wrapper->handle());
+    double duration = player_core_get_duration(_wrapper->handle());
+    
+    if (duration > 0 && [self.delegate respondsToSelector:@selector(playerDidUpdatePosition:duration:)]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.delegate playerDidUpdatePosition:position duration:duration];
+        });
     }
 }
 

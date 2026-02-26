@@ -92,11 +92,13 @@ set(MACOS_SOURCES
     main.mm
     AppDelegate.mm
     PlayerViewController.mm
+    SeekSlider.mm
 )
 
 set(MACOS_HEADERS
     AppDelegate.h
     PlayerViewController.h
+    SeekSlider.h
 )
 
 # 为纯 C++ 文件（核心库）设置编译标志

@@ -1,0 +1,28 @@
+name: HXCPlayerMacOSTest
+options:
+  bundleIdPrefix: com.hxcplayer
+  deploymentTarget:
+    macOS: "11.0"
+  
+targets:
+  HXCPlayerMacOSTest:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hxcplayer.macostest
+        INFOPLIST_FILE: Info.plist
+        CODE_SIGN_ENTITLEMENTS: HXCPlayerMacOSTest.entitlements
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+        FRAMEWORK_SEARCH_PATHS:
+          - $(inherited)
+          - $(PROJECT_DIR)/../../apple/build_xcframework
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - "@executable_path/../Frameworks"
+    dependencies:
+      - framework: ../../apple/build_xcframework/HXCPlayer.xcframework
+        embed: true

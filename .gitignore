@@ -45,6 +45,10 @@ test_videos/
 *.xcworkspace
 DerivedData/
 
+# macOS 第三方库编译目录
+macos-third/ffmpeg-build-macos/
+macos-third/soundtouch-build-macos/
+
 # Android
 *.iml
 .gradle/

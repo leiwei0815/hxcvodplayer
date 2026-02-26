@@ -1,0 +1,28 @@
+name: HXCPlayerIOSTest
+options:
+  bundleIdPrefix: com.hxcplayer
+  deploymentTarget:
+    iOS: "13.0"
+  
+targets:
+  HXCPlayerIOSTest:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hxcplayer.iostest
+        INFOPLIST_FILE: Info.plist
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_BITCODE: NO
+        FRAMEWORK_SEARCH_PATHS:
+          - $(inherited)
+          - $(PROJECT_DIR)/../../apple/build_xcframework
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - "@executable_path/Frameworks"
+    dependencies:
+      - framework: ../../apple/build_xcframework/HXCPlayer.xcframework
+        embed: true

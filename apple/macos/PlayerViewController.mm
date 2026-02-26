@@ -5,8 +5,9 @@
 
 #import "PlayerViewController.h"
 #import "../HXCPlayerControl.h"  // 使用统一的播放器类
+#import "SeekSlider.h"
 
-@interface PlayerViewController () <HXCPlayerControlDelegate>
+@interface PlayerViewController () <HXCPlayerControlDelegate, SeekSliderDelegate>
 
 @property (nonatomic, strong) HXCPlayerControl *player;
 
@@ -15,7 +16,7 @@
 @property (nonatomic, strong) NSButton *playPauseButton;
 @property (nonatomic, strong) NSButton *stopButton;
 @property (nonatomic, strong) NSButton *aspectRatioButton;
-@property (nonatomic, strong) NSSlider *progressSlider;
+@property (nonatomic, strong) SeekSlider *progressSlider;
 @property (nonatomic, strong) NSSlider *volumeSlider;
 @property (nonatomic, strong) NSPopUpButton *speedButton;
 @property (nonatomic, strong) NSTextField *timeLabel;
@@ -80,12 +81,11 @@
     ]];
     
     // 进度条
-    _progressSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(20, 70, 1240, 20)];
+    _progressSlider = [[SeekSlider alloc] initWithFrame:NSMakeRect(20, 70, 1240, 20)];
     _progressSlider.minValue = 0;
     _progressSlider.maxValue = 1000;
     _progressSlider.continuous = YES;
-    _progressSlider.target = self;
-    _progressSlider.action = @selector(progressSliderChanged:);
+    _progressSlider.seekDelegate = self;
     [controlBar addSubview:_progressSlider];
     
     _progressSlider.translatesAutoresizingMaskIntoConstraints = NO;
@@ -365,18 +365,35 @@
     }
 }
 
-- (void)progressSliderChanged:(id)sender {
-    if (!_isSeeking) {
-        _isSeeking = YES;
-        return;
+#pragma mark - SeekSliderDelegate
+
+- (void)seekSliderDidBeginTracking:(SeekSlider *)slider {
+    // 用户开始拖动，暂停 UI 自动更新
+    _isSeeking = YES;
+}
+
+- (void)seekSliderDidContinueTracking:(SeekSlider *)slider {
+    // 拖动过程中只更新时间显示，不执行真正的 seek
+    double value = slider.doubleValue;
+    double duration = _player.duration;
+    if (duration > 0) {
+        double position = (value / 1000.0) * duration;
+        _timeLabel.stringValue = [NSString stringWithFormat:@"%@ / %@",
+                                  [self formatTime:position],
+                                  [self formatTime:duration]];
     }
-    
-    double value = _progressSlider.doubleValue;
+}
+
+- (void)seekSliderDidEndTracking:(SeekSlider *)slider {
+    // 用户松手，执行真正的 seek 操作
+    double value = slider.doubleValue;
     double duration = _player.duration;
     if (duration > 0) {
         double position = (value / 1000.0) * duration;
         [_player seekToPosition:position];
     }
+    
+    // 恢复 UI 自动更新
     _isSeeking = NO;
 }
 
