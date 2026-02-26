@@ -49,6 +49,13 @@ DerivedData/
 macos-third/ffmpeg-build-macos/
 macos-third/soundtouch-build-macos/
 
+# iOS 第三方库编译目录
+ios-third/ffmpeg-build-ios/
+ios-third/soundtouch-build-ios/
+
+# Apple XCFramework 构建目录
+apple/build_xcframework/
+
 # Android
 *.iml
 .gradle/

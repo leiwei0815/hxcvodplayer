@@ -15,27 +15,26 @@ set(CMAKE_OBJCXX_STANDARD 17)
 # 项目根目录（从 apple/ios 向上两级）
 get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 
+# 根据 SDK 类型选择正确的库路径
+if(CMAKE_OSX_SYSROOT MATCHES ".*simulator.*" OR CMAKE_OSX_SYSROOT MATCHES ".*Simulator.*")
+    # iOS 模拟器 (arm64 + x86_64 通用二进制)
+    set(IOS_PLATFORM_DIR "ios-simulator")
+    message(STATUS "构建目标: iOS 模拟器")
+else()
+    # iOS 真机 (arm64)
+    set(IOS_PLATFORM_DIR "ios-device")
+    message(STATUS "构建目标: iOS 真机")
+endif()
+
 # FFmpeg 路径
-set(FFMPEG_ROOT "${PROJECT_ROOT}/ios-third/ffmpeg-build/FFmpeg-iOS")
+set(FFMPEG_ROOT "${PROJECT_ROOT}/ios-third/ffmpeg-build-ios/FFmpeg-iOS/${IOS_PLATFORM_DIR}")
 set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
 set(FFMPEG_LIB_DIR "${FFMPEG_ROOT}/lib")
 
-# SoundTouch 路径（根据编译目标选择）
-set(SOUNDTOUCH_ROOT "${PROJECT_ROOT}/ios-third/soundtouch-build/SoundTouch-iOS")
+# SoundTouch 路径
+set(SOUNDTOUCH_ROOT "${PROJECT_ROOT}/ios-third/soundtouch-build-ios/SoundTouch-iOS/${IOS_PLATFORM_DIR}")
 set(SOUNDTOUCH_INCLUDE_DIR "${SOUNDTOUCH_ROOT}/include")
-
-# 根据 SDK 类型选择 SoundTouch 库路径
-if(CMAKE_OSX_SYSROOT MATCHES ".*simulator.*" OR CMAKE_OSX_SYSROOT MATCHES ".*Simulator.*")
-    # 模拟器
-    set(SOUNDTOUCH_LIB_DIR "${SOUNDTOUCH_ROOT}/lib/simulator")
-    set(SOUNDTOUCH_LIBRARY "${SOUNDTOUCH_LIB_DIR}/libSoundTouch.a")
-    message(STATUS "使用 SoundTouch 模拟器库: ${SOUNDTOUCH_LIBRARY}")
-else()
-    # 真机
-    set(SOUNDTOUCH_LIB_DIR "${SOUNDTOUCH_ROOT}/lib/device")
-    set(SOUNDTOUCH_LIBRARY "${SOUNDTOUCH_LIB_DIR}/libSoundTouch.a")
-    message(STATUS "使用 SoundTouch 真机库: ${SOUNDTOUCH_LIBRARY}")
-endif()
+set(SOUNDTOUCH_LIB_DIR "${SOUNDTOUCH_ROOT}/lib")
 
 # 包含目录
 include_directories(
@@ -44,9 +43,10 @@ include_directories(
     ${SOUNDTOUCH_INCLUDE_DIR}
 )
 
-# 链接目录（只需要 FFmpeg，SoundTouch 使用完整路径）
+# 链接目录
 link_directories(
     ${FFMPEG_LIB_DIR}
+    ${SOUNDTOUCH_LIB_DIR}
 )
 
 # 核心库源文件
@@ -121,8 +121,8 @@ target_link_libraries(YXVodPlayer-iOS
     swscale
     swresample
     
-    # SoundTouch（使用完整路径）
-    ${SOUNDTOUCH_LIBRARY}
+    # SoundTouch
+    SoundTouch
     
     # iOS 系统框架
     "-framework Foundation"
@@ -182,9 +182,13 @@ source_group("iOS\\Sources" FILES ${IOS_SOURCES})
 # 输出信息
 message(STATUS "")
 message(STATUS "HXCPlayer iOS Configuration:")
-message(STATUS "  FFmpeg: ${FFMPEG_ROOT}")
+message(STATUS "  Platform: ${IOS_PLATFORM_DIR}")
+message(STATUS "  FFmpeg Root: ${FFMPEG_ROOT}")
+message(STATUS "  FFmpeg Include: ${FFMPEG_INCLUDE_DIR}")
+message(STATUS "  FFmpeg Lib: ${FFMPEG_LIB_DIR}")
+message(STATUS "  SoundTouch Root: ${SOUNDTOUCH_ROOT}")
 message(STATUS "  SoundTouch Include: ${SOUNDTOUCH_INCLUDE_DIR}")
-message(STATUS "  SoundTouch Library: ${SOUNDTOUCH_LIBRARY}")
+message(STATUS "  SoundTouch Lib: ${SOUNDTOUCH_LIB_DIR}")
 message(STATUS "  SDK: ${CMAKE_OSX_SYSROOT}")
 message(STATUS "  Deployment Target: ${CMAKE_OSX_DEPLOYMENT_TARGET}")
 message(STATUS "")

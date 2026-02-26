@@ -2,7 +2,7 @@
 
 # HXCPlayer XCFramework 构建脚本（一体化方案）
 # 将 FFmpeg 和 SoundTouch 静态链接到 HXCPlayer 中
-# 支持 iOS 模拟器 + macOS
+# 支持 iOS 真机 + iOS 模拟器 + macOS
 
 set -e
 
@@ -23,9 +23,29 @@ echo "=========================================="
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
+# ==================== 构建 iOS 真机版 ====================
+echo ""
+echo "📱 构建 iOS 真机版 (arm64)..."
+cd "$BUILD_DIR"
+mkdir -p ios-device && cd ios-device
+
+cmake -G Xcode \
+    -DCMAKE_SYSTEM_NAME=iOS \
+    -DCMAKE_OSX_SYSROOT=iphoneos \
+    -DCMAKE_OSX_ARCHITECTURES="arm64" \
+    -DIOS=ON \
+    "$FRAMEWORK_DIR"
+
+xcodebuild archive \
+    -scheme HXCPlayer \
+    -archivePath "$BUILD_DIR/ios-device.xcarchive" \
+    -destination "generic/platform=iOS" \
+    SKIP_INSTALL=NO \
+    BUILD_LIBRARY_FOR_DISTRIBUTION=YES
+
 # ==================== 构建 iOS 模拟器版 ====================
 echo ""
-echo "📱 构建 iOS 模拟器版..."
+echo "📱 构建 iOS 模拟器版 (arm64 + x86_64)..."
 cd "$BUILD_DIR"
 mkdir -p ios-simulator && cd ios-simulator
 
@@ -66,6 +86,7 @@ echo "📦 创建 XCFramework..."
 cd "$BUILD_DIR"
 
 xcodebuild -create-xcframework \
+    -framework "$BUILD_DIR/ios-device.xcarchive/Products/@rpath/HXCPlayer.framework" \
     -framework "$BUILD_DIR/ios-simulator.xcarchive/Products/@rpath/HXCPlayer.framework" \
     -framework "$BUILD_DIR/macos.xcarchive/Products/@rpath/HXCPlayer.framework" \
     -output "$BUILD_DIR/HXCPlayer.xcframework"
@@ -74,6 +95,14 @@ echo ""
 echo "✅ HXCPlayer.xcframework 构建成功！"
 echo ""
 echo "输出路径: $BUILD_DIR/HXCPlayer.xcframework"
+echo ""
+echo "=========================================="
+echo "架构支持"
+echo "=========================================="
+echo ""
+echo "✅ iOS 真机 (arm64)"
+echo "✅ iOS 模拟器 (arm64 + x86_64)"
+echo "✅ macOS (arm64)"
 echo ""
 echo "=========================================="
 echo "使用说明"
@@ -95,6 +124,6 @@ echo ""
 echo "3. 注意事项："
 echo "   - FFmpeg 和 SoundTouch 已静态链接到框架中"
 echo "   - 无需额外导入其他依赖"
-echo "   - 当前仅支持 iOS 模拟器和 macOS 平台"
-echo "   - iOS 真机支持需要重新编译 FFmpeg for iOS device"
+echo "   - 支持所有 iOS 设备和模拟器"
+echo "   - iOS 真机版本支持 VideoToolbox 硬件加速"
 echo ""

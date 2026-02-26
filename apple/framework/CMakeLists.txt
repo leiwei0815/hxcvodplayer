@@ -70,29 +70,28 @@ include_directories(
 )
 
 if(IOS)
-    # iOS: 使用预编译的静态库
-    set(FFMPEG_ROOT "${PROJECT_ROOT}/ios-third/ffmpeg-build/FFmpeg-iOS")
-    set(SOUNDTOUCH_ROOT "${PROJECT_ROOT}/ios-third/soundtouch-build/SoundTouch-iOS")
+    # iOS: 使用新编译的静态库
+    # 根据 SDK 类型选择库路径
+    if(CMAKE_OSX_SYSROOT MATCHES "simulator" OR CMAKE_OSX_SYSROOT MATCHES "Simulator")
+        message(STATUS "配置 iOS 模拟器库 (arm64 + x86_64)")
+        set(IOS_PLATFORM_DIR "ios-simulator")
+    else()
+        message(STATUS "配置 iOS 真机库 (arm64)")
+        set(IOS_PLATFORM_DIR "ios-device")
+    endif()
+    
+    set(FFMPEG_ROOT "${PROJECT_ROOT}/ios-third/ffmpeg-build-ios/FFmpeg-iOS/${IOS_PLATFORM_DIR}")
+    set(SOUNDTOUCH_ROOT "${PROJECT_ROOT}/ios-third/soundtouch-build-ios/SoundTouch-iOS/${IOS_PLATFORM_DIR}")
     
     include_directories(
         ${FFMPEG_ROOT}/include
         ${SOUNDTOUCH_ROOT}/include
     )
     
-    # 根据 SDK 类型选择库路径
-    if(CMAKE_OSX_SYSROOT MATCHES "simulator" OR CMAKE_OSX_SYSROOT MATCHES "Simulator")
-        message(STATUS "配置 iOS 模拟器库")
-        link_directories(
-            ${FFMPEG_ROOT}/lib
-            ${SOUNDTOUCH_ROOT}/lib/simulator
-        )
-    else()
-        message(STATUS "配置 iOS 真机库")
-        link_directories(
-            ${FFMPEG_ROOT}/lib
-            ${SOUNDTOUCH_ROOT}/lib/device
-        )
-    endif()
+    link_directories(
+        ${FFMPEG_ROOT}/lib
+        ${SOUNDTOUCH_ROOT}/lib
+    )
 else()
     # macOS: 配置将在后面根据自编译库是否存在来决定
     # 不在这里设置 include_directories 和 link_directories
