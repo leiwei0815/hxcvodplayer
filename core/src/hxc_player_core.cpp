@@ -14,6 +14,7 @@
 extern "C" {
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
+#include <libavformat/avformat.h>
 }
 
 // 跨平台延迟宏
@@ -48,13 +49,16 @@ PlayerCore::PlayerCore()
     , audio_current_pts_(0.0)
     , audio_current_pts_drift_(0.0)
     , aspect_ratio_mode_(AspectRatioMode::Fit)  // ⚠️ 默认 Fit 模式
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     , soundtouch_(nullptr)
     , soundtouch_buffer_index_(0)
 #endif
     , playback_rate_(1.0) {  // ⚠️ 默认正常速度
     
     LOG_INFO("初始化 PlayerCore...");
+    
+    // 初始化 FFmpeg 网络组件（必须在使用网络协议前调用）
+    avformat_network_init();
     
     // 初始化 FFmpeg
     av_log_set_level(AV_LOG_WARNING);
@@ -78,7 +82,7 @@ PlayerCore::~PlayerCore() {
     LOG_INFO("销毁 PlayerCore...");
     close();
     
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     // 释放 SoundTouch
     if (soundtouch_) {
         delete soundtouch_;
@@ -89,6 +93,9 @@ PlayerCore::~PlayerCore() {
 #ifndef NO_SDL
     SDL_Quit();
 #endif
+    
+    // 反初始化 FFmpeg 网络组件
+    avformat_network_deinit();
     
     LOG_INFO("PlayerCore 已销毁");
 }
@@ -101,16 +108,57 @@ int PlayerCore::open(const std::string& filename) {
     
     LOG_INFO("正在打开文件: ", filename);
     
+    // 🔍 检测 URL 协议
+    const char* proto = avio_find_protocol_name(filename.c_str());
+    if (proto) {
+        LOG_INFO("检测到的协议: ", proto);
+    } else {
+        LOG_ERROR("无法识别 URL 协议！URL: ", filename);
+    }
+
     // ⚠️ 重置终止标志（重要！否则之前 close() 设置的 true 会导致新线程立即退出）
     abort_request_ = false;
-    
+
     set_state(PlayerState::Opening);
-    
+
     // 打开输入文件
     format_ctx_ = avformat_alloc_context();
-    if (avformat_open_input(&format_ctx_, filename.c_str(), nullptr, nullptr) < 0) {
+    
+    // 🔧 设置网络超时和重试参数（对于网络流很重要）
+    AVDictionary* options = nullptr;
+    
+    // 设置超时时间（微秒）- 30 秒
+    av_dict_set(&options, "timeout", "30000000", 0);
+    
+    // 设置连接超时（微秒）- 10 秒  
+    av_dict_set(&options, "stimeout", "10000000", 0);
+    
+    // 设置重连次数
+    av_dict_set(&options, "reconnect", "1", 0);
+    av_dict_set(&options, "reconnect_streamed", "1", 0);
+    av_dict_set(&options, "reconnect_delay_max", "5", 0);
+    
+    // 设置 User-Agent（某些服务器可能检查）
+    av_dict_set(&options, "user_agent", "HXCPlayer/1.0", 0);
+    
+    // 🔧 增强重定向支持（处理 302 等重定向）
+    av_dict_set(&options, "follow_redirects", "1", 0);
+    av_dict_set(&options, "max_redirects", "10", 0);
+    
+    LOG_INFO("网络参数配置完成，开始打开流...");
+    LOG_INFO("调用 avformat_open_input，URL: ", filename);
+    
+    int ret = avformat_open_input(&format_ctx_, filename.c_str(), nullptr, &options);
+    
+    // 释放 options
+    av_dict_free(&options);
+    
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
         LOG_ERROR("无法打开文件: ", filename);
-        emit_error("无法打开文件: " + filename);
+        LOG_ERROR("FFmpeg 错误码: ", ret, ", 错误信息: ", errbuf);
+        emit_error("无法打开文件: " + filename + " (错误: " + std::string(errbuf) + ")");
         set_state(PlayerState::Error);
         return -1;
     }
@@ -459,6 +507,7 @@ void PlayerCore::read_thread() {
         }
         
         // ⚠️ 检查队列总大小（参考 ffplay）
+        // ⚠️ 减少缓冲区大小，从 15MB/30MB 降低到 5MB/10MB，防止内存泄漏
         // 只有当两个队列都满时才等待，避免阻塞单个队列
         int total_size = 0;
         bool video_full = false;
@@ -467,17 +516,17 @@ void PlayerCore::read_thread() {
         if (video_packet_queue_) {
             int vs = video_packet_queue_->get_size();
             total_size += vs;
-            video_full = (vs > 15 * 1024 * 1024);
+            video_full = (vs > 5 * 1024 * 1024);  // 从 15MB 降低到 5MB
         }
         
         if (audio_packet_queue_) {
             int as = audio_packet_queue_->get_size();
             total_size += as;
-            audio_full = (as > 15 * 1024 * 1024);
+            audio_full = (as > 5 * 1024 * 1024);  // 从 15MB 降低到 5MB
         }
         
-        // 只有当任一队列满 AND 总大小超过阈值时才等待
-        if ((video_full || audio_full) && total_size > 30 * 1024 * 1024) {
+        // ⚠️ 任一队列满或总大小超过 10MB 就等待（从 30MB 降低）
+        if ((video_full || audio_full) || total_size > 10 * 1024 * 1024) {
             PLAYER_DELAY(10);
             continue;
         }
@@ -573,7 +622,7 @@ int PlayerCore::stream_component_open(int stream_index) {
 
         LOG_INFO("音频解码器已创建");
         
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
         // 初始化 SoundTouch（用于倍速播放）
         if (!soundtouch_) {
             soundtouch_ = new soundtouch::SoundTouch();
@@ -1029,7 +1078,7 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
             // 消费队列中的帧
             audio_queue_->next();
             
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
             // 使用 SoundTouch 处理倍速播放
             double current_rate = playback_rate_.load();
             if (soundtouch_ && current_rate != 1.0) {
@@ -1196,7 +1245,7 @@ void PlayerCore::set_playback_rate(double rate) {
     
     playback_rate_.store(rate, std::memory_order_release);
     
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     // 更新 SoundTouch 的速度设置
     if (soundtouch_) {
         // 先清空缓冲区，避免旧数据影响新速度

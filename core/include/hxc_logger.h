@@ -10,6 +10,13 @@
 #include <sstream>
 #include <string>
 #include <ctime>
+#include <cstring>
+
+// Android Logcat 支持
+#ifdef __ANDROID__
+#include <android/log.h>
+#define ANDROID_LOG_TAG "PlayerCore"
+#endif
 
 namespace hxcplayer {
 
@@ -70,18 +77,32 @@ private:
     void log(const char* level_str, Args&&... args) {
         std::ostringstream oss;
         
+        // 构建消息内容
+        ((oss << args), ...);
+        std::string message = oss.str();
+        
+#ifdef __ANDROID__
+        // Android 平台使用 Logcat
+        android_LogPriority priority;
+        if (strcmp(level_str, "DEBUG") == 0) {
+            priority = ANDROID_LOG_DEBUG;
+        } else if (strcmp(level_str, "INFO") == 0) {
+            priority = ANDROID_LOG_INFO;
+        } else if (strcmp(level_str, "WARNING") == 0) {
+            priority = ANDROID_LOG_WARN;
+        } else {
+            priority = ANDROID_LOG_ERROR;
+        }
+        __android_log_print(priority, ANDROID_LOG_TAG, "%s", message.c_str());
+#else
+        // 其他平台使用标准输出
         // 时间戳
         time_t now = time(nullptr);
         char timestamp[32];
         strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
         
-        oss << "[" << timestamp << "] [" << level_str << "] ";
-        
-        // 消息
-        ((oss << args), ...);
-        oss << std::endl;
-        
-        std::cerr << oss.str();
+        std::cerr << "[" << timestamp << "] [" << level_str << "] " << message << std::endl;
+#endif
     }
     
     LogLevel level_;

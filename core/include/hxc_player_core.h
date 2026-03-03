@@ -24,7 +24,7 @@ extern "C" {
 }
 
 // ⚠️ SoundTouch 库（用于倍速播放，保持音调）
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
 #include <soundtouch/SoundTouch.h>
 #endif
 
@@ -184,7 +184,7 @@ private:
     double audio_current_pts_drift_;    // PTS 漂移
     
     // ⚠️ 倍速播放支持（SoundTouch）
-#if defined(__APPLE__) || defined(_WIN32)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     soundtouch::SoundTouch* soundtouch_;
     std::vector<float> soundtouch_buffer_;  // SoundTouch 输出缓冲区
     size_t soundtouch_buffer_index_;        // 当前读取位置

@@ -96,6 +96,12 @@ public:
             return;
         }
         
+        // ⚠️ 释放当前帧的 AVFrame（防止内存泄漏！）
+        if (frames_[rindex_].frame) {
+            av_frame_free(&frames_[rindex_].frame);
+            frames_[rindex_].frame = nullptr;
+        }
+        
         if (++rindex_ == max_size_) {
             rindex_ = 0;
         }
@@ -117,8 +123,12 @@ public:
     // 清空队列
     void flush() {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& frame : frames_) {
-            // T 的析构函数会自动释放资源
+        // ⚠️ 显式清空每个帧，触发 AVFrame 释放（重要！）
+        for (int i = 0; i < max_size_; i++) {
+            if (frames_[i].frame) {
+                av_frame_free(&frames_[i].frame);
+                frames_[i].frame = nullptr;
+            }
         }
         rindex_ = 0;
         windex_ = 0;

@@ -1,0 +1,22 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "HXCPlayerAndroidTest"
+include ':app'
+include ':hxcplayer'
+
+// 指向 android/hxcplayer 目录
+project(':hxcplayer').projectDir = new File(rootDir, '../../android/hxcplayer')
