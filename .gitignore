@@ -1,5 +1,6 @@
 # 构建目录
 build/
+build-*/
 cmake-build-*/
 
 # IDE 文件
@@ -60,6 +61,9 @@ android-third/mbedtls-build-android/
 
 # Apple XCFramework 构建目录
 apple/build_xcframework/
+
+# 构建输出目录
+output/
 
 # Android
 *.iml

@@ -3,6 +3,7 @@
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include "android_player.h"
+#include "hxc_player_core_c_bridge.h"
 
 #define LOG_TAG "HXCPlayerJNI"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
@@ -191,6 +192,53 @@ Java_com_hxcplayer_HXCPlayerControl_nativeGetState(
         return player->getState();
     }
     return 0; // IDLE
+}
+
+// ========== 日志配置方法 ==========
+
+// 启用文件日志
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_enableFileLogging(
+        JNIEnv *env, jclass clazz, jstring log_dir, jstring prefix) {
+    const char* logDirStr = env->GetStringUTFChars(log_dir, nullptr);
+    const char* prefixStr = env->GetStringUTFChars(prefix, nullptr);
+    
+    LOGD("enableFileLogging: dir=%s, prefix=%s", logDirStr, prefixStr);
+    
+    // 调用 C 接口启用文件日志
+    player_core_enable_file_logging(logDirStr, prefixStr);
+    
+    env->ReleaseStringUTFChars(log_dir, logDirStr);
+    env->ReleaseStringUTFChars(prefix, prefixStr);
+}
+
+// 禁用文件日志
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_disableFileLogging(JNIEnv *env, jclass clazz) {
+    LOGD("disableFileLogging");
+    player_core_disable_file_logging();
+}
+
+// 设置日志级别
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_setLogLevel(JNIEnv *env, jclass clazz, jint level) {
+    LOGD("setLogLevel: %d", level);
+    player_core_set_log_level(level);
+}
+
+// 设置日志保留天数
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_setLogRetentionDays(JNIEnv *env, jclass clazz, jint days) {
+    LOGD("setLogRetentionDays: %d", days);
+    player_core_set_log_retention_days(days);
+}
+
+// 获取当前日志文件路径
+JNIEXPORT jstring JNICALL
+Java_com_hxcplayer_HXCPlayerControl_getCurrentLogFile(JNIEnv *env, jclass clazz) {
+    const char* logFile = player_core_get_current_log_file();
+    LOGD("getCurrentLogFile: %s", logFile);
+    return env->NewStringUTF(logFile);
 }
 
 } // extern "C"

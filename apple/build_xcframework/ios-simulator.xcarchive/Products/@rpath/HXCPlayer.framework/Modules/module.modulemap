@@ -1,6 +1,0 @@
-framework module HXCPlayer {
-    umbrella header "HXCPlayer.h"
-    
-    export *
-    module * { export * }
-}

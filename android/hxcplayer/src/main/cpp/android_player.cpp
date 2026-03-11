@@ -369,7 +369,7 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     
     // 📐 根据 aspect_ratio_mode_ 计算实际渲染尺寸
     // FIT (0): 保持视频宽高比，适配到 Surface 内（可能有黑边）
-    // FILL (1): 填充整个 Surface（保持宽高比，可能裁剪视频）
+    // FILL (1): 等比例填充整个 Surface（保持宽高比，裁剪超出部分）
     int target_width = surface_w;
     int target_height = surface_h;
     
@@ -397,12 +397,24 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
             last_logged_mode = 0;
         }
     } else {
-        // FILL 模式：使用 surface 尺寸，让 swscale 处理拉伸
+        // FILL 模式：等比例填充整个 Surface（保持宽高比，裁剪超出部分）
+        float video_aspect = (float)width / (float)height;
+        float surface_aspect = (float)surface_w / (float)surface_h;
+        
+        if (video_aspect > surface_aspect) {
+            // 视频更宽，以高度为准（左右会被裁剪）
+            target_height = surface_h;
+            target_width = (int)(surface_h * video_aspect);
+        } else {
+            // 视频更高，以宽度为准（上下会被裁剪）
+            target_width = surface_w;
+            target_height = (int)(surface_w / video_aspect);
+        }
         
         // 模式切换时输出日志
         if (last_logged_mode != 1) {
-            LOGI("📐 FILL mode: video=%dx%d, surface=%dx%d -> target=%dx%d (stretched)", 
-                 width, height, surface_w, surface_h, target_width, target_height);
+            LOGI("📐 FILL mode: video=%dx%d (%.2f), surface=%dx%d (%.2f) -> target=%dx%d (crop)", 
+                 width, height, video_aspect, surface_w, surface_h, surface_aspect, target_width, target_height);
             last_logged_mode = 1;
         }
     }
@@ -538,32 +550,70 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         LOGW("⚠️ swscale slow: %lld ms", duration);
     }
     
-    // 复制到 ANativeWindow buffer（居中渲染，处理黑边）
+    // 复制到 ANativeWindow buffer（居中渲染，处理黑边或裁剪）
     uint16_t* dst_buffer = (uint16_t*)buffer.bits;
     uint16_t* src_buffer = (uint16_t*)rgb_buffer_;
     
     // 安全检查
-    if (buffer.stride < target_width) {
-        LOGE("❌ Buffer stride too small: %d < %d", buffer.stride, target_width);
+    if (buffer.stride < surface_w) {
+        LOGE("❌ Buffer stride too small: %d < %d", buffer.stride, surface_w);
         ANativeWindow_unlockAndPost(window);
         ANativeWindow_release(window);
         return;
     }
     
-    // 计算居中偏移（FIT 模式下可能有黑边）
-    int offset_x = (surface_w - target_width) / 2;
-    int offset_y = (surface_h - target_height) / 2;
+    // 计算居中偏移和裁剪区域
+    int offset_x = 0;
+    int offset_y = 0;
+    int src_offset_x = 0;
+    int src_offset_y = 0;
+    int copy_width = target_width;
+    int copy_height = target_height;
     
-    // 清空整个 buffer（黑色背景）
-    if (offset_x > 0 || offset_y > 0) {
-        memset(buffer.bits, 0, buffer.stride * surface_h * 2);
+    if (aspect_ratio_mode_ == 0) {
+        // FIT 模式：居中显示，可能有黑边
+        offset_x = (surface_w - target_width) / 2;
+        offset_y = (surface_h - target_height) / 2;
+        
+        // 清空整个 buffer（黑色背景）
+        if (offset_x > 0 || offset_y > 0) {
+            memset(buffer.bits, 0, buffer.stride * surface_h * 2);
+        }
+    } else {
+        // FILL 模式：裁剪超出部分
+        if (target_width > surface_w) {
+            // 视频宽度超出，需要裁剪左右
+            src_offset_x = (target_width - surface_w) / 2;
+            copy_width = surface_w;
+            offset_x = 0;
+        } else {
+            // 视频宽度未超出，居中显示
+            offset_x = (surface_w - target_width) / 2;
+            copy_width = target_width;
+        }
+        
+        if (target_height > surface_h) {
+            // 视频高度超出，需要裁剪上下
+            src_offset_y = (target_height - surface_h) / 2;
+            copy_height = surface_h;
+            offset_y = 0;
+        } else {
+            // 视频高度未超出，居中显示
+            offset_y = (surface_h - target_height) / 2;
+            copy_height = target_height;
+        }
+        
+        // 如果有未填充区域，清空为黑色
+        if (offset_x > 0 || offset_y > 0) {
+            memset(buffer.bits, 0, buffer.stride * surface_h * 2);
+        }
     }
     
-    // 逐行复制到居中位置
-    for (int i = 0; i < target_height; i++) {
+    // 逐行复制到目标位置（带裁剪）
+    for (int i = 0; i < copy_height; i++) {
         uint16_t* dst_line = dst_buffer + (offset_y + i) * buffer.stride + offset_x;
-        uint16_t* src_line = src_buffer + i * target_width;
-        memcpy(dst_line, src_line, target_width * 2);
+        uint16_t* src_line = src_buffer + (src_offset_y + i) * target_width + src_offset_x;
+        memcpy(dst_line, src_line, copy_width * 2);
     }
     
     static int frame_count = 0;

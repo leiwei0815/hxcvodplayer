@@ -30,6 +30,14 @@ private:
 // AudioQueue 缓冲区数量
 static const int kNumberOfBuffers = 3;
 
+// ========== C 回调函数前向声明 ==========
+static void state_changed_callback_c(PlayerStateC state, void* user_data);
+static void error_callback_c(int error_code, const char* error_msg, void* user_data);
+static void position_changed_callback_c(double position, void* user_data);
+static void buffer_progress_callback_c(double position, void* user_data);
+static void playback_completed_callback_c(void* user_data);
+static void loading_callback_c(bool is_loading, void* user_data);
+
 @interface HXCPlayerControl () {
     PlayerCoreWrapper *_wrapper;
     
@@ -62,13 +70,86 @@ static const int kNumberOfBuffers = 3;
 @property (nonatomic, strong) HXCPlayerView *videoView;
 @property (nonatomic, strong) dispatch_queue_t renderQueue;
 
+
+-(void)playerStateChange:(PlayerStateC)state;
+-(void)playerPositionChange:(double)position;
+
 @end
+
+// ========== C 回调函数实现（在 @interface 扩展之后，可以访问实例变量）==========
+
+// 状态变化回调
+static void state_changed_callback_c(PlayerStateC state, void* user_data) {
+    HXCPlayerControl* control = (__bridge HXCPlayerControl*)user_data;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [control playerStateChange:state];
+    });
+}
+
+// 错误回调
+static void error_callback_c(int error_code, const char* error_msg, void* user_data) {
+    HXCPlayerControl* self = (__bridge HXCPlayerControl*)user_data;
+    NSString* errorStr = error_msg ? [NSString stringWithUTF8String:error_msg] : @"Unknown error";
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([self.delegate respondsToSelector:@selector(player:didFailWithError:)]) {
+            NSError* nsError = [NSError errorWithDomain:@"HXCPlayerErrorDomain"
+                                                   code:error_code
+                                               userInfo:@{NSLocalizedDescriptionKey: errorStr}];
+            [self.delegate player:self didFailWithError:nsError];
+        }
+    });
+}
+
+// 播放进度回调（真实播放位置）
+static void position_changed_callback_c(double position, void* user_data) {
+    HXCPlayerControl* control = (__bridge HXCPlayerControl*)user_data;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [control playerPositionChange:position];
+    });
+}
+
+// 缓冲进度回调（解码位置）
+static void buffer_progress_callback_c(double position, void* user_data) {
+    HXCPlayerControl* self = (__bridge HXCPlayerControl*)user_data;
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([self.delegate respondsToSelector:@selector(player:didUpdateBufferProgress:)]) {
+            [self.delegate player:self didUpdateBufferProgress:position];
+        }
+    });
+}
+
+// 播放完成回调
+static void playback_completed_callback_c(void* user_data) {
+    HXCPlayerControl* self = (__bridge HXCPlayerControl*)user_data;
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([self.delegate respondsToSelector:@selector(playerDidFinishPlaying:)]) {
+            [self.delegate playerDidFinishPlaying:self];
+        }
+    });
+}
+
+// 网络加载状态回调
+static void loading_callback_c(bool is_loading, void* user_data) {
+    HXCPlayerControl* self = (__bridge HXCPlayerControl*)user_data;
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([self.delegate respondsToSelector:@selector(player:didChangeLoadingState:)]) {
+            [self.delegate player:self didChangeLoadingState:is_loading];
+        }
+    });
+}
 
 @implementation HXCPlayerControl
 
 - (instancetype)init {
     self = [super init];
     if (self) {
+        // ========== 配置日志系统 ==========
+        [self setupLogging];
+        
         _wrapper = new PlayerCoreWrapper();
         _state = HXCPlayerStateIdle;
         _volume = 1.0;
@@ -78,11 +159,30 @@ static const int kNumberOfBuffers = 3;
         _audioQueueRunning = NO;
         _lastPositionUpdateTime = 0;
         
+        // ========== 设置播放器回调 ==========
+        player_core_set_state_changed_callback(_wrapper->handle(), state_changed_callback_c, (__bridge void*)self);
+        player_core_set_error_callback(_wrapper->handle(), error_callback_c, (__bridge void*)self);
+        player_core_set_position_changed_callback(_wrapper->handle(), position_changed_callback_c, (__bridge void*)self);
+        player_core_set_buffer_progress_callback(_wrapper->handle(), buffer_progress_callback_c, (__bridge void*)self);
+        player_core_set_playback_completed_callback(_wrapper->handle(), playback_completed_callback_c, (__bridge void*)self);
+        player_core_set_loading_callback(_wrapper->handle(), loading_callback_c, (__bridge void*)self);
+        
         // 创建视频视图（自动管理布局）
         _videoView = [[HXCPlayerView alloc] initWithFrame:CGRectZero];
         
 #if TARGET_OS_IOS
         NSLog(@"[播放器] 初始化 HXCPlayerControl (iOS)");
+        // iOS 也需要设置 controlTimebase，否则 seek 后可能不渲染
+        AVSampleBufferDisplayLayer *videoLayer = _videoView.videoLayer;
+        CMTimebaseRef controlTimebase;
+        CMTimebaseCreateWithSourceClock(kCFAllocatorDefault,
+                                       CMClockGetHostTimeClock(),
+                                       &controlTimebase);
+        videoLayer.controlTimebase = controlTimebase;
+        CFRelease(controlTimebase);
+        
+        CMTimebaseSetTime(videoLayer.controlTimebase, kCMTimeZero);
+        CMTimebaseSetRate(videoLayer.controlTimebase, 1.0);
 #else
         // macOS 需要设置 controlTimebase
         AVSampleBufferDisplayLayer *videoLayer = _videoView.videoLayer;
@@ -110,7 +210,14 @@ static const int kNumberOfBuffers = 3;
 }
 
 - (void)dealloc {
+    NSLog(@"[播放器] HXCPlayerControl 正在销毁...");
+    
     [self stop];
+    
+    // 禁用文件日志（会自动刷新队列并停止后台线程）
+    player_core_disable_file_logging();
+    NSLog(@"📝 日志系统已关闭");
+    
     if (_wrapper) {
         delete _wrapper;
         _wrapper = nullptr;
@@ -123,15 +230,8 @@ static const int kNumberOfBuffers = 3;
     if (!url || url.length == 0) {
         return NO;
     }
-    
     [self stop];
     _playerUrl = [url copy];
-    _state = HXCPlayerStateOpening;
-    
-    if ([_delegate respondsToSelector:@selector(playerDidChangeState:)]) {
-        [_delegate playerDidChangeState:_state];
-    }
-    
     int ret;
     if (_startPosition > 0) {
         ret = player_core_open_with_start_position(_wrapper->handle(), url.UTF8String, _startPosition);
@@ -140,10 +240,6 @@ static const int kNumberOfBuffers = 3;
     }
     
     if (ret != 0) {
-        _state = HXCPlayerStateError;
-        if ([_delegate respondsToSelector:@selector(playerDidChangeState:)]) {
-            [_delegate playerDidChangeState:_state];
-        }
         return NO;
     }
     
@@ -157,19 +253,19 @@ static const int kNumberOfBuffers = 3;
         [self setupAudioQueue:sampleRate channels:channels];
     }
     
-    [self startDisplayLink];
+    // ⚠️ 如果设置了开始播放时间，需要更新 controlTimebase
+    if (_startPosition > 0 && _videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
+        CMTime startTime = CMTimeMake(_startPosition * 1000000, 1000000);
+        CMTimebaseSetTime(_videoView.videoLayer.controlTimebase, startTime);
+        NSLog(@"[打开文件] 设置 controlTimebase 开始时间: %.2f 秒", _startPosition);
+    }
     
-    _state = HXCPlayerStatePaused;
+    [self startDisplayLink];
     player_core_pause(_wrapper->handle());
     if (_audioQueue && _audioQueueRunning) {
         AudioQueuePause(_audioQueue);
         _audioQueueRunning = NO;
     }
-    
-    if ([_delegate respondsToSelector:@selector(playerDidChangeState:)]) {
-        [_delegate playerDidChangeState:_state];
-    }
-    
     return YES;
 }
 
@@ -183,33 +279,18 @@ static const int kNumberOfBuffers = 3;
         NSLog(@"警告: 请先调用 openURL:");
         return;
     }
-    
     player_core_play(_wrapper->handle());
-    
     if (_audioQueue && !_audioQueueRunning) {
         AudioQueueStart(_audioQueue, NULL);
         _audioQueueRunning = YES;
-    }
-    
-    _state = HXCPlayerStatePlaying;
-    
-    if ([_delegate respondsToSelector:@selector(playerDidChangeState:)]) {
-        [_delegate playerDidChangeState:_state];
     }
 }
 
 - (void)pause {
     player_core_pause(_wrapper->handle());
-    
     if (_audioQueue && _audioQueueRunning) {
         AudioQueuePause(_audioQueue);
         _audioQueueRunning = NO;
-    }
-    
-    _state = HXCPlayerStatePaused;
-    
-    if ([_delegate respondsToSelector:@selector(playerDidChangeState:)]) {
-        [_delegate playerDidChangeState:_state];
     }
 }
 
@@ -231,13 +312,18 @@ static const int kNumberOfBuffers = 3;
 - (void)seekToPosition:(double)position {
     player_core_seek(_wrapper->handle(), position);
     
-#if !TARGET_OS_IOS
-    // macOS 需要更新 controlTimebase
+    // iOS 和 macOS 都需要更新 controlTimebase
     if (_videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
-        CMTime newTime = CMTimeMake((int64_t)(position * 1000000), 1000000);
+        CMTime newTime = CMTimeMake(position * 1000000, 1000000);
         CMTimebaseSetTime(_videoView.videoLayer.controlTimebase, newTime);
+        
+        // 确保 timebase 在运行
+        if (CMTimebaseGetRate(_videoView.videoLayer.controlTimebase) == 0.0) {
+            CMTimebaseSetRate(_videoView.videoLayer.controlTimebase, 1.0);
+        }
+        
+        NSLog(@"[Seek] 更新 controlTimebase 到: %.2f 秒", position);
     }
-#endif
 }
 
 - (void)stop {
@@ -256,9 +342,46 @@ static const int kNumberOfBuffers = 3;
     _playerUrl = nil;
     _videoWidth = 0;
     _videoHeight = 0;
-    
-    if ([_delegate respondsToSelector:@selector(playerDidChangeState:)]) {
-        [_delegate playerDidChangeState:_state];
+}
+
+
+#pragma mark - private method
+
+-(void)playerPositionChange:(double)position {
+    self->_position = position;
+    if ([self.delegate respondsToSelector:@selector(player:didUpdatePosition:)]) {
+        [self.delegate player:self didUpdatePosition:position];
+    }
+}
+
+-(void)playerStateChange:(PlayerStateC)state {
+    HXCPlayerState objcState;
+    switch (state) {
+        case PLAYER_STATE_IDLE:
+            objcState = HXCPlayerStateIdle;
+            break;
+        case PLAYER_STATE_OPENING:
+            objcState = HXCPlayerStateOpening;
+            break;
+        case PLAYER_STATE_PLAYING:
+            objcState = HXCPlayerStatePlaying;
+            break;
+        case PLAYER_STATE_PAUSED:
+            objcState = HXCPlayerStatePaused;
+            break;
+        case PLAYER_STATE_STOPPED:
+            objcState = HXCPlayerStateStopped;
+            break;
+        case PLAYER_STATE_ERROR:
+            objcState = HXCPlayerStateError;
+            break;
+        default:
+            objcState = HXCPlayerStateIdle;
+            break;
+    }
+    self->_state = objcState;
+    if ([self.delegate respondsToSelector:@selector(player:didChangeState:)]) {
+        [self.delegate player:self didChangeState:objcState];
     }
 }
 
@@ -466,35 +589,48 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     double playbackRate = player_core_get_playback_rate(_wrapper->handle());
     double threshold = 0.04 / playbackRate;
     
-    if (delay <= -threshold) {
-        player_core_consume_video_frame(_wrapper->handle());
-    } else if (delay <= threshold) {
+    // ⚠️ 【关键修复】如果 delay 严重异常（< -5 秒），说明时钟还未同步（比如 seek 后）
+    // 此时应该强制显示帧，不丢帧，让时钟自动同步
+    if (delay < -5.0) {
+        NSLog(@"检测到时钟未同步: currentPTS=%.2f, masterClock=%.2f, delay=%.2f，强制显示帧",
+              currentPTS, masterClock, delay);
         [self displayVideoFrameData:&frame_data];
         player_core_consume_video_frame(_wrapper->handle());
-    }
-    
-    // 定期更新播放位置（限制为每 0.1 秒调用一次）
-    CFTimeInterval currentTime = CACurrentMediaTime();
-    if (currentTime - _lastPositionUpdateTime >= 0.1) {
-        _lastPositionUpdateTime = currentTime;
-        [self notifyPositionUpdate];
-    }
-}
-
-- (void)notifyPositionUpdate {
-    if (!_wrapper || !_wrapper->handle()) {
         return;
     }
     
-    double position = player_core_get_position(_wrapper->handle());
-    double duration = player_core_get_duration(_wrapper->handle());
-    
-    if (duration > 0 && [self.delegate respondsToSelector:@selector(playerDidUpdatePosition:duration:)]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self.delegate playerDidUpdatePosition:position duration:duration];
-        });
+    if (delay <= -threshold) {
+        // 丢帧：视频落后太多
+        player_core_consume_video_frame(_wrapper->handle());
+    } else if (delay <= threshold) {
+        // 正常显示
+        [self displayVideoFrameData:&frame_data];
+        player_core_consume_video_frame(_wrapper->handle());
     }
+    // else: delay > threshold，视频超前，不消费帧，等待下次渲染
+    
+    // 定期更新播放位置（限制为每 0.1 秒调用一次）
+//    CFTimeInterval currentTime = CACurrentMediaTime();
+//    if (currentTime - _lastPositionUpdateTime >= 0.1) {
+//        _lastPositionUpdateTime = currentTime;
+//        [self notifyPositionUpdate];
+//    }
 }
+
+//- (void)notifyPositionUpdate {
+//    if (!_wrapper || !_wrapper->handle()) {
+//        return;
+//    }
+//    
+//    double position = player_core_get_position(_wrapper->handle());
+//    double duration = player_core_get_duration(_wrapper->handle());
+//    
+//    if (duration > 0 && [self.delegate respondsToSelector:@selector(playerDidUpdatePosition:duration:)]) {
+//        dispatch_async(dispatch_get_main_queue(), ^{
+//            [self.delegate playerDidUpdatePosition:position duration:duration];
+//        });
+//    }
+//}
 
 - (void)displayVideoFrameData:(VideoFrameDataC *)frameData {
     if (!frameData || !_videoView.videoLayer) {
@@ -600,6 +736,55 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
     
     return pixelBuffer;
+}
+
+#pragma mark - 日志配置
+
+- (void)setupLogging {
+    // 设置日志级别为 DEBUG
+    player_core_set_log_level(0);
+    
+    // 获取 Documents 目录
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *documentsDirectory = [paths firstObject];
+    NSString *logDir = [documentsDirectory stringByAppendingPathComponent:@"Logs"];
+    
+    // 确保日志目录存在
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSError *error = nil;
+    if (![fileManager fileExistsAtPath:logDir]) {
+        [fileManager createDirectoryAtPath:logDir
+               withIntermediateDirectories:YES
+                                attributes:nil
+                                     error:&error];
+        if (error) {
+            NSLog(@"❌ 创建日志目录失败: %@", error.localizedDescription);
+            return;
+        }
+    }
+    
+    // 设置日志保留天数（默认7天）
+    player_core_set_log_retention_days(7);
+    
+    // 启用文件日志（会自动清理超过7天的旧日志）
+    player_core_enable_file_logging([logDir UTF8String], "hxcplayer");
+    
+    // 设置最大文件大小为 10MB
+    player_core_set_max_log_file_size(10 * 1024 * 1024);
+    
+    // 获取当前日志文件路径
+    const char* logFile = player_core_get_current_log_file();
+    NSString *logFilePath = logFile ? [NSString stringWithUTF8String:logFile] : @"未知";
+    
+    NSLog(@"========================================");
+    NSLog(@"📝 HXCPlayer 日志系统已启用");
+    NSLog(@"========================================");
+    NSLog(@"日志级别: DEBUG");
+    NSLog(@"日志目录: %@", logDir);
+    NSLog(@"日志文件: %@", logFilePath);
+    NSLog(@"保留天数: 7 天");
+    NSLog(@"最大大小: 10 MB");
+    NSLog(@"========================================");
 }
 
 @end

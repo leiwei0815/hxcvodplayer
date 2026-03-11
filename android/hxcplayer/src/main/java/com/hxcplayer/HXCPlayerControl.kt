@@ -31,6 +31,42 @@ class HXCPlayerControl(private val context: Context) {
         init {
             System.loadLibrary("hxcplayer")
         }
+        
+        // ========== 日志配置（静态方法） ==========
+        
+        /**
+         * 启用文件日志
+         * @param logDir 日志文件目录
+         * @param prefix 日志文件前缀（默认 "hxcplayer"）
+         */
+        @JvmStatic
+        external fun enableFileLogging(logDir: String, prefix: String = "hxcplayer")
+        
+        /**
+         * 禁用文件日志
+         */
+        @JvmStatic
+        external fun disableFileLogging()
+        
+        /**
+         * 设置日志级别
+         * @param level 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
+         */
+        @JvmStatic
+        external fun setLogLevel(level: Int)
+        
+        /**
+         * 设置日志保留天数
+         * @param days 保留天数（默认 7 天）
+         */
+        @JvmStatic
+        external fun setLogRetentionDays(days: Int)
+        
+        /**
+         * 获取当前日志文件路径
+         */
+        @JvmStatic
+        external fun getCurrentLogFile(): String
     }
     
     // 播放器状态
@@ -43,11 +79,34 @@ class HXCPlayerControl(private val context: Context) {
         ERROR
     }
     
+    // 错误码（对应 C 层的 PlayerErrorCodeC）
+    object PlayerErrorCode {
+        const val NONE = 0
+        const val INVALID_URL = 1
+        const val OPEN_INPUT_FAILED = 2
+        const val FIND_STREAM_INFO_FAILED = 3
+        const val NO_VIDEO_STREAM = 4
+        const val NO_AUDIO_STREAM = 5
+        const val CODEC_NOT_FOUND = 6
+        const val CODEC_OPEN_FAILED = 7
+        const val ALLOC_CONTEXT_FAILED = 8
+        const val SDL_INIT_FAILED = 9
+        const val AUDIO_DEVICE_OPEN_FAILED = 10
+        const val SEEK_FAILED = 11
+        const val READ_FRAME_FAILED = 12
+        const val DECODE_FAILED = 13
+        const val OUT_OF_MEMORY = 14
+        const val UNKNOWN = 999
+        
+        // FFmpeg 错误码范围 (负数)
+        // 使用 FFmpeg 原始错误码
+    }
+    
     // 回调接口
     interface PlayerCallback {
         fun onPlayerStateChanged(state: PlayerState)
         fun onPlayerPositionUpdated(position: Double, duration: Double)
-        fun onPlayerError(error: String)
+        fun onPlayerError(errorCode: Int, errorMessage: String)  // 添加 errorCode 参数
     }
     
     private var nativeHandle: Long = 0
@@ -107,7 +166,7 @@ class HXCPlayerControl(private val context: Context) {
         if (result) {
             callback?.onPlayerStateChanged(PlayerState.OPENING)
         } else {
-            callback?.onPlayerError("无法打开 URL: $url")
+            callback?.onPlayerError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
         }
         return result
     }

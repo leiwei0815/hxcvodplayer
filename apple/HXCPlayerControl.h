@@ -17,7 +17,7 @@
 
 // 导入播放器视图
 #import "HXCPlayerView.h"
-
+@class HXCPlayerControl;
 // 播放器状态
 typedef NS_ENUM(NSInteger, HXCPlayerState) {
     HXCPlayerStateIdle = 0,      // 空闲
@@ -35,12 +35,51 @@ typedef NS_ENUM(NSInteger, HXCAspectRatioMode) {
     HXCAspectRatioModeFill       // 填充（裁剪）
 };
 
+// ⚠️ 播放器错误码定义（对应 C 层的 PlayerErrorCodeC）
+typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
+    // 自定义错误码 (1-999)
+    HXCPlayerErrorNone = 0,                         // 无错误
+    HXCPlayerErrorInvalidURL = 1,                   // 无效的 URL
+    HXCPlayerErrorOpenInputFailed = 2,              // 打开输入失败
+    HXCPlayerErrorFindStreamInfoFailed = 3,         // 查找流信息失败
+    HXCPlayerErrorNoVideoStream = 4,                // 没有视频流
+    HXCPlayerErrorNoAudioStream = 5,                // 没有音频流
+    HXCPlayerErrorCodecNotFound = 6,                // 找不到解码器
+    HXCPlayerErrorCodecOpenFailed = 7,              // 打开解码器失败
+    HXCPlayerErrorAllocContextFailed = 8,           // 分配上下文失败
+    HXCPlayerErrorSDLInitFailed = 9,                // SDL 初始化失败
+    HXCPlayerErrorAudioDeviceOpenFailed = 10,       // 音频设备打开失败
+    HXCPlayerErrorSeekFailed = 11,                  // Seek 操作失败
+    HXCPlayerErrorReadFrameFailed = 12,             // 读取帧失败
+    HXCPlayerErrorDecodeFailed = 13,                // 解码失败
+    HXCPlayerErrorOutOfMemory = 14,                 // 内存不足
+    HXCPlayerErrorUnknown = 999,                    // 未知错误
+    
+    // FFmpeg 错误码范围 (负数)
+    // 例如：AVERROR_EOF, AVERROR(ENOMEM), AVERROR(EINVAL) 等
+    // 可以通过 NSError.code 获取具体的 FFmpeg 错误码
+};
+
 // 播放器回调协议
 @protocol HXCPlayerControlDelegate <NSObject>
 @optional
-- (void)playerDidChangeState:(HXCPlayerState)state;
-- (void)playerDidUpdatePosition:(double)position duration:(double)duration;
-- (void)playerDidEncounterError:(NSError *)error;
+// 状态变化通知
+- (void)player:(HXCPlayerControl *)player didChangeState:(HXCPlayerState)state;
+
+// 错误通知
+- (void)player:(HXCPlayerControl *)player didFailWithError:(NSError *)error;
+
+// 播放进度更新（真实播放位置）
+- (void)player:(HXCPlayerControl *)player didUpdatePosition:(double)position;
+
+// 缓冲进度更新（解码位置）
+- (void)player:(HXCPlayerControl *)player didUpdateBufferProgress:(double)position;
+
+// 播放完成通知
+- (void)playerDidFinishPlaying:(HXCPlayerControl *)player;
+
+// 网络加载状态通知（isLoading: YES=加载中，NO=加载完成）
+- (void)player:(HXCPlayerControl *)player didChangeLoadingState:(BOOL)isLoading;
 @end
 
 /**

@@ -66,6 +66,9 @@ class MainActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
         // 🔐 请求音频权限
         checkAndRequestPermissions()
         
+        // 📝 配置日志系统
+        setupLogging()
+        
         // 初始化播放器
         player = HXCPlayerControl(this)
         player.setCallback(this)
@@ -99,6 +102,40 @@ class MainActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
         player.videoView.post {
             // 注释掉自动播放，避免 SurfaceView 未准备好导致崩溃
             // player.openURL("https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4", 67.0)
+        }
+    }
+
+    // 📝 配置日志系统
+    private fun setupLogging() {
+        try {
+            // 获取应用的外部文件目录（Android/data/包名/files/）
+            val logDir = getExternalFilesDir(null)?.absolutePath ?: filesDir.absolutePath
+            
+            // 启用文件日志
+            HXCPlayerControl.enableFileLogging(logDir, "hxcplayer")
+            
+            // 设置日志级别：0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
+            HXCPlayerControl.setLogLevel(1)  // INFO 级别
+            
+            // 设置日志保留天数
+            HXCPlayerControl.setLogRetentionDays(7)  // 保留 7 天
+            
+            // 获取当前日志文件路径
+            val currentLogFile = HXCPlayerControl.getCurrentLogFile()
+            
+            android.util.Log.i("MainActivity", "========================================")
+            android.util.Log.i("MainActivity", "📝 日志系统已启用")
+            android.util.Log.i("MainActivity", "日志目录: $logDir")
+            android.util.Log.i("MainActivity", "当前日志文件: $currentLogFile")
+            android.util.Log.i("MainActivity", "日志级别: INFO")
+            android.util.Log.i("MainActivity", "保留天数: 7 天")
+            android.util.Log.i("MainActivity", "========================================")
+            
+            // 在状态栏显示日志路径（可选）
+            Toast.makeText(this, "日志文件: $currentLogFile", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            android.util.Log.e("MainActivity", "启用日志失败: ${e.message}", e)
+            Toast.makeText(this, "启用日志失败: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -188,7 +225,8 @@ class MainActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
         val editText = EditText(this).apply {
             inputType = InputType.TYPE_TEXT_VARIATION_URI
             hint = getString(R.string.video_url_hint)
-            setText("https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4")
+            setText("https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4")
+//            setText("https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4")
         }
         
         AlertDialog.Builder(this)
@@ -280,9 +318,30 @@ class MainActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
         }
     }
     
-    override fun onPlayerError(error: String) {
+    override fun onPlayerError(errorCode: Int, errorMessage: String) {
         runOnUiThread {
-            binding.statusText.text = "错误: $error"
+            // 根据错误码显示更友好的错误信息
+            val errorText = when (errorCode) {
+                HXCPlayerControl.PlayerErrorCode.OPEN_INPUT_FAILED -> "打开文件失败"
+                HXCPlayerControl.PlayerErrorCode.CODEC_NOT_FOUND -> "找不到解码器"
+                HXCPlayerControl.PlayerErrorCode.CODEC_OPEN_FAILED -> "打开解码器失败"
+                HXCPlayerControl.PlayerErrorCode.SEEK_FAILED -> "跳转失败"
+                HXCPlayerControl.PlayerErrorCode.OUT_OF_MEMORY -> "内存不足"
+                HXCPlayerControl.PlayerErrorCode.AUDIO_DEVICE_OPEN_FAILED -> "打开音频设备失败"
+                else -> {
+                    if (errorCode < 0) {
+                        "FFmpeg 错误 ($errorCode): $errorMessage"
+                    } else {
+                        "错误 ($errorCode): $errorMessage"
+                    }
+                }
+            }
+            
+            binding.statusText.text = errorText
+            Toast.makeText(this, errorText, Toast.LENGTH_LONG).show()
+            
+            // 记录详细日志
+            android.util.Log.e("MainActivity", "播放错误 - 错误码: $errorCode, 信息: $errorMessage")
         }
     }
     
