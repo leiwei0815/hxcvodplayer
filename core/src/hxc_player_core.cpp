@@ -4,26 +4,18 @@
  */
 
 #include "hxc_player_core.h"
+#include "hxc_player_core_c_bridge.h"  // 引入错误码定义
 #include "hxc_logger.h"
 #include "hxc_debug_helper.h"
 #include <iostream>
 #include <cmath>
 #include <chrono>
 #include <thread>
-
-// SoundTouch 条件编译
-#ifdef __APPLE__
-    #include <soundtouch/SoundTouch.h>
-    #ifndef HAS_SOUNDTOUCH
-        #define HAS_SOUNDTOUCH
-    #endif
-#elif defined(_WIN32) && defined(HAS_SOUNDTOUCH)
-    #include <soundtouch/SoundTouch.h>
-#endif
-
+#include <sstream>
 extern "C" {
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
+#include <libavformat/avformat.h>
 }
 
 // 跨平台延迟宏
@@ -47,6 +39,10 @@ PlayerCore::PlayerCore()
     , pause_request_(false)
     , seek_request_(false)
     , seek_pos_(0.0)
+    , seeking_(false)  // ⚠️ 初始化 seeking 标志
+    , seek_target_pos_(0.0)  // ⚠️ 初始化 seek 目标位置
+    , decode_finished_(false)  // ⚠️ 初始化解码结束标志
+    , playback_completed_notified_(false)  // ⚠️ 初始化播放完成通知标志
 #ifndef NO_SDL
     , audio_dev_(0)
 #endif
@@ -58,13 +54,16 @@ PlayerCore::PlayerCore()
     , audio_current_pts_(0.0)
     , audio_current_pts_drift_(0.0)
     , aspect_ratio_mode_(AspectRatioMode::Fit)  // ⚠️ 默认 Fit 模式
-#ifdef HAS_SOUNDTOUCH
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     , soundtouch_(nullptr)
     , soundtouch_buffer_index_(0)
 #endif
     , playback_rate_(1.0) {  // ⚠️ 默认正常速度
     
     LOG_INFO("初始化 PlayerCore...");
+    
+    // 初始化 FFmpeg 网络组件（必须在使用网络协议前调用）
+    avformat_network_init();
     
     // 初始化 FFmpeg
     av_log_set_level(AV_LOG_WARNING);
@@ -74,6 +73,7 @@ PlayerCore::PlayerCore()
     if (SDL_Init(SDL_INIT_AUDIO) < 0) {
         LOG_ERROR("SDL初始化失败: ", SDL_GetError());
         std::cerr << "SDL初始化失败: " << SDL_GetError() << std::endl;
+        emit_error(PLAYER_ERROR_SDL_INIT_FAILED, std::string("SDL 初始化失败: ") + SDL_GetError());
     } else {
         LOG_INFO("SDL 初始化成功");
     }
@@ -88,7 +88,7 @@ PlayerCore::~PlayerCore() {
     LOG_INFO("销毁 PlayerCore...");
     close();
     
-#ifdef HAS_SOUNDTOUCH
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     // 释放 SoundTouch
     if (soundtouch_) {
         delete soundtouch_;
@@ -100,27 +100,84 @@ PlayerCore::~PlayerCore() {
     SDL_Quit();
 #endif
     
+    // 反初始化 FFmpeg 网络组件
+    avformat_network_deinit();
+    
     LOG_INFO("PlayerCore 已销毁");
 }
 
 int PlayerCore::open(const std::string& filename) {
     if (state_ != PlayerState::Idle && state_ != PlayerState::Stopped) {
         LOG_WARNING("播放器状态错误，无法打开文件");
+        set_state(PlayerState::Error);
         return -1;
     }
     
-    LOG_INFO("正在打开文件: ", filename);
+    LOG_INFO("========================================");
+    LOG_INFO("开始打开文件");
+    LOG_INFO("========================================");
+    LOG_INFO("URL: ", filename);
+    LOG_INFO("当前状态: ", (int)state_);
+    LOG_INFO("配置信息:");
+    LOG_INFO("  - 启用音频: ", config_.enable_audio ? "是" : "否");
+    LOG_INFO("  - 启用视频: ", config_.enable_video ? "是" : "否");
+    LOG_INFO("  - 音频队列大小: ", config_.audio_queue_size);
+    LOG_INFO("  - 视频队列大小: ", config_.video_queue_size);
+    LOG_INFO("  - 开始播放时间: ", config_.start_time, " 秒");
     
+    // 🔍 检测 URL 协议
+    const char* proto = avio_find_protocol_name(filename.c_str());
+    if (proto) {
+        LOG_INFO("检测到的协议: ", proto);
+    } else {
+        LOG_ERROR("⚠️ 无法识别 URL 协议！URL: ", filename);
+    }
+
     // ⚠️ 重置终止标志（重要！否则之前 close() 设置的 true 会导致新线程立即退出）
     abort_request_ = false;
-    
+    decode_finished_ = false;  // ⚠️ 重置解码结束标志
+    playback_completed_notified_ = false;  // ⚠️ 重置播放完成通知标志
+
     set_state(PlayerState::Opening);
-    
+
     // 打开输入文件
     format_ctx_ = avformat_alloc_context();
-    if (avformat_open_input(&format_ctx_, filename.c_str(), nullptr, nullptr) < 0) {
+    
+    // 🔧 设置网络超时和重试参数（对于网络流很重要）
+    AVDictionary* options = nullptr;
+    
+    // 设置超时时间（微秒）- 30 秒
+    av_dict_set(&options, "timeout", "30000000", 0);
+    
+    // 设置连接超时（微秒）- 10 秒  
+    av_dict_set(&options, "stimeout", "10000000", 0);
+    
+    // 设置重连次数
+    av_dict_set(&options, "reconnect", "1", 0);
+    av_dict_set(&options, "reconnect_streamed", "1", 0);
+    av_dict_set(&options, "reconnect_delay_max", "5", 0);
+    
+    // 设置 User-Agent（某些服务器可能检查）
+    av_dict_set(&options, "user_agent", "HXCPlayer/1.0", 0);
+    
+    // 🔧 增强重定向支持（处理 302 等重定向）
+    av_dict_set(&options, "follow_redirects", "1", 0);
+    av_dict_set(&options, "max_redirects", "10", 0);
+    
+    LOG_INFO("网络参数配置完成，开始打开流...");
+    LOG_INFO("调用 avformat_open_input，URL: ", filename);
+    
+    int ret = avformat_open_input(&format_ctx_, filename.c_str(), nullptr, &options);
+    
+    // 释放 options
+    av_dict_free(&options);
+    
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
         LOG_ERROR("无法打开文件: ", filename);
-        emit_error("无法打开文件: " + filename);
+        LOG_ERROR("FFmpeg 错误码: ", ret, ", 错误信息: ", errbuf);
+        emit_error(ret, "无法打开文件: " + filename + " (错误: " + std::string(errbuf) + ")");
         set_state(PlayerState::Error);
         return -1;
     }
@@ -128,8 +185,11 @@ int PlayerCore::open(const std::string& filename) {
     LOG_INFO("文件打开成功");
     
     // 获取流信息
-    if (avformat_find_stream_info(format_ctx_, nullptr) < 0) {
-        emit_error("无法获取流信息");
+    ret = avformat_find_stream_info(format_ctx_, nullptr);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        emit_error(ret, "无法获取流信息 (错误: " + std::string(errbuf) + ")");
         set_state(PlayerState::Error);
         return -1;
     }
@@ -209,6 +269,8 @@ int PlayerCore::open(const std::string& filename) {
         LOG_INFO("打开视频流...");
         if (stream_component_open(video_stream_) < 0) {
             LOG_ERROR("无法打开视频流");
+            emit_error(PLAYER_ERROR_CODEC_OPEN_FAILED, "无法打开视频流");
+            // 注意：继续尝试打开音频流，不直接返回错误
         } else {
             LOG_INFO("视频流打开成功, 分辨率: ", media_info_.video_width, "x", media_info_.video_height);
         }
@@ -218,9 +280,19 @@ int PlayerCore::open(const std::string& filename) {
         LOG_INFO("打开音频流...");
         if (stream_component_open(audio_stream_) < 0) {
             LOG_ERROR("无法打开音频流");
+            emit_error(PLAYER_ERROR_CODEC_OPEN_FAILED, "无法打开音频流");
+            // 注意：继续播放，不直接返回错误（可能是纯视频文件）
         } else {
             LOG_INFO("音频流打开成功, 采样率: ", media_info_.audio_sample_rate, " Hz");
         }
+    }
+    
+    // ⚠️ 如果视频和音频都没有打开成功，则报错
+    if (!video_decoder_ && !audio_decoder_) {
+        LOG_ERROR("无法打开任何媒体流");
+        emit_error(PLAYER_ERROR_NO_VIDEO_STREAM, "无法打开任何视频或音频流");
+        set_state(PlayerState::Error);
+        return -1;
     }
     
     // 启动读取线程（此时已经 seek 到正确位置）
@@ -237,6 +309,12 @@ int PlayerCore::open(const std::string& filename) {
     
     LOG_INFO("解码器已恢复，开始播放");
     set_state(PlayerState::Playing);
+    
+    // ⚠️ 启动播放进度回调定时器线程
+    if (position_changed_callback_) {
+        progress_timer_thread_ = std::thread(&PlayerCore::progress_timer_thread, this);
+        LOG_INFO("播放进度回调定时器线程已启动");
+    }
     
     return 0;
 }
@@ -284,6 +362,12 @@ void PlayerCore::close() {
         LOG_INFO("等待音频线程结束...");
         audio_thread_.join();
         LOG_INFO("音频线程已结束");
+    }
+    
+    if (progress_timer_thread_.joinable()) {
+        LOG_INFO("等待播放进度回调线程结束...");
+        progress_timer_thread_.join();
+        LOG_INFO("播放进度回调线程已结束");
     }
     
     // ⚠️ 第五步：现在可以安全地关闭流组件
@@ -382,8 +466,33 @@ void PlayerCore::stop() {
 }
 
 void PlayerCore::seek(double pos) {
+    LOG_INFO("========================================");
+    LOG_INFO("请求跳转到位置: ", pos, " 秒");
+    LOG_INFO("当前位置: ", get_position(), " 秒");
+    LOG_INFO("视频时长: ", get_duration(), " 秒");
+    LOG_INFO("========================================");
+    
+    if (pos < 0) {
+        LOG_WARNING("⚠️ 跳转位置小于 0，修正为 0");
+        pos = 0;
+    }
+    
+    double duration = get_duration();
+    if (duration > 0 && pos > duration) {
+        LOG_WARNING("⚠️ 跳转位置超过视频时长，修正为时长值");
+        pos = duration;
+    }
+    
+    // ⚠️ 【关键修复】保存 seek 目标位置，在 seeking 期间直接返回此值
+    seek_target_pos_.store(pos, std::memory_order_release);
+    
+    // ⚠️ 使用 store(Release) 确保 seeking_ 的修改对其他线程立即可见
+    seeking_.store(true, std::memory_order_release);
+    LOG_INFO("设置 seeking 标志（Release），暂停进度回调");
+    
     seek_pos_ = pos;
     seek_request_ = true;
+    LOG_INFO("跳转请求已设置，等待读取线程处理...");
 }
 
 double PlayerCore::get_position() const {
@@ -407,6 +516,8 @@ void PlayerCore::read_thread() {
     AVPacket* pkt = av_packet_alloc();
     if (!pkt) {
         LOG_ERROR("无法分配 AVPacket");
+        emit_error(PLAYER_ERROR_OUT_OF_MEMORY, "内存不足：无法分配 AVPacket");
+        set_state(PlayerState::Error);
         return;
     }
     
@@ -419,14 +530,23 @@ void PlayerCore::read_thread() {
             double target_pos = seek_pos_;
             seek_request_ = false;  // ⚠️ 立即重置，允许新的 seek 请求排队
             
+            // 注意：seeking_ 标志已在 seek() 方法中设置为 true，这里不需要重复设置
+            
             int64_t seek_target = target_pos * AV_TIME_BASE;
             
             LOG_INFO("开始 Seek 到: ", target_pos, " 秒");
             
             if (av_seek_frame(format_ctx_, -1, seek_target, AVSEEK_FLAG_BACKWARD) < 0) {
                 LOG_ERROR("Seek 失败");
+                emit_error(PLAYER_ERROR_SEEK_FAILED, "跳转到指定位置失败");
+                seeking_.store(false, std::memory_order_release);  // Seek 失败也要清除标志
             } else {
                 LOG_INFO("Seek 成功");
+                
+                // ⚠️ 清除播放完成标志，允许重新播放
+                decode_finished_.store(false, std::memory_order_release);
+                playback_completed_notified_ = false;
+                LOG_INFO("清除解码结束标志和播放完成通知标志");
                 
                 // ⚠️ 1. 清空数据包队列
                 if (video_packet_queue_) video_packet_queue_->flush();
@@ -464,11 +584,33 @@ void PlayerCore::read_thread() {
                     audio_packet_queue_->put_nullpacket(audio_stream_);
                 }
                 
-                LOG_INFO("Seek 清理完成");
+                // ⚠️ 5. 【关键修复】立即更新时钟到目标位置，避免进度条跳动
+                // 这样 get_master_clock() 会立即返回正确的 seek 位置
+                if (audio_stream_ >= 0) {
+                    audio_clock_.set_clock(target_pos, 0);
+                    LOG_INFO("音频时钟已更新到 seek 位置: ", target_pos);
+                }
+                if (video_stream_ >= 0) {
+                    video_clock_.set_clock(target_pos, 0);
+                    LOG_INFO("视频时钟已更新到 seek 位置: ", target_pos);
+                }
+                external_clock_.set_clock(target_pos, 0);
+                
+                // ⚠️ 6. 【关键修复】立即触发一次进度回调，通知 UI 新位置
+                if (position_changed_callback_) {
+                    position_changed_callback_(target_pos);
+                    LOG_INFO("立即触发进度回调: ", target_pos);
+                }
+                
+                // ⚠️ 注意：不在这里清除 seeking_ 标志
+                // 等待音频解码线程解码第一帧后自动清除，确保时钟稳定
+                
+                LOG_INFO("Seek 清理完成，等待解码新帧后恢复进度回调");
             }
         }
         
         // ⚠️ 检查队列总大小（参考 ffplay）
+        // ⚠️ 减少缓冲区大小，从 15MB/30MB 降低到 5MB/10MB，防止内存泄漏
         // 只有当两个队列都满时才等待，避免阻塞单个队列
         int total_size = 0;
         bool video_full = false;
@@ -477,17 +619,17 @@ void PlayerCore::read_thread() {
         if (video_packet_queue_) {
             int vs = video_packet_queue_->get_size();
             total_size += vs;
-            video_full = (vs > 15 * 1024 * 1024);
+            video_full = (vs > 5 * 1024 * 1024);  // 从 15MB 降低到 5MB
         }
         
         if (audio_packet_queue_) {
             int as = audio_packet_queue_->get_size();
             total_size += as;
-            audio_full = (as > 15 * 1024 * 1024);
+            audio_full = (as > 5 * 1024 * 1024);  // 从 15MB 降低到 5MB
         }
         
-        // 只有当任一队列满 AND 总大小超过阈值时才等待
-        if ((video_full || audio_full) && total_size > 30 * 1024 * 1024) {
+        // ⚠️ 任一队列满或总大小超过 10MB 就等待（从 30MB 降低）
+        if ((video_full || audio_full) || total_size > 10 * 1024 * 1024) {
             PLAYER_DELAY(10);
             continue;
         }
@@ -497,22 +639,50 @@ void PlayerCore::read_thread() {
         
         if (ret < 0) {
             if (ret == AVERROR_EOF || avio_feof(format_ctx_->pb)) {
-                // 文件结束
+                // 文件结束，发送结束包给解码器
+                LOG_INFO("读取线程：文件读取结束");
                 if (video_stream_ >= 0) {
                     video_packet_queue_->put_nullpacket(video_stream_);
                 }
                 if (audio_stream_ >= 0) {
                     audio_packet_queue_->put_nullpacket(audio_stream_);
                 }
-                break;
+                
+                // ⚠️ 不要退出线程！等待可能的 seek 操作或终止信号
+                LOG_INFO("读取线程：进入等待状态，等待 seek 或终止信号");
+                while (!abort_request_ && !seek_request_) {
+                    PLAYER_DELAY(100);  // 等待 100ms 后再检查
+                }
+                
+                // 如果是 abort 导致退出，则真正退出线程
+                if (abort_request_) {
+                    LOG_INFO("读取线程：收到终止信号，退出");
+                    break;
+                }
+                
+                // 如果是 seek，则继续循环（seek 会在循环开头处理）
+                LOG_INFO("读取线程：检测到 seek 请求，继续读取");
+                continue;
             }
             
             if (format_ctx_->pb && format_ctx_->pb->error) {
+                LOG_ERROR("读取线程：IO 错误，退出");
+                emit_error(PLAYER_ERROR_READ_FRAME_FAILED, "读取数据包失败：IO 错误");
                 break;
+            }
+            
+            // ⚠️ 读取失败，可能是网络问题，触发加载回调
+            if (loading_callback_) {
+                loading_callback_(true);  // 开始加载
             }
             
             PLAYER_DELAY(10);
             continue;
+        }
+        
+        // ⚠️ 读取成功，结束加载状态
+        if (loading_callback_) {
+            loading_callback_(false);  // 加载完成
         }
         
         // 分发包到对应队列
@@ -543,23 +713,31 @@ int PlayerCore::stream_component_open(int stream_index) {
     // 查找解码器
     const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
     if (!codec) {
-        std::cerr << "找不到解码器" << std::endl;
+        std::ostringstream oss;
+        oss << "找不到解码器 codecID:" << codecpar->codec_id;
+        LOG_ERROR(oss.str());
+        emit_error(ERROR_CODEC_NOT_FOUND, oss.str());
         return -1;
     }
     
     // 创建解码器上下文
     AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
     if (!codec_ctx) {
+        emit_error(ERROR_ALLOC_CONTEXT_FAILED, "创建解码器上下文失败");
+        LOG_ERROR("创建解码器上下文失败 codecID:", codec->id, " codecName:", codec->long_name);
         return -1;
     }
     
     if (avcodec_parameters_to_context(codec_ctx, codecpar) < 0) {
+        LOG_ERROR("初始化解码器上下文参数失败 codecID:", codec->id, " codecName:", codec->long_name);
         avcodec_free_context(&codec_ctx);
         return -1;
     }
     
     // 打开解码器
     if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
+        LOG_ERROR("打开解码器失败~");
+        emit_error(ERROR_CODEC_OPEN_FAILED, "打开解码器失败");
         avcodec_free_context(&codec_ctx);
         return -1;
     }
@@ -583,7 +761,7 @@ int PlayerCore::stream_component_open(int stream_index) {
 
         LOG_INFO("音频解码器已创建");
         
-#ifdef HAS_SOUNDTOUCH
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
         // 初始化 SoundTouch（用于倍速播放）
         if (!soundtouch_) {
             soundtouch_ = new soundtouch::SoundTouch();
@@ -621,6 +799,7 @@ int PlayerCore::stream_component_open(int stream_index) {
         audio_dev_ = SDL_OpenAudioDevice(nullptr, 0, &wanted_spec, &spec, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
         if (audio_dev_ == 0) {
             LOG_ERROR("SDL_OpenAudioDevice 失败: ", SDL_GetError());
+            emit_error(PLAYER_ERROR_AUDIO_DEVICE_OPEN_FAILED, std::string("打开音频设备失败: ") + SDL_GetError());
             return -1;
         }
         
@@ -700,12 +879,14 @@ void PlayerCore::video_thread() {
     AVFrame* frame = av_frame_alloc();
     if (!frame) {
         LOG_ERROR("无法分配视频帧");
+        emit_error(PLAYER_ERROR_OUT_OF_MEMORY, "内存不足：无法分配视频帧");
+        set_state(PlayerState::Error);
         return;
     }
     
     double pts;
     double duration;
-    int frame_count = 0;
+//    int frame_count = 0;
     int error_count = 0;  // 添加错误计数
     
     LOG_INFO("[视频线程] 进入主循环, video_decoder_ exists=", (video_decoder_ != nullptr), ", abort_request_=", abort_request_);
@@ -742,16 +923,40 @@ void PlayerCore::video_thread() {
                     LOG_ERROR("视频解码错误: ", ret, " (错误次数: ", error_count, ")");
                 }
             }
+            emit_error(ERROR_DECODE_FAILED, "视频解码失败");
             PLAYER_DELAY(10);
             continue;  // 继续尝试
         } else if (ret == 0) {
             LOG_INFO("视频解码结束");
-            break;
+            // ⚠️ 设置解码结束标志
+            decode_finished_.store(true, std::memory_order_release);
+            LOG_INFO("设置解码结束标志");
+            
+            // ⚠️ 不要退出线程！等待可能的 seek 操作或终止信号
+            while (!abort_request_) {
+                // 检查是否有 seek 请求（队列被清空会触发 restart）
+                if (video_queue_ && video_queue_->nb_remaining() > 0) {
+                    // 队列有新数据，说明 seek 后开始解码了，清除结束标志
+                    decode_finished_.store(false, std::memory_order_release);
+                    LOG_INFO("检测到 seek 后新数据，清除解码结束标志，继续解码");
+                    break;  // 跳出等待循环，继续解码
+                }
+                PLAYER_DELAY(100);  // 等待 100ms 后再检查
+            }
+            
+            // 如果是 abort 导致退出，则真正退出线程
+            if (abort_request_) {
+                break;
+            }
+            
+            // 否则继续解码循环
+            continue;
         }
         
-        frame_count++;
-        if (frame_count % 100 == 0) {
-            LOG_INFO("已解码 ", frame_count, " 个视频帧");
+        // ⚠️ 【关键修复】如果是 seek 后的第一帧，清除 seeking 标志
+        if (seeking_.load(std::memory_order_acquire)) {
+            seeking_.store(false, std::memory_order_release);
+            LOG_INFO("视频线程：检测到 seek 后首帧，清除 seeking 标志，恢复进度回调");
         }
         
         // 计算帧时间戳
@@ -788,7 +993,7 @@ void PlayerCore::video_thread() {
             if (!isnan(diff)) {
                 if (diff <= -0.1) {
                     // 视频太慢（落后音频超过 100ms），丢帧
-                    LOG_INFO("视频落后，丢帧 diff=", diff);
+//                    LOG_INFO("视频落后，丢帧 diff=", diff);
                     av_frame_unref(frame);
                     video_queue_->next();  // 从队列中移除
                     continue;
@@ -800,11 +1005,6 @@ void PlayerCore::video_thread() {
                     if (physical_delay > 0.1) {
                         physical_delay = 0.1;  // 最多等待 100ms
                     }
-                    
-                    if (frame_count % 100 == 0) {
-                        LOG_INFO("视频领先，等待 ", (int)(physical_delay * 1000), " ms");
-                    }
-                    
                     PLAYER_DELAY((int)(physical_delay * 1000));
                 }
             }
@@ -828,6 +1028,8 @@ void PlayerCore::audio_thread() {
     AVFrame* frame = av_frame_alloc();
     if (!frame) {
         LOG_ERROR("无法分配音频帧");
+        emit_error(PLAYER_ERROR_OUT_OF_MEMORY, "内存不足：无法分配音频帧");
+        set_state(PlayerState::Error);
         return;
     }
     
@@ -877,28 +1079,62 @@ void PlayerCore::audio_thread() {
             if (error_count == 1 || error_count % 100 == 0) {
                 LOG_ERROR("音频解码错误: ", ret, " (连续 ", error_count, " 次)");
             }
+            emit_error(ERROR_DECODE_FAILED, "音频解码失败");
             PLAYER_DELAY(10);
             continue;  // 继续尝试
         } else if (ret == 0) {
             LOG_INFO("音频解码结束");
-            break;
+            
+            // ⚠️ 不要退出线程！等待可能的 seek 操作或终止信号
+            while (!abort_request_) {
+                // 检查是否有 seek 请求（队列被清空会触发 restart）
+                if (audio_queue_ && audio_queue_->nb_remaining() > 0) {
+                    // 队列有新数据，说明 seek 后开始解码了
+                    LOG_INFO("检测到 seek 后新数据（音频），继续解码");
+                    break;  // 跳出等待循环，继续解码
+                }
+                PLAYER_DELAY(100);  // 等待 100ms 后再检查
+            }
+            
+            // 如果是 abort 导致退出，则真正退出线程
+            if (abort_request_) {
+                break;
+            }
+            
+            // 否则继续解码循环
+            continue;
         }
         
         // 解码成功，重置错误计数
         error_count = 0;
         
+        // ⚠️ 【关键修复】如果是 seek 后的第一帧，清除 seeking 标志
+        if (seeking_.load(std::memory_order_acquire)) {
+            seeking_.store(false, std::memory_order_release);
+            // LOG_INFO("音频线程：检测到 seek 后首帧，清除 seeking 标志，恢复进度回调");
+        }
+        
         frame_count++;
-        if (frame_count == 1 || frame_count % 100 == 0) {
-            LOG_INFO("已解码 ", frame_count, " 个音频帧");
+//        if (frame_count == 1 || frame_count % 100 == 0) {
+//            LOG_INFO("已解码 ", frame_count, " 个音频帧");
+//        }
+        
+        // 防止 frame_count 溢出（每100万帧重置一次，约6小时）
+        if (frame_count > 1000000) {
+            frame_count = 0;
         }
         
         // 计算时间戳
         double pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : 
                      frame->pts * av_q2d(format_ctx_->streams[audio_stream_]->time_base);
         
-        // 更新音频时钟
-        if (!isnan(pts)) {
-            update_audio_pts(pts, audio_packet_queue_->get_serial());
+        // ⚠️ 注意：不要在这里更新音频时钟！
+        // 音频时钟应该在 audio_callback_impl 中，音频数据真正被消费时更新
+        // 这里的 pts 是解码位置，不是播放位置
+        
+        // ⚠️ 触发缓冲进度回调（报告音频解码位置）
+        if (!isnan(pts) && buffer_progress_callback_ && frame_count % 10 == 0) {
+            buffer_progress_callback_(pts);
         }
         
         // 获取可写帧
@@ -926,6 +1162,79 @@ void PlayerCore::audio_thread() {
     
     av_frame_free(&frame);
     LOG_INFO("音频线程已结束");
+}
+
+// ⚠️ 播放进度回调定时器线程
+// 定期读取 master clock 并触发回调，报告真实播放进度
+void PlayerCore::progress_timer_thread() {
+    LOG_INFO("播放进度回调定时器线程已启动");
+    const int CALLBACK_INTERVAL_MS = 200;  // 每 200ms 触发一次回调（每秒 5 次）
+    double last_position = -1.0;
+    int position_unchanged_count = 0;  // ⚠️ 位置未变化的次数
+
+    while (!abort_request_) {
+        // 检查播放器状态
+        if (state_ == PlayerState::Playing || state_ == PlayerState::Paused) {
+            double current_position;
+            
+            // ⚠️ 【关键修复】如果正在 seek，直接返回 seek 目标位置
+            if (seeking_.load(std::memory_order_acquire)) {
+                current_position = seek_target_pos_.load(std::memory_order_acquire);
+                position_unchanged_count = 0;  // 重置计数
+            } else {
+                // 获取真实播放进度（从 master clock）
+                current_position = get_master_clock();
+            }
+            
+            // 只在播放进度有效时触发回调
+            if (!isnan(current_position) && current_position >= 0.0) {
+                // 即使暂停也触发回调，让 UI 知道当前位置
+                if (position_changed_callback_) {
+                    position_changed_callback_(current_position);
+                }
+                
+                // ⚠️ 检测位置是否变化
+                if (state_ == PlayerState::Playing) {  // 只在播放状态下检测
+                    if (fabs(current_position - last_position) < 0.01) {  // 位置几乎没变化
+                        position_unchanged_count++;
+                    } else {
+                        position_unchanged_count = 0;  // 位置有变化，重置计数
+                    }
+                }
+                
+                last_position = current_position;
+                
+                // ⚠️ 【关键修复】判断播放完成的多个条件：
+                // 条件1：解码已结束 + 播放位置接近时长
+                // 条件2：播放中 + 位置连续 3 次（600ms）不变 + 位置接近时长
+                if (!playback_completed_notified_) {
+                    double duration = get_duration();
+                    bool near_end = duration > 0 && (duration - current_position) < 1.0;  // 最后 1 秒内
+                    
+                    bool condition1 = decode_finished_.load(std::memory_order_acquire) && near_end;
+                    bool condition2 = (state_ == PlayerState::Playing) && 
+                                     (position_unchanged_count >= 3) && 
+                                     near_end;
+                    
+                    if (condition1 || condition2) {
+                        playback_completed_notified_ = true;  // 避免重复通知
+                        LOG_INFO("检测到播放完成: 当前位置=", current_position, 
+                                ", 时长=", duration, 
+                                ", decode_finished=", decode_finished_.load(),
+                                ", position_unchanged_count=", position_unchanged_count);
+                        if (playback_completed_callback_) {
+                            playback_completed_callback_();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 等待一段时间后再次检查
+        PLAYER_DELAY(CALLBACK_INTERVAL_MS);
+    }
+
+    LOG_INFO("播放进度回调定时器线程已结束");
 }
 
 #ifndef NO_SDL
@@ -1039,7 +1348,7 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
             // 消费队列中的帧
             audio_queue_->next();
             
-#ifdef HAS_SOUNDTOUCH
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
             // 使用 SoundTouch 处理倍速播放
             double current_rate = playback_rate_.load();
             if (soundtouch_ && current_rate != 1.0) {
@@ -1192,9 +1501,9 @@ void PlayerCore::set_state(PlayerState state) {
     }
 }
 
-void PlayerCore::emit_error(const std::string& error) {
+void PlayerCore::emit_error(int error_code, const std::string& error_msg) {
     if (error_callback_) {
-        error_callback_(error);
+        error_callback_(error_code, error_msg);
     }
 }
 
@@ -1206,7 +1515,7 @@ void PlayerCore::set_playback_rate(double rate) {
     
     playback_rate_.store(rate, std::memory_order_release);
     
-#ifdef HAS_SOUNDTOUCH
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     // 更新 SoundTouch 的速度设置
     if (soundtouch_) {
         // 先清空缓冲区，避免旧数据影响新速度

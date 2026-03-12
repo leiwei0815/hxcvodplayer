@@ -13,60 +13,88 @@
 ✅ **平台支持**
 - **macOS 原生版**：Cocoa + AVFoundation + AudioQueue ✅
 - **iOS 原生版**：UIKit + AVFoundation + AudioQueue ✅
-- **Windows Desktop 版**：Qt5 + SDL2 ✅
-- **Linux Desktop 版**：Qt5 + SDL2 ✅
+- **Android 原生版**：ANativeWindow + OpenSL ES ✅
+- **Desktop 版**：Qt5 + SDL2 ✅
 
 ## 🚀 立即开始
 
 ### macOS 原生版
 
+**1. 编译第三方库（首次构建）：**
+```bash
+cd macos-third
+./build_all.sh
+```
+
+**2. 构建 Xcode 项目：**
 ```bash
 cd apple/macos
 ./build.sh
 # 会自动打开 Xcode 项目
 ```
 
-或者在 Xcode 中运行：
+或直接在 Xcode 中打开：
 ```bash
 open apple/macos/build/HXCPlayer-macOS.xcodeproj
 ```
 
 ### iOS 版
 
+**1. 编译第三方库（首次构建）：**
+```bash
+cd ios-third
+./build_all.sh
+```
+
+**2. 构建 Xcode 项目：**
 ```bash
 cd apple/ios
 ./build_ios.sh
 # 会自动打开 Xcode 项目
 ```
 
-或者在 Xcode 中运行：
+或直接在 Xcode 中打开：
 ```bash
 open apple/ios/build/YXVodPlayer-iOS.xcodeproj
 ```
 
+**3. 或构建 XCFramework（供其他项目集成）：**
+```bash
+cd apple
+./build_xcframework.sh
+```
+
+生成的 XCFramework 位于：`apple/build_xcframework/HXCPlayer.xcframework`
+
+### Android 版
+
+**1. 编译第三方库（首次构建）：**
+```bash
+cd android-third
+./build_all.sh
+```
+
+**2. 构建 APK（可直接安装到真机）：**
+```bash
+cd examples/android-test
+./build_apk.sh
+```
+
+**3. 或构建 AAR 库（供其他项目集成）：**
+```bash
+cd android/library
+./build_aar.sh release --copy-libs
+```
+
+或者在 Android Studio 中打开 `examples/android-test` 项目。
+
 ### Desktop 版（Qt）
 
-**macOS / Linux:**
 ```bash
 mkdir build_desktop && cd build_desktop
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j8
-# macOS
 open bin/YXVodPlayer.app
-# Linux
-./bin/YXVodPlayer
-```
-
-**Windows:**
-```cmd
-# 快速开始（推荐）
-quickstart_windows.bat
-
-# 或手动生成 Visual Studio 项目
-build_windows.bat vs2022
-
-# 详细说明请参考
-README_WINDOWS.md
 ```
 
 ## 特性
@@ -75,7 +103,8 @@ README_WINDOWS.md
 - 🎵 音视频同步播放
 - ⚡ 变速播放（0.5x - 2.0x，保持音调）
 - 🖼️ 视频显示模式（适应/填充）
-- 🖥️ 跨平台支持（macOS、iOS、Windows）
+- 🖥️ 跨平台支持（macOS、iOS、Android、Windows）
+- 🌐 网络流媒体支持（HTTP、HTTPS、HLS、302 重定向）
 - 🎨 现代化原生 UI 界面
 
 ## 架构设计
@@ -92,6 +121,10 @@ README_WINDOWS.md
   - 视频：`AVSampleBufferDisplayLayer`
   - 音频：`AudioQueue`
   - 同步：`CVDisplayLink`（macOS）/ `CADisplayLink`（iOS）
+- **Android**：`HXCPlayerControl` 类（Kotlin + JNI）
+  - 视频：`ANativeWindow` 直接渲染到 `SurfaceView`
+  - 音频：`OpenSL ES` 低延迟音频输出
+  - 网络：FFmpeg + mbedTLS（支持 HTTPS 和 302 重定向）
 - **Desktop**：Qt5 UI + SDL2 渲染
 
 ## 依赖
@@ -104,35 +137,95 @@ README_WINDOWS.md
 
 ### 平台依赖
 - **macOS/iOS**：Xcode 14+、iOS 13.0+、macOS 11.0+
-- **Desktop (Qt)**：Qt5、SDL2
-- **Windows**：Visual Studio 2019/2022、vcpkg（推荐）
+- **Android**：Android Studio、NDK 25+、API 24+
+- **Desktop**：Qt5、SDL2
 
 ## 构建
 
 ### macOS 原生版
 
-需要先安装依赖：
+**1. 编译第三方库（首次构建）：**
 ```bash
-brew install ffmpeg soundtouch
+cd macos-third
+./build_all.sh
 ```
 
-然后构建：
+这会自动下载并编译以下库（支持 arm64 和 x86_64）：
+- FFmpeg 6.x（静态库）
+- SoundTouch（静态库）
+
+**2. 构建 Xcode 项目：**
 ```bash
 cd apple/macos
 ./build.sh
 ```
 
+生成的库位于：
+- `macos-third/ffmpeg-build-macos/FFmpeg-macOS/`
+- `macos-third/soundtouch-build-macos/SoundTouch-macOS/`
+
 ### iOS 版
 
-需要预先编译 iOS 版本的 FFmpeg 和 SoundTouch 库，放置在：
-- `ios-third/ffmpeg-build/FFmpeg-iOS/`
-- `ios-third/soundtouch-build/SoundTouch-iOS/`
+**1. 编译第三方库（首次构建）：**
+```bash
+cd ios-third
+./build_all.sh
+```
 
-然后构建：
+这会自动下载并编译以下库（支持 arm64 和 arm64-simulator）：
+- FFmpeg 6.x（静态库）
+- SoundTouch（静态库）
+
+**2. 构建 Xcode 项目：**
 ```bash
 cd apple/ios
 ./build_ios.sh
 ```
+
+生成的库位于：
+- `ios-third/ffmpeg-build-ios/FFmpeg-iOS/`
+- `ios-third/soundtouch-build-ios/SoundTouch-iOS/`
+
+**3. 或构建 XCFramework（供其他项目集成）：**
+```bash
+cd apple
+./build_xcframework.sh
+```
+
+这会将 iOS 和 macOS 的静态库打包成统一的 XCFramework：
+- `apple/build_xcframework/HXCPlayer.xcframework`
+
+XCFramework 包含：
+- iOS 设备（arm64）
+- iOS 模拟器（arm64、x86_64）
+- macOS（arm64、x86_64）
+
+### Android 版
+
+**1. 编译第三方库（首次构建）：**
+```bash
+cd android-third
+./build_all.sh
+```
+
+这会自动下载并编译以下库（支持 arm64-v8a、armeabi-v7a、x86_64）：
+- FFmpeg 6.x（启用网络、HTTPS、HLS 支持）
+- SoundTouch（变速播放）
+- mbedTLS（HTTPS 和 SSL 支持）
+
+**2. 构建测试 APK：**
+```bash
+cd examples/android-test
+./build_apk.sh
+```
+
+**3. 或构建 AAR 库供其他项目使用：**
+```bash
+cd android/library
+./build_aar.sh release --copy-libs
+```
+
+生成的 AAR 位于：`android/hxcplayer/build/outputs/aar/`
 
 ### Desktop 版
 
@@ -145,30 +238,13 @@ brew install qt@5 sdl2 ffmpeg soundtouch
 sudo apt install qtbase5-dev libsdl2-dev libavcodec-dev \
   libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
   libsoundtouch-dev
-
-# Windows (使用 vcpkg)
-# 运行自动安装脚本
-powershell -ExecutionPolicy Bypass -File setup_windows_deps.ps1
-
-# 或手动安装
-vcpkg install ffmpeg:x64-windows sdl2:x64-windows soundtouch:x64-windows qt5-base:x64-windows qt5-multimedia:x64-windows
 ```
 
 构建：
 ```bash
-# macOS / Linux
 mkdir build_desktop && cd build_desktop
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j8
-
-# Windows
-# 使用快速开始脚本
-quickstart_windows.bat
-
-# 或使用 build_windows.bat
-build_windows.bat vs2022 release
-
-# 详细的 Windows 构建说明请参考 README_WINDOWS.md
 ```
 
 ## 目录结构
@@ -181,9 +257,19 @@ YXVodPlayer/
 ├── apple/                  # Apple 平台（iOS & macOS）
 │   ├── HXCPlayerControl.h/mm  # 统一播放器控制类
 │   ├── ios/               # iOS 特定代码
-│   └── macos/             # macOS 特定代码
+│   ├── macos/             # macOS 特定代码
+│   └── build_xcframework.sh  # XCFramework 构建脚本
+├── android/                # Android 平台
+│   ├── hxcplayer/         # Android 库模块（AAR）
+│   └── library/           # AAR 构建项目
 ├── desktop/               # Desktop (Qt5) 实现
-├── ios-third/             # iOS 第三方库
+├── examples/
+│   ├── ios-test/          # iOS 测试应用
+│   ├── macos-test/        # macOS 测试应用
+│   └── android-test/      # Android 测试应用
+├── macos-third/           # macOS 第三方库编译脚本
+├── ios-third/             # iOS 第三方库编译脚本
+├── android-third/         # Android 第三方库编译脚本
 ├── docs/                  # 文档
 └── CMakeLists.txt         # 主 CMake 配置
 ```
@@ -215,6 +301,47 @@ player.aspectRatioMode = HXCAspectRatioModeFit;
 - (void)playerDidChangeState:(HXCPlayerState)state {
     // 处理状态变化
 }
+```
+
+### Android
+
+```kotlin
+import com.hxcplayer.HXCPlayerControl
+
+// 创建播放器（在 Activity 或 Fragment 中）
+val player = HXCPlayerControl(this)
+
+// 将播放器的 videoView 添加到布局中
+val videoContainer = findViewById<FrameLayout>(R.id.videoContainer)
+videoContainer.addView(player.videoView)
+
+// 打开视频（支持本地文件和网络 URL）
+player.openURL("http://example.com/video.mp4")
+
+// 控制播放
+player.play()
+player.pause()
+player.stop()
+
+// 设置播放速率（0.5x - 2.0x）
+player.setPlaybackRate(1.5f)
+
+// 设置音量（0.0 - 1.0）
+player.setVolume(0.8f)
+
+// 设置画面比例模式
+player.setAspectRatioMode(0)  // 0: FIT（保持比例，黑边）
+player.setAspectRatioMode(1)  // 1: FILL（填充，可能裁剪）
+
+// 跳转
+player.seekTo(60.0)  // 跳转到 60 秒
+
+// 获取播放状态
+val duration = player.getDuration()
+val position = player.getCurrentPosition()
+
+// 清理资源（在 onDestroy 中调用）
+player.release()
 ```
 
 ## License

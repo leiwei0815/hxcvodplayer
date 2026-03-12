@@ -17,7 +17,6 @@
 @property (nonatomic, strong) UIButton *aspectRatioButton;  // 显示模式按钮
 @property (nonatomic, strong) UISlider *volumeSlider;
 
-@property (nonatomic, strong) NSTimer *progressTimer;
 @property (nonatomic, assign) BOOL isSeeking;
 
 @end
@@ -162,7 +161,6 @@
 }
 
 - (void)dealloc {
-    [_progressTimer invalidate];
     [_player stop];
 }
 
@@ -170,56 +168,15 @@
 
 - (void)openTestVideo {
     // 测试网络视频
-    NSString *urlString = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
-    
+    //    NSString *urlString = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
+    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
+//    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/0e19tzp2z8r2y8qqrhec87qqougy9hcg/hhAFpacIYZ4A.mp4";//h265
     BOOL success = [_player openURL:urlString];
     if (success) {
         NSLog(@"视频打开成功");
         [_player play];
-        [self startProgressTimer];
     } else {
         NSLog(@"视频打开失败");
-    }
-}
-
-#pragma mark - Progress Timer
-
-- (void)startProgressTimer {
-    if (_progressTimer) {
-        return;
-    }
-    
-    _progressTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer * _Nonnull timer) {
-        [self updateProgress];
-    }];
-}
-
-- (void)updateProgress {
-    if (_isSeeking) {
-        return;
-    }
-    
-    double position = _player.position;
-    double duration = _player.duration;
-    
-    if (duration > 0) {
-        _progressSlider.value = (position / duration) * 1000;
-        _timeLabel.text = [NSString stringWithFormat:@"%@ / %@",
-                          [self formatTime:position],
-                          [self formatTime:duration]];
-    }
-}
-
-- (NSString *)formatTime:(double)seconds {
-    int totalSeconds = (int)seconds;
-    int hours = totalSeconds / 3600;
-    int minutes = (totalSeconds % 3600) / 60;
-    int secs = totalSeconds % 60;
-    
-    if (hours > 0) {
-        return [NSString stringWithFormat:@"%d:%02d:%02d", hours, minutes, secs];
-    } else {
-        return [NSString stringWithFormat:@"%02d:%02d", minutes, secs];
     }
 }
 
@@ -294,11 +251,29 @@
 
 #pragma mark - HXCPlayerControlDelegate
 
-- (void)playerDidChangeState:(HXCPlayerState)state {
+// 状态变化
+- (void)player:(HXCPlayerControl *)player didChangeState:(HXCPlayerState)state {
     NSLog(@"播放器状态改变: %ld", (long)state);
+    
+    switch (state) {
+        case HXCPlayerStatePlaying:
+            [_playPauseButton setTitle:@"暂停" forState:UIControlStateNormal];
+            break;
+        case HXCPlayerStatePaused:
+            [_playPauseButton setTitle:@"播放" forState:UIControlStateNormal];
+            break;
+        case HXCPlayerStateStopped:
+            [_playPauseButton setTitle:@"播放" forState:UIControlStateNormal];
+            _progressSlider.value = 0;
+            _timeLabel.text = @"00:00 / 00:00";
+            break;
+        default:
+            break;
+    }
 }
 
-- (void)playerDidEncounterError:(NSError *)error {
+// 错误通知
+- (void)player:(HXCPlayerControl *)player didFailWithError:(NSError *)error {
     NSLog(@"播放器错误: %@", error.localizedDescription);
     
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"错误"
@@ -306,6 +281,43 @@
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+// 播放进度更新（真实播放位置）
+- (void)player:(HXCPlayerControl *)player didUpdatePosition:(double)position {
+    if (_isSeeking) {
+        return;  // 拖动时不更新进度条
+    }
+    
+    double duration = player.duration;
+    
+    if (duration > 0) {
+        _progressSlider.value = (position / duration) * 1000;
+        _timeLabel.text = [NSString stringWithFormat:@"%@ / %@",
+                          [self formatTime:position],
+                          [self formatTime:duration]];
+    }
+}
+
+// 缓冲进度更新（解码位置）
+- (void)player:(HXCPlayerControl *)player didUpdateBufferProgress:(double)position {
+    // 可以在这里显示缓冲进度条
+    NSLog(@"缓冲进度: %.2f", position);
+}
+
+#pragma mark - Helper Methods
+
+- (NSString *)formatTime:(double)seconds {
+    int totalSeconds = (int)seconds;
+    int hours = totalSeconds / 3600;
+    int minutes = (totalSeconds % 3600) / 60;
+    int secs = totalSeconds % 60;
+    
+    if (hours > 0) {
+        return [NSString stringWithFormat:@"%d:%02d:%02d", hours, minutes, secs];
+    } else {
+        return [NSString stringWithFormat:@"%02d:%02d", minutes, secs];
+    }
 }
 
 @end

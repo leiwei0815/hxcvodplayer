@@ -1,5 +1,6 @@
 # 构建目录
 build/
+build-*/
 cmake-build-*/
 
 # IDE 文件
@@ -59,8 +60,16 @@ macos-third/soundtouch-build-macos/
 ios-third/ffmpeg-build-ios/
 ios-third/soundtouch-build-ios/
 
+# Android 第三方库编译目录
+android-third/ffmpeg-build-android/
+android-third/soundtouch-build-android/
+android-third/mbedtls-build-android/
+
 # Apple XCFramework 构建目录
 apple/build_xcframework/
+
+# 构建输出目录
+output/
 
 # Android
 *.iml

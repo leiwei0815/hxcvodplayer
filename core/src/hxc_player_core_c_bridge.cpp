@@ -7,15 +7,9 @@
 #include "hxc_player_core.h"
 #include <cstring>
 #include <vector>
-
-// SoundTouch: macOS/iOS 默认启用，Windows 需要 CMake 检测
-#ifdef __APPLE__
-    #include <soundtouch/SoundTouch.h>
-    #ifndef HAS_SOUNDTOUCH
-        #define HAS_SOUNDTOUCH
-    #endif
-#elif defined(_WIN32) && defined(HAS_SOUNDTOUCH)
-    #include <soundtouch/SoundTouch.h>
+#include "hxc_logger.h"
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+#include <soundtouch/SoundTouch.h>
 #endif
 
 // PlayerCoreHandle 结构，包含音频处理所需的状态
@@ -27,7 +21,12 @@ struct PlayerCoreHandle {
     unsigned int audio_buf_size;
     unsigned int audio_buf_index;
     
-#ifdef HAS_SOUNDTOUCH
+    // ⚠️ 音频时钟跟踪（用于 iOS/macOS/Android 平台）
+    double audio_current_pts;           // 当前音频帧的 PTS
+    int audio_current_sample_rate;      // 当前音频采样率
+    int audio_current_channels;         // 当前音频通道数
+    
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     soundtouch::SoundTouch* soundtouch;
     bool soundtouch_initialized;  // 标记 SoundTouch 是否已设置采样率和通道数
 #endif
@@ -35,16 +34,50 @@ struct PlayerCoreHandle {
     // 视频显示模式
     AspectRatioModeC aspect_ratio_mode;
     
+    // 回调函数及用户数据
+    StateChangedCallbackC state_changed_callback;
+    void* state_changed_user_data;
+    
+    ErrorCallbackC error_callback;
+    void* error_user_data;
+    
+    PositionChangedCallbackC position_changed_callback;
+    void* position_user_data;
+    
+    BufferProgressCallbackC buffer_progress_callback;
+    void* buffer_progress_user_data;
+    
+    PlaybackCompletedCallbackC playback_completed_callback;
+    void* playback_completed_user_data;
+    
+    LoadingCallbackC loading_callback;
+    void* loading_user_data;
+    
     PlayerCoreHandle() 
         : core(nullptr)
         , audio_buf(nullptr)
         , audio_buf_size(0)
         , audio_buf_index(0)
-#ifdef HAS_SOUNDTOUCH
+        , audio_current_pts(0.0)
+        , audio_current_sample_rate(0)
+        , audio_current_channels(0)
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
         , soundtouch(nullptr)
         , soundtouch_initialized(false)
 #endif
         , aspect_ratio_mode(ASPECT_RATIO_FIT)  // 默认 Fit 模式
+        , state_changed_callback(nullptr)
+        , state_changed_user_data(nullptr)
+        , error_callback(nullptr)
+        , error_user_data(nullptr)
+        , position_changed_callback(nullptr)
+        , position_user_data(nullptr)
+        , buffer_progress_callback(nullptr)
+        , buffer_progress_user_data(nullptr)
+        , playback_completed_callback(nullptr)
+        , playback_completed_user_data(nullptr)
+        , loading_callback(nullptr)
+        , loading_user_data(nullptr)
     {}
     
     ~PlayerCoreHandle() {
@@ -52,7 +85,7 @@ struct PlayerCoreHandle {
             free(audio_buf);
             audio_buf = nullptr;
         }
-#ifdef HAS_SOUNDTOUCH
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
         if (soundtouch) {
             delete soundtouch;
             soundtouch = nullptr;
@@ -72,7 +105,7 @@ PlayerCoreHandle* player_core_create(void) {
     config.sync_mode = hxcplayer::SyncMode::AudioMaster;
     handle->core->set_config(config);
     
-#ifdef HAS_SOUNDTOUCH
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     // 初始化 SoundTouch（用于倍速播放）
     // 注意：采样率和通道数会在第一次获取音频数据时设置
     handle->soundtouch = new soundtouch::SoundTouch();
@@ -180,7 +213,7 @@ void player_core_set_playback_rate(PlayerCoreHandle* handle, float rate) {
     if (handle && handle->core) {
         handle->core->set_playback_rate(rate);
         
-#ifdef HAS_SOUNDTOUCH
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
         // 同时更新桥接层的 SoundTouch
         if (handle->soundtouch) {
             handle->soundtouch->clear();  // 清空缓冲
@@ -254,6 +287,28 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             memcpy(buffer, handle->audio_buf + handle->audio_buf_index, len1);
             handle->audio_buf_index += len1;
             
+            // ⚠️ 【关键修复】在数据被复制给平台层后，更新音频时钟
+            if (handle->audio_current_sample_rate > 0 && handle->audio_current_channels > 0) {
+                // 计算实际消费的样本数
+                int consumed_samples = len1 / (handle->audio_current_channels * sizeof(int16_t));
+                
+                // 计算消费时长（媒体时间）
+                double consumed_duration = (double)consumed_samples / handle->audio_current_sample_rate;
+                
+                // ⚠️ SoundTouch 倍速播放：每个输出样本对应 playback_rate 倍的媒体内容时间
+                // 例如：2.0x 时，512 个输出样本对应 1024 个原始样本的媒体时间
+                double current_rate = handle->core->get_playback_rate();
+                if (current_rate != 1.0) {
+                    consumed_duration *= current_rate;
+                }
+                
+                // 更新 PTS（逐步累加）
+                handle->audio_current_pts += consumed_duration;
+                
+                // 更新音频时钟
+                handle->core->update_audio_pts(handle->audio_current_pts, 0);
+            }
+            
             return len1;  // 返回复制的字节数
         }
         
@@ -272,6 +327,12 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         int channels = frame->ch_layout.nb_channels;
         int samples = frame->nb_samples;
         int sample_rate = frame->sample_rate;
+        double pts = af->pts;  // ⚠️ 保存 PTS，用于后续时钟更新
+        
+        // ⚠️ 保存当前帧的时钟信息
+        handle->audio_current_pts = pts;
+        handle->audio_current_sample_rate = sample_rate;
+        handle->audio_current_channels = channels;
         
         // 计算原始输出数据大小（S16 格式）
         int raw_output_size = samples * channels * sizeof(int16_t);
@@ -397,7 +458,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         // 消费音频帧
         audioQueue->next();
         
-#ifdef HAS_SOUNDTOUCH
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
         // 使用 SoundTouch 处理倍速播放
         double current_rate = handle->core->get_playback_rate();
         
@@ -469,7 +530,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             handle->audio_buf_index = 0;
         }
 #else
-        // 非 macOS/Windows 平台或未启用 SoundTouch，直接使用原始音频
+        // 非 macOS/Windows 平台，直接使用原始音频
         handle->audio_buf_size = raw_output_size;
         handle->audio_buf_index = 0;
 #endif
@@ -513,4 +574,182 @@ void player_core_set_aspect_ratio_mode(PlayerCoreHandle* handle, AspectRatioMode
 AspectRatioModeC player_core_get_aspect_ratio_mode(PlayerCoreHandle* handle) {
     if (!handle) return ASPECT_RATIO_FIT;
     return handle->aspect_ratio_mode;
+}
+
+// ========== 回调函数实现 ==========
+
+// 设置状态变化回调
+void player_core_set_state_changed_callback(PlayerCoreHandle* handle, StateChangedCallbackC callback, void* user_data) {
+    if (!handle || !handle->core) return;
+    
+    handle->state_changed_callback = callback;
+    handle->state_changed_user_data = user_data;
+    
+    // 设置 C++ 层回调
+    if (callback) {
+        handle->core->set_state_changed_callback([handle](hxcplayer::PlayerState state) {
+            if (handle->state_changed_callback) {
+                // 将 C++ 枚举转换为 C 枚举
+                PlayerStateC c_state = static_cast<PlayerStateC>(state);
+                handle->state_changed_callback(c_state, handle->state_changed_user_data);
+            }
+        });
+    } else {
+        handle->core->set_state_changed_callback(nullptr);
+    }
+}
+
+// 设置错误回调
+void player_core_set_error_callback(PlayerCoreHandle* handle, ErrorCallbackC callback, void* user_data) {
+    if (!handle || !handle->core) return;
+    
+    handle->error_callback = callback;
+    handle->error_user_data = user_data;
+    
+    // 设置 C++ 层回调
+    if (callback) {
+        handle->core->set_error_callback([handle](int error_code, const std::string& error_msg) {
+            if (handle->error_callback) {
+                handle->error_callback(error_code, error_msg.c_str(), handle->error_user_data);
+            }
+        });
+    } else {
+        handle->core->set_error_callback(nullptr);
+    }
+}
+
+// 设置播放进度回调
+void player_core_set_position_changed_callback(PlayerCoreHandle* handle, PositionChangedCallbackC callback, void* user_data) {
+    if (!handle || !handle->core) return;
+    
+    handle->position_changed_callback = callback;
+    handle->position_user_data = user_data;
+    
+    // 设置 C++ 层回调
+    if (callback) {
+        handle->core->set_position_changed_callback([handle](double position) {
+            if (handle->position_changed_callback) {
+                handle->position_changed_callback(position, handle->position_user_data);
+            }
+        });
+    } else {
+        handle->core->set_position_changed_callback(nullptr);
+    }
+}
+
+void player_core_set_buffer_progress_callback(PlayerCoreHandle* handle, BufferProgressCallbackC callback, void* user_data) {
+    if (!handle || !handle->core) return;
+    
+    handle->buffer_progress_callback = callback;
+    handle->buffer_progress_user_data = user_data;
+    
+    // 设置 C++ 层回调
+    if (callback) {
+        handle->core->set_buffer_progress_callback([handle](double position) {
+            if (handle->buffer_progress_callback) {
+                handle->buffer_progress_callback(position, handle->buffer_progress_user_data);
+            }
+        });
+    } else {
+        handle->core->set_buffer_progress_callback(nullptr);
+    }
+}
+
+void player_core_set_playback_completed_callback(PlayerCoreHandle* handle, PlaybackCompletedCallbackC callback, void* user_data) {
+    if (!handle || !handle->core) return;
+    
+    handle->playback_completed_callback = callback;
+    handle->playback_completed_user_data = user_data;
+    
+    // 设置 C++ 层回调
+    if (callback) {
+        handle->core->set_playback_completed_callback([handle]() {
+            if (handle->playback_completed_callback) {
+                handle->playback_completed_callback(handle->playback_completed_user_data);
+            }
+        });
+    } else {
+        handle->core->set_playback_completed_callback(nullptr);
+    }
+}
+
+void player_core_set_loading_callback(PlayerCoreHandle* handle, LoadingCallbackC callback, void* user_data) {
+    if (!handle || !handle->core) return;
+    
+    handle->loading_callback = callback;
+    handle->loading_user_data = user_data;
+    
+    // 设置 C++ 层回调
+    if (callback) {
+        handle->core->set_loading_callback([handle](bool is_loading) {
+            if (handle->loading_callback) {
+                handle->loading_callback(is_loading, handle->loading_user_data);
+            }
+        });
+    } else {
+        handle->core->set_loading_callback(nullptr);
+    }
+}
+
+// ========== 日志配置实现 ==========
+
+// 静态变量存储日志文件路径
+static std::string g_current_log_file;
+
+void player_core_set_log_level(int level) {
+    hxcplayer::LogLevel log_level;
+    switch (level) {
+        case 0: log_level = hxcplayer::LogLevel::DEBUG; break;
+        case 1: log_level = hxcplayer::LogLevel::INFO; break;
+        case 2: log_level = hxcplayer::LogLevel::WARNING; break;
+        case 3: log_level = hxcplayer::LogLevel::ERROR; break;
+        default: log_level = hxcplayer::LogLevel::INFO; break;
+    }
+    hxcplayer::Logger::instance().set_level(log_level);
+}
+
+void player_core_enable_file_logging(const char* log_dir, const char* prefix) {
+    if (!log_dir) return;
+    
+    std::string dir(log_dir);
+    std::string pfx = prefix ? std::string(prefix) : "hxcplayer";
+    
+    hxcplayer::Logger::instance().enable_file_logging(dir, pfx);
+    g_current_log_file = hxcplayer::Logger::instance().get_current_log_file();
+    
+    LOG_INFO("========================================");
+    LOG_INFO("HXCPlayer 文件日志已启用");
+    LOG_INFO("日志目录: ", log_dir);
+    LOG_INFO("日志前缀: ", pfx);
+    LOG_INFO("日志文件: ", g_current_log_file);
+    LOG_INFO("========================================");
+    
+    // 注意：cleanup_old_logs() 已在 enable_file_logging() 中自动调用
+}
+
+void player_core_disable_file_logging(void) {
+    LOG_INFO("HXCPlayer 文件日志已禁用");
+    hxcplayer::Logger::instance().disable_file_logging();
+}
+
+void player_core_set_max_log_file_size(size_t max_size) {
+    hxcplayer::Logger::instance().set_max_file_size(max_size);
+    LOG_INFO("日志文件最大大小设置为: ", max_size, " 字节");
+}
+
+void player_core_set_log_retention_days(int days) {
+    if (days < 1) days = 1;  // 至少保留 1 天
+    hxcplayer::Logger::instance().set_log_retention_days(days);
+    LOG_INFO("日志保留天数设置为: ", days, " 天");
+}
+
+int player_core_cleanup_old_logs(void) {
+    int deleted_count = hxcplayer::Logger::instance().cleanup_old_logs();
+    LOG_INFO("清理了 ", deleted_count, " 个过期日志文件");
+    return deleted_count;
+}
+
+const char* player_core_get_current_log_file(void) {
+    g_current_log_file = hxcplayer::Logger::instance().get_current_log_file();
+    return g_current_log_file.c_str();
 }

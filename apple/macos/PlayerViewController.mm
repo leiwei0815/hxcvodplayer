@@ -20,7 +20,6 @@
 @property (nonatomic, strong) NSSlider *volumeSlider;
 @property (nonatomic, strong) NSPopUpButton *speedButton;
 @property (nonatomic, strong) NSTextField *timeLabel;
-@property (nonatomic, strong) NSTimer *updateTimer;
 
 @property (nonatomic, assign) BOOL isSeeking;
 
@@ -37,11 +36,9 @@
     
     [self setupPlayer];
     [self setupUI];
-    [self startUpdateTimer];
 }
 
 - (void)dealloc {
-    [_updateTimer invalidate];
     [_player stop];
 }
 
@@ -258,14 +255,6 @@
     ]];
 }
 
-- (void)startUpdateTimer {
-    _updateTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
-                                                    target:self
-                                                  selector:@selector(updateUI)
-                                                  userInfo:nil
-                                                   repeats:YES];
-}
-
 #pragma mark - Actions
 
 - (void)openButtonClicked:(id)sender {
@@ -314,7 +303,9 @@
     // 创建输入框
     NSTextField *input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 400, 24)];
     input.placeholderString = @"https://example.com/video.mp4";
-    input.stringValue = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
+//    input.stringValue = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
+    input.stringValue = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
+//    input.stringValue = @"https://vod.tenwiseacademy.cn/111453136245362688/0e19tzp2z8r2y8qqrhec87qqougy9hcg/hhAFpacIYZ4A.mp4";//h265
     alert.accessoryView = input;
     
     // 设置输入框为第一响应者
@@ -432,42 +423,10 @@
     }
 }
 
-- (void)updateUI {
-    // 如果正在 seek，跳过 UI 更新避免冲突
-    if (_isSeeking) {
-        return;
-    }
-    
-    double position = _player.position;
-    double duration = _player.duration;
-    
-    // 只要有有效的时长，就更新进度显示（不管是播放还是暂停状态）
-    if (duration > 0) {
-        double value = (position / duration) * 1000.0;
-        _progressSlider.doubleValue = value;
-        
-        _timeLabel.stringValue = [NSString stringWithFormat:@"%@ / %@",
-                                  [self formatTime:position],
-                                  [self formatTime:duration]];
-    }
-}
-
-- (NSString *)formatTime:(double)seconds {
-    int totalSeconds = (int)seconds;
-    int hours = totalSeconds / 3600;
-    int minutes = (totalSeconds % 3600) / 60;
-    int secs = totalSeconds % 60;
-    
-    if (hours > 0) {
-        return [NSString stringWithFormat:@"%d:%02d:%02d", hours, minutes, secs];
-    } else {
-        return [NSString stringWithFormat:@"%02d:%02d", minutes, secs];
-    }
-}
-
 #pragma mark - HXCPlayerControlDelegate
 
-- (void)playerDidChangeState:(HXCPlayerState)state {
+// 状态变化
+- (void)player:(HXCPlayerControl *)player didChangeState:(HXCPlayerState)state {
     dispatch_async(dispatch_get_main_queue(), ^{
         switch (state) {
             case HXCPlayerStatePlaying:
@@ -500,7 +459,8 @@
     });
 }
 
-- (void)playerDidEncounterError:(NSError *)error {
+// 错误通知
+- (void)player:(HXCPlayerControl *)player didFailWithError:(NSError *)error {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSAlert *alert = [[NSAlert alloc] init];
         alert.messageText = @"播放错误";
@@ -508,6 +468,51 @@
         alert.alertStyle = NSAlertStyleCritical;
         [alert runModal];
     });
+}
+
+// 播放进度更新（真实播放位置）
+- (void)player:(HXCPlayerControl *)player didUpdatePosition:(double)position {
+    // 如果正在 seek，跳过 UI 更新避免冲突
+    if (_isSeeking) {
+        return;
+    }
+    
+    double duration = player.duration;
+    
+    // 只要有有效的时长，就更新进度显示
+    if (duration > 0) {
+        double value = (position / duration) * 1000.0;
+        self.progressSlider.doubleValue = value;
+        
+        self.timeLabel.stringValue = [NSString stringWithFormat:@"%@ / %@",
+                                      [self formatTime:position],
+                                      [self formatTime:duration]];
+    }
+}
+
+// 缓冲进度更新（解码位置）
+- (void)player:(HXCPlayerControl *)player didUpdateBufferProgress:(double)position {
+    // 可以在这里显示缓冲进度
+    NSLog(@"缓冲进度: %.2f", position);
+}
+
+-(void)playerDidFinishPlaying:(HXCPlayerControl *)player {
+    NSLog(@"视频播放结束...");
+}
+
+#pragma mark - Helper Methods
+
+- (NSString *)formatTime:(double)seconds {
+    int totalSeconds = (int)seconds;
+    int hours = totalSeconds / 3600;
+    int minutes = (totalSeconds % 3600) / 60;
+    int secs = totalSeconds % 60;
+    
+    if (hours > 0) {
+        return [NSString stringWithFormat:@"%d:%02d:%02d", hours, minutes, secs];
+    } else {
+        return [NSString stringWithFormat:@"%02d:%02d", minutes, secs];
+    }
 }
 
 @end
