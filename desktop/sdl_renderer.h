@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file sdl_renderer.h
  * @brief SDL 渲染器（可选实现）
  */

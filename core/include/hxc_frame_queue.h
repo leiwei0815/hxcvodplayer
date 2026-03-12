@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file frame_queue.h
  * @brief 帧队列管理（参照 ffplay 实现）
  */

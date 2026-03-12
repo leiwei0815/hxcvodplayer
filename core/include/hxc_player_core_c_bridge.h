@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file player_core_c_bridge.h
  * @brief C 接口桥接层（隔离 C++ 和 Objective-C++，避免 FFmpeg/AVFoundation 冲突）
  */

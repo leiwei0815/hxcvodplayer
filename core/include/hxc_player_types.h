@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file player_types.h
  * @brief 播放器核心类型定义
  */

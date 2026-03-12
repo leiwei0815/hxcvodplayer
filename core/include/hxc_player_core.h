@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file player_core.h
  * @brief 播放器核心类（参照 ffplay 架构）
  */
@@ -24,8 +24,18 @@ extern "C" {
 }
 
 // ⚠️ SoundTouch 库（用于倍速播放，保持音调）
-#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
-#include <soundtouch/SoundTouch.h>
+// 只有在编译时找到 SoundTouch 库时才包含
+#ifdef HAS_SOUNDTOUCH
+    #if defined(__APPLE__)
+        // macOS/iOS 使用 Homebrew 安装的 SoundTouch
+        #include <soundtouch/SoundTouch.h>
+    #elif defined(_WIN32)
+        // Windows 使用本地编译或 vcpkg 的 SoundTouch
+        #include <soundtouch/SoundTouch.h>
+    #elif defined(__ANDROID__)
+        // Android 使用 NDK 编译的 SoundTouch
+        #include <soundtouch/SoundTouch.h>
+    #endif
 #endif
 
 namespace hxcplayer {

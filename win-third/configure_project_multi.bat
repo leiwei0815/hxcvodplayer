@@ -64,10 +64,8 @@ cmake ..\.. ^
     -G "Visual Studio 17 2022" ^
     -A x64 ^
     -DCMAKE_BUILD_TYPE=Debug ^
-    -DCMAKE_PREFIX_PATH="C:\vcpkg\installed\x64-windows;C:\Qt\5.15.2\msvc2019_64;%SOUNDTOUCH_DEBUG%" ^
+    -DCMAKE_PREFIX_PATH="C:\vcpkg\installed\x64-windows;C:\Qt\5.15.2\msvc2019_64" ^
     -DQt5_DIR="C:\Qt\5.15.2\msvc2019_64\lib\cmake\Qt5" ^
-    -DSOUNDTOUCH_INCLUDE_DIR="%SOUNDTOUCH_DEBUG%\include" ^
-    -DSOUNDTOUCH_LIBRARY="%SOUNDTOUCH_DEBUG%\lib\SoundTouch.lib" ^
     -DBUILD_DESKTOP=ON
 
 if %ERRORLEVEL% NEQ 0 (
@@ -100,10 +98,8 @@ cmake ..\.. ^
     -G "Visual Studio 17 2022" ^
     -A x64 ^
     -DCMAKE_BUILD_TYPE=Release ^
-    -DCMAKE_PREFIX_PATH="C:\vcpkg\installed\x64-windows;C:\Qt\5.15.2\msvc2019_64;%SOUNDTOUCH_RELEASE%" ^
+    -DCMAKE_PREFIX_PATH="C:\vcpkg\installed\x64-windows;C:\Qt\5.15.2\msvc2019_64" ^
     -DQt5_DIR="C:\Qt\5.15.2\msvc2019_64\lib\cmake\Qt5" ^
-    -DSOUNDTOUCH_INCLUDE_DIR="%SOUNDTOUCH_RELEASE%\include" ^
-    -DSOUNDTOUCH_LIBRARY="%SOUNDTOUCH_RELEASE%\lib\SoundTouch.lib" ^
     -DBUILD_DESKTOP=ON
 
 if %ERRORLEVEL% NEQ 0 (

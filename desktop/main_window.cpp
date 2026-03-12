@@ -46,18 +46,27 @@ MainWindow::MainWindow(QWidget *parent)
         });
     });
     
-    player_->set_error_callback([this](const std::string& error) {
-        QMetaObject::invokeMethod(this, [this, error]() {
+    player_->set_error_callback([this](int error_code, const std::string& error) {
+        QMetaObject::invokeMethod(this, [this, error_code, error]() {
             onError(QString::fromStdString(error));
         });
     });
     
-    // UI 更新定时器（只更新进度条等 UI 元素，不负责视频刷新）
-    update_timer_ = new QTimer(this);
-    connect(update_timer_, &QTimer::timeout, this, &MainWindow::updateUI);
-    update_timer_->start(100);  // 100ms 更新一次进度条即可
-//    
-//    // ⚠️ 视频刷新定时器（高频率检查，由帧 PTS 控制实际刷新）
+    // 播放进度回调（替代定时器更新进度条）
+    player_->set_position_changed_callback([this](double position) {
+        QMetaObject::invokeMethod(this, [this, position]() {
+            updateProgress(position);
+        });
+    });
+    
+    // 播放完成回调
+    player_->set_playback_completed_callback([this]() {
+        QMetaObject::invokeMethod(this, [this]() {
+            onPlaybackCompleted();
+        });
+    });
+    
+    // ⚠️ 视频刷新定时器（高频率检查，由帧 PTS 控制实际刷新）
     refresh_timer_ = new QTimer(this);
     connect(refresh_timer_, &QTimer::timeout, this, &MainWindow::refreshVideo);
     refresh_timer_->start(10);  // 10ms 检查一次（不是刷新频率！）
@@ -154,6 +163,7 @@ void MainWindow::openNetworkURL() {
         "请输入视频的网络地址（HTTP/HTTPS）:",
         QLineEdit::Normal,
         "https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4",
+        //"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4",
         &ok
     );
     
@@ -198,8 +208,7 @@ void MainWindow::on_stopButton_clicked() {
 void MainWindow::handleSeekSliderPressed() {
     is_seeking_ = true;
     
-    // ⚠️ 停止所有定时器，避免干扰
-    if (update_timer_) update_timer_->stop();
+    // ⚠️ 停止视频刷新定时器，避免干扰
     if (refresh_timer_) refresh_timer_->stop();
 }
 
@@ -208,8 +217,7 @@ void MainWindow::handleSeekSliderReleased() {
     
     if (!player_) {
         is_seeking_ = false;
-        // ⚠️ 重新启动定时器
-        if (update_timer_) update_timer_->start(100);
+        // ⚠️ 重新启动视频刷新定时器
         if (refresh_timer_) refresh_timer_->start(10);
         return;
     }
@@ -232,11 +240,10 @@ void MainWindow::handleSeekSliderReleased() {
     }
     
     // ⚠️ 在 seek 调用后再恢复状态和定时器
-    // 这样 updateUI() 即使获取到旧时钟，也不会覆盖我们手动设置的值
+    // 这样播放进度回调即使获取到旧时钟，也不会覆盖我们手动设置的值
     is_seeking_ = false;
     
-    // ⚠️ 重新启动定时器
-    if (update_timer_) update_timer_->start(100);
+    // ⚠️ 重新启动视频刷新定时器
     if (refresh_timer_) refresh_timer_->start(10);
 }
 
@@ -252,27 +259,25 @@ void MainWindow::handleVolumeChanged(int value) {
     }
 }
 
-void MainWindow::updateUI() {
+// 播放进度更新（由播放器回调触发）
+void MainWindow::updateProgress(double position) {
     if (!player_) return;
     
-    // ⚠️ 关键修复：拖动时完全跳过 updateUI，避免任何干扰
+    // ⚠️ 拖动时跳过更新，避免干扰
     if (is_seeking_) {
-        return;  // 用户正在拖动，不做任何更新
+        return;
     }
     
-    // 更新进度条和时间（不管是播放还是暂停状态）
-    double position = player_->get_position();
     double duration = player_->get_duration();
     
     if (duration > 0) {
+        // 更新进度条
         int value = static_cast<int>((position / duration) * 1000);
         int current_value = ui->seekSlider->value();
         
-        // ⚠️ 只有值变化超过阈值时才更新，避免 seek 后的小幅抖动
-        // seek 刚完成时，音频时钟可能还有几毫秒的延迟
-        const int threshold = 2;  // 允许 0.2% 的误差（约 0.2 秒 / 100 秒视频）
+        // 只有值变化超过阈值时才更新，避免小幅抖动
+        const int threshold = 2;  // 允许 0.2% 的误差
         if (std::abs(value - current_value) > threshold) {
-            // 阻止信号，避免触发 valueChanged
             ui->seekSlider->blockSignals(true);
             ui->seekSlider->setValue(value);
             ui->seekSlider->blockSignals(false);
@@ -282,6 +287,26 @@ void MainWindow::updateUI() {
         ui->timeLabel->setText(formatTime(position) + " / " + formatTime(duration));
     }
 }
+
+// 播放完成回调
+void MainWindow::onPlaybackCompleted() {
+    qDebug() << "播放完成";
+    
+    // 停止视频刷新
+    if (refresh_timer_) {
+        refresh_timer_->stop();
+    }
+    
+    // 重置播放按钮为"播放"状态
+    ui->playPauseButton->setText("播放");
+    
+    // 可选：将进度条移到开头或结尾
+    // ui->seekSlider->setValue(0);  // 移到开头
+    // ui->seekSlider->setValue(1000);  // 停在结尾
+}
+
+void MainWindow::updateUI() {}
+    // 此方法已弃用，由 updateProgress 回调替代
 
 // ⚠️ 新增：基于 PTS 的精确视频刷新（参考 ffplay）
 void MainWindow::refreshVideo() {

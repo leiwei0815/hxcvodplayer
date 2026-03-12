@@ -1,3 +1,4 @@
+# 源文件
 set(CORE_SOURCES
     hxc_player_types.cpp
     hxc_packet_queue.cpp
@@ -6,7 +7,19 @@ set(CORE_SOURCES
     hxc_player_core_c_bridge.cpp
 )
 
-add_library(hxcplayer_core STATIC ${CORE_SOURCES})
+# 头文件
+set(CORE_HEADERS
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_player_types.h
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_packet_queue.h
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_frame_queue.h
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_decoder.h
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_player_core.h
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_player_core_c_bridge.h
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_logger.h
+)
+
+# 创建静态库（包含源文件和头文件）
+add_library(hxcplayer_core STATIC ${CORE_SOURCES} ${CORE_HEADERS})
 
 target_include_directories(hxcplayer_core PUBLIC
     ${CMAKE_SOURCE_DIR}/core/include
@@ -21,6 +34,7 @@ target_link_libraries(hxcplayer_core PUBLIC
 
 # SoundTouch（倍速播放）
 if(SOUNDTOUCH_FOUND)
+    target_include_directories(hxcplayer_core PUBLIC ${SOUNDTOUCH_INCLUDE_DIR})
     target_link_libraries(hxcplayer_core PUBLIC ${SOUNDTOUCH_LIBRARIES})
     target_compile_definitions(hxcplayer_core PUBLIC HAS_SOUNDTOUCH)
 endif()
@@ -47,8 +61,14 @@ elseif(WIN32)
         strmiids    # Streaming Media Interfaces
     )
     
-    # 添加 UTF-8 编码支持
-    target_compile_options(hxcplayer_core PRIVATE
-        /utf-8      # 源文件和执行字符集都使用 UTF-8
+    # Windows 平台编译选项
+    target_compile_options(hxcplayer_core PUBLIC
+        /utf-8      # 源文件和执行字符集都使用 UTF-8（PUBLIC 以便传递给依赖项目）
+    )
+    
+    # Windows 平台预处理器定义
+    target_compile_definitions(hxcplayer_core PUBLIC
+        NOMINMAX    # 禁用 Windows 的 min/max 宏，避免与 std::min/std::max 冲突
+        WIN32_LEAN_AND_MEAN  # 减少 Windows 头文件的包含，加快编译速度
     )
 endif()

@@ -113,15 +113,31 @@ set BUILD_DIR=build\vs2022_%BUILD_TYPE%
 mkdir "%BUILD_DIR%" 2>nul
 cd "%BUILD_DIR%"
 
-REM 使用本地 Qt 和 vcpkg 依赖，不使用 vcpkg toolchain
+REM 检查本地 SoundTouch
+if "%BUILD_TYPE%"=="debug" (
+    set SOUNDTOUCH_DIR=%~dp0win-third\soundtouch-install\debug
+) else (
+    set SOUNDTOUCH_DIR=%~dp0win-third\soundtouch-install\release
+)
+
 echo [信息] 使用本地 Qt: C:\Qt\5.15.2\msvc2019_64
 echo [信息] 使用 vcpkg 依赖: C:\vcpkg\installed\x64-windows
+
+REM 检查 SoundTouch 是否存在
+if exist "!SOUNDTOUCH_DIR!\include\soundtouch\SoundTouch.h" (
+    echo [信息] 使用本地编译的 SoundTouch: !SOUNDTOUCH_DIR!
+    set "CMAKE_PREFIX_PATH=C:\vcpkg\installed\x64-windows;C:\Qt\5.15.2\msvc2019_64;!SOUNDTOUCH_DIR!"
+) else (
+    echo [警告] 未找到本地编译的 SoundTouch
+    echo [提示] 运行 'cd win-third ^&^& .\install_all.bat' 来编译 SoundTouch
+    set "CMAKE_PREFIX_PATH=C:\vcpkg\installed\x64-windows;C:\Qt\5.15.2\msvc2019_64"
+)
 
 cmake ..\.. ^
     -G "Visual Studio 17 2022" ^
     -A x64 ^
     -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% ^
-    -DCMAKE_PREFIX_PATH="C:\vcpkg\installed\x64-windows;C:\Qt\5.15.2\msvc2019_64" ^
+    -DCMAKE_PREFIX_PATH="!CMAKE_PREFIX_PATH!" ^
     -DQt5_DIR="C:\Qt\5.15.2\msvc2019_64\lib\cmake\Qt5" ^
     -DBUILD_DESKTOP=ON
 
@@ -134,10 +150,7 @@ if %ERRORLEVEL% NEQ 0 (
     echo   1. Qt5 (https://www.qt.io/download)
     echo   2. FFmpeg (通过 vcpkg: vcpkg install ffmpeg:x64-windows)
     echo   3. SDL2 (通过 vcpkg: vcpkg install sdl2:x64-windows)
-    echo   4. SoundTouch (可选，通过 vcpkg: vcpkg install soundtouch:x64-windows)
-    echo.
-    echo 或者使用 vcpkg 一次性安装所有依赖:
-    echo   vcpkg install ffmpeg:x64-windows sdl2:x64-windows soundtouch:x64-windows qt5-base:x64-windows qt5-multimedia:x64-windows
+    echo   4. SoundTouch (通过 'cd win-third ^&^& .\install_all.bat' 编译)
     echo.
     exit /b 1
 )

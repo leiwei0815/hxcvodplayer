@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file decoder.h
  * @brief 解码器（参照 ffplay 实现）
  */

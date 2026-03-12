@@ -37,7 +37,9 @@ private slots:
     void handleSeekSliderMoved(int position);
     void handleVolumeChanged(int value);
     
-    void updateUI();
+    void updateUI();  // 已弃用，保留以兼容旧代码
+    void updateProgress(double position);  // 播放进度更新（由回调触发）
+    void onPlaybackCompleted();  // 播放完成回调
     void onStateChanged(hxcplayer::PlayerState state);
     void onError(const QString& error);
 
@@ -67,8 +69,7 @@ private:
     Ui::MainWindow *ui;
     std::unique_ptr<hxcplayer::PlayerCore> player_;
     VideoWidget* video_widget_;
-    QTimer* update_timer_;
-    QTimer* refresh_timer_;  // 视频刷新定时器
+    QTimer* refresh_timer_;  // 视频刷新定时器（保留用于视频帧刷新）
     bool is_seeking_;
     double last_video_pts_;  // 上一帧的 PTS
 };

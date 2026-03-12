@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file video_widget.h
  * @brief 视频显示窗口
  */

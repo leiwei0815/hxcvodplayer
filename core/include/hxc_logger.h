@@ -41,7 +41,7 @@ enum class LogLevel {
     DEBUG,
     INFO,
     WARNING,
-    ERROR
+    ERROR_LEVEL  // Windows 平台 ERROR 是宏，改为 ERROR_LEVEL
 };
 
 // 日志消息结构（用于异步队列）
@@ -178,7 +178,7 @@ public:
     
     template<typename... Args>
     void error(Args&&... args) {
-        if (level_ <= LogLevel::ERROR) {
+        if (level_ <= LogLevel::ERROR_LEVEL) {
             log("ERROR", std::forward<Args>(args)...);
         }
     }
@@ -196,7 +196,7 @@ public:
     
     template<typename... Args>
     void error_with_location(const char* file, int line, const char* func, Args&&... args) {
-        if (level_ <= LogLevel::ERROR) {
+        if (level_ <= LogLevel::ERROR_LEVEL) {
             std::ostringstream oss;
             oss << "[" << get_filename(file) << ":" << line << " " << func << "()] ";
             ((oss << args), ...);

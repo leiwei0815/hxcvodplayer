@@ -65,8 +65,14 @@ if(WIN32)
         WIN32_EXECUTABLE TRUE
     )
     
-    # 添加 UTF-8 编码支持（解决中文字符串编译问题）
+    # Windows 平台编译选项
     target_compile_options(HXCVodPlayer PRIVATE
         /utf-8           # 源文件和执行字符集都使用 UTF-8
     )
+    
+    # Windows 平台预处理器定义（从 core 继承了 PUBLIC 的定义，这里可选）
+    # target_compile_definitions(HXCVodPlayer PRIVATE
+    #     NOMINMAX
+    #     WIN32_LEAN_AND_MEAN
+    # )
 endif()

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file qt_platform_factory.h
  * @brief Qt 平台工厂
  */
