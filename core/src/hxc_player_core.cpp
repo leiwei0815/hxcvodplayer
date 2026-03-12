@@ -11,6 +11,16 @@
 #include <chrono>
 #include <thread>
 
+// SoundTouch 条件编译
+#ifdef __APPLE__
+    #include <soundtouch/SoundTouch.h>
+    #ifndef HAS_SOUNDTOUCH
+        #define HAS_SOUNDTOUCH
+    #endif
+#elif defined(_WIN32) && defined(HAS_SOUNDTOUCH)
+    #include <soundtouch/SoundTouch.h>
+#endif
+
 extern "C" {
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
@@ -48,7 +58,7 @@ PlayerCore::PlayerCore()
     , audio_current_pts_(0.0)
     , audio_current_pts_drift_(0.0)
     , aspect_ratio_mode_(AspectRatioMode::Fit)  // ⚠️ 默认 Fit 模式
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
     , soundtouch_(nullptr)
     , soundtouch_buffer_index_(0)
 #endif
@@ -78,7 +88,7 @@ PlayerCore::~PlayerCore() {
     LOG_INFO("销毁 PlayerCore...");
     close();
     
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
     // 释放 SoundTouch
     if (soundtouch_) {
         delete soundtouch_;
@@ -573,7 +583,7 @@ int PlayerCore::stream_component_open(int stream_index) {
 
         LOG_INFO("音频解码器已创建");
         
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
         // 初始化 SoundTouch（用于倍速播放）
         if (!soundtouch_) {
             soundtouch_ = new soundtouch::SoundTouch();
@@ -1029,7 +1039,7 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
             // 消费队列中的帧
             audio_queue_->next();
             
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
             // 使用 SoundTouch 处理倍速播放
             double current_rate = playback_rate_.load();
             if (soundtouch_ && current_rate != 1.0) {
@@ -1196,7 +1206,7 @@ void PlayerCore::set_playback_rate(double rate) {
     
     playback_rate_.store(rate, std::memory_order_release);
     
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
     // 更新 SoundTouch 的速度设置
     if (soundtouch_) {
         // 先清空缓冲区，避免旧数据影响新速度

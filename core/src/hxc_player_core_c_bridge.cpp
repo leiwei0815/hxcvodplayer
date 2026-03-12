@@ -8,8 +8,14 @@
 #include <cstring>
 #include <vector>
 
-#if defined(__APPLE__) || defined(_WIN32)
-#include <soundtouch/SoundTouch.h>
+// SoundTouch: macOS/iOS 默认启用，Windows 需要 CMake 检测
+#ifdef __APPLE__
+    #include <soundtouch/SoundTouch.h>
+    #ifndef HAS_SOUNDTOUCH
+        #define HAS_SOUNDTOUCH
+    #endif
+#elif defined(_WIN32) && defined(HAS_SOUNDTOUCH)
+    #include <soundtouch/SoundTouch.h>
 #endif
 
 // PlayerCoreHandle 结构，包含音频处理所需的状态
@@ -21,7 +27,7 @@ struct PlayerCoreHandle {
     unsigned int audio_buf_size;
     unsigned int audio_buf_index;
     
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
     soundtouch::SoundTouch* soundtouch;
     bool soundtouch_initialized;  // 标记 SoundTouch 是否已设置采样率和通道数
 #endif
@@ -34,7 +40,7 @@ struct PlayerCoreHandle {
         , audio_buf(nullptr)
         , audio_buf_size(0)
         , audio_buf_index(0)
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
         , soundtouch(nullptr)
         , soundtouch_initialized(false)
 #endif
@@ -46,7 +52,7 @@ struct PlayerCoreHandle {
             free(audio_buf);
             audio_buf = nullptr;
         }
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
         if (soundtouch) {
             delete soundtouch;
             soundtouch = nullptr;
@@ -66,7 +72,7 @@ PlayerCoreHandle* player_core_create(void) {
     config.sync_mode = hxcplayer::SyncMode::AudioMaster;
     handle->core->set_config(config);
     
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
     // 初始化 SoundTouch（用于倍速播放）
     // 注意：采样率和通道数会在第一次获取音频数据时设置
     handle->soundtouch = new soundtouch::SoundTouch();
@@ -174,7 +180,7 @@ void player_core_set_playback_rate(PlayerCoreHandle* handle, float rate) {
     if (handle && handle->core) {
         handle->core->set_playback_rate(rate);
         
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
         // 同时更新桥接层的 SoundTouch
         if (handle->soundtouch) {
             handle->soundtouch->clear();  // 清空缓冲
@@ -391,7 +397,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         // 消费音频帧
         audioQueue->next();
         
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
         // 使用 SoundTouch 处理倍速播放
         double current_rate = handle->core->get_playback_rate();
         
@@ -463,7 +469,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             handle->audio_buf_index = 0;
         }
 #else
-        // 非 macOS/Windows 平台，直接使用原始音频
+        // 非 macOS/Windows 平台或未启用 SoundTouch，直接使用原始音频
         handle->audio_buf_size = raw_output_size;
         handle->audio_buf_index = 0;
 #endif

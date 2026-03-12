@@ -13,7 +13,8 @@
 ✅ **平台支持**
 - **macOS 原生版**：Cocoa + AVFoundation + AudioQueue ✅
 - **iOS 原生版**：UIKit + AVFoundation + AudioQueue ✅
-- **Desktop 版**：Qt5 + SDL2 ✅
+- **Windows Desktop 版**：Qt5 + SDL2 ✅
+- **Linux Desktop 版**：Qt5 + SDL2 ✅
 
 ## 🚀 立即开始
 
@@ -45,11 +46,27 @@ open apple/ios/build/YXVodPlayer-iOS.xcodeproj
 
 ### Desktop 版（Qt）
 
+**macOS / Linux:**
 ```bash
 mkdir build_desktop && cd build_desktop
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j8
+# macOS
 open bin/YXVodPlayer.app
+# Linux
+./bin/YXVodPlayer
+```
+
+**Windows:**
+```cmd
+# 快速开始（推荐）
+quickstart_windows.bat
+
+# 或手动生成 Visual Studio 项目
+build_windows.bat vs2022
+
+# 详细说明请参考
+README_WINDOWS.md
 ```
 
 ## 特性
@@ -87,7 +104,8 @@ open bin/YXVodPlayer.app
 
 ### 平台依赖
 - **macOS/iOS**：Xcode 14+、iOS 13.0+、macOS 11.0+
-- **Desktop**：Qt5、SDL2
+- **Desktop (Qt)**：Qt5、SDL2
+- **Windows**：Visual Studio 2019/2022、vcpkg（推荐）
 
 ## 构建
 
@@ -127,13 +145,30 @@ brew install qt@5 sdl2 ffmpeg soundtouch
 sudo apt install qtbase5-dev libsdl2-dev libavcodec-dev \
   libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
   libsoundtouch-dev
+
+# Windows (使用 vcpkg)
+# 运行自动安装脚本
+powershell -ExecutionPolicy Bypass -File setup_windows_deps.ps1
+
+# 或手动安装
+vcpkg install ffmpeg:x64-windows sdl2:x64-windows soundtouch:x64-windows qt5-base:x64-windows qt5-multimedia:x64-windows
 ```
 
 构建：
 ```bash
+# macOS / Linux
 mkdir build_desktop && cd build_desktop
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j8
+
+# Windows
+# 使用快速开始脚本
+quickstart_windows.bat
+
+# 或使用 build_windows.bat
+build_windows.bat vs2022 release
+
+# 详细的 Windows 构建说明请参考 README_WINDOWS.md
 ```
 
 ## 目录结构

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# YXVodPlayer 构建脚本
+# HXCVodPlayer 构建脚本
 # 使用方法: ./build.sh [platform] [build_type]
 # 平台: desktop, android, ios
 # 类型: debug, release
@@ -11,7 +11,7 @@ PLATFORM=${1:-desktop}
 BUILD_TYPE=${2:-release}
 
 echo "========================================="
-echo "YXVodPlayer 构建脚本"
+echo "HXCVodPlayer 构建脚本"
 echo "平台: $PLATFORM"
 echo "类型: $BUILD_TYPE"
 echo "========================================="
@@ -95,7 +95,7 @@ function build_desktop() {
     cd ../..
     
     print_info "Desktop 版本构建完成！"
-    print_info "可执行文件: $BUILD_DIR/bin/YXVodPlayer"
+    print_info "可执行文件: $BUILD_DIR/bin/HXCVodPlayer"
 }
 
 # 构建 Android 版本
@@ -194,8 +194,8 @@ function clean() {
 function run_tests() {
     print_info "运行测试..."
     
-    if [ -f "build/desktop_release/bin/YXVodPlayer_test" ]; then
-        ./build/desktop_release/bin/YXVodPlayer_test
+    if [ -f "build/desktop_release/bin/HXCVodPlayer_test" ]; then
+        ./build/desktop_release/bin/HXCVodPlayer_test
     else
         print_warn "测试程序未找到，请先构建"
     fi
@@ -216,7 +216,7 @@ function main() {
             cmake ../.. -G Xcode -DCMAKE_BUILD_TYPE=Debug -DBUILD_DESKTOP=ON
             cd ../..
             print_info "Xcode 项目生成完成！"
-            print_info "运行: open build/xcode/YXVodPlayer.xcodeproj"
+            print_info "运行: open build/xcode/HXCVodPlayer.xcodeproj"
             ;;
         android)
             build_android

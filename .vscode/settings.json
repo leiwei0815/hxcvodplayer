@@ -1,0 +1,33 @@
+{
+  "cmake.configureOnOpen": false,
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.buildDirectory": "${workspaceFolder}/build/${buildType}",
+  "cmake.generator": "Visual Studio 17 2022",
+  "cmake.platform": "x64",
+  "cmake.configureSettings": {
+    "BUILD_DESKTOP": "ON"
+  },
+  "cmake.configureArgs": [
+    "-DCMAKE_TOOLCHAIN_FILE=${env:VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+  ],
+  "cmake.buildArgs": [
+    "--parallel"
+  ],
+  "cmake.defaultVariants": {
+    "buildType": {
+      "default": "release",
+      "choices": {
+        "debug": {
+          "short": "Debug",
+          "long": "Emit debug information without optimizations",
+          "buildType": "Debug"
+        },
+        "release": {
+          "short": "Release",
+          "long": "Enable optimizations, omit debug info",
+          "buildType": "Release"
+        }
+      }
+    }
+  }
+}

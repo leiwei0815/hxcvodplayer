@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(YXVodPlayer VERSION 1.0.0 LANGUAGES CXX)
+project(HXCVodPlayer VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,19 +38,62 @@ option(BUILD_DESKTOP "Build desktop version (Qt5)" ON)
 option(BUILD_TESTS "Build tests" OFF)
 
 # 查找依赖
-find_package(PkgConfig REQUIRED)
-
-# FFmpeg
-pkg_check_modules(FFMPEG REQUIRED
-    libavcodec
-    libavformat
-    libavutil
-    libswscale
-    libswresample
-)
-
-# SDL2
-pkg_check_modules(SDL2 REQUIRED sdl2)
+if(WIN32)
+    # Windows 平台通常使用 vcpkg，直接使用 find_package
+    find_package(PkgConfig)
+    
+    # FFmpeg
+    find_package(FFMPEG)
+    if(NOT FFMPEG_FOUND)
+        # 手动查找 FFmpeg（vcpkg 方式）
+        find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
+        find_library(AVCODEC_LIBRARY avcodec)
+        find_library(AVFORMAT_LIBRARY avformat)
+        find_library(AVUTIL_LIBRARY avutil)
+        find_library(SWSCALE_LIBRARY swscale)
+        find_library(SWRESAMPLE_LIBRARY swresample)
+        
+        if(FFMPEG_INCLUDE_DIR AND AVCODEC_LIBRARY AND AVFORMAT_LIBRARY AND AVUTIL_LIBRARY AND SWSCALE_LIBRARY AND SWRESAMPLE_LIBRARY)
+            set(FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIR})
+            set(FFMPEG_LIBRARIES ${AVCODEC_LIBRARY} ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY} ${SWSCALE_LIBRARY} ${SWRESAMPLE_LIBRARY})
+            message(STATUS "✓ FFmpeg found (manual)")
+        else()
+            message(FATAL_ERROR "FFmpeg not found. Please install via vcpkg: vcpkg install ffmpeg:x64-windows")
+        endif()
+    endif()
+    
+    # SDL2
+    find_package(SDL2 CONFIG)
+    if(NOT SDL2_FOUND)
+        # 手动查找 SDL2
+        find_path(SDL2_INCLUDE_DIR SDL2/SDL.h)
+        find_library(SDL2_LIBRARY SDL2)
+        find_library(SDL2MAIN_LIBRARY SDL2main)
+        
+        if(SDL2_INCLUDE_DIR AND SDL2_LIBRARY)
+            set(SDL2_INCLUDE_DIRS ${SDL2_INCLUDE_DIR})
+            set(SDL2_LIBRARIES ${SDL2_LIBRARY} ${SDL2MAIN_LIBRARY})
+            message(STATUS "✓ SDL2 found (manual)")
+        else()
+            message(FATAL_ERROR "SDL2 not found. Please install via vcpkg: vcpkg install sdl2:x64-windows")
+        endif()
+    endif()
+else()
+    # macOS/Linux 使用 pkg-config
+    find_package(PkgConfig REQUIRED)
+    
+    # FFmpeg
+    pkg_check_modules(FFMPEG REQUIRED
+        libavcodec
+        libavformat
+        libavutil
+        libswscale
+        libswresample
+    )
+    
+    # SDL2
+    pkg_check_modules(SDL2 REQUIRED sdl2)
+endif()
 
 # SoundTouch（用于倍速播放，仅 macOS 和 Windows）
 if(APPLE OR WIN32)
@@ -141,7 +184,7 @@ endif()
 
 # 输出信息
 message(STATUS "")
-message(STATUS "YXVodPlayer Configuration:")
+message(STATUS "HXCVodPlayer Configuration:")
 message(STATUS "  Platform: ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")

@@ -1,0 +1,38 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "HXCVodPlayer (Windows Debug)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/vs2022_debug/bin/Debug/HXCVodPlayer.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "externalTerminal"
+    },
+    {
+      "name": "HXCVodPlayer (Windows Release)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/vs2022_release/bin/Release/HXCVodPlayer.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "externalTerminal"
+    },
+    {
+      "name": "HXCVodPlayer with Video File",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/vs2022_debug/bin/Debug/HXCVodPlayer.exe",
+      "args": ["${workspaceFolder}/test_video.mp4"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "externalTerminal"
+    }
+  ]
+}

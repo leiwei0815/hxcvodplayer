@@ -16,7 +16,7 @@ extern "C" {
 int main(int argc, char *argv[]) {
     // ========== 调试断点：程序入口 ==========
     std::cout << "=========================================" << std::endl;
-    std::cout << "YXVodPlayer 启动中..." << std::endl;
+    std::cout << "HXCVodPlayer 启动中..." << std::endl;
     std::cout << "参数数量: " << argc << std::endl;
     for (int i = 0; i < argc; i++) {
         std::cout << "参数[" << i << "]: " << argv[i] << std::endl;
@@ -29,9 +29,9 @@ int main(int argc, char *argv[]) {
     
     // 创建 Qt 应用
     QApplication app(argc, argv);
-    app.setApplicationName("YXVodPlayer");
+    app.setApplicationName("HXCVodPlayer");
     app.setApplicationVersion("1.0.0");
-    app.setOrganizationName("YX");
+    app.setOrganizationName("HXC");
     
     std::cout << "Qt 应用创建完成" << std::endl;
     

@@ -24,8 +24,14 @@ extern "C" {
 }
 
 // ⚠️ SoundTouch 库（用于倍速播放，保持音调）
-#if defined(__APPLE__) || defined(_WIN32)
-#include <soundtouch/SoundTouch.h>
+// macOS/iOS 默认启用，Windows 需要通过 CMake 检测
+#ifdef __APPLE__
+    #include <soundtouch/SoundTouch.h>
+    #ifndef HAS_SOUNDTOUCH
+        #define HAS_SOUNDTOUCH
+    #endif
+#elif defined(_WIN32) && defined(HAS_SOUNDTOUCH)
+    #include <soundtouch/SoundTouch.h>
 #endif
 
 namespace hxcplayer {
@@ -184,7 +190,7 @@ private:
     double audio_current_pts_drift_;    // PTS 漂移
     
     // ⚠️ 倍速播放支持（SoundTouch）
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef HAS_SOUNDTOUCH
     soundtouch::SoundTouch* soundtouch_;
     std::vector<float> soundtouch_buffer_;  // SoundTouch 输出缓冲区
     size_t soundtouch_buffer_index_;        // 当前读取位置

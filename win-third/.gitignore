@@ -1,0 +1,8 @@
+# SoundTouch 源码
+soundtouch-src/
+
+# 构建目录
+soundtouch-build/
+
+# 安装目录（编译产物）
+soundtouch-install/

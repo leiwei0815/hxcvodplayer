@@ -36,4 +36,19 @@ if(APPLE)
         "-framework CoreAudio"
         "-framework AudioToolbox"
     )
+elseif(WIN32)
+    # Windows 平台需要链接的系统库
+    target_link_libraries(hxcplayer_core PUBLIC
+        ws2_32      # Windows Sockets
+        secur32     # Security library
+        bcrypt      # Cryptography library
+        mfplat      # Media Foundation Platform
+        mfuuid      # Media Foundation UUIDs
+        strmiids    # Streaming Media Interfaces
+    )
+    
+    # 添加 UTF-8 编码支持
+    target_compile_options(hxcplayer_core PRIVATE
+        /utf-8      # 源文件和执行字符集都使用 UTF-8
+    )
 endif()

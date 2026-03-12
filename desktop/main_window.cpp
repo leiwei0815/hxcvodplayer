@@ -69,7 +69,7 @@ MainWindow::~MainWindow() {
 }
 
 void MainWindow::setupUI() {
-    setWindowTitle("YXVodPlayer");
+    setWindowTitle("HXCVodPlayer");
     setMinimumSize(800, 600);
     resize(1280, 720);
     
@@ -471,9 +471,9 @@ void MainWindow::openFile(const QString& filename) {
     if (ret == 0) {
         // 设置窗口标题（网络 URL 显示简短信息）
         if (filename.startsWith("http://") || filename.startsWith("https://")) {
-            setWindowTitle("YXVodPlayer - 网络视频");
+            setWindowTitle("HXCVodPlayer - 网络视频");
         } else {
-            setWindowTitle("YXVodPlayer - " + QFileInfo(filename).fileName());
+            setWindowTitle("HXCVodPlayer - " + QFileInfo(filename).fileName());
         }
         
         // 更新 UI
