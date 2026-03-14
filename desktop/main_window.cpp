@@ -14,10 +14,24 @@
 #include <QTime>
 #include <QDebug>
 #include <QFileInfo>
+#include <iostream>
+
+#ifdef _WIN32
+// Windows 平台：使用 SDK C API（包含渲染器）
+#include "../win-sdk/hxcplayer_sdk_c_api.h"
+#else
+// 其他平台：继续使用 C++ API
+#include "hxc_player_core.h"
+#endif
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
+#ifndef _WIN32
+    , player_(nullptr)
+#else
+    , player_sdk_(nullptr)
+#endif
     , is_seeking_(false)
     , last_video_pts_(0.0) {
     
@@ -29,8 +43,59 @@ MainWindow::MainWindow(QWidget *parent)
         disconnect(slider, nullptr, this, nullptr);
     }
     
+#ifdef _WIN32
+    // ========== Windows: 先创建播放器，再设置 UI ==========
+    qDebug() << "[Windows] 使用 SDK API (D3D11 渲染器)";
+    
+    player_sdk_ = hxc_player_create();
+    if (!player_sdk_) {
+        qCritical() << "[Windows] SDK 播放器创建失败!";
+        return;
+    }
+    
+    // 设置回调
+    hxc_player_set_state_callback(player_sdk_, 
+        [](HXCPlayerState state, void* user_data) {
+            MainWindow* self = static_cast<MainWindow*>(user_data);
+            QMetaObject::invokeMethod(self, [self, state]() {
+                self->onStateChanged(static_cast<hxcplayer::PlayerState>(state));
+            });
+        }, this);
+    
+    hxc_player_set_error_callback(player_sdk_,
+        [](int error_code, const char* error, void* user_data) {
+            MainWindow* self = static_cast<MainWindow*>(user_data);
+            QString errorMsg = QString::fromUtf8(error);
+            QMetaObject::invokeMethod(self, [self, errorMsg]() {
+                self->onError(errorMsg);
+            });
+        }, this);
+    
+    hxc_player_set_position_callback(player_sdk_,
+        [](double position, void* user_data) {
+            MainWindow* self = static_cast<MainWindow*>(user_data);
+            QMetaObject::invokeMethod(self, [self, position]() {
+                self->updateProgress(position);
+            });
+        }, this);
+    
+    hxc_player_set_completion_callback(player_sdk_,
+        [](void* user_data) {
+            MainWindow* self = static_cast<MainWindow*>(user_data);
+            QMetaObject::invokeMethod(self, [self]() {
+                self->onPlaybackCompleted();
+            });
+        }, this);
+    
+    // Windows SDK 模式不需要刷新定时器（自动渲染）
+    refresh_timer_ = nullptr;
+    
+    // 创建 UI（包括 video_widget_）
+    // 创建 UI（包括 video_widget_）
     setupUI();
     
+#else
+    // ========== 其他平台: 使用 C++ API ==========
     // 创建播放器
     player_ = std::make_unique<hxcplayer::PlayerCore>();
     
@@ -66,14 +131,25 @@ MainWindow::MainWindow(QWidget *parent)
         });
     });
     
+    // 创建 UI（包括 video_widget_）
+    setupUI();
+    
     // ⚠️ 视频刷新定时器（高频率检查，由帧 PTS 控制实际刷新）
     refresh_timer_ = new QTimer(this);
     connect(refresh_timer_, &QTimer::timeout, this, &MainWindow::refreshVideo);
     refresh_timer_->start(10);  // 10ms 检查一次（不是刷新频率！）
+#endif
 }
 
 MainWindow::~MainWindow() {
+#ifdef _WIN32
+    if (player_sdk_) {
+        hxc_player_stop(player_sdk_);
+        hxc_player_destroy(player_sdk_);
+    }
+#else
     player_->close();
+#endif
     delete ui;
 }
 
@@ -120,6 +196,32 @@ void MainWindow::setupUI() {
     ui->stopButton->setEnabled(false);
 //    ui->seekSlider->setEnabled(false);
     ui->volumeSlider->setValue(100);
+    
+#ifdef _WIN32
+    // Windows SDK: 在 video_widget_ 创建后设置渲染窗口
+    if (player_sdk_) {
+        video_widget_->setAttribute(Qt::WA_NativeWindow);
+        int result = hxc_player_set_window(
+            player_sdk_,
+            (void*)video_widget_->winId(),
+            HXC_RENDERER_AUTO
+        );
+        
+        if (result == 0) {
+            const char* renderer = hxc_player_get_renderer_name(player_sdk_);
+            qDebug() << "[Windows] 渲染器已设置:" << renderer;
+        } else {
+            qDebug() << "[Windows] 渲染器设置失败";
+        }
+        
+        // 连接 resize 信号，通知渲染器窗口大小变化
+        connect(video_widget_, &VideoWidget::resized, this, [this](int width, int height) {
+            if (player_sdk_) {
+                hxc_player_on_resize(player_sdk_, width, height);
+            }
+        }, Qt::UniqueConnection);
+    }
+#endif
 }
 
 void MainWindow::on_openButton_clicked() {
@@ -162,8 +264,8 @@ void MainWindow::openNetworkURL() {
         "输入网络地址",
         "请输入视频的网络地址（HTTP/HTTPS）:",
         QLineEdit::Normal,
-        "https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4",
-        //"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4",
+        //"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4",
+        "https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4",
         &ok
     );
     
@@ -175,8 +277,18 @@ void MainWindow::openNetworkURL() {
 }
 
 void MainWindow::on_playPauseButton_clicked() {
-    if (!player_) return;
+    if (!PLAYER_EXISTS()) return;
     
+#ifdef _WIN32
+    HXCPlayerState state = hxc_player_get_state(player_sdk_);
+    if (state == HXC_STATE_PLAYING) {
+        hxc_player_pause(player_sdk_);
+        ui->playPauseButton->setText("播放");
+    } else if (state == HXC_STATE_PAUSED) {
+        hxc_player_play(player_sdk_);
+        ui->playPauseButton->setText("暂停");
+    }
+#else
     auto state = player_->get_state();
     if (state == hxcplayer::PlayerState::Playing) {
         player_->pause();
@@ -185,11 +297,12 @@ void MainWindow::on_playPauseButton_clicked() {
         player_->play();
         ui->playPauseButton->setText("暂停");
     }
+#endif
 }
 
 void MainWindow::on_stopButton_clicked() {
-    if (player_) {
-        player_->stop();
+    if (PLAYER_EXISTS()) {
+        PLAYER_CALL_VOID(stop);
         ui->playPauseButton->setText("播放");
         ui->playPauseButton->setEnabled(false);
         ui->stopButton->setEnabled(false);
@@ -215,14 +328,14 @@ void MainWindow::handleSeekSliderPressed() {
 void MainWindow::handleSeekSliderReleased() {
     int value = ui->seekSlider->value();
     
-    if (!player_) {
+    if (!PLAYER_EXISTS()) {
         is_seeking_ = false;
         // ⚠️ 重新启动视频刷新定时器
         if (refresh_timer_) refresh_timer_->start(10);
         return;
     }
     
-    double duration = player_->get_duration();
+    double duration = PLAYER_CALL(get_duration, 0.0);
     if (duration > 0) {
         double position = (value / 1000.0) * duration;
         
@@ -236,7 +349,7 @@ void MainWindow::handleSeekSliderReleased() {
         ui->seekSlider->blockSignals(false);
         
         // 执行 seek
-        player_->seek(position);
+        PLAYER_CALL_VOID(seek, position);
     }
     
     // ⚠️ 在 seek 调用后再恢复状态和定时器
@@ -254,21 +367,19 @@ void MainWindow::handleSeekSliderMoved(int position) {
 }
 
 void MainWindow::handleVolumeChanged(int value) {
-    if (player_) {
-        player_->set_volume(value);
-    }
+    PLAYER_CALL_VOID(set_volume, value / 100.0f);
 }
 
 // 播放进度更新（由播放器回调触发）
 void MainWindow::updateProgress(double position) {
-    if (!player_) return;
+    if (!PLAYER_EXISTS()) return;
     
     // ⚠️ 拖动时跳过更新，避免干扰
     if (is_seeking_) {
         return;
     }
     
-    double duration = player_->get_duration();
+    double duration = PLAYER_CALL(get_duration, 0.0);
     
     if (duration > 0) {
         // 更新进度条
@@ -310,6 +421,10 @@ void MainWindow::updateUI() {}
 
 // ⚠️ 新增：基于 PTS 的精确视频刷新（参考 ffplay）
 void MainWindow::refreshVideo() {
+#ifdef _WIN32
+    // Windows D3D11 模式下不需要手动刷新（自动渲染）
+    return;
+#else
     if (!player_) return;
     
     // ⚠️ 拖动时不执行任何操作
@@ -416,6 +531,7 @@ void MainWindow::refreshVideo() {
         video_widget_->updateFrame(video_queue);
         last_video_pts_ = frame_pts;
     }
+#endif
 }
 
 void MainWindow::onStateChanged(hxcplayer::PlayerState state) {
@@ -450,9 +566,16 @@ void MainWindow::onError(const QString& error) {
 
 void MainWindow::onAspectRatioModeChanged(hxcplayer::AspectRatioMode mode) {
     // ⚠️ 同步到核心层
+#ifdef _WIN32
+    if (player_sdk_) {
+        hxc_player_set_aspect_ratio_mode(player_sdk_, 
+            mode == hxcplayer::AspectRatioMode::Fit ? HXC_ASPECT_RATIO_FIT : HXC_ASPECT_RATIO_FILL);
+    }
+#else
     if (player_) {
         player_->set_aspect_ratio_mode(mode);
     }
+#endif
     
     // ⚠️ 更新按钮文本
     if (mode == hxcplayer::AspectRatioMode::Fit) {
@@ -467,16 +590,22 @@ void MainWindow::onAspectRatioModeChanged(hxcplayer::AspectRatioMode mode) {
 }
 
 void MainWindow::setStartTime(double seconds) {
-    if (!player_) return;
+    if (!PLAYER_EXISTS()) return;
     
+#ifdef _WIN32
+    // Windows: C API 需要先获取、修改、再设置配置
+    // 简化处理：不支持动态修改配置
+    qDebug() << "Windows C API 模式下暂不支持动态修改开始时间";
+#else
     // ⚠️ 获取当前配置，修改开始时间，再设置回去
     auto config = player_->get_config();
     config.start_time = seconds;
     player_->set_config(config);
+#endif
 }
 
 void MainWindow::openFile(const QString& filename) {
-    if (!player_) {
+    if (!PLAYER_EXISTS()) {
         qWarning() << "播放器未初始化";
         return;
     }
@@ -488,6 +617,44 @@ void MainWindow::openFile(const QString& filename) {
     
     qDebug() << "正在打开文件:" << filename;
     
+#ifdef _WIN32
+    // 关闭之前的文件
+    hxc_player_stop(player_sdk_);
+    
+    // 打开新文件
+    std::string filepath = filename.toStdString();
+    int ret = hxc_player_open(player_sdk_, filepath.c_str(), 0.0);
+    if (ret == 0) {
+        // 设置窗口标题（网络 URL 显示简短信息）
+        if (filename.startsWith("http://") || filename.startsWith("https://")) {
+            setWindowTitle("HXCVodPlayer - 网络视频");
+        } else {
+            setWindowTitle("HXCVodPlayer - " + QFileInfo(filename).fileName());
+        }
+        
+        // 更新 UI
+        double duration = hxc_player_get_duration(player_sdk_);
+        
+        qDebug() << "文件打开成功";
+        qDebug() << "  时长: " << duration << "秒";
+        
+        ui->timeLabel->setText(formatTime(0) + " / " + formatTime(duration));
+        ui->seekSlider->blockSignals(true);
+        ui->seekSlider->setValue(0);
+        ui->seekSlider->setEnabled(true);
+        ui->seekSlider->blockSignals(false);
+        
+        ui->playPauseButton->setText("暂停");
+        ui->playPauseButton->setEnabled(true);
+        ui->stopButton->setEnabled(true);
+        
+        statusBar()->showMessage("就绪", 2000);
+    } else {
+        QString errorMsg = "无法打开文件: " + filename + "\n错误代码: " + QString::number(ret);
+        QMessageBox::critical(this, "错误", errorMsg);
+        qWarning() << errorMsg;
+    }
+#else
     // 关闭之前的文件
     player_->close();
     
@@ -502,24 +669,33 @@ void MainWindow::openFile(const QString& filename) {
         }
         
         // 更新 UI
-        ui->playPauseButton->setEnabled(true);
-        ui->stopButton->setEnabled(true);
-        ui->seekSlider->setEnabled(true);
-        ui->playPauseButton->setText("暂停");
-        
-        // 获取媒体信息
         const auto& info = player_->get_media_info();
-        if (info.video_width > 0 && info.video_height > 0) {
-            qDebug() << "视频尺寸:" << info.video_width << "x" << info.video_height;
-            video_widget_->setVideoSize(info.video_width, info.video_height);
-        }
+        double duration = player_->get_duration();
         
         qDebug() << "文件打开成功";
+        qDebug() << "  视频: " << info.width << "x" << info.height 
+                 << " @ " << info.video_fps << "fps";
+        qDebug() << "  音频: " << info.audio_sample_rate << "Hz, " 
+                 << info.audio_channels << " channels";
+        qDebug() << "  时长: " << duration << "秒";
+        
+        ui->timeLabel->setText(formatTime(0) + " / " + formatTime(duration));
+        ui->seekSlider->blockSignals(true);
+        ui->seekSlider->setValue(0);
+        ui->seekSlider->setEnabled(true);
+        ui->seekSlider->blockSignals(false);
+        
+        ui->playPauseButton->setText("暂停");
+        ui->playPauseButton->setEnabled(true);
+        ui->stopButton->setEnabled(true);
+        
+        statusBar()->showMessage("就绪", 2000);
     } else {
-        qWarning() << "文件打开失败，错误码:" << ret;
-        QMessageBox::warning(this, "打开失败", 
-            QString("无法打开文件：%1\n错误码：%2").arg(filename).arg(ret));
+        QString errorMsg = "无法打开文件: " + filename + "\n错误代码: " + QString::number(ret);
+        QMessageBox::critical(this, "错误", errorMsg);
+        qWarning() << errorMsg;
     }
+#endif
 }
 
 QString MainWindow::formatTime(double seconds) {
@@ -541,9 +717,15 @@ QString MainWindow::formatTime(double seconds) {
 }
 
 void MainWindow::closeEvent(QCloseEvent *event) {
+#ifdef _WIN32
+    if (player_sdk_) {
+        hxc_player_stop(player_sdk_);
+    }
+#else
     if (player_) {
         player_->close();
     }
+#endif
     QMainWindow::closeEvent(event);
 }
 
@@ -566,7 +748,7 @@ void MainWindow::dropEvent(QDropEvent *event) {
 
 // ⚠️ 倍速变化处理
 void MainWindow::handleSpeedChanged(int index) {
-    if (!player_) {
+    if (!PLAYER_EXISTS()) {
         return;
     }
     
@@ -586,10 +768,10 @@ void MainWindow::handleSpeedChanged(int index) {
     qDebug() << "[UI] 用户选择播放速率:" << rate << "x (索引:" << index << ")";
     qDebug() << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
     
-    player_->set_playback_rate(rate);
+    PLAYER_CALL_VOID(set_playback_rate, rate);
     
     // 验证设置是否成功
-    double actual_rate = player_->get_playback_rate();
+    double actual_rate = PLAYER_CALL(get_playback_rate, 1.0);
     qDebug() << "[UI] 实际播放速率:" << actual_rate << "x";
 }
 
@@ -606,14 +788,15 @@ void MainWindow::on_aspectRatioButton_clicked() {
     hxcplayer::AspectRatioMode new_mode;
     if (current_mode == hxcplayer::AspectRatioMode::Fit) {
         new_mode = hxcplayer::AspectRatioMode::Fill;
-        ui->aspectRatioButton->setText("填充");
     } else {
         new_mode = hxcplayer::AspectRatioMode::Fit;
-        ui->aspectRatioButton->setText("适应");
     }
     
-    // 设置新模式
+    // 设置新模式（video_widget 仅用于状态记录）
     video_widget_->setAspectRatioMode(new_mode);
+    
+    // 触发回调，实际更新渲染器（Windows D3D11 或其他平台）
+    onAspectRatioModeChanged(new_mode);
     
     qDebug() << "[UI] 切换显示模式:" 
              << (new_mode == hxcplayer::AspectRatioMode::Fit ? "适应" : "填充");

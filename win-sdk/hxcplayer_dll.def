@@ -1,0 +1,62 @@
+LIBRARY hxcplayer
+EXPORTS
+    ; 播放器核心 API
+    player_core_create
+    player_core_destroy
+    player_core_open
+    player_core_open_with_start_position
+    player_core_play
+    player_core_pause
+    player_core_stop
+    player_core_get_state
+    player_core_get_duration
+    player_core_get_position
+    player_core_seek
+    player_core_set_volume
+    player_core_set_playback_rate
+    player_core_get_playback_rate
+    player_core_set_aspect_ratio_mode
+    player_core_get_aspect_ratio_mode
+    player_core_get_video_frame
+    player_core_consume_video_frame
+    player_core_get_video_frame_rgb
+    player_core_get_audio_data
+    player_core_get_audio_sample_rate
+    player_core_get_audio_channels
+    player_core_get_video_width
+    player_core_get_video_height
+    
+    ; 回调设置
+    player_core_set_state_changed_callback
+    player_core_set_error_callback
+    player_core_set_position_changed_callback
+    player_core_set_buffer_progress_callback
+    player_core_set_playback_completed_callback
+    player_core_set_loading_callback
+    
+    ; 日志配置
+    player_core_set_log_level
+    player_core_enable_file_logging
+    player_core_disable_file_logging
+    player_core_set_max_log_file_size
+    player_core_set_log_retention_days
+    player_core_cleanup_old_logs
+    player_core_get_current_log_file
+    
+    ; SDK 工具函数
+    hxcplayer_get_version
+    hxcplayer_get_build_info
+    hxcplayer_init
+    hxcplayer_cleanup
+    
+    ; 视频渲染 API
+    player_core_set_render_window
+    player_core_set_render_mode
+    player_core_get_render_mode
+    player_core_refresh_video
+    
+    ; Windows D3D11/OpenGL 渲染器 API
+    player_core_set_render_window_ex
+    player_core_on_window_resize
+    player_core_get_current_renderer
+    player_core_is_renderer_available

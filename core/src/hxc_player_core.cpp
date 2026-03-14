@@ -53,7 +53,18 @@ PlayerCore::PlayerCore()
     , audio_buf_index_(0)
     , audio_current_pts_(0.0)
     , audio_current_pts_drift_(0.0)
+    , render_window_(nullptr)
+    , render_mode_(RenderMode::Auto)
     , aspect_ratio_mode_(AspectRatioMode::Fit)  // ⚠️ 默认 Fit 模式
+#ifndef NO_SDL
+    , sdl_renderer_(nullptr)
+    , sdl_texture_(nullptr)
+    , texture_width_(0)
+    , texture_height_(0)
+    , last_frame_width_(0)
+    , last_frame_height_(0)
+    , has_last_frame_(false)
+#endif
 #if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     , soundtouch_(nullptr)
     , soundtouch_buffer_index_(0)
@@ -87,6 +98,7 @@ PlayerCore::PlayerCore()
 PlayerCore::~PlayerCore() {
     LOG_INFO("销毁 PlayerCore...");
     close();
+    cleanup_sdl_renderer();  // 清理渲染器
     
 #if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
     // 释放 SoundTouch
@@ -368,6 +380,12 @@ void PlayerCore::close() {
         LOG_INFO("等待播放进度回调线程结束...");
         progress_timer_thread_.join();
         LOG_INFO("播放进度回调线程已结束");
+    }
+    
+    if (video_refresh_thread_.joinable()) {
+        LOG_INFO("等待视频刷新线程结束...");
+        video_refresh_thread_.join();
+        LOG_INFO("视频刷新线程已结束");
     }
     
     // ⚠️ 第五步：现在可以安全地关闭流组件
@@ -1525,6 +1543,347 @@ void PlayerCore::set_playback_rate(double rate) {
         soundtouch_->setTempo(rate);
     }
 #endif
+}
+
+// ========== 视频渲染相关实现 ==========
+
+void PlayerCore::set_render_window(void* window_handle) {
+    render_window_ = window_handle;
+    
+    // 如果是自动渲染模式，初始化 SDL 渲染器
+    if (render_mode_ == RenderMode::Auto && window_handle != nullptr) {
+        init_sdl_renderer();
+        
+        // 启动视频刷新线程
+        if (!video_refresh_thread_.joinable()) {
+            video_refresh_thread_ = std::thread(&PlayerCore::video_refresh_thread_func, this);
+            LOG_INFO("视频刷新线程已启动");
+        }
+    }
+}
+
+void PlayerCore::init_sdl_renderer() {
+#ifndef NO_SDL
+    // ⚠️ 不要在这里调用 cleanup，保留最后一帧数据
+    
+    if (!render_window_) {
+        LOG_WARNING("未设置渲染窗口，无法初始化渲染器");
+        return;
+    }
+    
+    // 清理旧的渲染器和纹理（但保留帧数据）
+    if (sdl_texture_) {
+        SDL_DestroyTexture(sdl_texture_);
+        sdl_texture_ = nullptr;
+    }
+    
+    if (sdl_renderer_) {
+        SDL_DestroyRenderer(sdl_renderer_);
+        sdl_renderer_ = nullptr;
+    }
+    
+    // 初始化 SDL 视频子系统（如果还未初始化）
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) {
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
+            LOG_ERROR("SDL 视频子系统初始化失败: ", SDL_GetError());
+            return;
+        }
+        LOG_INFO("SDL 视频子系统初始化成功");
+    }
+    
+    // 从窗口句柄创建 SDL 窗口
+#ifdef _WIN32
+    // Windows: HWND
+    SDL_Window* sdl_window = SDL_CreateWindowFrom(render_window_);
+#elif defined(__APPLE__)
+    // macOS: NSView*
+    SDL_Window* sdl_window = SDL_CreateWindowFrom(render_window_);
+#else
+    // Linux: X11 Window
+    SDL_Window* sdl_window = SDL_CreateWindowFrom(render_window_);
+#endif
+    
+    if (!sdl_window) {
+        LOG_ERROR("创建 SDL 窗口失败: ", SDL_GetError());
+        return;
+    }
+    
+    // 创建渲染器
+    sdl_renderer_ = SDL_CreateRenderer(sdl_window, -1, 
+                                        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!sdl_renderer_) {
+        LOG_ERROR("创建 SDL 渲染器失败: ", SDL_GetError());
+        SDL_DestroyWindow(sdl_window);
+        return;
+    }
+    
+    LOG_INFO("SDL 渲染器初始化成功");
+    
+    // ⚠️ 如果有缓存的最后一帧，立即渲染它以避免黑屏
+    if (has_last_frame_ && last_frame_width_ > 0 && last_frame_height_ > 0) {
+        LOG_INFO("重建渲染器后，立即渲染缓存的最后一帧");
+        
+        // 重新创建纹理
+        sdl_texture_ = SDL_CreateTexture(
+            sdl_renderer_,
+            SDL_PIXELFORMAT_IYUV,
+            SDL_TEXTUREACCESS_STREAMING,
+            last_frame_width_, last_frame_height_
+        );
+        
+        if (sdl_texture_) {
+            texture_width_ = last_frame_width_;
+            texture_height_ = last_frame_height_;
+            
+            // 更新纹理
+            int y_size = last_frame_width_ * last_frame_height_;
+            int uv_size = (last_frame_width_ / 2) * (last_frame_height_ / 2);
+            
+            SDL_UpdateYUVTexture(
+                sdl_texture_,
+                nullptr,
+                last_frame_y_.data(), last_frame_width_,
+                last_frame_u_.data(), last_frame_width_ / 2,
+                last_frame_v_.data(), last_frame_width_ / 2
+            );
+            
+            // 渲染到屏幕
+            SDL_RenderClear(sdl_renderer_);
+            SDL_RenderCopy(sdl_renderer_, sdl_texture_, nullptr, nullptr);
+            SDL_RenderPresent(sdl_renderer_);
+            
+            LOG_INFO("最后一帧已渲染，避免黑屏");
+        }
+    }
+#endif
+}
+
+void PlayerCore::cleanup_sdl_renderer() {
+#ifndef NO_SDL
+    if (sdl_texture_) {
+        SDL_DestroyTexture(sdl_texture_);
+        sdl_texture_ = nullptr;
+    }
+    
+    if (sdl_renderer_) {
+        SDL_Window* window = SDL_RenderGetWindow(sdl_renderer_);
+        SDL_DestroyRenderer(sdl_renderer_);
+        sdl_renderer_ = nullptr;
+        
+        // 注意：不销毁窗口，因为窗口是外部管理的
+        // SDL_DestroyWindow(window);
+    }
+#endif
+}
+
+void PlayerCore::render_video_frame(const VideoFrame& frame) {
+#ifndef NO_SDL
+    if (!sdl_renderer_) {
+        static bool logged = false;
+        if (!logged) {
+            LOG_ERROR("render_video_frame: sdl_renderer_ 为空，无法渲染");
+            logged = true;
+        }
+        return;
+    }
+    
+    // 首次渲染时输出日志
+    static bool first_render = true;
+    if (first_render) {
+        LOG_INFO("开始渲染第一帧: ", frame.frame->width, "x", frame.frame->height);
+        first_render = false;
+    }
+    
+    // ⚠️ 缓存当前帧数据（用于 resize 时避免黑屏）
+    int width = frame.frame->width;
+    int height = frame.frame->height;
+    int y_size = width * height;
+    int uv_size = (width / 2) * (height / 2);
+    
+    if (last_frame_width_ != width || last_frame_height_ != height) {
+        last_frame_y_.resize(y_size);
+        last_frame_u_.resize(uv_size);
+        last_frame_v_.resize(uv_size);
+        last_frame_width_ = width;
+        last_frame_height_ = height;
+    }
+    
+    // 复制帧数据
+    memcpy(last_frame_y_.data(), frame.frame->data[0], y_size);
+    memcpy(last_frame_u_.data(), frame.frame->data[1], uv_size);
+    memcpy(last_frame_v_.data(), frame.frame->data[2], uv_size);
+    has_last_frame_ = true;
+    
+    // 创建或更新纹理
+    if (!sdl_texture_ || 
+        frame.frame->width != texture_width_ ||
+        frame.frame->height != texture_height_) {
+        
+        if (sdl_texture_) {
+            SDL_DestroyTexture(sdl_texture_);
+        }
+        
+        sdl_texture_ = SDL_CreateTexture(
+            sdl_renderer_,
+            SDL_PIXELFORMAT_IYUV,  // YUV420P
+            SDL_TEXTUREACCESS_STREAMING,
+            frame.frame->width,
+            frame.frame->height
+        );
+        
+        if (!sdl_texture_) {
+            LOG_ERROR("创建 SDL 纹理失败: ", SDL_GetError());
+            return;
+        }
+        
+        texture_width_ = frame.frame->width;
+        texture_height_ = frame.frame->height;
+        LOG_INFO("SDL 纹理已创建: ", frame.frame->width, "x", frame.frame->height);
+    }
+    
+    // 更新纹理数据
+    SDL_UpdateYUVTexture(
+        sdl_texture_,
+        nullptr,
+        frame.frame->data[0], frame.frame->linesize[0],  // Y
+        frame.frame->data[1], frame.frame->linesize[1],  // U
+        frame.frame->data[2], frame.frame->linesize[2]   // V
+    );
+    
+    // 获取窗口大小
+    int window_width, window_height;
+    SDL_RenderGetLogicalSize(sdl_renderer_, &window_width, &window_height);
+    if (window_width == 0 || window_height == 0) {
+        SDL_GetRendererOutputSize(sdl_renderer_, &window_width, &window_height);
+    }
+    
+    // 计算显示矩形（考虑宽高比）
+    SDL_Rect dst_rect;
+    int video_width = frame.frame->width;
+    int video_height = frame.frame->height;
+    
+    if (aspect_ratio_mode_ == AspectRatioMode::Fit) {
+        // Fit 模式：保持宽高比，可能有黑边
+        float video_aspect = (float)video_width / video_height;
+        float window_aspect = (float)window_width / window_height;
+        
+        if (video_aspect > window_aspect) {
+            // 视频更宽，以宽度为准
+            dst_rect.w = window_width;
+            dst_rect.h = (int)(window_width / video_aspect);
+            dst_rect.x = 0;
+            dst_rect.y = (window_height - dst_rect.h) / 2;
+        } else {
+            // 视频更高，以高度为准
+            dst_rect.h = window_height;
+            dst_rect.w = (int)(window_height * video_aspect);
+            dst_rect.x = (window_width - dst_rect.w) / 2;
+            dst_rect.y = 0;
+        }
+    } else {
+        // Fill 模式：填充整个窗口，可能裁剪
+        dst_rect.x = 0;
+        dst_rect.y = 0;
+        dst_rect.w = window_width;
+        dst_rect.h = window_height;
+    }
+    
+    // 渲染
+    SDL_RenderClear(sdl_renderer_);
+    SDL_RenderCopy(sdl_renderer_, sdl_texture_, nullptr, &dst_rect);
+    SDL_RenderPresent(sdl_renderer_);
+#endif
+}
+
+int PlayerCore::refresh_video() {
+    if (!render_window_) {
+        return -2;  // 未设置窗口
+    }
+    
+    if (render_mode_ == RenderMode::Manual) {
+        // 手动模式下，用户需要自己调用 get_video_frame
+        return -1;
+    }
+    
+    // 自动渲染模式
+    if (!video_queue_ || video_queue_->nb_remaining() == 0) {
+        static int log_count = 0;
+        if (++log_count % 1000 == 0) {
+            LOG_DEBUG("refresh_video: 视频队列为空 (video_queue_=", (void*)video_queue_.get(), 
+                     ", remaining=", (video_queue_ ? video_queue_->nb_remaining() : -1), ")");
+        }
+        return -1;  // 无帧可用
+    }
+    
+    // 获取当前帧
+    VideoFrame* frame = video_queue_->peek_readable();
+    if (!frame) {
+        return -1;
+    }
+    
+    // 检查是否到达显示时间
+    double delay = frame->pts - get_master_clock();
+    if (delay > 0) {
+        return -1;  // 还没到显示时间
+    }
+    
+    // 渲染帧
+    render_video_frame(*frame);
+    
+    // 移到下一帧
+    video_queue_->next();
+    
+    return 0;
+}
+
+void PlayerCore::video_refresh_thread_func() {
+    LOG_INFO("视频刷新线程已启动");
+    
+    int frame_count = 0;
+    int no_frame_count = 0;
+    
+    while (!abort_request_) {
+        // 如果不是自动渲染模式，退出
+        if (render_mode_ != RenderMode::Auto) {
+            PLAYER_DELAY(100);
+            continue;
+        }
+        
+        // 如果没有渲染窗口，退出
+        if (!render_window_) {
+            PLAYER_DELAY(100);
+            continue;
+        }
+        
+        // 尝试刷新视频
+        int ret = refresh_video();
+        
+        // 调试：定期输出状态
+        if (ret == 0) {
+            frame_count++;
+            no_frame_count = 0;
+            if (frame_count % 100 == 0) {
+                LOG_INFO("视频刷新线程：已渲染 ", frame_count, " 帧");
+            }
+        } else {
+            no_frame_count++;
+            if (no_frame_count == 1000) {  // 5 秒没有帧
+                LOG_WARNING("视频刷新线程：5秒内无帧可渲染 (ret=", ret, ")");
+                no_frame_count = 0;  // 重置计数器
+            }
+        }
+        
+        // 根据返回值决定等待时间
+        if (ret == 0) {
+            // 成功渲染一帧，短暂等待
+            PLAYER_DELAY(1);  // 1ms，让出 CPU
+        } else {
+            // 没有帧可渲染或还没到显示时间，稍长等待
+            PLAYER_DELAY(5);  // 5ms
+        }
+    }
+    
+    LOG_INFO("视频刷新线程已退出，共渲染 ", frame_count, " 帧");
 }
 
 } // namespace hxcplayer

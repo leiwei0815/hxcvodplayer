@@ -9,7 +9,35 @@
 #include <QMainWindow>
 #include <QTimer>
 #include <memory>
+
+#ifdef _WIN32
+// Windows: 使用 SDK C API
+#include "../win-sdk/hxcplayer_sdk_c_api.h"
+
+// 辅助宏：Windows SDK C API 调用
+#define PLAYER_CALL_VOID(method, ...) \
+    if (player_sdk_) { hxc_player_##method(player_sdk_, ##__VA_ARGS__); }
+
+#define PLAYER_CALL(method, default_val, ...) \
+    (player_sdk_ ? hxc_player_##method(player_sdk_, ##__VA_ARGS__) : default_val)
+
+#define PLAYER_EXISTS() (player_sdk_ != nullptr)
+
+#else
+// 其他平台: 使用 C++ API
 #include "hxc_player_core.h"
+
+// 辅助宏：C++ API 调用
+#define PLAYER_CALL_VOID(method, ...) \
+    if (player_) { player_->method(__VA_ARGS__); }
+
+#define PLAYER_CALL(method, default_val, ...) \
+    (player_ ? player_->method(__VA_ARGS__) : default_val)
+
+#define PLAYER_EXISTS() (player_ != nullptr)
+
+#endif
+
 #include "video_widget.h"
 
 QT_BEGIN_NAMESPACE
@@ -67,9 +95,15 @@ private slots:
 
 private:
     Ui::MainWindow *ui;
-    std::unique_ptr<hxcplayer::PlayerCore> player_;
+    
+#ifdef _WIN32
+    HXCPlayerSDK* player_sdk_;  // Windows: SDK C API 句柄
+#else
+    std::unique_ptr<hxcplayer::PlayerCore> player_;  // 其他平台: C++ API
+#endif
+    
     VideoWidget* video_widget_;
-    QTimer* refresh_timer_;  // 视频刷新定时器（保留用于视频帧刷新）
+    QTimer* refresh_timer_;  // 视频刷新定时器（Windows D3D11 模式不使用）
     bool is_seeking_;
     double last_video_pts_;  // 上一帧的 PTS
 };

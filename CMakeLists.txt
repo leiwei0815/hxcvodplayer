@@ -39,44 +39,154 @@ option(BUILD_TESTS "Build tests" OFF)
 
 # 查找依赖
 if(WIN32)
-    # Windows 平台通常使用 vcpkg，直接使用 find_package
-    find_package(PkgConfig)
+    # ==========================================
+    # Windows: 优先使用本地编译的库
+    # ==========================================
+    message(STATUS "🔍 Looking for libraries (Windows)...")
     
-    # FFmpeg
-    find_package(FFMPEG)
-    if(NOT FFMPEG_FOUND)
-        # 手动查找 FFmpeg（vcpkg 方式）
-        find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
-        find_library(AVCODEC_LIBRARY avcodec)
-        find_library(AVFORMAT_LIBRARY avformat)
-        find_library(AVUTIL_LIBRARY avutil)
-        find_library(SWSCALE_LIBRARY swscale)
-        find_library(SWRESAMPLE_LIBRARY swresample)
-        
-        if(FFMPEG_INCLUDE_DIR AND AVCODEC_LIBRARY AND AVFORMAT_LIBRARY AND AVUTIL_LIBRARY AND SWSCALE_LIBRARY AND SWRESAMPLE_LIBRARY)
-            set(FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIR})
-            set(FFMPEG_LIBRARIES ${AVCODEC_LIBRARY} ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY} ${SWSCALE_LIBRARY} ${SWRESAMPLE_LIBRARY})
-            message(STATUS "✓ FFmpeg found (manual)")
-        else()
-            message(FATAL_ERROR "FFmpeg not found. Please install via vcpkg: vcpkg install ffmpeg:x64-windows")
-        endif()
+    # 本地库目录
+    set(WIN_THIRD_DIR "${CMAKE_SOURCE_DIR}/win-third")
+    
+    # 根据构建类型选择目录
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(LOCAL_BUILD_TYPE "debug")
+    else()
+        set(LOCAL_BUILD_TYPE "release")
     endif()
     
-    # SDL2
-    find_package(SDL2 CONFIG)
-    if(NOT SDL2_FOUND)
-        # 手动查找 SDL2
-        find_path(SDL2_INCLUDE_DIR SDL2/SDL.h)
-        find_library(SDL2_LIBRARY SDL2)
-        find_library(SDL2MAIN_LIBRARY SDL2main)
+    # ========================================
+    # FFmpeg
+    # ========================================
+    message(STATUS "Looking for FFmpeg...")
+    
+    # 1. 优先查找本地编译版本（强制只查找本地路径）
+    set(FFMPEG_LOCAL_DIR "${WIN_THIRD_DIR}/ffmpeg-install")
+    
+    find_path(FFMPEG_INCLUDE_DIR 
+        NAMES libavcodec/avcodec.h
+        PATHS ${FFMPEG_LOCAL_DIR}/include
+        NO_DEFAULT_PATH
+    )
+    
+    # 如果本地没找到，再查找其他位置
+    if(NOT FFMPEG_INCLUDE_DIR)
+        find_path(FFMPEG_INCLUDE_DIR 
+            NAMES libavcodec/avcodec.h
+            PATHS 
+                ${CMAKE_PREFIX_PATH}/include
+                $ENV{VCPKG_ROOT}/installed/x64-windows/include
+        )
+    endif()
+    
+    # 查找库文件
+    foreach(LIB avcodec avformat avutil swscale swresample)
+        string(TOUPPER ${LIB} LIB_UPPER)
         
-        if(SDL2_INCLUDE_DIR AND SDL2_LIBRARY)
-            set(SDL2_INCLUDE_DIRS ${SDL2_INCLUDE_DIR})
-            set(SDL2_LIBRARIES ${SDL2_LIBRARY} ${SDL2MAIN_LIBRARY})
-            message(STATUS "✓ SDL2 found (manual)")
-        else()
-            message(FATAL_ERROR "SDL2 not found. Please install via vcpkg: vcpkg install sdl2:x64-windows")
+        # 先在本地查找
+        find_library(${LIB_UPPER}_LIBRARY
+            NAMES ${LIB}
+            PATHS ${FFMPEG_LOCAL_DIR}/lib
+            NO_DEFAULT_PATH
+        )
+        
+        # 如果本地没找到，再查找其他位置
+        if(NOT ${LIB_UPPER}_LIBRARY)
+            find_library(${LIB_UPPER}_LIBRARY 
+                NAMES ${LIB}
+                PATHS 
+                    ${CMAKE_PREFIX_PATH}/lib
+                    $ENV{VCPKG_ROOT}/installed/x64-windows/lib
+            )
         endif()
+    endforeach()
+    
+    if(FFMPEG_INCLUDE_DIR AND AVCODEC_LIBRARY AND AVFORMAT_LIBRARY AND AVUTIL_LIBRARY AND SWSCALE_LIBRARY AND SWRESAMPLE_LIBRARY)
+        set(FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIR})
+        set(FFMPEG_LIBRARIES ${AVCODEC_LIBRARY} ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY} ${SWSCALE_LIBRARY} ${SWRESAMPLE_LIBRARY})
+        
+        # 判断来源
+        if(FFMPEG_INCLUDE_DIR MATCHES "win-third")
+            message(STATUS "  ✓ FFmpeg found (local build): ${FFMPEG_LOCAL_DIR}")
+        else()
+            message(STATUS "  ✓ FFmpeg found (vcpkg/system)")
+        endif()
+    else()
+        message(FATAL_ERROR "FFmpeg not found. Please:\n"
+            "  1. Run win-third/build_ffmpeg.bat (recommended), or\n"
+            "  2. Install via vcpkg: vcpkg install ffmpeg:x64-windows")
+    endif()
+    
+    # ========================================
+    # SDL2
+    # ========================================
+    message(STATUS "Looking for SDL2...")
+    
+    # 1. 优先查找本地编译版本（强制只查找本地路径）
+    set(SDL2_LOCAL_DIR "${WIN_THIRD_DIR}/sdl2-install/${LOCAL_BUILD_TYPE}")
+    
+    find_path(SDL2_INCLUDE_DIR 
+        NAMES SDL2/SDL.h
+        PATHS ${SDL2_LOCAL_DIR}/include
+        NO_DEFAULT_PATH
+    )
+    
+    # 如果本地没找到，再查找其他位置
+    if(NOT SDL2_INCLUDE_DIR)
+        find_path(SDL2_INCLUDE_DIR 
+            NAMES SDL2/SDL.h
+            PATHS 
+                ${CMAKE_PREFIX_PATH}/include
+                $ENV{VCPKG_ROOT}/installed/x64-windows/include
+        )
+    endif()
+    
+    find_library(SDL2_LIBRARY
+        NAMES SDL2
+        PATHS ${SDL2_LOCAL_DIR}/lib
+        NO_DEFAULT_PATH
+    )
+    
+    if(NOT SDL2_LIBRARY)
+        find_library(SDL2_LIBRARY
+            NAMES SDL2
+            PATHS 
+                ${CMAKE_PREFIX_PATH}/lib
+                $ENV{VCPKG_ROOT}/installed/x64-windows/lib
+        )
+    endif()
+    
+    find_library(SDL2MAIN_LIBRARY
+        NAMES SDL2main
+        PATHS ${SDL2_LOCAL_DIR}/lib
+        NO_DEFAULT_PATH
+    )
+    
+    if(NOT SDL2MAIN_LIBRARY)
+        find_library(SDL2MAIN_LIBRARY
+            NAMES SDL2main
+            PATHS 
+                ${CMAKE_PREFIX_PATH}/lib
+                $ENV{VCPKG_ROOT}/installed/x64-windows/lib
+        )
+    endif()
+    
+    if(SDL2_INCLUDE_DIR AND SDL2_LIBRARY)
+        set(SDL2_INCLUDE_DIRS ${SDL2_INCLUDE_DIR})
+        set(SDL2_LIBRARIES ${SDL2_LIBRARY})
+        if(SDL2MAIN_LIBRARY)
+            list(APPEND SDL2_LIBRARIES ${SDL2MAIN_LIBRARY})
+        endif()
+        
+        # 判断来源
+        if(SDL2_INCLUDE_DIR MATCHES "win-third")
+            message(STATUS "  ✓ SDL2 found (local build): ${SDL2_LOCAL_DIR}")
+        else()
+            message(STATUS "  ✓ SDL2 found (vcpkg/system)")
+        endif()
+    else()
+        message(FATAL_ERROR "SDL2 not found. Please:\n"
+            "  1. Run win-third/build_sdl2.bat (recommended), or\n"
+            "  2. Install via vcpkg: vcpkg install sdl2:x64-windows")
     endif()
 else()
     # macOS/Linux 使用 pkg-config
@@ -238,6 +348,11 @@ endif()
 
 # 核心库
 add_subdirectory(core/src)
+
+# Windows SDK（静态库，包含渲染器）
+if(WIN32)
+    add_subdirectory(win-sdk)
+endif()
 
 # 桌面版本
 if(BUILD_DESKTOP AND (PLATFORM_MACOS OR PLATFORM_WINDOWS))

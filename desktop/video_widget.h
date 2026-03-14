@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file video_widget.h
  * @brief 视频显示窗口
  */
@@ -38,6 +38,7 @@ protected:
 
 signals:
     void aspectRatioModeChanged(hxcplayer::AspectRatioMode mode);
+    void resized(int width, int height);
 
 private:
     QImage convertFrameToImage(AVFrame* frame);

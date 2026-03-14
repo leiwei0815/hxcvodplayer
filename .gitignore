@@ -60,6 +60,14 @@ macos-third/soundtouch-build-macos/
 ios-third/ffmpeg-build-ios/
 ios-third/soundtouch-build-ios/
 
+# Windows 第三方库编译目录
+win-third/ffmpeg-build-wsl/
+win-third/ffmpeg-src/
+win-third/sdl2-build/
+win-third/sdl2-src/
+win-third/soundtouch-build/
+win-third/soundtouch-src/
+
 # Android 第三方库编译目录
 android-third/ffmpeg-build-android/
 android-third/soundtouch-build-android/

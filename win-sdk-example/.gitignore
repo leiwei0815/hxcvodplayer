@@ -1,0 +1,25 @@
+# 构建输出目录
+build/
+
+# Visual Studio 生成的文件
+*.user
+*.suo
+*.vcxproj.filters
+
+# Qt MOC 生成文件
+*_autogen/
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# 可执行文件
+*.exe
+*.dll
+*.exp
+*.ilk
+*.pdb
+
+# CMake 缓存
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake

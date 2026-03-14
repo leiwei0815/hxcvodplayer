@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file player_core.h
  * @brief 播放器核心类（参照 ffplay 架构）
  */
@@ -109,6 +109,17 @@ public:
     void set_aspect_ratio_mode(AspectRatioMode mode) { aspect_ratio_mode_ = mode; }
     AspectRatioMode get_aspect_ratio_mode() const { return aspect_ratio_mode_; }
     
+    // ⚠️ 视频渲染管理
+    enum class RenderMode {
+        Auto = 0,    // 自动渲染
+        Manual = 1   // 手动渲染
+    };
+    
+    void set_render_window(void* window_handle);
+    void set_render_mode(RenderMode mode) { render_mode_ = mode; }
+    RenderMode get_render_mode() const { return render_mode_; }
+    int refresh_video();  // 刷新视频帧到窗口
+    
     // ⚠️ 播放速率控制（倍速播放）
     void set_playback_rate(double rate);  // 0.5 ~ 2.0
     double get_playback_rate() const { return playback_rate_; }
@@ -180,9 +191,6 @@ private:
     PlayerState state_;
     MediaInfo media_info_;
     
-    // ⚠️ 视频显示模式（核心层管理，UI 层读取）
-    AspectRatioMode aspect_ratio_mode_;
-    
     // FFmpeg 对象
     AVFormatContext* format_ctx_;
     int video_stream_;
@@ -205,6 +213,12 @@ private:
     std::unique_ptr<VideoDecoder> video_decoder_;
     std::unique_ptr<AudioDecoder> audio_decoder_;
     
+    // 渲染相关辅助函数
+    void init_sdl_renderer();    // 初始化 SDL 渲染器
+    void cleanup_sdl_renderer();  // 清理 SDL 渲染器
+    void render_video_frame(const VideoFrame& frame);  // 渲染视频帧
+    void video_refresh_thread_func();  // 视频刷新线程函数
+    
     // 时钟
     Clock video_clock_;
     Clock audio_clock_;
@@ -215,6 +229,7 @@ private:
     std::thread video_thread_;
     std::thread audio_thread_;  // ⚠️ 新增：音频解码线程
     std::thread progress_timer_thread_;  // ⚠️ 播放进度回调定时器线程
+    std::thread video_refresh_thread_;  // ⚠️ 视频渲染刷新线程（自动渲染模式）
     
     // 控制标志
     std::atomic<bool> abort_request_;
@@ -243,12 +258,32 @@ private:
     double audio_current_pts_drift_;    // PTS 漂移
     
     // ⚠️ 倍速播放支持（SoundTouch）
-#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+#ifdef HAS_SOUNDTOUCH
     soundtouch::SoundTouch* soundtouch_;
     std::vector<float> soundtouch_buffer_;  // SoundTouch 输出缓冲区
     size_t soundtouch_buffer_index_;        // 当前读取位置
 #endif
     std::atomic<double> playback_rate_;     // 当前播放速率
+    
+    // ⚠️ 视频渲染相关
+    void* render_window_;                   // 渲染窗口句柄 (HWND/NSView*/QWidget*/CWnd*)
+    RenderMode render_mode_;                // 渲染模式
+    AspectRatioMode aspect_ratio_mode_;     // 宽高比模式
+    
+#ifndef NO_SDL
+    SDL_Renderer* sdl_renderer_;            // SDL 渲染器（用于自动渲染）
+    SDL_Texture* sdl_texture_;              // SDL 纹理
+    int texture_width_;                     // 纹理宽度
+    int texture_height_;                    // 纹理高度
+    
+    // 最后一帧的缓存（用于 resize 时避免黑屏）
+    std::vector<uint8_t> last_frame_y_;     // Y 平面数据
+    std::vector<uint8_t> last_frame_u_;     // U 平面数据
+    std::vector<uint8_t> last_frame_v_;     // V 平面数据
+    int last_frame_width_;                  // 最后一帧宽度
+    int last_frame_height_;                 // 最后一帧高度
+    bool has_last_frame_;                   // 是否有缓存的最后一帧
+#endif
     
     // 回调
     StateChangedCallback state_changed_callback_;

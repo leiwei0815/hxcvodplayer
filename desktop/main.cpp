@@ -4,20 +4,59 @@
  */
 
 #include "main_window.h"
+#include "hxc_logger.h"
 #include <QApplication>
 #include <QTimer>
 #include <QDebug>
+#include <QStandardPaths>
+#include <QDir>
 #include <iostream>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 extern "C" {
 #include <libavformat/avformat.h>
 }
 
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+    // ========== Windows 控制台 UTF-8 编码设置 ==========
+    // 设置控制台代码页为 UTF-8
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    
+    // 设置 C++ 标准流为 UTF-8
+    std::cout.imbue(std::locale(""));
+    std::cerr.imbue(std::locale(""));
+#endif
+    
+    // ========== 初始化日志系统 ==========
+    // 获取用户文档目录
+    QString logDir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/HXCVodPlayer/logs";
+    QDir().mkpath(logDir);  // 确保目录存在
+    
+    // 启用文件日志
+    hxcplayer::Logger::instance().enable_file_logging(logDir.toStdString(), "hxcplayer");
+    hxcplayer::Logger::instance().set_level(hxcplayer::LogLevel::DEBUG);  // 设置为DEBUG级别
+    
+    LOG_INFO("========================================");
+    LOG_INFO("HXCVodPlayer 启动");
+    LOG_INFO("日志文件: ", hxcplayer::Logger::instance().get_current_log_file());
+    LOG_INFO("========================================");
+    
     // ========== 调试断点：程序入口 ==========
     std::cout << "=========================================" << std::endl;
     std::cout << "HXCVodPlayer 启动中..." << std::endl;
+    std::cout << "日志文件: " << hxcplayer::Logger::instance().get_current_log_file() << std::endl;
     std::cout << "参数数量: " << argc << std::endl;
+    
+    // 创建 Qt 应用
+    QApplication app(argc, argv);
+    app.setApplicationName("HXCVodPlayer");
+    app.setApplicationVersion("1.0.0");
+    app.setOrganizationName("HXC");
     for (int i = 0; i < argc; i++) {
         std::cout << "参数[" << i << "]: " << argv[i] << std::endl;
     }
@@ -27,13 +66,6 @@ int main(int argc, char *argv[]) {
     av_log_set_level(AV_LOG_WARNING);
     std::cout << "FFmpeg 初始化完成" << std::endl;
     
-    // 创建 Qt 应用
-    QApplication app(argc, argv);
-    app.setApplicationName("HXCVodPlayer");
-    app.setApplicationVersion("1.0.0");
-    app.setOrganizationName("HXC");
-    
-    std::cout << "Qt 应用创建完成" << std::endl;
     
     // ========== 调试断点：创建主窗口 ==========
     std::cout << "正在创建主窗口..." << std::endl;
@@ -87,6 +119,13 @@ int main(int argc, char *argv[]) {
     std::cout << "=========================================" << std::endl;
     std::cout << "应用程序退出，返回码: " << result << std::endl;
     std::cout << "=========================================" << std::endl;
+    
+    LOG_INFO("========================================");
+    LOG_INFO("HXCVodPlayer 退出，返回码: ", result);
+    LOG_INFO("========================================");
+    
+    // 禁用日志（确保所有日志都写入文件）
+    hxcplayer::Logger::instance().disable_file_logging();
     
     return result;
 }

@@ -9,6 +9,11 @@
 #include <vector>
 #include "hxc_logger.h"
 
+extern "C" {
+#include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
+}
+
 // PlayerCoreHandle 结构，包含音频处理所需的状态
 struct PlayerCoreHandle {
     hxcplayer::PlayerCore* core;
@@ -202,7 +207,10 @@ void player_core_seek(PlayerCoreHandle* handle, double pos) {
 
 void player_core_set_volume(PlayerCoreHandle* handle, float volume) {
     if (handle && handle->core) {
-        handle->core->set_volume(volume);
+        // 转换 float[0.0, 1.0] 到 int[0, 100]
+        int volume_int = static_cast<int>(volume * 100.0f);
+        handle->core->set_volume(volume_int);
+        LOG_INFO("设置音量: ", volume_int, "%");
     }
 }
 
@@ -264,6 +272,91 @@ void player_core_consume_video_frame(PlayerCoreHandle* handle) {
     if (videoQueue) {
         videoQueue->next();
     }
+}
+
+// YUV → RGB 转换便利函数
+int player_core_get_video_frame_rgb(
+    PlayerCoreHandle* handle,
+    unsigned char* rgb_buffer,
+    int buffer_size,
+    int* width,
+    int* height,
+    int* linesize
+) {
+    if (!handle || !handle->core || !rgb_buffer || !width || !height || !linesize) {
+        return -1;
+    }
+    
+    auto* videoQueue = handle->core->get_video_queue();
+    if (!videoQueue || videoQueue->size() <= 0) {
+        return -1;  // 没有可用帧
+    }
+    
+    auto* vf = videoQueue->peek_readable();
+    if (!vf || !vf->frame) {
+        return -1;
+    }
+    
+    AVFrame* frame = vf->frame;
+    int frame_width = frame->width;
+    int frame_height = frame->height;
+    int required_size = frame_width * frame_height * 3;  // RGB24
+    
+    // 检查缓冲区大小
+    if (buffer_size < required_size) {
+        return -1;  // 缓冲区太小
+    }
+    
+    // 创建 RGB 帧
+    AVFrame* rgb_frame = av_frame_alloc();
+    if (!rgb_frame) {
+        return -1;
+    }
+    
+    rgb_frame->format = AV_PIX_FMT_RGB24;
+    rgb_frame->width = frame_width;
+    rgb_frame->height = frame_height;
+    
+    // 将用户提供的缓冲区关联到 RGB 帧
+    av_image_fill_arrays(
+        rgb_frame->data, rgb_frame->linesize,
+        rgb_buffer, AV_PIX_FMT_RGB24,
+        frame_width, frame_height, 1
+    );
+    
+    // 创建转换上下文
+    SwsContext* sws_ctx = sws_getContext(
+        frame_width, frame_height, (AVPixelFormat)frame->format,
+        frame_width, frame_height, AV_PIX_FMT_RGB24,
+        SWS_BILINEAR, nullptr, nullptr, nullptr
+    );
+    
+    if (!sws_ctx) {
+        av_frame_free(&rgb_frame);
+        return -1;
+    }
+    
+    // 执行 YUV → RGB 转换
+    sws_scale(
+        sws_ctx,
+        (const uint8_t* const*)frame->data, frame->linesize,
+        0, frame_height,
+        rgb_frame->data, rgb_frame->linesize
+    );
+    
+    // 清理
+    sws_freeContext(sws_ctx);
+    av_frame_free(&rgb_frame);  // 只释放 AVFrame 结构，不释放 rgb_buffer
+    
+    // 设置输出参数
+    *width = frame_width;
+    *height = frame_height;
+    *linesize = frame_width * 3;
+    
+    // 自动消费帧
+    videoQueue->next();
+    
+    return 0;  // 成功
 }
 
 
@@ -749,4 +842,72 @@ int player_core_cleanup_old_logs(void) {
 const char* player_core_get_current_log_file(void) {
     g_current_log_file = hxcplayer::Logger::instance().get_current_log_file();
     return g_current_log_file.c_str();
+}
+
+// ========== 视频渲染 API ==========
+
+void player_core_set_render_window(PlayerCoreHandle* handle, void* window_handle) {
+    if (!handle || !handle->core) {
+        LOG_ERROR("player_core_set_render_window: 无效的句柄");
+        return;
+    }
+    
+    handle->core->set_render_window(window_handle);
+    LOG_INFO("设置渲染窗口: ", window_handle);
+}
+
+void player_core_set_render_mode(PlayerCoreHandle* handle, RenderModeC mode) {
+    if (!handle || !handle->core) {
+        LOG_ERROR("player_core_set_render_mode: 无效的句柄");
+        return;
+    }
+    
+    hxcplayer::PlayerCore::RenderMode cpp_mode = 
+        (mode == RENDER_MODE_AUTO) ? hxcplayer::PlayerCore::RenderMode::Auto 
+                                    : hxcplayer::PlayerCore::RenderMode::Manual;
+    
+    handle->core->set_render_mode(cpp_mode);
+    LOG_INFO("设置渲染模式: ", (mode == RENDER_MODE_AUTO ? "AUTO" : "MANUAL"));
+}
+
+RenderModeC player_core_get_render_mode(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) {
+        LOG_ERROR("player_core_get_render_mode: 无效的句柄");
+        return RENDER_MODE_MANUAL;
+    }
+    
+    hxcplayer::PlayerCore::RenderMode cpp_mode = handle->core->get_render_mode();
+    return (cpp_mode == hxcplayer::PlayerCore::RenderMode::Auto) ? RENDER_MODE_AUTO : RENDER_MODE_MANUAL;
+}
+
+int player_core_refresh_video(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) {
+        LOG_ERROR("player_core_refresh_video: 无效的句柄");
+        return -1;
+    }
+    
+    return handle->core->refresh_video();
+}
+
+// ========== Windows D3D11/OpenGL 渲染器 API 实现 ==========
+// ⚠️ 注意：这些实现在应用层（desktop/win-sdk-example）提供
+// core 层仅声明，不提供实现，以避免链接冲突
+
+#ifdef _WIN32
+
+// 这些函数在 desktop/win_renderer_bridge.cpp 中实现
+// 不在此处提供实现
+
+#endif // _WIN32
+
+// ========== SDK 辅助函数：获取 PlayerCore* ==========
+/**
+ * @brief 从 PlayerCoreHandle 获取 PlayerCore* 指针
+ * @note 此函数供 Windows SDK 使用，不对外暴露
+ */
+hxcplayer::PlayerCore* get_player_core_from_handle(PlayerCoreHandle* handle) {
+    if (!handle) {
+        return nullptr;
+    }
+    return handle->core;
 }

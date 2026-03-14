@@ -204,6 +204,7 @@ void VideoWidget::paintEvent(QPaintEvent *event) {
 
 void VideoWidget::resizeEvent(QResizeEvent *event) {
     QWidget::resizeEvent(event);
+    emit resized(width(), height());
     update();
 }
 

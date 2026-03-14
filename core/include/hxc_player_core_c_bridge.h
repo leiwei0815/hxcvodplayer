@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file player_core_c_bridge.h
  * @brief C 接口桥接层（隔离 C++ 和 Objective-C++，避免 FFmpeg/AVFoundation 冲突）
  */
@@ -86,7 +86,85 @@ float player_core_get_playback_rate(PlayerCoreHandle* handle);
 void player_core_set_aspect_ratio_mode(PlayerCoreHandle* handle, AspectRatioModeC mode);
 AspectRatioModeC player_core_get_aspect_ratio_mode(PlayerCoreHandle* handle);
 
-// 视频帧获取（用于 iOS 渲染）
+// ========== 视频渲染配置 ==========
+
+// 渲染模式
+typedef enum {
+    RENDER_MODE_AUTO = 0,    // 自动渲染（SDK 内部渲染到窗口）
+    RENDER_MODE_MANUAL = 1   // 手动渲染（用户主动获取帧并渲染）
+} RenderModeC;
+
+// 设置渲染窗口句柄
+// window_handle: Windows HWND, macOS NSView*, Qt QWidget*, MFC CWnd*
+void player_core_set_render_window(PlayerCoreHandle* handle, void* window_handle);
+
+// 设置渲染模式（默认 AUTO）
+void player_core_set_render_mode(PlayerCoreHandle* handle, RenderModeC mode);
+
+// 获取当前渲染模式
+RenderModeC player_core_get_render_mode(PlayerCoreHandle* handle);
+
+// 刷新视频帧到窗口（AUTO 模式下自动调用，MANUAL 模式下用户可主动调用）
+// 返回值: 0=成功，-1=失败（无新帧），-2=未设置窗口
+int player_core_refresh_video(PlayerCoreHandle* handle);
+
+// ========== Windows D3D11/OpenGL 渲染器 API ==========
+
+#ifdef _WIN32
+// 渲染器类型（仅 Windows）
+typedef enum {
+    HXC_RENDERER_TYPE_AUTO = 0,     // 自动选择（优先 D3D11）
+    HXC_RENDERER_TYPE_D3D11,        // Direct3D 11
+    HXC_RENDERER_TYPE_OPENGL        // OpenGL 3.3+
+} HXCRendererTypeC;
+
+/**
+ * @brief 设置渲染窗口（扩展版，支持选择渲染器类型）
+ * @param handle 播放器句柄
+ * @param window_handle 窗口句柄 (HWND)
+ * @param renderer_type 渲染器类型
+ * @return 0=成功，-1=失败
+ * 
+ * @note 仅 Windows 平台可用，macOS/iOS/Android 使用原有 API
+ * @note 调用此函数后会自动启动渲染线程，无需手动刷新
+ */
+int player_core_set_render_window_ex(
+    PlayerCoreHandle* handle,
+    void* window_handle,
+    HXCRendererTypeC renderer_type
+);
+
+/**
+ * @brief 窗口大小改变回调
+ * @param handle 播放器句柄
+ * @param width 新宽度
+ * @param height 新高度
+ * 
+ * @note 在窗口 resize 事件中调用，渲染器会自动调整
+ */
+void player_core_on_window_resize(
+    PlayerCoreHandle* handle,
+    int width,
+    int height
+);
+
+/**
+ * @brief 获取当前使用的渲染器类型
+ * @return 渲染器类型名称（"Direct3D 11", "OpenGL", "None"）
+ */
+const char* player_core_get_current_renderer(PlayerCoreHandle* handle);
+
+/**
+ * @brief 检查指定渲染器是否可用
+ * @param type 渲染器类型
+ * @return 1=可用，0=不可用
+ */
+int player_core_is_renderer_available(HXCRendererTypeC type);
+#endif // _WIN32
+
+// ========== 视频帧获取（跨平台）==========
+
+// 视频帧获取（用于 MANUAL 模式或 iOS 渲染）
 typedef struct {
     void* y_data;
     void* u_data;
@@ -101,6 +179,40 @@ typedef struct {
 
 int player_core_get_video_frame(PlayerCoreHandle* handle, VideoFrameDataC* frame_data);
 void player_core_consume_video_frame(PlayerCoreHandle* handle);
+
+// ========== YUV → RGB 转换便利函数 ==========
+
+/**
+ * @brief 获取视频帧并转换为 RGB24 格式（跨平台通用）
+ * 
+ * 这个函数会自动处理 YUV → RGB 转换，适用于所有平台（Windows/macOS/Linux/Android/iOS）
+ * 
+ * @param handle 播放器句柄
+ * @param rgb_buffer 输出 RGB 数据的缓冲区（用户分配，至少 width * height * 3 字节）
+ * @param buffer_size 缓冲区大小（字节）
+ * @param width 输出：视频宽度
+ * @param height 输出：视频高度
+ * @param linesize 输出：RGB 数据每行的字节数（通常是 width * 3）
+ * @return 0=成功，-1=失败（无可用帧或缓冲区太小）
+ * 
+ * @note 调用此函数后，会自动消费当前帧（无需再调用 consume_video_frame）
+ * @note RGB 格式：连续的 RGB RGB RGB...，每像素 3 字节
+ * 
+ * @example
+ * unsigned char* rgb_buffer = malloc(1920 * 1080 * 3);
+ * int width, height, linesize;
+ * if (player_core_get_video_frame_rgb(player, rgb_buffer, 1920*1080*3, &width, &height, &linesize) == 0) {
+ *     // 使用 rgb_buffer 绘制图像
+ * }
+ */
+int player_core_get_video_frame_rgb(
+    PlayerCoreHandle* handle,
+    unsigned char* rgb_buffer,
+    int buffer_size,
+    int* width,
+    int* height,
+    int* linesize
+);
 
 // 音频数据获取（用于 iOS AudioQueue）
 int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, int buffer_size);
@@ -151,6 +263,21 @@ int player_core_cleanup_old_logs(void);
 
 // 获取当前日志文件路径
 const char* player_core_get_current_log_file(void);
+
+// ========== Windows SDK 内部辅助函数（不对外使用） ==========
+#ifdef _WIN32
+#ifdef __cplusplus
+}  // 临时结束 extern "C"
+
+// C++ 接口：从 PlayerCoreHandle 获取 PlayerCore* 指针
+namespace hxcplayer {
+    class PlayerCore;
+}
+hxcplayer::PlayerCore* get_player_core_from_handle(PlayerCoreHandle* handle);
+
+extern "C" {
+#endif // __cplusplus
+#endif // _WIN32
 
 #ifdef __cplusplus
 }

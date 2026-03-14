@@ -54,6 +54,22 @@ if %ERRORLEVEL% NEQ 0 (
 :vs2019
 echo [信息] 生成 Visual Studio 2019 项目...
 set BUILD_DIR=build\vs2019_%BUILD_TYPE%
+
+REM 保存项目根目录（在 cd 之前）
+set PROJECT_ROOT=%~dp0
+
+REM 自动清理旧的构建目录
+if exist "%BUILD_DIR%" (
+    echo [清理] 删除旧的构建目录: %BUILD_DIR%
+    rmdir /s /q "%BUILD_DIR%" >nul 2>&1
+    if %ERRORLEVEL% equ 0 (
+        echo [清理] ✓ 构建目录已清理
+    ) else (
+        echo [警告] 构建目录可能仍在使用中，尝试继续...
+    )
+    echo.
+)
+
 mkdir "%BUILD_DIR%" 2>nul
 cd "%BUILD_DIR%"
 
@@ -110,27 +126,74 @@ goto end
 :vs2022
 echo [信息] 生成 Visual Studio 2022 项目...
 set BUILD_DIR=build\vs2022_%BUILD_TYPE%
+
+REM 保存项目根目录（在 cd 之前）
+set PROJECT_ROOT=%~dp0
+
+REM 自动清理旧的构建目录
+if exist "%BUILD_DIR%" (
+    echo [清理] 删除旧的构建目录: %BUILD_DIR%
+    rmdir /s /q "%BUILD_DIR%" >nul 2>&1
+    if %ERRORLEVEL% equ 0 (
+        echo [清理] ✓ 构建目录已清理
+    ) else (
+        echo [警告] 构建目录可能仍在使用中，尝试继续...
+    )
+    echo.
+)
+
 mkdir "%BUILD_DIR%" 2>nul
 cd "%BUILD_DIR%"
 
-REM 检查本地 SoundTouch
+REM 设置本地库目录（使用保存的项目根目录）
+set WIN_THIRD_DIR=%PROJECT_ROOT%win-third
+
 if "%BUILD_TYPE%"=="debug" (
-    set SOUNDTOUCH_DIR=%~dp0win-third\soundtouch-install\debug
+    set SOUNDTOUCH_DIR=%WIN_THIRD_DIR%\soundtouch-install\debug
+    set SDL2_DIR=%WIN_THIRD_DIR%\sdl2-install\debug
 ) else (
-    set SOUNDTOUCH_DIR=%~dp0win-third\soundtouch-install\release
+    set SOUNDTOUCH_DIR=%WIN_THIRD_DIR%\soundtouch-install\release
+    set SDL2_DIR=%WIN_THIRD_DIR%\sdl2-install\release
 )
 
-echo [信息] 使用本地 Qt: C:\Qt\5.15.2\msvc2019_64
-echo [信息] 使用 vcpkg 依赖: C:\vcpkg\installed\x64-windows
+set FFMPEG_DIR=%WIN_THIRD_DIR%\ffmpeg-install
 
-REM 检查 SoundTouch 是否存在
-if exist "!SOUNDTOUCH_DIR!\include\soundtouch\SoundTouch.h" (
-    echo [信息] 使用本地编译的 SoundTouch: !SOUNDTOUCH_DIR!
-    set "CMAKE_PREFIX_PATH=C:\vcpkg\installed\x64-windows;C:\Qt\5.15.2\msvc2019_64;!SOUNDTOUCH_DIR!"
-) else (
-    echo [警告] 未找到本地编译的 SoundTouch
-    echo [提示] 运行 'cd win-third ^&^& .\install_all.bat' 来编译 SoundTouch
-    set "CMAKE_PREFIX_PATH=C:\vcpkg\installed\x64-windows;C:\Qt\5.15.2\msvc2019_64"
+echo [信息] 使用本地编译的库:
+echo   Qt:         C:\Qt\5.15.2\msvc2019_64
+echo   FFmpeg:     !FFMPEG_DIR!
+echo   SDL2:       !SDL2_DIR!
+echo   SoundTouch: !SOUNDTOUCH_DIR!
+echo.
+
+REM 构建 CMAKE_PREFIX_PATH，本地库优先
+set "CMAKE_PREFIX_PATH=!FFMPEG_DIR!;!SDL2_DIR!;!SOUNDTOUCH_DIR!;C:\Qt\5.15.2\msvc2019_64"
+
+REM 检查必需库
+set MISSING_LIBS=
+if not exist "!FFMPEG_DIR!\include" (
+    echo [警告] 未找到本地 FFmpeg
+    echo [提示] 运行 'cd win-third ^&^& .\build_ffmpeg_wsl.sh' 编译 FFmpeg
+    set MISSING_LIBS=!MISSING_LIBS! FFmpeg
+)
+if not exist "!SDL2_DIR!\include" (
+    echo [警告] 未找到本地 SDL2
+    echo [提示] 运行 'cd win-third ^&^& .\build_sdl2.bat' 编译 SDL2
+    set MISSING_LIBS=!MISSING_LIBS! SDL2
+)
+if not exist "!SOUNDTOUCH_DIR!\include" (
+    echo [警告] 未找到本地 SoundTouch
+    echo [提示] 运行 'cd win-third ^&^& .\install_all.bat' 编译 SoundTouch
+    set MISSING_LIBS=!MISSING_LIBS! SoundTouch
+)
+
+if not "!MISSING_LIBS!"=="" (
+    echo.
+    echo [警告] 缺少本地库:!MISSING_LIBS!
+    echo [信息] 将尝试使用 vcpkg 的库作为后备
+    echo.
+    if not "%VCPKG_ROOT%"=="" (
+        set "CMAKE_PREFIX_PATH=!CMAKE_PREFIX_PATH!;C:\vcpkg\installed\x64-windows"
+    )
 )
 
 cmake ..\.. ^
@@ -140,6 +203,8 @@ cmake ..\.. ^
     -DCMAKE_PREFIX_PATH="!CMAKE_PREFIX_PATH!" ^
     -DQt5_DIR="C:\Qt\5.15.2\msvc2019_64\lib\cmake\Qt5" ^
     -DBUILD_DESKTOP=ON
+
+REM 注意：这里故意不使用 CMAKE_TOOLCHAIN_FILE，让本地库优先
 
 if %ERRORLEVEL% NEQ 0 (
     cd ..\..
@@ -166,6 +231,22 @@ goto end
 :build
 echo [信息] 构建 Windows Desktop 版本...
 set BUILD_DIR=build\windows_%BUILD_TYPE%
+
+REM 保存项目根目录（在 cd 之前）
+set PROJECT_ROOT=%~dp0
+
+REM 自动清理旧的构建目录
+if exist "%BUILD_DIR%" (
+    echo [清理] 删除旧的构建目录: %BUILD_DIR%
+    rmdir /s /q "%BUILD_DIR%" >nul 2>&1
+    if %ERRORLEVEL% equ 0 (
+        echo [清理] ✓ 构建目录已清理
+    ) else (
+        echo [警告] 构建目录可能仍在使用中，尝试继续...
+    )
+    echo.
+)
+
 mkdir "%BUILD_DIR%" 2>nul
 cd "%BUILD_DIR%"
 
