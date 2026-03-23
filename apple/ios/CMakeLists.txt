@@ -26,28 +26,52 @@ else()
     message(STATUS "构建目标: iOS 真机")
 endif()
 
-# FFmpeg 路径
+# FFmpeg 和 SoundTouch 路径
 set(FFMPEG_ROOT "${PROJECT_ROOT}/ios-third/ffmpeg-build-ios/FFmpeg-iOS/${IOS_PLATFORM_DIR}")
-set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
-set(FFMPEG_LIB_DIR "${FFMPEG_ROOT}/lib")
-
-# SoundTouch 路径
 set(SOUNDTOUCH_ROOT "${PROJECT_ROOT}/ios-third/soundtouch-build-ios/SoundTouch-iOS/${IOS_PLATFORM_DIR}")
-set(SOUNDTOUCH_INCLUDE_DIR "${SOUNDTOUCH_ROOT}/include")
-set(SOUNDTOUCH_LIB_DIR "${SOUNDTOUCH_ROOT}/lib")
+
+# 检查 FFmpeg 是否存在
+if(EXISTS "${FFMPEG_ROOT}/lib/libavcodec.a")
+    message(STATUS "✅ 找到 iOS FFmpeg 静态库")
+    set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
+    set(FFMPEG_LIB_DIR "${FFMPEG_ROOT}/lib")
+    set(HAS_FFMPEG TRUE)
+else()
+    message(FATAL_ERROR "❌ 未找到 iOS FFmpeg 静态库！请先运行 ios-third/build_ffmpeg_ios.sh 编译")
+endif()
+
+# 检查 SoundTouch 是否存在
+if(EXISTS "${SOUNDTOUCH_ROOT}/lib/libSoundTouch.a")
+    message(STATUS "✅ 找到 iOS SoundTouch 静态库")
+    set(SOUNDTOUCH_INCLUDE_DIR "${SOUNDTOUCH_ROOT}/include")
+    set(SOUNDTOUCH_LIB_DIR "${SOUNDTOUCH_ROOT}/lib")
+    set(HAS_SOUNDTOUCH TRUE)
+else()
+    message(WARNING "⚠️  未找到 iOS SoundTouch 静态库，倍速播放功能将被禁用")
+    message(WARNING "    请运行 ios-third/build_soundtouch_ios.sh 编译")
+    set(HAS_SOUNDTOUCH FALSE)
+endif()
 
 # 包含目录
 include_directories(
     ${PROJECT_ROOT}/core/include
     ${FFMPEG_INCLUDE_DIR}
-    ${SOUNDTOUCH_INCLUDE_DIR}
 )
+
+# 如果有 SoundTouch，添加其包含目录
+if(HAS_SOUNDTOUCH)
+    include_directories(${SOUNDTOUCH_INCLUDE_DIR})
+endif()
 
 # 链接目录
 link_directories(
     ${FFMPEG_LIB_DIR}
-    ${SOUNDTOUCH_LIB_DIR}
 )
+
+# 如果有 SoundTouch，添加其链接目录
+if(HAS_SOUNDTOUCH)
+    link_directories(${SOUNDTOUCH_LIB_DIR})
+endif()
 
 # 核心库源文件
 set(CORE_SOURCES
@@ -121,13 +145,11 @@ target_link_libraries(YXVodPlayer-iOS
     swscale
     swresample
     
-    # SoundTouch
-    SoundTouch
-    
     # iOS 系统框架
     "-framework Foundation"
     "-framework UIKit"
     "-framework AVFoundation"
+    "-framework AVKit"
     "-framework CoreMedia"
     "-framework CoreVideo"
     "-framework VideoToolbox"
@@ -143,16 +165,29 @@ target_link_libraries(YXVodPlayer-iOS
     c++
 )
 
+# 如果有 SoundTouch，链接它
+if(HAS_SOUNDTOUCH)
+    target_link_libraries(YXVodPlayer-iOS SoundTouch)
+endif()
+
 # 编译选项
 target_compile_options(YXVodPlayer-iOS PRIVATE
     -Wno-deprecated-declarations
     -fembed-bitcode-marker
 )
 
-# 禁用 SDL（iOS 不使用 SDL）
-target_compile_definitions(YXVodPlayer-iOS PRIVATE
-    NO_SDL=1
-)
+# 定义宏
+set(COMPILE_DEFINITIONS NO_SDL=1)
+
+# 如果找到 SoundTouch，添加 HAS_SOUNDTOUCH 宏
+if(HAS_SOUNDTOUCH)
+    list(APPEND COMPILE_DEFINITIONS HAS_SOUNDTOUCH=1)
+    message(STATUS "✅ 已启用 SoundTouch 支持（倍速播放）")
+else()
+    message(STATUS "⚠️  SoundTouch 未启用，倍速播放功能将被禁用")
+endif()
+
+target_compile_definitions(YXVodPlayer-iOS PRIVATE ${COMPILE_DEFINITIONS})
 
 # 为所有 ObjC/ObjC++ 源文件启用 ARC
 set_target_properties(YXVodPlayer-iOS PROPERTIES

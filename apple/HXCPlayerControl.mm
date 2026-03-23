@@ -67,6 +67,16 @@ static void loading_callback_c(bool is_loading, void* user_data);
     CFTimeInterval _lastPositionUpdateTime;
 }
 
+#if TARGET_OS_IOS
+// 画中画相关（仅 iOS）
+@property (nonatomic, strong) AVPictureInPictureController *pictureInPictureController;
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 150000
+@property (nonatomic, strong) AVPictureInPictureControllerContentSource *pipContentSource API_AVAILABLE(ios(15.0));
+#else
+@property (nonatomic, strong) id pipContentSource;
+#endif
+#endif
+
 @property (nonatomic, strong) HXCPlayerView *videoView;
 @property (nonatomic, strong) dispatch_queue_t renderQueue;
 
@@ -75,6 +85,12 @@ static void loading_callback_c(bool is_loading, void* user_data);
 -(void)playerPositionChange:(double)position;
 
 @end
+
+#if TARGET_OS_IOS
+// iOS: 添加画中画代理协议
+@interface HXCPlayerControl () <AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate>
+@end
+#endif
 
 // ========== C 回调函数实现（在 @interface 扩展之后，可以访问实例变量）==========
 
@@ -183,6 +199,9 @@ static void loading_callback_c(bool is_loading, void* user_data) {
         
         CMTimebaseSetTime(videoLayer.controlTimebase, kCMTimeZero);
         CMTimebaseSetRate(videoLayer.controlTimebase, 1.0);
+        
+        // 初始化画中画
+        [self setupPictureInPicture];
 #else
         // macOS 需要设置 controlTimebase
         AVSampleBufferDisplayLayer *videoLayer = _videoView.videoLayer;
@@ -279,18 +298,39 @@ static void loading_callback_c(bool is_loading, void* user_data) {
         NSLog(@"警告: 请先调用 openURL:");
         return;
     }
+    HXCPlayerState previousState = _state;
     player_core_play(_wrapper->handle());
     if (_audioQueue && !_audioQueueRunning) {
         AudioQueueStart(_audioQueue, NULL);
         _audioQueueRunning = YES;
     }
+    // 立即与底层一致，避免画中画依赖异步 state 回调时读到旧状态
+    _state = HXCPlayerStatePlaying;
+    if (previousState != HXCPlayerStatePlaying) {
+        if ([_delegate respondsToSelector:@selector(player:didChangeState:)]) {
+            [_delegate player:self didChangeState:_state];
+        }
+#if TARGET_OS_IOS
+        [self invalidatePictureInPicturePlaybackStateIfNeeded];
+#endif
+    }
 }
 
 - (void)pause {
+    HXCPlayerState previousState = _state;
     player_core_pause(_wrapper->handle());
     if (_audioQueue && _audioQueueRunning) {
         AudioQueuePause(_audioQueue);
         _audioQueueRunning = NO;
+    }
+    _state = HXCPlayerStatePaused;
+    if (previousState != HXCPlayerStatePaused) {
+        if ([_delegate respondsToSelector:@selector(player:didChangeState:)]) {
+            [_delegate player:self didChangeState:_state];
+        }
+#if TARGET_OS_IOS
+        [self invalidatePictureInPicturePlaybackStateIfNeeded];
+#endif
     }
 }
 
@@ -327,6 +367,7 @@ static void loading_callback_c(bool is_loading, void* user_data) {
 }
 
 - (void)stop {
+    HXCPlayerState previousState = _state;
     [self stopDisplayLink];
     [self teardownAudioQueue];
     
@@ -342,6 +383,11 @@ static void loading_callback_c(bool is_loading, void* user_data) {
     _playerUrl = nil;
     _videoWidth = 0;
     _videoHeight = 0;
+#if TARGET_OS_IOS
+    if (previousState != HXCPlayerStateIdle) {
+        [self invalidatePictureInPicturePlaybackStateIfNeeded];
+    }
+#endif
 }
 
 
@@ -379,11 +425,26 @@ static void loading_callback_c(bool is_loading, void* user_data) {
             objcState = HXCPlayerStateIdle;
             break;
     }
+    HXCPlayerState previous = _state;
     self->_state = objcState;
-    if ([self.delegate respondsToSelector:@selector(player:didChangeState:)]) {
-        [self.delegate player:self didChangeState:objcState];
+    // 与 play/pause/openURL 的乐观更新对齐：仅在核心状态真的变化时通知，避免重复回调
+    if (previous != objcState) {
+        if ([self.delegate respondsToSelector:@selector(player:didChangeState:)]) {
+            [self.delegate player:self didChangeState:objcState];
+        }
+#if TARGET_OS_IOS
+        [self invalidatePictureInPicturePlaybackStateIfNeeded];
+#endif
     }
 }
+
+-(void)playerErrorHandler:(HXCPlayerErrorCode)errCode errMsg:(NSString *)errMsg {
+    if ([self.delegate respondsToSelector:@selector(player:didFailWithError:)]) {
+        NSError *error = [NSError errorWithDomain:@"HXCPlayerErrorDomain" code:errCode userInfo:@{NSLocalizedDescriptionKey: errMsg}];
+        [self.delegate player:self didFailWithError:error];
+    }
+}
+
 
 #pragma mark - Properties
 
@@ -740,20 +801,19 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 
 #pragma mark - 日志配置
 
-- (void)setupLogging {
-    // 设置日志级别为 DEBUG
-    player_core_set_log_level(0);
-    
-    // 获取 Documents 目录
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *documentsDirectory = [paths firstObject];
-    NSString *logDir = [documentsDirectory stringByAppendingPathComponent:@"Logs"];
-    
-    // 确保日志目录存在
++(void)setLogLevel:(HXCPlayerLogLevel)level {
+    player_core_set_log_level((int)level);
+}
+
++(void)setLogDir:(NSString *)dir {
+    if (!dir) {
+        NSLog(@"日志路径设置不能为空");
+        return;
+    }
     NSFileManager *fileManager = [NSFileManager defaultManager];
     NSError *error = nil;
-    if (![fileManager fileExistsAtPath:logDir]) {
-        [fileManager createDirectoryAtPath:logDir
+    if (![fileManager fileExistsAtPath:dir]) {
+        [fileManager createDirectoryAtPath:dir
                withIntermediateDirectories:YES
                                 attributes:nil
                                      error:&error];
@@ -762,12 +822,22 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
             return;
         }
     }
-    
+    player_core_enable_file_logging([dir UTF8String], "hxcplayer");
+}
+
+- (void)setupLogging {
+    // 设置日志级别为 DEBUG
+    [HXCPlayerControl setLogLevel:HXCPlayerLogLevelDebug];
+    // 获取 Documents 目录
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *documentsDirectory = [paths firstObject];
+    NSString *logDir = [documentsDirectory stringByAppendingPathComponent:@"HXCPlayerLogs"];
+    [HXCPlayerControl setLogDir:logDir];
     // 设置日志保留天数（默认7天）
     player_core_set_log_retention_days(7);
     
     // 启用文件日志（会自动清理超过7天的旧日志）
-    player_core_enable_file_logging([logDir UTF8String], "hxcplayer");
+//    player_core_enable_file_logging([logDir UTF8String], "hxcplayer");
     
     // 设置最大文件大小为 10MB
     player_core_set_max_log_file_size(10 * 1024 * 1024);
@@ -786,5 +856,253 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     NSLog(@"最大大小: 10 MB");
     NSLog(@"========================================");
 }
+
+#pragma mark - Picture in Picture (iOS only)
+
+#if TARGET_OS_IOS
+
+/// 通知系统重新查询 Sample Buffer PiP 的播放/暂停状态（依赖 pictureInPictureControllerIsPlaybackPaused:）
+- (void)invalidatePictureInPicturePlaybackStateIfNeeded {
+    if (@available(iOS 15.0, *)) {
+        if (_pictureInPictureController) {
+            [_pictureInPictureController invalidatePlaybackState];
+        }
+    }
+}
+
+- (void)setupPictureInPicture {
+    // 检查设备是否支持画中画
+    if (![AVPictureInPictureController isPictureInPictureSupported]) {
+        NSLog(@"⚠️ 当前设备不支持画中画功能");
+        [self playerErrorHandler:HXCPlayerErrorNotSupportPIPPlayer errMsg:@"当前设备不支持画中画功能"];
+        return;
+    }
+    
+    // 检查 iOS 版本（PiP 需要 iOS 15.0+ 使用 AVSampleBufferDisplayLayer）
+    if (@available(iOS 15.0, *)) {
+        // iOS 15.0+ 支持
+    } else {
+        NSLog(@"⚠️ 画中画功能需要 iOS 15.0 或更高版本");
+        [self playerErrorHandler:HXCPlayerErrorNotSupportPIPPlayer errMsg:@"画中画功能需要 iOS 15.0 或更高版本"];
+        return;
+    }
+    
+    // 配置音频会话，支持后台播放
+    NSError *audioSessionError = nil;
+    AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+    [audioSession setCategory:AVAudioSessionCategoryPlayback 
+                         mode:AVAudioSessionModeMoviePlayback 
+                      options:0 
+                        error:&audioSessionError];
+    [audioSession setActive:YES error:&audioSessionError];
+    
+    if (audioSessionError) {
+        NSString *msg = [NSString stringWithFormat:@"音频会话设置失败: %@", audioSessionError.localizedDescription];
+        [self playerErrorHandler:HXCPlayerErrorAudioSessionConfigFail errMsg:msg];
+    }
+    
+    // 获取 AVSampleBufferDisplayLayer
+    AVSampleBufferDisplayLayer *sampleBufferLayer = _videoView.videoLayer;
+    
+    if (!sampleBufferLayer) {
+        NSLog(@"❌ videoLayer 为空，无法创建画中画控制器");
+        return;
+    }
+    
+    // iOS 15.0+ 创建画中画内容源和控制器
+    if (@available(iOS 15.0, *)) {
+        _pipContentSource = [[AVPictureInPictureControllerContentSource alloc]
+                             initWithSampleBufferDisplayLayer:sampleBufferLayer
+                             playbackDelegate:self];
+        
+        // 创建画中画控制器
+        _pictureInPictureController = [[AVPictureInPictureController alloc]
+                                       initWithContentSource:_pipContentSource];
+        _pictureInPictureController.delegate = self;
+        
+        // iOS 14.2+ 默认关闭自动画中画（用户可通过属性开启）
+        if (@available(iOS 14.2, *)) {
+            _pictureInPictureController.canStartPictureInPictureAutomaticallyFromInline = YES;
+            NSLog(@"🎬 自动画中画默认关闭，可通过 canStartPictureInPictureAutomaticallyFromInline 属性开启");
+        }
+        
+        NSLog(@"✅ 画中画控制器初始化成功 (iOS 15.0+)");
+    }
+}
+
+- (BOOL)isPictureInPictureSupported {
+    return [AVPictureInPictureController isPictureInPictureSupported];
+}
+
+- (BOOL)isPictureInPictureActive {
+    return _pictureInPictureController.isPictureInPictureActive;
+}
+
+- (BOOL)isPictureInPicturePossible {
+    return _pictureInPictureController.isPictureInPicturePossible;
+}
+
+- (BOOL)canStartPictureInPictureAutomaticallyFromInline {
+    if (@available(iOS 14.2, *)) {
+        return _pictureInPictureController.canStartPictureInPictureAutomaticallyFromInline;
+    }
+    return NO;
+}
+
+- (void)setCanStartPictureInPictureAutomaticallyFromInline:(BOOL)canStartPictureInPictureAutomaticallyFromInline {
+    if (@available(iOS 14.2, *)) {
+        if (_pictureInPictureController) {
+            _pictureInPictureController.canStartPictureInPictureAutomaticallyFromInline = canStartPictureInPictureAutomaticallyFromInline;
+            NSLog(@"🎬 设置自动画中画: %@", canStartPictureInPictureAutomaticallyFromInline ? @"开启" : @"关闭");
+        } else {
+            NSLog(@"⚠️ 画中画控制器未初始化，无法设置自动画中画");
+        }
+    } else {
+        NSLog(@"⚠️ 自动画中画功能需要 iOS 14.2 或更高版本");
+    }
+}
+
+- (void)startPictureInPicture {
+    // 检查 iOS 版本
+    if (@available(iOS 15.0, *)) {
+        // iOS 15.0+ 支持
+    } else {
+        NSLog(@"❌ 画中画功能需要 iOS 15.0 或更高版本");
+        return;
+    }
+    
+    if (!_pictureInPictureController) {
+        NSLog(@"❌ 画中画控制器未初始化");
+        return;
+    }
+    
+    if (![self isPictureInPicturePossible]) {
+        NSLog(@"⚠️ 当前无法启动画中画（视频可能未开始播放或已在画中画模式中）");
+        return;
+    }
+    
+    NSLog(@"🎬 启动画中画...");
+    [_pictureInPictureController startPictureInPicture];
+}
+
+- (void)stopPictureInPicture {
+    if (!_pictureInPictureController) {
+        return;
+    }
+    
+    if ([self isPictureInPictureActive]) {
+        NSLog(@"🛑 停止画中画...");
+        [_pictureInPictureController stopPictureInPicture];
+    }
+}
+
+#pragma mark - AVPictureInPictureControllerDelegate
+
+- (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+    NSLog(@"📺 画中画即将开始");
+    
+    if ([_delegate respondsToSelector:@selector(player:pictureInPictureControllerWillStartPictureInPicture:)]) {
+        [_delegate player:self pictureInPictureControllerWillStartPictureInPicture:pictureInPictureController];
+    }
+}
+
+- (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+    NSLog(@"✅ 画中画已开始");
+    [self invalidatePictureInPicturePlaybackStateIfNeeded];
+    
+    if ([_delegate respondsToSelector:@selector(player:pictureInPictureControllerDidStartPictureInPicture:)]) {
+        [_delegate player:self pictureInPictureControllerDidStartPictureInPicture:pictureInPictureController];
+    }
+}
+
+- (void)pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+    NSLog(@"📺 画中画即将停止");
+    
+    if ([_delegate respondsToSelector:@selector(player:pictureInPictureControllerWillStopPictureInPicture:)]) {
+        [_delegate player:self pictureInPictureControllerWillStopPictureInPicture:pictureInPictureController];
+    }
+}
+
+- (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+    NSLog(@"✅ 画中画已停止");
+    
+    if ([_delegate respondsToSelector:@selector(player:pictureInPictureControllerDidStopPictureInPicture:)]) {
+        [_delegate player:self pictureInPictureControllerDidStopPictureInPicture:pictureInPictureController];
+    }
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController 
+           failedToStartPictureInPictureWithError:(NSError *)error {
+    NSLog(@"❌ 画中画启动失败: %@", error.localizedDescription);
+    
+    if ([_delegate respondsToSelector:@selector(player:didFailWithError:)]) {
+        [_delegate player:self didFailWithError:error];
+    }
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController 
+    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL restored))completionHandler {
+    NSLog(@"🔄 从画中画恢复用户界面");
+    
+    // 通知 delegate 恢复界面
+    if ([_delegate respondsToSelector:@selector(player:restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:)]) {
+        [_delegate player:self restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:completionHandler];
+    } else {
+        // 如果 delegate 没有实现，直接完成
+        completionHandler(YES);
+    }
+}
+
+#pragma mark - AVPictureInPictureSampleBufferPlaybackDelegate
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController 
+                        setPlaying:(BOOL)playing {
+    NSLog(@"📺 画中画窗口控制播放: %@", playing ? @"播放" : @"暂停");
+    
+    if (playing) {
+        [self play];
+    } else {
+        [self pause];
+    }
+}
+
+- (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:(AVPictureInPictureController *)pictureInPictureController {
+    // 返回可播放的时间范围
+    double duration = [self duration];
+    if (duration > 0) {
+        return CMTimeRangeMake(kCMTimeZero, CMTimeMakeWithSeconds(duration, 1000000));
+    }
+    return CMTimeRangeMake(kCMTimeZero, kCMTimePositiveInfinity);
+}
+
+- (BOOL)pictureInPictureControllerIsPlaybackPaused:(AVPictureInPictureController *)pictureInPictureController {
+    // 返回当前是否暂停
+    return _state != HXCPlayerStatePlaying;
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController 
+                    didTransitionToRenderSize:(CMVideoDimensions)newRenderSize {
+    NSLog(@"📺 画中画渲染尺寸变化: %dx%d", newRenderSize.width, newRenderSize.height);
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController 
+                   skipByInterval:(CMTime)skipInterval 
+                completionHandler:(void (^)(void))completionHandler {
+    // 处理快进/快退
+    double skipSeconds = CMTimeGetSeconds(skipInterval);
+    double currentPos = [self position];
+    double newPos = currentPos + skipSeconds;
+    
+    // 限制在有效范围内
+    if (newPos < 0) newPos = 0;
+    if (newPos > [self duration]) newPos = [self duration];
+    
+    NSLog(@"⏩ 画中画跳转: %.2f 秒 (%.2f → %.2f)", skipSeconds, currentPos, newPos);
+    [self seekToPosition:newPos];
+    
+    completionHandler();
+}
+
+#endif // TARGET_OS_IOS
 
 @end

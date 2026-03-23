@@ -83,15 +83,26 @@ if(IOS)
     set(FFMPEG_ROOT "${PROJECT_ROOT}/ios-third/ffmpeg-build-ios/FFmpeg-iOS/${IOS_PLATFORM_DIR}")
     set(SOUNDTOUCH_ROOT "${PROJECT_ROOT}/ios-third/soundtouch-build-ios/SoundTouch-iOS/${IOS_PLATFORM_DIR}")
     
-    include_directories(
-        ${FFMPEG_ROOT}/include
-        ${SOUNDTOUCH_ROOT}/include
-    )
+    # 检查 FFmpeg 是否存在
+    if(EXISTS "${FFMPEG_ROOT}/lib/libavcodec.a")
+        message(STATUS "✅ 找到 iOS FFmpeg 静态库")
+        include_directories(${FFMPEG_ROOT}/include)
+        link_directories(${FFMPEG_ROOT}/lib)
+        set(HAS_FFMPEG TRUE)
+    else()
+        message(FATAL_ERROR "❌ 未找到 iOS FFmpeg 静态库！请先运行 ios-third/build_ffmpeg_ios.sh 编译")
+    endif()
     
-    link_directories(
-        ${FFMPEG_ROOT}/lib
-        ${SOUNDTOUCH_ROOT}/lib
-    )
+    # 检查 SoundTouch 是否存在
+    if(EXISTS "${SOUNDTOUCH_ROOT}/lib/libSoundTouch.a")
+        message(STATUS "✅ 找到 iOS SoundTouch 静态库")
+        include_directories(${SOUNDTOUCH_ROOT}/include)
+        link_directories(${SOUNDTOUCH_ROOT}/lib)
+        set(HAS_SOUNDTOUCH TRUE)
+    else()
+        message(WARNING "⚠️  未找到 iOS SoundTouch 静态库，倍速播放功能将被禁用")
+        set(HAS_SOUNDTOUCH FALSE)
+    endif()
 else()
     # macOS: 配置将在后面根据自编译库是否存在来决定
     # 不在这里设置 include_directories 和 link_directories
@@ -128,6 +139,7 @@ set_target_properties(HXCPlayer PROPERTIES
 )
 
 # 为纯 C++ 文件设置编译标志（添加 NO_SDL 宏定义）
+# 注意：这里不能在 COMPILE_FLAGS 中定义 HAS_SOUNDTOUCH，因为它会被覆盖
 set_source_files_properties(
     ${CORE_SOURCES}
     PROPERTIES
@@ -140,6 +152,15 @@ set_source_files_properties(
     PROPERTIES
     COMPILE_FLAGS "-x objective-c++ -fobjc-arc"
 )
+
+# 定义编译宏（在 target 级别定义，避免被覆盖）
+target_compile_definitions(HXCPlayer PRIVATE NO_SDL=1)
+if(HAS_SOUNDTOUCH)
+    target_compile_definitions(HXCPlayer PRIVATE HAS_SOUNDTOUCH=1)
+    message(STATUS "✅ Framework 已启用 SoundTouch 支持")
+else()
+    message(STATUS "⚠️  Framework SoundTouch 未启用")
+endif()
 
 # ==================== 链接库 ====================
 
@@ -156,6 +177,7 @@ target_link_libraries(HXCPlayer PUBLIC
 if(IOS)
     target_link_libraries(HXCPlayer PUBLIC
         "-framework UIKit"
+        "-framework AVKit"
     )
 else()
     target_link_libraries(HXCPlayer PUBLIC
@@ -172,8 +194,12 @@ if(IOS)
         avutil
         swscale
         swresample
-        SoundTouch
     )
+    
+    # 如果有 SoundTouch，链接它
+    if(HAS_SOUNDTOUCH)
+        target_link_libraries(HXCPlayer PUBLIC SoundTouch)
+    endif()
 else()
     # macOS: 优先使用自编译的静态库，否则使用 Homebrew
     set(MACOS_FFMPEG_ROOT "${PROJECT_ROOT}/macos-third/ffmpeg-build-macos/FFmpeg-macOS")
@@ -213,16 +239,21 @@ else()
         target_link_libraries(HXCPlayer PUBLIC
             ${MACOS_SOUNDTOUCH_ROOT}/lib/libSoundTouch.a
         )
+        set(HAS_SOUNDTOUCH TRUE)
     else()
         message(STATUS "使用 Homebrew SoundTouch（请运行 macos-third/build_soundtouch_macos.sh 编译静态库）")
         # 使用 Homebrew 的头文件和库
         include_directories(/opt/homebrew/include)
         link_directories(/opt/homebrew/lib)
         
-        # 使用 Homebrew 的动态库
-        target_link_libraries(HXCPlayer PUBLIC
-            SoundTouch
-        )
+        # 检查 Homebrew 是否有 SoundTouch
+        if(EXISTS "/opt/homebrew/include/soundtouch/SoundTouch.h")
+            target_link_libraries(HXCPlayer PUBLIC SoundTouch)
+            set(HAS_SOUNDTOUCH TRUE)
+        else()
+            message(WARNING "⚠️  未找到 SoundTouch，倍速播放功能将被禁用")
+            set(HAS_SOUNDTOUCH FALSE)
+        endif()
     endif()
     
     # macOS FFmpeg 静态库可能需要的额外系统框架

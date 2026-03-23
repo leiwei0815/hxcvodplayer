@@ -18,6 +18,11 @@ extern "C" {
 #include <libavformat/avformat.h>
 }
 
+// FFmpeg 错误码定义
+#ifndef AVERROR_PATCHWELCOME
+#define AVERROR_PATCHWELCOME (-MKTAG('P','A','W','E'))  // "功能未实现"
+#endif
+
 // 跨平台延迟宏
 #ifndef NO_SDL
     #define PLAYER_DELAY(ms) SDL_Delay(ms)
@@ -65,7 +70,7 @@ PlayerCore::PlayerCore()
     , last_frame_height_(0)
     , has_last_frame_(false)
 #endif
-#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+#ifdef HAS_SOUNDTOUCH
     , soundtouch_(nullptr)
     , soundtouch_buffer_index_(0)
 #endif
@@ -99,8 +104,8 @@ PlayerCore::~PlayerCore() {
     LOG_INFO("销毁 PlayerCore...");
     close();
     cleanup_sdl_renderer();  // 清理渲染器
-    
-#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+
+#ifdef HAS_SOUNDTOUCH
     // 释放 SoundTouch
     if (soundtouch_) {
         delete soundtouch_;
@@ -155,31 +160,97 @@ int PlayerCore::open(const std::string& filename) {
     // 打开输入文件
     format_ctx_ = avformat_alloc_context();
     
+    // 🔧 设置中断回调（防止网络卡住导致无限等待）
+    format_ctx_->interrupt_callback.callback = [](void* ctx) -> int {
+        PlayerCore* player = static_cast<PlayerCore*>(ctx);
+        // 如果用户请求中止，返回 1
+        return player->abort_request_.load() ? 1 : 0;
+    };
+    format_ctx_->interrupt_callback.opaque = this;
+    
     // 🔧 设置网络超时和重试参数（对于网络流很重要）
     AVDictionary* options = nullptr;
     
-    // 设置超时时间（微秒）- 30 秒
-    av_dict_set(&options, "timeout", "30000000", 0);
+    // 设置超时时间（微秒）- 15 秒（缩短以快速失败）
+    av_dict_set(&options, "timeout", "15000000", 0);
     
-    // 设置连接超时（微秒）- 10 秒  
-    av_dict_set(&options, "stimeout", "10000000", 0);
+    // 设置连接超时（微秒）- 5 秒  
+    av_dict_set(&options, "stimeout", "5000000", 0);
     
     // 设置重连次数
     av_dict_set(&options, "reconnect", "1", 0);
     av_dict_set(&options, "reconnect_streamed", "1", 0);
     av_dict_set(&options, "reconnect_delay_max", "5", 0);
     
-    // 设置 User-Agent（某些服务器可能检查）
+    // 设置 User-Agent（根据平台自适应）
+#if defined(__APPLE__) && TARGET_OS_IOS
+    // iOS 平台使用 Mobile Safari User-Agent
+    av_dict_set(&options, "user_agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1", 0);
+#elif defined(__APPLE__) && TARGET_OS_OSX
+    // macOS 平台使用 Safari User-Agent
+    av_dict_set(&options, "user_agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15", 0);
+#elif defined(__ANDROID__)
+    // Android 平台使用 Chrome Mobile User-Agent
+    av_dict_set(&options, "user_agent", "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36", 0);
+#elif defined(_WIN32)
+    // Windows 平台使用 Chrome User-Agent
+    av_dict_set(&options, "user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36", 0);
+#else
+    // 其他平台使用通用 User-Agent
     av_dict_set(&options, "user_agent", "HXCPlayer/1.0", 0);
+#endif
     
     // 🔧 增强重定向支持（处理 302 等重定向）
     av_dict_set(&options, "follow_redirects", "1", 0);
     av_dict_set(&options, "max_redirects", "10", 0);
     
+    // 🔧 HTTPS/TLS 配置（解决证书信任问题）
+    // 检查是否是 HTTPS 链接
+    bool is_https = (filename.find("https://") == 0);
+    if (is_https) {
+        LOG_INFO("检测到 HTTPS 链接，配置 TLS 参数...");
+        
+        // 禁用 TLS 证书验证（用于解决 iOS 不信任某些 CA 的问题）
+        av_dict_set(&options, "tls_verify", "0", 0);
+        
+        // 设置 HTTP 协议选项
+        av_dict_set(&options, "multiple_requests", "1", 0);
+        // ⚠️ 移除 seekable=0，该选项会导致 HTTPS 失败
+        // av_dict_set(&options, "seekable", "0", 0);
+        
+        // 增加超时设置（避免卡住）
+        av_dict_set(&options, "rw_timeout", "10000000", 0);     // 读写超时 10秒
+        
+        LOG_INFO("TLS 参数配置完成（证书验证已禁用）");
+    }
+    
+    // 🔧 设置缓冲区大小（对于网络流很重要）
+    av_dict_set(&options, "buffer_size", "1024000", 0);  // 1MB 缓冲
+    
+    // 🔧 设置分析时长（快速开始播放）
+    av_dict_set(&options, "analyzeduration", "5000000", 0);  // 5秒
+    av_dict_set(&options, "probesize", "5000000", 0);  // 5MB
+    
     LOG_INFO("网络参数配置完成，开始打开流...");
     LOG_INFO("调用 avformat_open_input，URL: ", filename);
     
-    int ret = avformat_open_input(&format_ctx_, filename.c_str(), nullptr, &options);
+    // 🔍 在调用前打印所有配置的选项
+//    LOG_INFO("========== FFmpeg 选项配置 ==========");
+//    AVDictionaryEntry* debug_entry = nullptr;
+//    while ((debug_entry = av_dict_get(options, "", debug_entry, AV_DICT_IGNORE_SUFFIX))) {
+//        LOG_INFO("  ", debug_entry->key, " = ", debug_entry->value);
+//    }
+//    LOG_INFO("=====================================");
+    
+    // ⚠️ 对于网络协议，很多选项需要通过 URL 参数传递
+    // 构建带参数的 URL
+    std::string url_with_params = filename;
+    int ret = avformat_open_input(&format_ctx_, url_with_params.c_str(), nullptr, &options);
+    // 🔍 打印未使用的选项（用于诊断）
+//    AVDictionaryEntry* entry = nullptr;
+//    while ((entry = av_dict_get(options, "", entry, AV_DICT_IGNORE_SUFFIX))) {
+//        LOG_WARNING("未使用的 FFmpeg 选项: ", entry->key, " = ", entry->value);
+//    }
     
     // 释放 options
     av_dict_free(&options);
@@ -778,8 +849,8 @@ int PlayerCore::stream_component_open(int stream_index) {
         audio_decoder_->init(codec_ctx, audio_packet_queue_.get());
 
         LOG_INFO("音频解码器已创建");
-        
-#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+
+#ifdef HAS_SOUNDTOUCH
         // 初始化 SoundTouch（用于倍速播放）
         if (!soundtouch_) {
             soundtouch_ = new soundtouch::SoundTouch();
@@ -1365,8 +1436,8 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
             
             // 消费队列中的帧
             audio_queue_->next();
-            
-#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+
+#ifdef HAS_SOUNDTOUCH
             // 使用 SoundTouch 处理倍速播放
             double current_rate = playback_rate_.load();
             if (soundtouch_ && current_rate != 1.0) {
@@ -1532,8 +1603,8 @@ void PlayerCore::set_playback_rate(double rate) {
     if (rate > 2.0) rate = 2.0;
     
     playback_rate_.store(rate, std::memory_order_release);
-    
-#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+
+#ifdef HAS_SOUNDTOUCH
     // 更新 SoundTouch 的速度设置
     if (soundtouch_) {
         // 先清空缓冲区，避免旧数据影响新速度

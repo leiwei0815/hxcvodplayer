@@ -29,14 +29,46 @@ message(STATUS "构建类型: ${CMAKE_BUILD_TYPE}")
 message(STATUS "项目根目录: ${PROJECT_ROOT}")
 message(STATUS "========================================")
 
-# FFmpeg 路径（使用 Homebrew 安装的 FFmpeg）
-set(FFMPEG_ROOT "/opt/homebrew")
-set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
-set(FFMPEG_LIB_DIR "${FFMPEG_ROOT}/lib")
+# FFmpeg 和 SoundTouch 路径配置
+# 优先使用本地编译的静态库，否则使用 Homebrew
 
-# SoundTouch 路径（使用 Homebrew 安装的 SoundTouch）
-set(SOUNDTOUCH_INCLUDE_DIR "${FFMPEG_ROOT}/include")
-set(SOUNDTOUCH_LIB_DIR "${FFMPEG_ROOT}/lib")
+set(MACOS_FFMPEG_ROOT "${PROJECT_ROOT}/macos-third/ffmpeg-build-macos/FFmpeg-macOS")
+set(MACOS_SOUNDTOUCH_ROOT "${PROJECT_ROOT}/macos-third/soundtouch-build-macos/SoundTouch-macOS")
+
+# 检查是否存在本地编译的库
+if(EXISTS "${MACOS_FFMPEG_ROOT}/lib/libavcodec.a")
+    message(STATUS "✅ 使用本地编译的 FFmpeg 静态库")
+    set(FFMPEG_INCLUDE_DIR "${MACOS_FFMPEG_ROOT}/include")
+    set(FFMPEG_LIB_DIR "${MACOS_FFMPEG_ROOT}/lib")
+    set(USE_LOCAL_FFMPEG TRUE)
+else()
+    message(STATUS "⚠️  使用 Homebrew FFmpeg")
+    set(FFMPEG_ROOT "/opt/homebrew")
+    set(FFMPEG_INCLUDE_DIR "${FFMPEG_ROOT}/include")
+    set(FFMPEG_LIB_DIR "${FFMPEG_ROOT}/lib")
+    set(USE_LOCAL_FFMPEG FALSE)
+endif()
+
+if(EXISTS "${MACOS_SOUNDTOUCH_ROOT}/lib/libSoundTouch.a")
+    message(STATUS "✅ 使用本地编译的 SoundTouch 静态库")
+    set(SOUNDTOUCH_INCLUDE_DIR "${MACOS_SOUNDTOUCH_ROOT}/include")
+    set(SOUNDTOUCH_LIB_DIR "${MACOS_SOUNDTOUCH_ROOT}/lib")
+    set(USE_LOCAL_SOUNDTOUCH TRUE)
+    set(HAS_SOUNDTOUCH TRUE)
+else()
+    message(STATUS "⚠️  使用 Homebrew SoundTouch")
+    set(FFMPEG_ROOT "/opt/homebrew")
+    set(SOUNDTOUCH_INCLUDE_DIR "${FFMPEG_ROOT}/include")
+    set(SOUNDTOUCH_LIB_DIR "${FFMPEG_ROOT}/lib")
+    set(USE_LOCAL_SOUNDTOUCH FALSE)
+    # 检查 Homebrew 是否有 SoundTouch
+    if(EXISTS "/opt/homebrew/include/soundtouch/SoundTouch.h")
+        set(HAS_SOUNDTOUCH TRUE)
+    else()
+        message(WARNING "⚠️  未找到 SoundTouch，倍速播放功能将被禁用")
+        set(HAS_SOUNDTOUCH FALSE)
+    endif()
+endif()
 
 # 注意：macOS 原生项目不使用 SDL2
 # 音视频渲染使用 AVFoundation + AudioQueue
@@ -128,15 +160,27 @@ add_executable(HXCPlayer-macOS MACOSX_BUNDLE
 
 # 链接 FFmpeg 库
 target_link_libraries(HXCPlayer-macOS
-    # FFmpeg
-    avcodec
-    avformat
-    avutil
-    swscale
-    swresample
+    # FFmpeg（根据是否使用本地编译决定链接方式）
+    $<IF:$<BOOL:${USE_LOCAL_FFMPEG}>,
+        ${FFMPEG_LIB_DIR}/libavcodec.a
+        ${FFMPEG_LIB_DIR}/libavformat.a
+        ${FFMPEG_LIB_DIR}/libavutil.a
+        ${FFMPEG_LIB_DIR}/libswscale.a
+        ${FFMPEG_LIB_DIR}/libswresample.a,
+        avcodec
+        avformat
+        avutil
+        swscale
+        swresample
+    >
     
-    # SoundTouch
-    SoundTouch
+    # SoundTouch（根据是否使用本地编译决定链接方式）
+    $<$<BOOL:${HAS_SOUNDTOUCH}>:
+        $<IF:$<BOOL:${USE_LOCAL_SOUNDTOUCH}>,
+            ${SOUNDTOUCH_LIB_DIR}/libSoundTouch.a,
+            SoundTouch
+        >
+    >
     
     # 注意：macOS 原生项目不使用 SDL2
     # 音视频渲染使用 AVFoundation + AudioQueue
@@ -151,6 +195,10 @@ target_link_libraries(HXCPlayer-macOS
     "-framework AudioToolbox"
     "-framework QuartzCore"
     "-framework Security"
+    "-framework CoreFoundation"
+    "-framework CoreText"
+    "-framework CoreImage"
+    "-framework CoreGraphics"
     
     # 系统库
     bz2
@@ -164,10 +212,18 @@ target_compile_options(HXCPlayer-macOS PRIVATE
     -Wno-deprecated-declarations
 )
 
-# 定义 NO_SDL 宏（macOS 原生项目不使用 SDL）
-target_compile_definitions(HXCPlayer-macOS PRIVATE
-    NO_SDL=1
-)
+# 定义宏
+set(COMPILE_DEFINITIONS NO_SDL=1)
+
+# 如果找到 SoundTouch，添加 HAS_SOUNDTOUCH 宏
+if(HAS_SOUNDTOUCH)
+    list(APPEND COMPILE_DEFINITIONS HAS_SOUNDTOUCH=1)
+    message(STATUS "✅ 已启用 SoundTouch 支持（倍速播放）")
+else()
+    message(WARNING "⚠️  SoundTouch 未启用，倍速播放功能将被禁用")
+endif()
+
+target_compile_definitions(HXCPlayer-macOS PRIVATE ${COMPILE_DEFINITIONS})
 
 # 设置 macOS Bundle 属性
 set_target_properties(HXCPlayer-macOS PROPERTIES

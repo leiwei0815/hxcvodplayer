@@ -11,6 +11,7 @@
 
 #if TARGET_OS_IOS
 #import <UIKit/UIKit.h>
+#import <AVKit/AVKit.h>
 #else
 #import <AppKit/AppKit.h>
 #endif
@@ -18,6 +19,15 @@
 // 导入播放器视图
 #import "HXCPlayerView.h"
 @class HXCPlayerControl;
+
+// 日志等级，默认debug会记录所有日志，release模式下建议开启infoLevel
+typedef NS_ENUM(NSInteger, HXCPlayerLogLevel) {
+    HXCPlayerLogLevelDebug,
+    HXCPlayerLogLevelInfo,
+    HXCPlayerLogLevelWarning,
+    HXCPlayerLogLevelError
+};
+
 // 播放器状态
 typedef NS_ENUM(NSInteger, HXCPlayerState) {
     HXCPlayerStateIdle = 0,      // 空闲
@@ -53,6 +63,8 @@ typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
     HXCPlayerErrorReadFrameFailed = 12,             // 读取帧失败
     HXCPlayerErrorDecodeFailed = 13,                // 解码失败
     HXCPlayerErrorOutOfMemory = 14,                 // 内存不足
+    HXCPlayerErrorNotSupportPIPPlayer = 15,         //当前设备不支持画中画播放
+    HXCPlayerErrorAudioSessionConfigFail = 16,      //音频会话配置失败
     HXCPlayerErrorUnknown = 999,                    // 未知错误
     
     // FFmpeg 错误码范围 (负数)
@@ -80,7 +92,30 @@ typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
 
 // 网络加载状态通知（isLoading: YES=加载中，NO=加载完成）
 - (void)player:(HXCPlayerControl *)player didChangeLoadingState:(BOOL)isLoading;
+
+#if TARGET_OS_IOS
+// 画中画状态回调
+- (void)player:(HXCPlayerControl *)player 
+    pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller;
+    
+- (void)player:(HXCPlayerControl *)player 
+    pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller;
+    
+- (void)player:(HXCPlayerControl *)player 
+    pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)controller;
+    
+- (void)player:(HXCPlayerControl *)player 
+    pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller;
+
+- (void)player:(HXCPlayerControl *)player 
+    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL restored))completionHandler;
+#endif
+
 @end
+
+
+
+
 
 /**
  * @brief Apple 平台统一播放器控制类
@@ -89,6 +124,7 @@ typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
  * - 视频: AVSampleBufferDisplayLayer
  * - 音频: AudioQueue
  * - 变速: SoundTouch
+ * 
  */
 @interface HXCPlayerControl : NSObject
 
@@ -103,6 +139,14 @@ typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
 @property (nonatomic, readonly) double position;
 @property (nonatomic, strong, readonly) HXCPlayerView *videoView;  // 视频视图（自动管理布局）
 
+#if TARGET_OS_IOS
+// 画中画相关属性（仅 iOS）
+@property (nonatomic, readonly) BOOL isPictureInPictureSupported;   // 设备是否支持画中画
+@property (nonatomic, readonly) BOOL isPictureInPictureActive;      // 画中画是否正在运行
+@property (nonatomic, readonly) BOOL isPictureInPicturePossible;    // 当前是否可以启动画中画
+@property (nonatomic, assign) BOOL canStartPictureInPictureAutomaticallyFromInline API_AVAILABLE(ios(14.2));  // 是否允许自动从内联启动画中画（iOS 14.2+）
+#endif
+
 // 播放控制
 - (BOOL)openURL:(NSString *)url;                      // 打开 URL（不自动播放）
 - (BOOL)prepareToPlay:(NSString *)url;                // 准备播放（等同于 openURL，不自动播放）
@@ -112,6 +156,18 @@ typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
 - (void)stop;                                          // 停止播放并释放资源
 - (void)replay;                                        // 重新播放
 - (void)seekToPosition:(double)position;               // 跳转到指定位置
+
+#if TARGET_OS_IOS
+// 画中画控制（仅 iOS）
+- (void)startPictureInPicture;                         // 开启画中画
+- (void)stopPictureInPicture;                          // 停止画中画
+#endif
+
+/// 设置日志等级 需要在播放之前设置
++(void)setLogLevel:(HXCPlayerLogLevel)level;
+
+/// 设置日志存储路径，默认在document/HXCPlayerLogs。需要在播放之前设置
++(void)setLogDir:(NSString *)dir;
 
 @end
 

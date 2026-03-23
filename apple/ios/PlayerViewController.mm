@@ -6,6 +6,8 @@
 #import "PlayerViewController.h"
 #import "../HXCPlayerControl.h"  // 使用统一的播放器类
 
+//com.nuoshan.app
+
 @interface PlayerViewController () <HXCPlayerControlDelegate>
 
 @property (nonatomic, strong) HXCPlayerControl *player;
@@ -15,6 +17,7 @@
 @property (nonatomic, strong) UILabel *timeLabel;
 @property (nonatomic, strong) UIButton *speedButton;
 @property (nonatomic, strong) UIButton *aspectRatioButton;  // 显示模式按钮
+@property (nonatomic, strong) UIButton *pipButton;  // 画中画按钮
 @property (nonatomic, strong) UISlider *volumeSlider;
 
 @property (nonatomic, assign) BOOL isSeeking;
@@ -31,6 +34,10 @@
     // 创建播放器
     _player = [[HXCPlayerControl alloc] init];
     _player.startPosition = 67;
+    if (@available(iOS 14.2, *)) {
+        _player.canStartPictureInPictureAutomaticallyFromInline = YES;
+    }
+    
     _player.delegate = self;
     
     [self setupUI];
@@ -101,6 +108,14 @@
     [_aspectRatioButton addTarget:self action:@selector(aspectRatioButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [controlBar addSubview:_aspectRatioButton];
     
+    // 画中画按钮
+    _pipButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_pipButton setTitle:@"PiP" forState:UIControlStateNormal];
+    _pipButton.tintColor = [UIColor whiteColor];
+    _pipButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [_pipButton addTarget:self action:@selector(pipButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [controlBar addSubview:_pipButton];
+    
     // 音量滑块
     _volumeSlider = [[UISlider alloc] init];
     _volumeSlider.minimumValue = 0;
@@ -139,6 +154,11 @@
         [_speedButton.topAnchor constraintEqualToAnchor:controlBar.topAnchor constant:16],
         [_speedButton.widthAnchor constraintEqualToConstant:60],
         
+        // 画中画按钮（在倍速按钮左边）
+        [_pipButton.trailingAnchor constraintEqualToAnchor:_speedButton.leadingAnchor constant:-8],
+        [_pipButton.topAnchor constraintEqualToAnchor:controlBar.topAnchor constant:16],
+        [_pipButton.widthAnchor constraintEqualToConstant:60],
+        
         // 进度条
         [_progressSlider.leadingAnchor constraintEqualToAnchor:controlBar.leadingAnchor constant:16],
         [_progressSlider.trailingAnchor constraintEqualToAnchor:controlBar.trailingAnchor constant:-16],
@@ -168,9 +188,11 @@
 
 - (void)openTestVideo {
     // 测试网络视频
-    //    NSString *urlString = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
-    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
-//    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/0e19tzp2z8r2y8qqrhec87qqougy9hcg/hhAFpacIYZ4A.mp4";//h265
+//        NSString *urlString = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
+//    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
+//    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/4ece4b555145403697569546683/v.f1440843.mp4";//h265
+    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
+//    NSString *urlString = @"https://f18c14f8-vod-tx-cdn-cskziwl-cn.tliveapp.com/1/47/mnt/g/file/20250930/b/o/u/c6ae79da0c546e0e/k43g4cz9f5c1sva3.m3u8";
     BOOL success = [_player openURL:urlString];
     if (success) {
         NSLog(@"视频打开成功");
@@ -249,6 +271,15 @@
     _player.volume = sender.value;
 }
 
+- (void)pipButtonTapped:(UIButton *)sender {
+    // 切换画中画模式
+    if ([_player isPictureInPictureActive]) {
+        [_player stopPictureInPicture];
+    } else {
+        [_player startPictureInPicture];
+    }
+}
+
 #pragma mark - HXCPlayerControlDelegate
 
 // 状态变化
@@ -303,6 +334,43 @@
 - (void)player:(HXCPlayerControl *)player didUpdateBufferProgress:(double)position {
     // 可以在这里显示缓冲进度条
     NSLog(@"缓冲进度: %.2f", position);
+}
+
+#pragma mark - Picture in Picture Delegate
+
+- (void)player:(HXCPlayerControl *)player 
+    pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
+    NSLog(@"📺 画中画即将开始");
+}
+
+- (void)player:(HXCPlayerControl *)player 
+    pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller {
+    NSLog(@"✅ 画中画已开始");
+    // 可以隐藏播放器界面
+    // self.view.alpha = 0.5;
+}
+
+- (void)player:(HXCPlayerControl *)player 
+    pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)controller {
+    NSLog(@"📺 画中画即将停止");
+}
+
+- (void)player:(HXCPlayerControl *)player 
+    pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
+    NSLog(@"✅ 画中画已停止");
+    // 恢复播放器界面
+    // self.view.alpha = 1.0;
+}
+
+- (void)player:(HXCPlayerControl *)player 
+    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL))completionHandler {
+    NSLog(@"🔄 从画中画恢复用户界面");
+    
+    // 恢复应用界面（例如：导航回播放器页面）
+    // 这里可以添加恢复逻辑
+    
+    // 完成后调用 completionHandler
+    completionHandler(YES);
 }
 
 #pragma mark - Helper Methods

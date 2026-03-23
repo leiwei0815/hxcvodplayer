@@ -123,6 +123,7 @@ build_ffmpeg() {
         --enable-protocol=https \
         --enable-protocol=tcp \
         --enable-protocol=tls \
+        --enable-securetransport \
         --disable-encoders \
         --disable-decoders \
         --enable-decoder=h264 \
@@ -135,6 +136,7 @@ build_ffmpeg() {
         --enable-decoder=mjpeg \
         --disable-muxers \
         --disable-demuxers \
+        --enable-demuxer=hls \
         --enable-demuxer=mov \
         --enable-demuxer=mp4 \
         --enable-demuxer=m4v \
@@ -166,7 +168,7 @@ build_ffmpeg() {
         $ASM_FLAGS \
         --disable-iconv \
         --disable-bzlib \
-        --disable-zlib \
+        --enable-zlib \
         --disable-lzma
     
     echo ""

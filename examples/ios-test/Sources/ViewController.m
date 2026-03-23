@@ -50,7 +50,8 @@
     [self.view addSubview:videoView];
     
     // 测试视频 URL
-    NSString *testURL = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
+//    NSString *testURL = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
+    NSString *testURL = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
     
     // 打开视频
     [self.player openURL:testURL];
@@ -260,12 +261,11 @@
     self.statusLabel.text = [NSString stringWithFormat:@"❌ 错误: %@", error.localizedDescription];
 }
 
-- (void)playerDidUpdatePosition:(double)position duration:(double)duration {
-    // 拖动进度条时跳过更新，避免冲突
+-(void)player:(HXCPlayerControl *)player didUpdatePosition:(double)position {
     if (self.isSeeking) {
         return;
     }
-    
+    double duration = player.duration;
     // 更新进度条和时间标签
     if (duration > 0) {
         self.progressSlider.value = position / duration;
@@ -275,6 +275,7 @@
                               [self formatTime:duration]];
     }
 }
+
 
 #pragma mark - 辅助方法
 
