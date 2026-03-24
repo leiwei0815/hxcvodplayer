@@ -31,25 +31,39 @@ typedef enum {
     ASPECT_RATIO_FILL = 1   // 填充模式：等比拉伸填充，无黑边，画面会被裁剪
 } AspectRatioModeC;
 
-// ⚠️ 播放器错误码定义
+// ⚠️ 播放器错误码定义（与 C++ 层 PlayerErrorCode 保持一致，全部使用负数）
 typedef enum {
-    // 自定义错误码 (1-999)
-    PLAYER_ERROR_NONE = 0,                          // 无错误
-    PLAYER_ERROR_INVALID_URL = 1,                   // 无效的 URL
-    PLAYER_ERROR_OPEN_INPUT_FAILED = 2,             // 打开输入失败
-    PLAYER_ERROR_FIND_STREAM_INFO_FAILED = 3,       // 查找流信息失败
-    PLAYER_ERROR_NO_VIDEO_STREAM = 4,               // 没有视频流
-    PLAYER_ERROR_NO_AUDIO_STREAM = 5,               // 没有音频流
-    PLAYER_ERROR_CODEC_NOT_FOUND = 6,               // 找不到解码器
-    PLAYER_ERROR_CODEC_OPEN_FAILED = 7,             // 打开解码器失败
-    PLAYER_ERROR_ALLOC_CONTEXT_FAILED = 8,          // 分配上下文失败
-    PLAYER_ERROR_SDL_INIT_FAILED = 9,               // SDL 初始化失败
-    PLAYER_ERROR_AUDIO_DEVICE_OPEN_FAILED = 10,     // 音频设备打开失败
-    PLAYER_ERROR_SEEK_FAILED = 11,                  // Seek 操作失败
-    PLAYER_ERROR_READ_FRAME_FAILED = 12,            // 读取帧失败
-    PLAYER_ERROR_DECODE_FAILED = 13,                // 解码失败
-    PLAYER_ERROR_OUT_OF_MEMORY = 14,                // 内存不足
-    PLAYER_ERROR_UNKNOWN = 999,                     // 未知错误
+    // 自定义错误码（负数）
+    PLAYER_ERROR_NONE = 0,                              // 无错误
+    PLAYER_ERROR_INVALID_URL = -1001,                   // 无效的 URL
+    PLAYER_ERROR_OPEN_INPUT_FAILED = -1002,             // 打开输入失败
+    PLAYER_ERROR_FIND_STREAM_INFO_FAILED = -1003,       // 查找流信息失败
+    PLAYER_ERROR_NO_VIDEO_STREAM = -1004,               // 没有视频流
+    PLAYER_ERROR_NO_AUDIO_STREAM = -1005,               // 没有音频流
+    PLAYER_ERROR_CODEC_NOT_FOUND = -1006,               // 找不到解码器
+    PLAYER_ERROR_CODEC_OPEN_FAILED = -1007,             // 打开解码器失败
+    PLAYER_ERROR_ALLOC_CONTEXT_FAILED = -1008,          // 分配上下文失败
+    PLAYER_ERROR_SDL_INIT_FAILED = -1009,               // SDL 初始化失败
+    PLAYER_ERROR_AUDIO_DEVICE_OPEN_FAILED = -1010,      // 音频设备打开失败
+    PLAYER_ERROR_SEEK_FAILED = -1011,                   // Seek 操作失败
+    PLAYER_ERROR_READ_FRAME_FAILED = -1012,             // 读取帧失败
+    PLAYER_ERROR_DECODE_FAILED = -1013,                 // 解码失败
+    PLAYER_ERROR_OUT_OF_MEMORY = -1014,                 // 内存不足
+    PLAYER_ERROR_INPUT_INVALID_DATA = -1018,            // 无效数据
+    PLAYER_ERROR_NOT_SUPPORT = -1019,                   // 不支持的格式或协议
+    PLAYER_ERROR_UNKNOWN = -1099,                       // 未知错误
+    
+    // 网络相关错误 (-2001 ~ -2999)
+    PLAYER_ERROR_NET_CONNECTION_TIMEOUT = -2001,        // 网络连接超时
+    PLAYER_ERROR_NET_CONNECTION_REFUSED = -2002,        // 服务器拒绝连接
+    PLAYER_ERROR_NET_UNREACHABLE = -2003,               // 网络不可达
+    
+    // HTTP 相关错误 (-3001 ~ -3999)
+    PLAYER_ERROR_HTTP_BAD_REQUEST = -3001,              // HTTP 请求错误（400）
+    PLAYER_ERROR_HTTP_NOT_FOUND = -3002,                // HTTP 404 文件不存在
+    PLAYER_ERROR_HTTP_SERVER_ERROR = -3003,             // HTTP 服务器错误（5xx）
+    PLAYER_ERROR_HTTP_UNAUTHORIZED = -3004,             // 需要身份验证（401）
+    PLAYER_ERROR_HTTP_FORBIDDEN = -3005,                // 访问被禁止（403）
     
     // FFmpeg 错误码范围 (负数)
     // 使用 FFmpeg 原始错误码，例如：

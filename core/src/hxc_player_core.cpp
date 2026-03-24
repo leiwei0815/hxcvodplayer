@@ -245,7 +245,151 @@ int PlayerCore::open(const std::string& filename) {
     // ⚠️ 对于网络协议，很多选项需要通过 URL 参数传递
     // 构建带参数的 URL
     std::string url_with_params = filename;
-    int ret = avformat_open_input(&format_ctx_, url_with_params.c_str(), nullptr, &options);
+    
+    // 🔄 重试机制配置
+    const int MAX_RETRY_COUNT = 3;          // 最大重试次数
+    const int RETRY_DELAY_MS = 1000;        // 重试间隔（毫秒）
+    int retry_count = 0;
+    int ret = -1;
+    
+    // 尝试打开文件（支持重试）
+    while (retry_count <= MAX_RETRY_COUNT) {
+        if (retry_count > 0) {
+            LOG_WARNING("正在重试打开文件... (第 ", retry_count, "/", MAX_RETRY_COUNT, " 次)");
+            
+            // 重试前等待一段时间
+            PLAYER_DELAY(RETRY_DELAY_MS);
+            
+            // 检查是否被中止
+            if (abort_request_.load()) {
+                LOG_INFO("用户取消操作，停止重试");
+                
+                // 用户取消，回调错误
+                emit_error(AVERROR_EXIT, "用户取消了播放操作");
+                set_state(PlayerState::Stopped);
+                av_dict_free(&options);
+                return -1;
+            }
+            
+            // 重新分配 format_ctx（之前的可能已损坏）
+            if (format_ctx_) {
+                avformat_close_input(&format_ctx_);
+                format_ctx_ = nullptr;
+            }
+            format_ctx_ = avformat_alloc_context();
+            
+            // 重新设置中断回调
+            format_ctx_->interrupt_callback.callback = [](void* ctx) -> int {
+                PlayerCore* player = static_cast<PlayerCore*>(ctx);
+                return player->abort_request_.load() ? 1 : 0;
+            };
+            format_ctx_->interrupt_callback.opaque = this;
+        }
+        
+        // 尝试打开
+        ret = avformat_open_input(&format_ctx_, url_with_params.c_str(), nullptr, &options);
+        
+        // 成功则退出循环
+        if (ret == 0) {
+            if (retry_count > 0) {
+                LOG_INFO("重试成功！文件已打开");
+            } else {
+                LOG_INFO("文件打开成功");
+            }
+            break;
+        }
+        
+        // 失败，分析错误类型
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        
+        LOG_ERROR("打开文件失败 (尝试 ", retry_count + 1, "/", MAX_RETRY_COUNT + 1, ")");
+        LOG_ERROR("FFmpeg 错误码: ", ret, ", 错误信息: ", errbuf);
+        
+        // 判断是否应该重试
+        bool should_retry = false;
+        std::string error_category = "未知错误";
+        
+        // 网络相关错误应该重试
+        if (ret == AVERROR(ETIMEDOUT) ||        // 超时
+            ret == AVERROR(ECONNREFUSED) ||     // 连接被拒绝
+            ret == AVERROR(ENETUNREACH) ||      // 网络不可达
+            ret == AVERROR(EIO) ||              // I/O 错误
+            ret == AVERROR(EAGAIN)) {           // 资源暂时不可用
+            should_retry = true;
+            error_category = "网络错误";
+            LOG_INFO("检测到网络错误，将进行重试");
+        }
+        
+        // 服务器错误可能需要重试
+        if (ret == AVERROR_HTTP_BAD_REQUEST ||
+            ret == AVERROR_HTTP_SERVER_ERROR) {
+            should_retry = true;
+            error_category = "服务器错误";
+            LOG_INFO("检测到服务器错误，将进行重试");
+        }
+        
+        // 某些错误不应该重试 - 立即回调并退出
+        if (ret == AVERROR(ENOENT)) {           // 文件不存在
+            should_retry = false;
+            error_category = "文件不存在";
+            LOG_ERROR("检测到不可恢复错误：文件不存在，立即停止");
+            
+            // 立即回调错误
+            emit_error(ERROR_INVALID_URL, "文件不存在: " + filename + " (错误码: " + std::to_string(ERROR_INVALID_URL) + ", " + std::string(errbuf) + ")");
+            set_state(PlayerState::Error);
+            av_dict_free(&options);
+            return -1;
+        }
+        
+        if (ret == AVERROR(EACCES)) {           // 权限拒绝
+            should_retry = false;
+            error_category = "权限拒绝";
+            LOG_ERROR("检测到不可恢复错误：权限拒绝，立即停止");
+            
+            // 立即回调错误
+            emit_error(ERROR_OPEN_INPUT_FAILED, "无权限访问: " + filename + " (错误码: " + std::to_string(ERROR_OPEN_INPUT_FAILED) + ", " + std::string(errbuf) + ")");
+            set_state(PlayerState::Error);
+            av_dict_free(&options);
+            return -1;
+        }
+        
+        if (ret == AVERROR_INVALIDDATA) {       // 无效数据
+            should_retry = false;
+            error_category = "无效数据";
+            LOG_ERROR("检测到不可恢复错误：无效数据格式，立即停止");
+            
+            // 立即回调错误
+            emit_error(ERROR_INPUT_INVALID_DATA, "文件格式无效或损坏: " + filename + " (错误码: " + std::to_string(ERROR_INPUT_INVALID_DATA) + ", " + std::string(errbuf) + ")");
+            set_state(PlayerState::Error);
+            av_dict_free(&options);
+            return -1;
+        }
+        
+        if (ret == AVERROR_PATCHWELCOME) {      // 功能未实现
+            should_retry = false;
+            error_category = "功能未实现";
+            LOG_ERROR("检测到不可恢复错误：功能未实现，立即停止");
+            
+            // 立即回调错误
+            emit_error(ERROR_NOT_SUPPORT, "不支持的格式或协议: " + filename + " (错误码: " + std::to_string(ERROR_NOT_SUPPORT) + ", " + std::string(errbuf) + ")");
+            set_state(PlayerState::Error);
+            av_dict_free(&options);
+            return -1;
+        }
+        
+        // 如果不应该重试或已达到最大重试次数，退出循环
+        if (!should_retry || retry_count >= MAX_RETRY_COUNT) {
+            // 记录错误类别，用于最终错误消息
+            if (retry_count >= MAX_RETRY_COUNT) {
+                LOG_ERROR("已达到最大重试次数，停止重试");
+            }
+            break;
+        }
+        
+        retry_count++;
+    }
+    
     // 🔍 打印未使用的选项（用于诊断）
 //    AVDictionaryEntry* entry = nullptr;
 //    while ((entry = av_dict_get(options, "", entry, AV_DICT_IGNORE_SUFFIX))) {
@@ -255,24 +399,71 @@ int PlayerCore::open(const std::string& filename) {
     // 释放 options
     av_dict_free(&options);
     
+    // 最终检查结果
     if (ret < 0) {
         char errbuf[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, errbuf, sizeof(errbuf));
+        
+        // 构建详细的错误消息
+        std::string error_message;
+        
+        if (retry_count > 0) {
+            LOG_ERROR("重试 ", retry_count, " 次后仍然失败");
+            error_message = "重试 " + std::to_string(retry_count) + " 次后仍然失败: ";
+        } else {
+            error_message = "打开文件失败: ";
+        }
+        PlayerErrorCode code = ERROR_NONE;
+        // 根据错误类型提供更友好的错误消息
+        if (ret == AVERROR(ETIMEDOUT)) {
+            error_message += "连接超时，请检查网络连接";
+            code = ERROR_NET_CONNECTION_TIMEOUT;
+        } else if (ret == AVERROR(ECONNREFUSED)) {
+            error_message += "服务器拒绝连接";
+            code = ERROR_NET_CONNECTION_REFUSED;
+        } else if (ret == AVERROR(ENETUNREACH)) {
+            error_message += "网络不可达，请检查网络设置";
+            code = ERROR_INPUT_INVALID_DATA;
+        } else if (ret == AVERROR(EIO)) {
+            code = ERROR_OPEN_INPUT_FAILED;
+            error_message += "I/O 错误，可能是网络问题";
+        } else if (ret == AVERROR_HTTP_BAD_REQUEST) {
+            code = ERROR_HTTP_BAD_REQUEST;
+            error_message += "HTTP 请求错误（400）";
+        } else if (ret == AVERROR_HTTP_NOT_FOUND) {
+            code = ERROR_HTTP_NOT_FOUND;
+            error_message += "文件不存在（404）";
+        } else if (ret == AVERROR_HTTP_SERVER_ERROR) {
+            code = ERROR_HTTP_SERVER_ERROR;
+            error_message += "服务器内部错误（5xx）";
+        } else if (ret == AVERROR_HTTP_UNAUTHORIZED) {
+            code = ERROR_HTTP_UNAUTHORIZED;
+            error_message += "需要身份验证（401）";
+        } else if (ret == AVERROR_HTTP_FORBIDDEN) {
+            code = ERROR_HTTP_FORBIDDEN;
+            error_message += "访问被禁止（403）";
+        } else {
+            error_message += filename;
+            code = ERROR_UNKNOWN;
+        }
+        
+        error_message += " (错误码: " + std::to_string(code) + ", " + std::string(errbuf) + ")";
+        
         LOG_ERROR("无法打开文件: ", filename);
         LOG_ERROR("FFmpeg 错误码: ", ret, ", 错误信息: ", errbuf);
-        emit_error(ret, "无法打开文件: " + filename + " (错误: " + std::string(errbuf) + ")");
+        
+        // 发送错误回调给外层
+        emit_error(code, error_message);
         set_state(PlayerState::Error);
         return -1;
     }
-    
-    LOG_INFO("文件打开成功");
     
     // 获取流信息
     ret = avformat_find_stream_info(format_ctx_, nullptr);
     if (ret < 0) {
         char errbuf[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, errbuf, sizeof(errbuf));
-        emit_error(ret, "无法获取流信息 (错误: " + std::string(errbuf) + ")");
+        emit_error(ERROR_FIND_STREAM_INFO_FAILED, "无法获取流信息 (错误: " + std::string(errbuf) + ")");
         set_state(PlayerState::Error);
         return -1;
     }
@@ -352,7 +543,7 @@ int PlayerCore::open(const std::string& filename) {
         LOG_INFO("打开视频流...");
         if (stream_component_open(video_stream_) < 0) {
             LOG_ERROR("无法打开视频流");
-            emit_error(PLAYER_ERROR_CODEC_OPEN_FAILED, "无法打开视频流");
+            emit_error(ERROR_NO_VIDEO_STREAM, "无法打开视频流");
             // 注意：继续尝试打开音频流，不直接返回错误
         } else {
             LOG_INFO("视频流打开成功, 分辨率: ", media_info_.video_width, "x", media_info_.video_height);
@@ -363,7 +554,7 @@ int PlayerCore::open(const std::string& filename) {
         LOG_INFO("打开音频流...");
         if (stream_component_open(audio_stream_) < 0) {
             LOG_ERROR("无法打开音频流");
-            emit_error(PLAYER_ERROR_CODEC_OPEN_FAILED, "无法打开音频流");
+            emit_error(ERROR_NO_AUDIO_STREAM, "无法打开音频流");
             // 注意：继续播放，不直接返回错误（可能是纯视频文件）
         } else {
             LOG_INFO("音频流打开成功, 采样率: ", media_info_.audio_sample_rate, " Hz");
@@ -373,7 +564,7 @@ int PlayerCore::open(const std::string& filename) {
     // ⚠️ 如果视频和音频都没有打开成功，则报错
     if (!video_decoder_ && !audio_decoder_) {
         LOG_ERROR("无法打开任何媒体流");
-        emit_error(PLAYER_ERROR_NO_VIDEO_STREAM, "无法打开任何视频或音频流");
+        emit_error(ERROR_FIND_STREAM_INFO_FAILED, "无法打开任何视频或音频流");
         set_state(PlayerState::Error);
         return -1;
     }
@@ -1378,7 +1569,7 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
             if (!swr_ctx_) {
                 AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_STEREO;
                 av_channel_layout_copy(&out_ch_layout, &audio_codec_ctx_->ch_layout);
-                
+
                 swr_alloc_set_opts2(&swr_ctx_,
                     &out_ch_layout,
                     AV_SAMPLE_FMT_S16,
@@ -1387,8 +1578,19 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
                     audio_codec_ctx_->sample_fmt,
                     audio_codec_ctx_->sample_rate,
                     0, nullptr);
+
+                if (!swr_ctx_) {
+                    LOG_ERROR("重采样上下文分配失败");
+                    emit_error(ERROR_ALLOC_CONTEXT_FAILED, "音频重采样上下文分配失败");
+                    audio_queue_->next();
+                    return;
+                }
                 
-                if (!swr_ctx_ || swr_init(swr_ctx_) < 0) {
+                if (swr_init(swr_ctx_) < 0) {
+                    LOG_ERROR("重采样上下文初始化失败");
+                    emit_error(ERROR_ALLOC_CONTEXT_FAILED, "音频重采样上下文初始化失败");
+                    swr_free(&swr_ctx_);
+                    swr_ctx_ = nullptr;
                     audio_queue_->next();
                     return;
                 }
@@ -1400,32 +1602,43 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
                 audio_codec_ctx_->sample_rate,
                 audio_codec_ctx_->sample_rate,
                 AV_ROUND_UP));
-            
+
             int out_size = av_samples_get_buffer_size(
                 nullptr,
                 audio_codec_ctx_->ch_layout.nb_channels,
                 out_samples,
                 AV_SAMPLE_FMT_S16,
                 1);
-            
+
             if (out_size < 0) {
+                LOG_ERROR("计算音频缓冲区大小失败: ", out_size);
+                emit_error(ERROR_OUT_OF_MEMORY, "计算音频缓冲区大小失败");
                 audio_queue_->next();
                 return;
             }
-            
+
             // 分配输出缓冲区
             if (!audio_buf_ || audio_buf_size_ < (unsigned int)out_size) {
                 av_free(audio_buf_);
                 audio_buf_ = (uint8_t*)av_malloc(out_size);
+                if (!audio_buf_) {
+                    LOG_ERROR("音频缓冲区内存分配失败: ", out_size, " 字节");
+                    emit_error(ERROR_OUT_OF_MEMORY, "音频缓冲区内存分配失败");
+                    audio_buf_size_ = 0;
+                    audio_queue_->next();
+                    return;
+                }
                 audio_buf_size_ = out_size;
             }
-            
+
             // 执行重采样
             uint8_t* out[] = {audio_buf_};
             int samples = swr_convert(swr_ctx_, out, out_samples,
                                      (const uint8_t**)frame->data, frame->nb_samples);
-            
+
             if (samples < 0) {
+                LOG_ERROR("音频重采样失败: ", samples);
+                emit_error(ERROR_DECODE_FAILED, "音频重采样失败");
                 audio_queue_->next();
                 return;
             }
@@ -1443,55 +1656,86 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
             if (soundtouch_ && current_rate != 1.0) {
                 int channels = audio_codec_ctx_->ch_layout.nb_channels;
                 
-                // 转换为 float
-                std::vector<float> float_input(samples * channels);
-                int16_t* s16_src = (int16_t*)audio_buf_;
-                for (int i = 0; i < samples * channels; i++) {
-                    float_input[i] = (float)s16_src[i] / 32768.0f;
-                }
-                
-                // 送入样本到 SoundTouch
-                soundtouch_->putSamples(float_input.data(), samples);
-                
-                // 获取可用样本数
-                uint32_t available = soundtouch_->numSamples();
-                
-                // 计算期望输出样本数（基于输入和速率）
-                uint32_t expected_output = (uint32_t)(samples / current_rate);
-                
-                // 只有当积累的样本 >= 期望输出的 80% 时才取出
-                if (available >= expected_output * 0.8) {
-                    uint32_t samples_to_get = std::max(available, expected_output);
-                    std::vector<float> output_buffer(samples_to_get * channels);
-                    uint32_t received = soundtouch_->receiveSamples(output_buffer.data(), samples_to_get);
+                // 验证 channels 有效性
+                if (channels <= 0 || channels > 8) {
+                    LOG_ERROR("无效的音频通道数: ", channels);
+                    emit_error(ERROR_DECODE_FAILED, "音频通道数无效 (channels: " + std::to_string(channels) + ")");
+                    // 降级：使用原始音频
+                    audio_buf_size_ = samples * std::max(2, channels) * sizeof(int16_t);
+                    audio_buf_index_ = 0;
+                } else {
+                    // 转换为 float
+                    std::vector<float> float_input(samples * channels);
+                    int16_t* s16_src = (int16_t*)audio_buf_;
+                    for (int i = 0; i < samples * channels; i++) {
+                        float_input[i] = (float)s16_src[i] / 32768.0f;
+                    }
                     
-                    if (received > 0) {
-                        // 转换回 S16
-                        int out_size = received * channels * sizeof(int16_t);
-                        if (audio_buf_size_ < (unsigned int)out_size) {
-                            av_free(audio_buf_);
-                            audio_buf_ = (uint8_t*)av_malloc(out_size * 2);
-                        }
+                    try {
+                        // 送入样本到 SoundTouch
+                        soundtouch_->putSamples(float_input.data(), samples);
                         
-                        int16_t* s16_dst = (int16_t*)audio_buf_;
-                        for (size_t i = 0; i < received * channels; i++) {
-                            float sample = output_buffer[i];
-                            if (sample > 1.0f) sample = 1.0f;
-                            if (sample < -1.0f) sample = -1.0f;
-                            s16_dst[i] = (int16_t)(sample * 32767.0f);
-                        }
+                        // 获取可用样本数
+                        uint32_t available = soundtouch_->numSamples();
                         
-                        audio_buf_size_ = out_size;
+                        // 计算期望输出样本数（基于输入和速率）
+                        uint32_t expected_output = (uint32_t)(samples / current_rate);
+                        
+                        // 只有当积累的样本 >= 期望输出的 80% 时才取出
+                        if (available >= expected_output * 0.8) {
+                            uint32_t samples_to_get = std::max(available, expected_output);
+                            std::vector<float> output_buffer(samples_to_get * channels);
+                            uint32_t received = soundtouch_->receiveSamples(output_buffer.data(), samples_to_get);
+                            
+                            if (received > 0) {
+                                // 转换回 S16
+                                int out_size = received * channels * sizeof(int16_t);
+                                if (audio_buf_size_ < (unsigned int)out_size) {
+                                    av_free(audio_buf_);
+                                    audio_buf_ = (uint8_t*)av_malloc(out_size * 2);
+                                    if (!audio_buf_) {
+                                        LOG_ERROR("SoundTouch 输出缓冲区内存分配失败: ", out_size * 2, " 字节");
+                                        emit_error(ERROR_OUT_OF_MEMORY, "SoundTouch 输出缓冲区内存分配失败");
+                                        // 降级：输出静音
+                                        audio_buf_size_ = 0;
+                                        audio_buf_index_ = 0;
+                                        return;
+                                    }
+                                }
+                                
+                                int16_t* s16_dst = (int16_t*)audio_buf_;
+                                for (size_t i = 0; i < received * channels; i++) {
+                                    float sample = output_buffer[i];
+                                    if (sample > 1.0f) sample = 1.0f;
+                                    if (sample < -1.0f) sample = -1.0f;
+                                    s16_dst[i] = (int16_t)(sample * 32767.0f);
+                                }
+                                
+                                audio_buf_size_ = out_size;
+                                audio_buf_index_ = 0;
+                            } else {
+                                // 降级：使用原始音频
+                                audio_buf_size_ = samples * channels * sizeof(int16_t);
+                                audio_buf_index_ = 0;
+                            }
+                        } else {
+                            // SoundTouch 积累中，输出静音
+                            audio_buf_size_ = 0;
+                            audio_buf_index_ = 0;
+                        }
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("SoundTouch 处理异常: ", e.what());
+                        emit_error(ERROR_DECODE_FAILED, std::string("SoundTouch 音频处理失败: ") + e.what());
+                        // 降级：使用原始音频
+                        audio_buf_size_ = samples * channels * sizeof(int16_t);
                         audio_buf_index_ = 0;
-                    } else {
+                    } catch (...) {
+                        LOG_ERROR("SoundTouch 处理未知异常");
+                        emit_error(ERROR_DECODE_FAILED, "SoundTouch 音频处理发生未知错误");
                         // 降级：使用原始音频
                         audio_buf_size_ = samples * channels * sizeof(int16_t);
                         audio_buf_index_ = 0;
                     }
-                } else {
-                    // SoundTouch 积累中，输出静音
-                    audio_buf_size_ = 0;
-                    audio_buf_index_ = 0;
                 }
             } else {
                 // 1.0x 速度或 SoundTouch 未启用，使用原始音频

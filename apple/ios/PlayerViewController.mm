@@ -189,10 +189,12 @@
 - (void)openTestVideo {
     // 测试网络视频
 //        NSString *urlString = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
-//    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
+    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
 //    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/4ece4b555145403697569546683/v.f1440843.mp4";//h265
-    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
+//    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
 //    NSString *urlString = @"https://f18c14f8-vod-tx-cdn-cskziwl-cn.tliveapp.com/1/47/mnt/g/file/20250930/b/o/u/c6ae79da0c546e0e/k43g4cz9f5c1sva3.m3u8";
+//    NSString *urlString = @"/path/to/nonexistent.mp4"; // 错误码: -1001, No such file or directory
+//    NSString *urlString = @"https://example.com/nonexistent-video.mp4";
     BOOL success = [_player openURL:urlString];
     if (success) {
         NSLog(@"视频打开成功");
