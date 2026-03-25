@@ -47,6 +47,7 @@
 - (void)setupPlayer {
     // 创建播放器
     _player = [[HXCPlayerControl alloc] init];
+    _player.startPosition = 60;
     _player.delegate = self;
     // 添加视频视图
     [self.view addSubview:_player.videoView];
@@ -304,8 +305,8 @@
     NSTextField *input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 400, 24)];
     input.placeholderString = @"https://example.com/video.mp4";
 //    input.stringValue = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
-//    input.stringValue = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
-    input.stringValue = @"https://v.shkt.online/772388bdvodtranscq1317978474/4ece4b555145403697569546683/v.f1440843.mp4";
+    input.stringValue = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
+//    input.stringValue = @"https://v.shkt.online/772388bdvodtranscq1317978474/4ece4b555145403697569546683/v.f1440843.mp4";
 //    input.stringValue = @"https://vod.tenwiseacademy.cn/111453136245362688/0e19tzp2z8r2y8qqrhec87qqougy9hcg/hhAFpacIYZ4A.mp4";//h265
     alert.accessoryView = input;
     
@@ -412,8 +413,21 @@
 
 - (void)openURL:(NSString *)urlString {
     [_player stop];
-
-    if ([_player prepareToPlay:urlString]) {
+    BOOL success = NO;
+#if 1
+    HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeCustomHTTP;  // 或者 HXCPlayerDataSourceModeDefault
+    // 配置参数（可选，不传则使用默认值）
+    HXCPlayerDataSourceConfig *config = [HXCPlayerDataSourceConfig defaultConfig];
+    config.timeoutMs = 30000;           // 30秒超时
+    config.maxRetries = 3;              // 最多重试3次
+    config.cacheSize = 2 * 1024 * 1024; // 2MB 缓存
+    config.avioBufferSize = 64 * 1024;  // 64KB AVIO 缓冲区
+    success = [_player openURL:urlString withMode:mode config:config];
+#else
+    success = [_player prepareToPlay:urlString];
+#endif
+    
+    if (success) {
         [_player play];
     } else {
         NSAlert *alert = [[NSAlert alloc] init];

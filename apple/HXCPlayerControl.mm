@@ -3,9 +3,20 @@
  * @brief Apple 平台统一播放器实现（支持 iOS 和 macOS）
  */
 
+// 只包含 C 桥接层（不包含 FFmpeg 头文件）
 #include "hxc_player_core_c_bridge.h"
+
+// 包含 Objective-C 头文件
 #import "HXCPlayerControl.h"
 #import "HXCPlayerView.h"
+
+// 包含 AVFoundation（没有冲突）
+#import <AVFoundation/AVFoundation.h>
+#if TARGET_OS_IOS
+#import <AVKit/AVKit.h>
+#endif
+
+// 系统框架
 #include <AudioToolbox/AudioToolbox.h>
 
 // C++ 播放器包装器
@@ -158,6 +169,32 @@ static void loading_callback_c(bool is_loading, void* user_data) {
     });
 }
 
+// ========== HXCPlayerDataSourceConfig 实现 ==========
+@implementation HXCPlayerDataSourceConfig
+
++ (instancetype)defaultConfig {
+    HXCPlayerDataSourceConfig *config = [[HXCPlayerDataSourceConfig alloc] init];
+    config.timeoutMs = 30000;           // 30秒
+    config.maxRetries = 3;              // 重试3次
+    config.cacheSize = 2 * 1024 * 1024; // 2MB
+    config.avioBufferSize = 64 * 1024;  // 64KB
+    return config;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        // 使用默认值
+        self.timeoutMs = 30000;
+        self.maxRetries = 3;
+        self.cacheSize = 2 * 1024 * 1024;
+        self.avioBufferSize = 64 * 1024;
+    }
+    return self;
+}
+
+@end
+
 @implementation HXCPlayerControl
 
 - (instancetype)init {
@@ -257,34 +294,104 @@ static void loading_callback_c(bool is_loading, void* user_data) {
     } else {
         ret = player_core_open(_wrapper->handle(), url.UTF8String);
     }
-    
+
     if (ret != 0) {
         return NO;
     }
-    
+
     int sampleRate = player_core_get_audio_sample_rate(_wrapper->handle());
     int channels = player_core_get_audio_channels(_wrapper->handle());
     _duration = player_core_get_duration(_wrapper->handle());
     _videoWidth = player_core_get_video_width(_wrapper->handle());
     _videoHeight = player_core_get_video_height(_wrapper->handle());
     
-    if (sampleRate > 0) {
-        [self setupAudioQueue:sampleRate channels:channels];
+    [self setupAudioQueue:sampleRate channels:channels];
+
+    // 如果设置了起始播放位置，更新 controlTimebase
+    if (_startPosition > 0) {
+        if (_videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
+            CMTime newTime = CMTimeMake((int64_t)(_startPosition * 1000000), 1000000);
+            CMTimebaseSetTime(_videoView.videoLayer.controlTimebase, newTime);
+            CMTimebaseSetRate(_videoView.videoLayer.controlTimebase, 1.0);
+        }
     }
-    
-    // ⚠️ 如果设置了开始播放时间，需要更新 controlTimebase
-    if (_startPosition > 0 && _videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
-        CMTime startTime = CMTimeMake(_startPosition * 1000000, 1000000);
-        CMTimebaseSetTime(_videoView.videoLayer.controlTimebase, startTime);
-        NSLog(@"[打开文件] 设置 controlTimebase 开始时间: %.2f 秒", _startPosition);
-    }
-    
+
+    // 启动视频渲染定时器
     [self startDisplayLink];
-    player_core_pause(_wrapper->handle());
-    if (_audioQueue && _audioQueueRunning) {
-        AudioQueuePause(_audioQueue);
-        _audioQueueRunning = NO;
+
+    return YES;
+}
+
+// ✨ 使用指定数据源模式打开（推荐方式）
+- (BOOL)openURL:(NSString *)url withMode:(HXCPlayerDataSourceMode)mode config:(HXCPlayerDataSourceConfig *)config {
+    if (!url || url.length == 0) {
+        return NO;
     }
+    
+    [self stop];
+    _playerUrl = [url copy];
+    
+    // 使用默认配置（如果没有提供）
+    if (!config) {
+        config = [HXCPlayerDataSourceConfig defaultConfig];
+    }
+    
+    // 转换配置参数到 C 结构
+    PlayerDataSourceConfigC cConfig;
+    cConfig.timeout_ms = (int)config.timeoutMs;
+    cConfig.max_retries = (int)config.maxRetries;
+    cConfig.cache_size = config.cacheSize;
+    cConfig.avio_buffer_size = config.avioBufferSize;
+    
+    // 转换模式枚举
+    PlayerDataSourceModeC cMode;
+    switch (mode) {
+        case HXCPlayerDataSourceModeDefault:
+            cMode = PLAYER_DATA_SOURCE_MODE_DEFAULT;
+            break;
+        case HXCPlayerDataSourceModeCustomHTTP:
+            cMode = PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP;
+            break;
+        default:
+            cMode = PLAYER_DATA_SOURCE_MODE_DEFAULT;
+            break;
+    }
+    
+    // 调用底层 C 接口
+    int ret = player_core_open_with_mode(_wrapper->handle(), url.UTF8String, cMode, &cConfig, _startPosition);
+    
+    if (ret != 0) {
+        NSLog(@"❌ 打开失败: mode=%ld, ret=%d", (long)mode, ret);
+        return NO;
+    }
+    
+    // 获取媒体信息
+    int sampleRate = player_core_get_audio_sample_rate(_wrapper->handle());
+    int channels = player_core_get_audio_channels(_wrapper->handle());
+    _duration = player_core_get_duration(_wrapper->handle());
+    _videoWidth = player_core_get_video_width(_wrapper->handle());
+    _videoHeight = player_core_get_video_height(_wrapper->handle());
+    
+    NSLog(@"✅ 使用模式 %ld 打开成功", (long)mode);
+    NSLog(@"   URL: %@", url);
+    NSLog(@"   时长: %.2f 秒", _duration);
+    NSLog(@"   分辨率: %d x %d", _videoWidth, _videoHeight);
+    NSLog(@"   音频: %d Hz, %d 通道", sampleRate, channels);
+    
+    [self setupAudioQueue:sampleRate channels:channels];
+    
+    // 如果设置了起始播放位置，更新 controlTimebase
+    if (_startPosition > 0) {
+        if (_videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
+            CMTime newTime = CMTimeMake((int64_t)(_startPosition * 1000000), 1000000);
+            CMTimebaseSetTime(_videoView.videoLayer.controlTimebase, newTime);
+            CMTimebaseSetRate(_videoView.videoLayer.controlTimebase, 1.0);
+        }
+    }
+    
+    // 启动视频渲染定时器
+    [self startDisplayLink];
+    
     return YES;
 }
 
@@ -1000,34 +1107,30 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 
 - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
     NSLog(@"📺 画中画即将开始");
-    
-    if ([_delegate respondsToSelector:@selector(player:pictureInPictureControllerWillStartPictureInPicture:)]) {
-        [_delegate player:self pictureInPictureControllerWillStartPictureInPicture:pictureInPictureController];
+    if ([_delegate respondsToSelector:@selector(player:pictureInPictureStateDidChange:)]) {
+        [_delegate player:self pictureInPictureStateDidChange:HXCPlayerPIPStateWillStart];
     }
 }
 
 - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
     NSLog(@"✅ 画中画已开始");
     [self invalidatePictureInPicturePlaybackStateIfNeeded];
-    
-    if ([_delegate respondsToSelector:@selector(player:pictureInPictureControllerDidStartPictureInPicture:)]) {
-        [_delegate player:self pictureInPictureControllerDidStartPictureInPicture:pictureInPictureController];
+    if ([_delegate respondsToSelector:@selector(player:pictureInPictureStateDidChange:)]) {
+        [_delegate player:self pictureInPictureStateDidChange:HXCPlayerPIPStateDidStart];
     }
 }
 
 - (void)pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
     NSLog(@"📺 画中画即将停止");
-    
-    if ([_delegate respondsToSelector:@selector(player:pictureInPictureControllerWillStopPictureInPicture:)]) {
-        [_delegate player:self pictureInPictureControllerWillStopPictureInPicture:pictureInPictureController];
+    if ([_delegate respondsToSelector:@selector(player:pictureInPictureStateDidChange:)]) {
+        [_delegate player:self pictureInPictureStateDidChange:HXCPlayerPIPStateWillStop];
     }
 }
 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
     NSLog(@"✅ 画中画已停止");
-    
-    if ([_delegate respondsToSelector:@selector(player:pictureInPictureControllerDidStopPictureInPicture:)]) {
-        [_delegate player:self pictureInPictureControllerDidStopPictureInPicture:pictureInPictureController];
+    if ([_delegate respondsToSelector:@selector(player:pictureInPictureStateDidChange:)]) {
+        [_delegate player:self pictureInPictureStateDidChange:HXCPlayerPIPStateDidStop];
     }
 }
 
@@ -1050,6 +1153,10 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     } else {
         // 如果 delegate 没有实现，直接完成
         completionHandler(YES);
+    }
+    //已经恢复
+    if ([_delegate respondsToSelector:@selector(player:pictureInPictureStateDidChange:)]) {
+        [_delegate player:self pictureInPictureStateDidChange:HXCPlayerPIPStateRestore];
     }
 }
 

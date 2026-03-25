@@ -74,6 +74,20 @@ typedef enum {
     // 可以使用 av_strerror() 将负数错误码转换为错误信息
 } PlayerErrorCodeC;
 
+// ⚠️ 数据源模式（与 C++ 层 DataSourceMode 保持一致）
+typedef enum {
+    PLAYER_DATA_SOURCE_MODE_DEFAULT = 0,      // 默认模式（FFmpeg 直接打开）
+    PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP = 1,  // 自定义 HTTP Range 下载器
+} PlayerDataSourceModeC;
+
+// ⚠️ 自定义数据源配置（与 C++ 层 CustomDataSourceConfig 保持一致）
+typedef struct {
+    int timeout_ms;           // 超时时间（毫秒），默认 30000
+    int max_retries;          // 最大重试次数，默认 3
+    size_t cache_size;        // 缓存大小（字节），默认 2MB
+    size_t avio_buffer_size;  // AVIO 缓冲区大小（字节），默认 64KB
+} PlayerDataSourceConfigC;
+
 // 创建/销毁播放器
 PlayerCoreHandle* player_core_create(void);
 void player_core_destroy(PlayerCoreHandle* handle);
@@ -81,6 +95,7 @@ void player_core_destroy(PlayerCoreHandle* handle);
 // 播放控制
 int player_core_open(PlayerCoreHandle* handle, const char* url);
 int player_core_open_with_start_position(PlayerCoreHandle* handle, const char* url, double start_pos);
+int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, PlayerDataSourceModeC mode, const PlayerDataSourceConfigC* config, double start_position);
 void player_core_play(PlayerCoreHandle* handle);
 void player_core_pause(PlayerCoreHandle* handle);
 void player_core_stop(PlayerCoreHandle* handle);

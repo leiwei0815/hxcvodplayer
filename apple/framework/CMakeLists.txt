@@ -35,6 +35,7 @@ set(CORE_SOURCES
     ${PROJECT_ROOT}/core/src/hxc_player_types.cpp
     ${PROJECT_ROOT}/core/src/hxc_packet_queue.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_core_c_bridge.cpp
+    ${PROJECT_ROOT}/core/src/hxc_custom_io.cpp
 )
 
 # Apple 平台 Objective-C++ 源文件
@@ -58,6 +59,7 @@ set(PRIVATE_HEADERS
     ${PROJECT_ROOT}/core/include/hxc_packet_queue.h
     ${PROJECT_ROOT}/core/include/hxc_frame_queue.h
     ${PROJECT_ROOT}/core/include/hxc_player_core_c_bridge.h
+    ${PROJECT_ROOT}/core/include/hxc_custom_io.h
     ${PROJECT_ROOT}/core/include/hxc_logger.h
     ${PROJECT_ROOT}/core/include/hxc_debug_helper.h
 )
@@ -269,6 +271,7 @@ target_link_libraries(HXCPlayer PUBLIC
     "-framework VideoToolbox"
     "-framework CoreGraphics"
     "-framework Security"
+    "-framework CFNetwork"
     "-lz"
     "-lbz2"
     "-liconv"

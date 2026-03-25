@@ -80,6 +80,7 @@ set(CORE_SOURCES
     ${PROJECT_ROOT}/core/src/hxc_player_types.cpp
     ${PROJECT_ROOT}/core/src/hxc_packet_queue.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_core_c_bridge.cpp
+    ${PROJECT_ROOT}/core/src/hxc_custom_io.cpp
 )
 
 # 核心库头文件
@@ -92,6 +93,7 @@ set(CORE_HEADERS
     ${PROJECT_ROOT}/core/include/hxc_logger.h
     ${PROJECT_ROOT}/core/include/hxc_debug_helper.h
     ${PROJECT_ROOT}/core/include/hxc_player_core_c_bridge.h
+    ${PROJECT_ROOT}/core/include/hxc_custom_io.h
 )
 
 # iOS 源文件（使用统一的播放器类）
@@ -136,6 +138,28 @@ add_executable(YXVodPlayer-iOS MACOSX_BUNDLE
     ${IOS_HEADERS}
 )
 
+# 设置包含目录（确保对所有源文件生效，包括设置了 -x c++ 的文件）
+target_include_directories(YXVodPlayer-iOS PRIVATE
+    ${PROJECT_ROOT}/core/include
+    ${FFMPEG_INCLUDE_DIR}
+)
+
+# 如果有 SoundTouch，添加其包含目录
+if(HAS_SOUNDTOUCH)
+    target_include_directories(YXVodPlayer-iOS PRIVATE ${SOUNDTOUCH_INCLUDE_DIR})
+endif()
+
+# 强制设置 Xcode 的 HEADER_SEARCH_PATHS
+if(HAS_SOUNDTOUCH)
+    set_target_properties(YXVodPlayer-iOS PROPERTIES
+        XCODE_ATTRIBUTE_HEADER_SEARCH_PATHS "${PROJECT_ROOT}/core/include ${FFMPEG_INCLUDE_DIR} ${SOUNDTOUCH_INCLUDE_DIR}"
+    )
+else()
+    set_target_properties(YXVodPlayer-iOS PROPERTIES
+        XCODE_ATTRIBUTE_HEADER_SEARCH_PATHS "${PROJECT_ROOT}/core/include ${FFMPEG_INCLUDE_DIR}"
+    )
+endif()
+
 # 链接库
 target_link_libraries(YXVodPlayer-iOS
     # FFmpeg
@@ -157,6 +181,7 @@ target_link_libraries(YXVodPlayer-iOS
     "-framework CoreGraphics"
     "-framework QuartzCore"
     "-framework Security"
+    "-framework CFNetwork"
     
     # 系统库
     bz2

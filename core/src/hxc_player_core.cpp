@@ -156,10 +156,8 @@ int PlayerCore::open(const std::string& filename) {
     playback_completed_notified_ = false;  // ⚠️ 重置播放完成通知标志
 
     set_state(PlayerState::Opening);
-
     // 打开输入文件
     format_ctx_ = avformat_alloc_context();
-    
     // 🔧 设置中断回调（防止网络卡住导致无限等待）
     format_ctx_->interrupt_callback.callback = [](void* ctx) -> int {
         PlayerCore* player = static_cast<PlayerCore*>(ctx);
@@ -532,6 +530,10 @@ int PlayerCore::open(const std::string& filename) {
                 LOG_INFO("初始 seek 成功，将从 ", config_.start_time, " 秒开始播放");
                 // ⚠️ 清空解复用器的内部缓冲区
                 avformat_flush(format_ctx_);
+                // 更新时钟到 seek 目标位置，避免音视频同步判断异常
+                audio_clock_.set_clock(config_.start_time, 0);
+                video_clock_.set_clock(config_.start_time, 0);
+                external_clock_.set_clock(config_.start_time, 0);
             }
         } else {
             LOG_WARNING("开始播放时间 ", config_.start_time, " 无效或超过视频时长，忽略");
@@ -591,6 +593,285 @@ int PlayerCore::open(const std::string& filename) {
     }
     
     return 0;
+}
+
+// 使用自定义数据源打开
+int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io) {
+    if (state_ != PlayerState::Idle && state_ != PlayerState::Stopped) {
+        LOG_WARNING("播放器状态错误，无法打开文件");
+        set_state(PlayerState::Error);
+        return -1;
+    }
+    
+    LOG_INFO("========================================");
+    LOG_INFO("使用自定义数据源打开文件");
+    LOG_INFO("========================================");
+    LOG_INFO("配置信息:");
+    LOG_INFO("  - 启用音频: ", config_.enable_audio ? "是" : "否");
+    LOG_INFO("  - 启用视频: ", config_.enable_video ? "是" : "否");
+    
+    // 重置标志
+    abort_request_ = false;
+    decode_finished_ = false;
+    playback_completed_notified_ = false;
+    
+    // 保存自定义 IO
+    custom_io_ = std::move(custom_io);
+    
+    set_state(PlayerState::Opening);
+    
+    // 分配 AVFormatContext
+    format_ctx_ = avformat_alloc_context();
+    
+    // 使用自定义 AVIOContext
+    format_ctx_->pb = custom_io_->get_avio_context();
+    
+    // 设置中断回调
+    format_ctx_->interrupt_callback.callback = [](void* ctx) -> int {
+        PlayerCore* player = static_cast<PlayerCore*>(ctx);
+        return player->abort_request_.load() ? 1 : 0;
+    };
+    format_ctx_->interrupt_callback.opaque = this;
+    
+    LOG_INFO("开始打开输入流（使用自定义 AVIOContext）...");
+    
+    // 打开输入（URL 传 nullptr，因为数据通过 pb 提供）
+    int ret = avformat_open_input(&format_ctx_, nullptr, nullptr, nullptr);
+    
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        LOG_ERROR("无法打开输入流（自定义数据源）");
+        LOG_ERROR("FFmpeg 错误码: ", ret, ", 错误信息: ", errbuf);
+        emit_error(ret, "无法打开输入流（自定义数据源）: " + std::string(errbuf));
+        set_state(PlayerState::Error);
+        return -1;
+    }
+    
+    LOG_INFO("输入流打开成功（自定义数据源）");
+    
+    // 获取流信息
+    ret = avformat_find_stream_info(format_ctx_, nullptr);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        emit_error(ret, "无法获取流信息 (错误: " + std::string(errbuf) + ")");
+        set_state(PlayerState::Error);
+        return -1;
+    }
+    
+    // 打印媒体信息
+    av_dump_format(format_ctx_, 0, "custom_io_stream", 0);
+    
+    // 打印详细的媒体信息（调试用）
+    DebugHelper::print_media_info(format_ctx_);
+    
+    // 查找视频流和音频流
+    video_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    audio_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    
+    // 填充媒体信息
+    media_info_.filename = "custom_io_stream";
+    media_info_.duration = format_ctx_->duration;
+    media_info_.bitrate = format_ctx_->bit_rate;
+    
+    if (video_stream_ >= 0) {
+        AVStream* stream = format_ctx_->streams[video_stream_];
+        media_info_.video_width = stream->codecpar->width;
+        media_info_.video_height = stream->codecpar->height;
+        media_info_.video_codec = stream->codecpar->codec_id;
+        AVRational frame_rate = av_guess_frame_rate(format_ctx_, stream, nullptr);
+        media_info_.video_fps = av_q2d(frame_rate);
+        
+        LOG_INFO("视频流已找到: ", video_stream_);
+    } else {
+        LOG_WARNING("未找到视频流");
+    }
+    
+    if (audio_stream_ >= 0) {
+        AVStream* stream = format_ctx_->streams[audio_stream_];
+        media_info_.audio_sample_rate = stream->codecpar->sample_rate;
+        media_info_.audio_channels = stream->codecpar->ch_layout.nb_channels;
+        media_info_.audio_codec = stream->codecpar->codec_id;
+        
+        LOG_INFO("音频流已找到: ", audio_stream_);
+    } else {
+        LOG_WARNING("未找到音频流");
+    }
+    
+    // 创建数据包队列和帧队列（必须在启动线程前创建）
+    video_packet_queue_ = std::make_unique<PacketQueue>();
+    audio_packet_queue_ = std::make_unique<PacketQueue>();
+    subtitle_packet_queue_ = std::make_unique<PacketQueue>();
+    video_queue_ = std::make_unique<FrameQueue<VideoFrame>>(config_.video_queue_size);
+    audio_queue_ = std::make_unique<FrameQueue<AudioFrame>>(config_.audio_queue_size);
+    LOG_INFO("队列创建完成");
+    
+    // 如果配置了开始播放时间，在打开流组件之前先 seek
+    if (config_.start_time > 0.0) {
+        double duration = get_duration();
+        if (duration > 0 && config_.start_time < duration) {
+            int64_t seek_target = config_.start_time * AV_TIME_BASE;
+            LOG_INFO("配置了开始播放时间: ", config_.start_time, " 秒，在启动线程前先 seek...");
+            
+            int seek_ret = avformat_seek_file(format_ctx_, -1,
+                                              INT64_MIN,
+                                              seek_target,
+                                              seek_target,
+                                              0);
+            if (seek_ret < 0) {
+                LOG_WARNING("初始 seek 失败，将从头开始播放");
+            } else {
+                LOG_INFO("初始 seek 成功，将从 ", config_.start_time, " 秒开始播放");
+                avformat_flush(format_ctx_);
+                // 更新时钟到 seek 目标位置，避免音视频同步判断异常
+                audio_clock_.set_clock(config_.start_time, 0);
+                video_clock_.set_clock(config_.start_time, 0);
+                external_clock_.set_clock(config_.start_time, 0);
+            }
+        } else {
+            LOG_WARNING("开始播放时间 ", config_.start_time, " 无效或超过视频时长，忽略");
+        }
+    }
+    
+    // 打开流组件
+    if (config_.enable_video && video_stream_ >= 0) {
+        ret = stream_component_open(video_stream_);
+        if (ret < 0) {
+            LOG_ERROR("打开视频流失败");
+            return -1;
+        }
+    }
+    
+    if (config_.enable_audio && audio_stream_ >= 0) {
+        ret = stream_component_open(audio_stream_);
+        if (ret < 0) {
+            LOG_ERROR("打开音频流失败");
+            return -1;
+        }
+    }
+    
+    // 启动读取线程
+    read_thread_ = std::thread(&PlayerCore::read_thread, this);
+    
+    // 恢复解码器（解码器创建时默认暂停）
+    if (video_decoder_) {
+        video_decoder_->resume();
+    }
+    if (audio_decoder_) {
+        audio_decoder_->resume();
+    }
+    LOG_INFO("解码器已恢复，开始播放");
+    
+    // 启动播放进度定时器线程
+    if (position_changed_callback_) {
+        progress_timer_thread_ = std::thread(&PlayerCore::progress_timer_thread, this);
+    }
+    
+    set_state(PlayerState::Playing);
+    LOG_INFO("播放器已启动（自定义数据源）");
+    
+    return 0;
+}
+
+// 使用指定数据源模式打开
+int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, const CustomDataSourceConfig& config) {
+    if (state_ != PlayerState::Idle && state_ != PlayerState::Stopped) {
+        LOG_WARNING("播放器状态错误，无法打开文件");
+        set_state(PlayerState::Error);
+        return -1;
+    }
+    
+    LOG_INFO("========================================");
+    LOG_INFO("使用数据源模式打开文件");
+    LOG_INFO("  URL: ", url);
+    LOG_INFO("  模式: ", static_cast<int>(mode));
+    LOG_INFO("========================================");
+    
+    // 根据模式选择打开方式
+    switch (mode) {
+        case DataSourceMode::Default:
+            // 使用默认的 FFmpeg 直接打开
+            LOG_INFO("使用默认模式（FFmpeg 直接打开）");
+            return open(url);
+            
+        case DataSourceMode::CustomHTTP: {
+            // 自动创建 HttpRangeDataSource 和 CustomAVIOContext
+            LOG_INFO("使用自定义 HTTP Range 下载器模式");
+            LOG_INFO("配置参数:");
+            LOG_INFO("  - 超时时间: ", config.timeout_ms, " ms");
+            LOG_INFO("  - 最大重试: ", config.max_retries, " 次");
+            LOG_INFO("  - 缓存大小: ", config.cache_size / 1024, " KB");
+            LOG_INFO("  - AVIO 缓冲区: ", config.avio_buffer_size / 1024, " KB");
+            
+            try {
+                // 1. 创建 HttpRangeDataSource
+                auto dataSource = std::make_unique<HttpRangeDataSource>();
+                
+                // 2. 配置下载器参数
+                auto* downloader = dataSource->get_downloader();
+                downloader->set_timeout(config.timeout_ms / 1000); // 转换为秒
+                downloader->set_max_retries(config.max_retries);
+                dataSource->set_cache_size(config.cache_size);
+                
+                // 3. 设置下载进度回调
+                auto last_percent = std::make_shared<int>(-1);
+                downloader->set_progress_callback([this, last_percent](size_t downloaded, size_t total) {
+                    if (total > 0) {
+                        int percent = (int)((double)downloaded / total * 100.0);
+                        if (percent != *last_percent) {
+                            *last_percent = percent;
+                            LOG_DEBUG("下载进度: ", percent, "% (", 
+                                     downloaded / 1024 / 1024, "MB/", 
+                                     total / 1024 / 1024, "MB)");
+                        }
+                    }
+                });
+                
+                // 4. 打开数据源（获取文件大小等信息）
+                if (dataSource->open(url) < 0) {
+                    LOG_ERROR("无法打开数据源: ", url);
+                    emit_error(ERROR_OPEN_INPUT_FAILED, "无法打开数据源");
+                    set_state(PlayerState::Error);
+                    return -1;
+                }
+                
+                LOG_INFO("数据源打开成功");
+                LOG_INFO("  - 文件大小: ", dataSource->size() / 1024 / 1024, " MB");
+                LOG_INFO("  - 支持 Seek: ", dataSource->seekable() ? "是" : "否");
+                
+                // 5. 创建 CustomAVIOContext
+                auto customIO = std::make_unique<CustomAVIOContext>(
+                    std::move(dataSource),
+                    config.avio_buffer_size
+                );
+                
+                if (!customIO->get_avio_context()) {
+                    LOG_ERROR("无法创建 AVIOContext");
+                    emit_error(ERROR_ALLOC_CONTEXT_FAILED, "无法创建 AVIOContext");
+                    set_state(PlayerState::Error);
+                    return -1;
+                }
+                
+                LOG_INFO("CustomAVIOContext 创建成功");
+                
+                // 6. 使用自定义 IO 打开
+                return open_with_custom_io(std::move(customIO));
+                
+            } catch (const std::exception& e) {
+                LOG_ERROR("创建自定义数据源失败: ", e.what());
+                emit_error(ERROR_OPEN_INPUT_FAILED, std::string("创建自定义数据源失败: ") + e.what());
+                set_state(PlayerState::Error);
+                return -1;
+            }
+        }
+            
+        default:
+            LOG_ERROR("不支持的数据源模式: ", static_cast<int>(mode));
+            emit_error(ERROR_NOT_SUPPORT, "不支持的数据源模式");
+            set_state(PlayerState::Error);
+            return -1;
+    }
 }
 
 void PlayerCore::close() {
@@ -658,6 +939,14 @@ void PlayerCore::close() {
     if (format_ctx_) {
         avformat_close_input(&format_ctx_);
         format_ctx_ = nullptr;
+    }
+    
+    // 清理自定义数据源
+    if (custom_io_) {
+        LOG_INFO("关闭自定义数据源...");
+        custom_io_->close();
+        custom_io_.reset();
+        LOG_INFO("自定义数据源已关闭");
     }
     
     // 清理队列

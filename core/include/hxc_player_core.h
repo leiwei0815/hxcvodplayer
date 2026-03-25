@@ -10,6 +10,7 @@
 #include "hxc_packet_queue.h"
 #include "hxc_frame_queue.h"
 #include "hxc_decoder.h"
+#include "hxc_custom_io.h"
 #include <string>
 #include <memory>
 #include <thread>
@@ -78,6 +79,24 @@ enum PlayerErrorCode {
     // 这些值保持为 FFmpeg 的负数错误码
 };
 
+// ⚠️ 数据源模式
+enum class DataSourceMode {
+    Default = 0,     // 默认模式（FFmpeg 直接打开）
+    CustomHTTP = 1,  // 自定义 HTTP Range 下载器
+    // 未来可扩展：
+    // Encrypted = 2,   // 加密视频
+    // P2P = 3,         // P2P 数据源
+    // Cached = 4,      // 本地缓存
+};
+
+// ⚠️ 自定义数据源配置
+struct CustomDataSourceConfig {
+    int timeout_ms = 30000;           // 超时时间（毫秒）
+    int max_retries = 3;              // 最大重试次数
+    size_t cache_size = 2 * 1024 * 1024;  // 缓存大小（字节）
+    size_t avio_buffer_size = 64 * 1024;  // AVIO 缓冲区大小（字节）
+};
+
 /**
  * @brief 播放器核心类
  * 负责媒体文件的解复用、解码、同步和播放控制
@@ -93,6 +112,12 @@ public:
     
     // 打开媒体文件
     int open(const std::string& filename);
+    
+    // 使用自定义数据源打开
+    int open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io);
+    
+    // 使用指定数据源模式打开（新接口）
+    int open_with_mode(const std::string& url, DataSourceMode mode, const CustomDataSourceConfig& config = CustomDataSourceConfig());
     
     // 关闭
     void close();
@@ -304,6 +329,9 @@ private:
     BufferProgressCallback buffer_progress_callback_;    // 缓冲进度回调
     PlaybackCompletedCallback playback_completed_callback_;  // 播放完成回调
     LoadingCallback loading_callback_;                   // 网络加载回调
+    
+    // 自定义数据源
+    std::unique_ptr<CustomAVIOContext> custom_io_;       // 自定义 AVIOContext
 };
 
 } // namespace hxcplayer

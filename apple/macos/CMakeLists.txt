@@ -94,6 +94,7 @@ set(CORE_SOURCES
     ${PROJECT_ROOT}/core/src/hxc_decoder.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_core.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_core_c_bridge.cpp
+    ${PROJECT_ROOT}/core/src/hxc_custom_io.cpp
 )
 
 # 核心库头文件
@@ -103,6 +104,7 @@ set(CORE_HEADERS
     ${PROJECT_ROOT}/core/include/hxc_decoder.h
     ${PROJECT_ROOT}/core/include/hxc_player_core.h
     ${PROJECT_ROOT}/core/include/hxc_player_core_c_bridge.h
+    ${PROJECT_ROOT}/core/include/hxc_custom_io.h
     ${PROJECT_ROOT}/core/include/hxc_frame_queue.h
     ${PROJECT_ROOT}/core/include/hxc_logger.h
     ${PROJECT_ROOT}/core/include/hxc_debug_helper.h
@@ -195,6 +197,7 @@ target_link_libraries(HXCPlayer-macOS
     "-framework AudioToolbox"
     "-framework QuartzCore"
     "-framework Security"
+    "-framework CFNetwork"
     "-framework CoreFoundation"
     "-framework CoreText"
     "-framework CoreImage"

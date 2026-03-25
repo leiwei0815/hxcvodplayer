@@ -11,7 +11,6 @@
 
 #if TARGET_OS_IOS
 #import <UIKit/UIKit.h>
-#import <AVKit/AVKit.h>
 #else
 #import <AppKit/AppKit.h>
 #endif
@@ -86,6 +85,23 @@ typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
     // 可以通过 NSError.code 获取具体的 FFmpeg 错误码
 };
 
+// ⚠️ 数据源模式
+typedef NS_ENUM(NSInteger, HXCPlayerDataSourceMode) {
+    HXCPlayerDataSourceModeDefault = 0,      // 默认模式（FFmpeg 直接打开）
+    HXCPlayerDataSourceModeCustomHTTP = 1,   // 自定义 HTTP Range 下载器
+};
+
+// ⚠️ 自定义数据源配置
+@interface HXCPlayerDataSourceConfig : NSObject
+@property (nonatomic, assign) NSInteger timeoutMs;          // 超时时间（毫秒），默认 30000
+@property (nonatomic, assign) NSInteger maxRetries;         // 最大重试次数，默认 3
+@property (nonatomic, assign) NSUInteger cacheSize;         // 缓存大小（字节），默认 2MB
+@property (nonatomic, assign) NSUInteger avioBufferSize;    // AVIO 缓冲区大小（字节），默认 64KB
+
+// 默认配置
++ (instancetype)defaultConfig;
+@end
+
 // 播放器回调协议
 @protocol HXCPlayerControlDelegate <NSObject>
 @optional
@@ -108,20 +124,28 @@ typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
 - (void)player:(HXCPlayerControl *)player didChangeLoadingState:(BOOL)isLoading;
 
 #if TARGET_OS_IOS
-// 画中画状态回调
-- (void)player:(HXCPlayerControl *)player 
-    pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller;
-    
-- (void)player:(HXCPlayerControl *)player 
-    pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller;
-    
-- (void)player:(HXCPlayerControl *)player 
-    pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)controller;
-    
-- (void)player:(HXCPlayerControl *)player 
-    pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller;
 
-- (void)player:(HXCPlayerControl *)player 
+/// 画中画状态
+typedef NS_ENUM(NSInteger, HXCPlayerPIPState) {
+    //未开始
+    HXCPlayerPIPStateNone = 0,
+    //即将开始
+    HXCPlayerPIPStateWillStart,
+    //已经开始
+    HXCPlayerPIPStateDidStart,
+    //即将停止
+    HXCPlayerPIPStateWillStop,
+    //已经停止
+    HXCPlayerPIPStateDidStop,
+    //已经恢复
+    HXCPlayerPIPStateRestore
+};
+
+// 画中画状态回调
+- (void)player:(HXCPlayerControl *)player pictureInPictureStateDidChange:(HXCPlayerPIPState)state;
+
+// 画中画回到应用内恢复ui操作,可以实现这个方法实现自己的ui恢复操作，画中画会默认恢复不需要操作 restored需要返回YES
+- (void)player:(HXCPlayerControl *)player
     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL restored))completionHandler;
 #endif
 
@@ -164,6 +188,10 @@ typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
 // 播放控制
 - (BOOL)openURL:(NSString *)url;                      // 打开 URL（不自动播放）
 - (BOOL)prepareToPlay:(NSString *)url;                // 准备播放（等同于 openURL，不自动播放）
+
+// 使用指定数据源模式打开（推荐方式）
+- (BOOL)openURL:(NSString *)url withMode:(HXCPlayerDataSourceMode)mode config:(HXCPlayerDataSourceConfig *)config;
+
 - (void)play;                                          // 开始播放
 - (void)pause;                                         // 暂停
 - (void)resume;                                        // 恢复播放

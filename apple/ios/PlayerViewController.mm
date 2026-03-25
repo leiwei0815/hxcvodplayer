@@ -5,7 +5,6 @@
 
 #import "PlayerViewController.h"
 #import "../HXCPlayerControl.h"  // 使用统一的播放器类
-
 //com.nuoshan.app
 
 @interface PlayerViewController () <HXCPlayerControlDelegate>
@@ -195,12 +194,33 @@
 //    NSString *urlString = @"https://f18c14f8-vod-tx-cdn-cskziwl-cn.tliveapp.com/1/47/mnt/g/file/20250930/b/o/u/c6ae79da0c546e0e/k43g4cz9f5c1sva3.m3u8";
 //    NSString *urlString = @"/path/to/nonexistent.mp4"; // 错误码: -1001, No such file or directory
 //    NSString *urlString = @"https://example.com/nonexistent-video.mp4";
+#if 0
+    // ✨ 选择数据源模式（推荐使用新接口）
+    HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeCustomHTTP;  // 或者 HXCPlayerDataSourceModeDefault
+    
+    // 配置参数（可选，不传则使用默认值）
+    HXCPlayerDataSourceConfig *config = [HXCPlayerDataSourceConfig defaultConfig];
+    config.timeoutMs = 30000;           // 30秒超时
+    config.maxRetries = 3;              // 最多重试3次
+    config.cacheSize = 2 * 1024 * 1024; // 2MB 缓存
+    config.avioBufferSize = 64 * 1024;  // 64KB AVIO 缓冲区
+    
+    NSLog(@"========================================");
+    NSLog(@"🎬 打开视频");
+    NSLog(@"   URL: %@", urlString);
+    NSLog(@"   模式: %@", mode == HXCPlayerDataSourceModeDefault ? @"默认" : @"自定义HTTP");
+    NSLog(@"========================================");
+    
+    // 使用统一接口打开（底层自动处理数据源创建）
+    BOOL success = [_player openURL:urlString withMode:mode config:config];
+#else
     BOOL success = [_player openURL:urlString];
+#endif
     if (success) {
-        NSLog(@"视频打开成功");
+        NSLog(@"✅ 视频打开成功");
         [_player play];
     } else {
-        NSLog(@"视频打开失败");
+        NSLog(@"❌ 视频打开失败");
     }
 }
 
@@ -335,33 +355,32 @@
 // 缓冲进度更新（解码位置）
 - (void)player:(HXCPlayerControl *)player didUpdateBufferProgress:(double)position {
     // 可以在这里显示缓冲进度条
-    NSLog(@"缓冲进度: %.2f", position);
+//    NSLog(@"缓冲进度: %.2f", position);
 }
 
 #pragma mark - Picture in Picture Delegate
 
-- (void)player:(HXCPlayerControl *)player 
-    pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
-    NSLog(@"📺 画中画即将开始");
-}
-
-- (void)player:(HXCPlayerControl *)player 
-    pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller {
-    NSLog(@"✅ 画中画已开始");
-    // 可以隐藏播放器界面
-    // self.view.alpha = 0.5;
-}
-
-- (void)player:(HXCPlayerControl *)player 
-    pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)controller {
-    NSLog(@"📺 画中画即将停止");
-}
-
-- (void)player:(HXCPlayerControl *)player 
-    pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
-    NSLog(@"✅ 画中画已停止");
-    // 恢复播放器界面
-    // self.view.alpha = 1.0;
+-(void)player:(HXCPlayerControl *)player pictureInPictureStateDidChange:(HXCPlayerPIPState)state {
+    switch (state) {
+        case HXCPlayerPIPStateWillStart:
+            NSLog(@"📺 画中画即将开始");
+            break;
+        case HXCPlayerPIPStateDidStart:
+            NSLog(@"✅ 画中画已开始");
+            break;
+        case HXCPlayerPIPStateWillStop:
+            NSLog(@"📺 画中画即将停止");
+            break;
+        case HXCPlayerPIPStateDidStop:
+            NSLog(@"✅ 画中画已停止");
+            break;
+        case HXCPlayerPIPStateRestore:
+            NSLog(@"🔄 从画中画恢复用户界面");
+            break;
+            
+        default:
+            break;
+    }
 }
 
 - (void)player:(HXCPlayerControl *)player 

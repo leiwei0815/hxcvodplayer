@@ -5,6 +5,7 @@ set(CORE_SOURCES
     hxc_decoder.cpp
     hxc_player_core.cpp
     hxc_player_core_c_bridge.cpp
+    hxc_custom_io.cpp
 )
 
 # 头文件
@@ -15,6 +16,7 @@ set(CORE_HEADERS
     ${CMAKE_SOURCE_DIR}/core/include/hxc_decoder.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_player_core.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_player_core_c_bridge.h
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_custom_io.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_logger.h
 )
 
@@ -42,6 +44,34 @@ endif()
 # 线程库
 find_package(Threads REQUIRED)
 target_link_libraries(hxcplayer_core PUBLIC Threads::Threads)
+
+# HTTP 下载后端（用于 hxc_custom_io.cpp）
+if(APPLE)
+    # Apple 平台使用 CFNetwork（系统框架，无需 curl）
+    target_link_libraries(hxcplayer_core PUBLIC
+        "-framework CFNetwork"
+    )
+elseif(WIN32)
+    find_package(CURL)
+    if(CURL_FOUND)
+        target_include_directories(hxcplayer_core PUBLIC ${CURL_INCLUDE_DIRS})
+        target_link_libraries(hxcplayer_core PUBLIC ${CURL_LIBRARIES})
+        message(STATUS "✅ 找到 libcurl: ${CURL_LIBRARIES}")
+    else()
+        message(WARNING "⚠️  未找到 libcurl，自定义数据源功能将不可用")
+        message(WARNING "    Windows 平台请使用 vcpkg 安装: vcpkg install curl")
+    endif()
+elseif(ANDROID)
+    message(WARNING "⚠️  Android 平台需要手动配置 libcurl")
+else()
+    find_package(CURL)
+    if(CURL_FOUND)
+        target_include_directories(hxcplayer_core PUBLIC ${CURL_INCLUDE_DIRS})
+        target_link_libraries(hxcplayer_core PUBLIC ${CURL_LIBRARIES})
+    else()
+        message(WARNING "⚠️  未找到 libcurl，请安装: sudo apt-get install libcurl4-openssl-dev")
+    endif()
+endif()
 
 # 平台特定链接
 if(APPLE)

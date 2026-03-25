@@ -156,6 +156,44 @@ int player_core_open_with_start_position(PlayerCoreHandle* handle, const char* u
     return handle->core->open(url);
 }
 
+int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, PlayerDataSourceModeC mode, const PlayerDataSourceConfigC* config, double start_position) {
+    if (!handle || !handle->core || !url) {
+        return -1;
+    }
+
+    // 设置起始播放时间
+    if (start_position > 0.0) {
+        auto playerConfig = handle->core->get_config();
+        playerConfig.start_time = start_position;
+        handle->core->set_config(playerConfig);
+    }
+
+    // 转换 C 枚举到 C++ 枚举
+    hxcplayer::DataSourceMode cppMode;
+    switch (mode) {
+        case PLAYER_DATA_SOURCE_MODE_DEFAULT:
+            cppMode = hxcplayer::DataSourceMode::Default;
+            break;
+        case PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP:
+            cppMode = hxcplayer::DataSourceMode::CustomHTTP;
+            break;
+        default:
+            return -1;  // 不支持的模式
+    }
+    
+    // 转换配置参数（如果提供了）
+    hxcplayer::CustomDataSourceConfig cppConfig;
+    if (config) {
+        cppConfig.timeout_ms = config->timeout_ms;
+        cppConfig.max_retries = config->max_retries;
+        cppConfig.cache_size = config->cache_size;
+        cppConfig.avio_buffer_size = config->avio_buffer_size;
+    }
+    // 否则使用默认配置
+    
+    return handle->core->open_with_mode(url, cppMode, cppConfig);
+}
+
 void player_core_play(PlayerCoreHandle* handle) {
     if (handle && handle->core) {
         handle->core->play();
