@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <memory>
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
 
@@ -17,6 +18,9 @@ extern "C" {
 
 // 前向声明
 struct PlayerCoreHandle;
+namespace hxcplayer {
+    class ICustomDataSource;
+}
 
 /**
  * Android 播放器实现类
@@ -35,7 +39,10 @@ public:
     
     // 打开 URL
     bool openURL(const char* url);
-    bool openURL(const char* url, double start_position);  // 从指定位置开始播放
+    bool openURL(const char* url, double start_position);
+
+    // 使用自定义 HTTP 模式打开
+    bool openWithCustomHTTP(const char* url, int timeout_ms = 30000, int max_retries = 3);
     
     // 播放控制
     void play();

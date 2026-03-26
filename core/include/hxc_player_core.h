@@ -218,6 +218,9 @@ private:
     // 流打开
     int stream_component_open(int stream_index);
     void stream_component_close(int stream_index);
+
+    // 打开后的公共处理（查找流、打开解码器等）
+    int open_common_process(const std::string &filename);
     
     // 状态更新
     void set_state(PlayerState state);

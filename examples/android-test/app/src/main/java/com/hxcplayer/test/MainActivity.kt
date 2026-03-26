@@ -236,6 +236,7 @@ class MainActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
                 val url = editText.text.toString()
                 if (url.isNotEmpty()) {
                     player.openURL(url)
+                    player.openWithCustomHTTP(url);
                 }
             }
             .setNeutralButton("诊断") { _, _ ->

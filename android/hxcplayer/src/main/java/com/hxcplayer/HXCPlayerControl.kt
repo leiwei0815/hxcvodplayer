@@ -152,9 +152,9 @@ class HXCPlayerControl(private val context: Context) {
     
     // 打开 URL
     fun openURL(url: String): Boolean {
-        return openURL(url, 0.0)  // 默认从头开始
+        return openURL(url, 0.0)
     }
-    
+
     // 打开 URL 并指定起始位置（秒）
     fun openURL(url: String, startPosition: Double): Boolean {
         val result = if (startPosition > 0.0) {
@@ -162,11 +162,22 @@ class HXCPlayerControl(private val context: Context) {
         } else {
             nativeOpenURL(nativeHandle, url)
         }
-        
+
         if (result) {
             callback?.onPlayerStateChanged(PlayerState.OPENING)
         } else {
             callback?.onPlayerError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
+        }
+        return result
+    }
+
+    // 使用自定义 HTTP 模式打开（支持 Range 下载）
+    fun openWithCustomHTTP(url: String, timeoutMs: Int = 30000, maxRetries: Int = 3): Boolean {
+        val result = nativeOpenWithCustomHTTP(nativeHandle, url, timeoutMs, maxRetries)
+        if (result) {
+            callback?.onPlayerStateChanged(PlayerState.OPENING)
+        } else {
+            callback?.onPlayerError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开自定义 HTTP: $url")
         }
         return result
     }
@@ -255,6 +266,7 @@ class HXCPlayerControl(private val context: Context) {
     private external fun nativeUpdateSurfaceSize(handle: Long, width: Int, height: Int)
     private external fun nativeOpenURL(handle: Long, url: String): Boolean
     private external fun nativeOpenURLWithStartPosition(handle: Long, url: String, startPosition: Double): Boolean
+    private external fun nativeOpenWithCustomHTTP(handle: Long, url: String, timeoutMs: Int, maxRetries: Int): Boolean
     private external fun nativePlay(handle: Long)
     private external fun nativePause(handle: Long)
     private external fun nativeStop(handle: Long)

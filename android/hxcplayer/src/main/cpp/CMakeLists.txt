@@ -11,6 +11,7 @@ get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.."
 # 第三方库路径
 set(ANDROID_THIRD_ROOT "${PROJECT_ROOT}/android-third")
 set(MBEDTLS_ROOT "${ANDROID_THIRD_ROOT}/mbedtls-build-android/mbedTLS-Android/${ANDROID_ABI}")
+set(CURL_ROOT "${ANDROID_THIRD_ROOT}/curl-build-android/curl-Android/${ANDROID_ABI}")
 set(FFMPEG_ROOT "${ANDROID_THIRD_ROOT}/ffmpeg-build-android/FFmpeg-Android/${ANDROID_ABI}")
 set(SOUNDTOUCH_ROOT "${ANDROID_THIRD_ROOT}/soundtouch-build-android/SoundTouch-Android/${ANDROID_ABI}")
 
@@ -31,6 +32,8 @@ set(CORE_SOURCES
     ${PROJECT_ROOT}/core/src/hxc_player_types.cpp
     ${PROJECT_ROOT}/core/src/hxc_packet_queue.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_core_c_bridge.cpp
+    ${PROJECT_ROOT}/core/src/hxc_custom_io.cpp
+    ${PROJECT_ROOT}/core/src/hxc_audio_resampler.cpp
 )
 
 # JNI 桥接源文件
@@ -43,6 +46,7 @@ set(JNI_SOURCES
 include_directories(
     ${PROJECT_ROOT}/core/include
     ${MBEDTLS_ROOT}/include
+    ${CURL_ROOT}/include
     ${FFMPEG_ROOT}/include
     ${SOUNDTOUCH_ROOT}/include
     ${ANDROID_NDK}/sources/android/native_app_glue
@@ -96,6 +100,10 @@ set_target_properties(mbedx509 PROPERTIES IMPORTED_LOCATION ${MBEDTLS_ROOT}/lib/
 add_library(mbedcrypto SHARED IMPORTED)
 set_target_properties(mbedcrypto PROPERTIES IMPORTED_LOCATION ${MBEDTLS_ROOT}/lib/libmbedcrypto.so)
 
+# 导入 curl 静态库
+add_library(curl STATIC IMPORTED)
+set_target_properties(curl PROPERTIES IMPORTED_LOCATION ${CURL_ROOT}/lib/libcurl.a)
+
 # 链接库（顺序很重要！）
 target_link_libraries(hxcplayer
     # FFmpeg 库（按依赖顺序）
@@ -104,26 +112,29 @@ target_link_libraries(hxcplayer
     swresample
     swscale
     avutil
-    
+
+    # curl 库（用于 custom_io）
+    curl
+
     # mbedTLS 库（FFmpeg HTTPS 依赖）
     mbedtls
     mbedx509
     mbedcrypto
-    
+
     # SoundTouch 库
     soundtouch
-    
+
     # Android 系统库
     ${log-lib}
     ${android-lib}
     ${mediandk-lib}
-    
+
     # OpenSL ES (音频输出)
     OpenSLES
-    
+
     # C++ 标准库
     c++_shared
-    
+
     # 系统库（FFmpeg 依赖）
     z
     m

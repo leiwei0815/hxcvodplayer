@@ -191,6 +191,42 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     }
 }
 
+bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_retries) {
+    if (!player_core_) {
+        LOGE("Player core not initialized");
+        return false;
+    }
+
+    LOGI("Opening with custom HTTP: %s", url);
+
+    PlayerDataSourceConfigC config;
+    config.timeout_ms = timeout_ms;
+    config.max_retries = max_retries;
+    config.cache_size = 2 * 1024 * 1024;  // 2MB
+    config.avio_buffer_size = 64 * 1024;  // 64KB
+
+    int result = player_core_open_with_mode(player_core_, url, PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP, &config, 0.0);
+
+    if (result == 0) {
+        LOGI("Custom HTTP opened successfully");
+
+        int sample_rate = player_core_get_audio_sample_rate(player_core_);
+        int channels = player_core_get_audio_channels(player_core_);
+
+        if (sample_rate > 0 && channels > 0 && !audio_initialized_) {
+            if (initAudioOutput(sample_rate, channels)) {
+                LOGI("Audio initialized: %d Hz, %d channels", sample_rate, channels);
+            }
+        }
+
+        player_core_pause(player_core_);
+        return true;
+    } else {
+        LOGE("Failed to open with custom HTTP: %d", result);
+        return false;
+    }
+}
+
 void AndroidPlayer::play() {
     if (!player_core_) return;
     

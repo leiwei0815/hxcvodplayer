@@ -241,4 +241,20 @@ Java_com_hxcplayer_HXCPlayerControl_getCurrentLogFile(JNIEnv *env, jclass clazz)
     return env->NewStringUTF(logFile);
 }
 
+// 使用自定义 HTTP 模式打开
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomHTTP(
+        JNIEnv *env, jobject thiz, jlong handle, jstring url, jint timeout_ms, jint max_retries) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return JNI_FALSE;
+
+    const char* urlStr = env->GetStringUTFChars(url, nullptr);
+    LOGD("nativeOpenWithCustomHTTP: %s", urlStr);
+
+    bool result = player->openWithCustomHTTP(urlStr, timeout_ms, max_retries);
+
+    env->ReleaseStringUTFChars(url, urlStr);
+    return result ? JNI_TRUE : JNI_FALSE;
+}
+
 } // extern "C"

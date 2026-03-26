@@ -81,6 +81,7 @@ set(CORE_SOURCES
     ${PROJECT_ROOT}/core/src/hxc_packet_queue.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_core_c_bridge.cpp
     ${PROJECT_ROOT}/core/src/hxc_custom_io.cpp
+    ${PROJECT_ROOT}/core/src/hxc_audio_resampler.cpp
 )
 
 # 核心库头文件
@@ -94,6 +95,7 @@ set(CORE_HEADERS
     ${PROJECT_ROOT}/core/include/hxc_debug_helper.h
     ${PROJECT_ROOT}/core/include/hxc_player_core_c_bridge.h
     ${PROJECT_ROOT}/core/include/hxc_custom_io.h
+    ${PROJECT_ROOT}/core/include/hxc_audio_resampler.h
 )
 
 # iOS 源文件（使用统一的播放器类）

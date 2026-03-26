@@ -577,9 +577,14 @@ static void loading_callback_c(bool is_loading, void* user_data) {
 - (void)setPlaybackRate:(double)playbackRate {
     playbackRate = MAX(0.5, MIN(2.0, playbackRate));
     _playbackRate = playbackRate;
-    
+
     if (_wrapper) {
         player_core_set_playback_rate(_wrapper->handle(), playbackRate);
+    }
+
+    // 更新 controlTimebase 的速率以匹配倍速
+    if (_videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
+        CMTimebaseSetRate(_videoView.videoLayer.controlTimebase, playbackRate);
     }
 }
 

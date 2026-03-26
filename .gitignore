@@ -72,6 +72,8 @@ win-third/soundtouch-src/
 android-third/ffmpeg-build-android/
 android-third/soundtouch-build-android/
 android-third/mbedtls-build-android/
+android-third/curl-build-android/
+
 
 # Apple XCFramework 构建目录
 apple/build_xcframework/

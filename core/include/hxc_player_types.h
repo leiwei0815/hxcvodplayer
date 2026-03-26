@@ -67,8 +67,8 @@ enum class PixelFormat {
 struct PlayerConfig {
     SyncMode sync_mode = SyncMode::AudioMaster;
     int audio_buffer_size = 1024;
-    int video_queue_size = 3;
-    int audio_queue_size = 9;
+    int video_queue_size = 9;
+    int audio_queue_size = 16;
     int subtitle_queue_size = 16;
     bool enable_audio = true;
     bool enable_video = true;

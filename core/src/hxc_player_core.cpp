@@ -456,143 +456,7 @@ int PlayerCore::open(const std::string& filename) {
         return -1;
     }
     
-    // 获取流信息
-    ret = avformat_find_stream_info(format_ctx_, nullptr);
-    if (ret < 0) {
-        char errbuf[AV_ERROR_MAX_STRING_SIZE];
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        emit_error(ERROR_FIND_STREAM_INFO_FAILED, "无法获取流信息 (错误: " + std::string(errbuf) + ")");
-        set_state(PlayerState::Error);
-        return -1;
-    }
-    
-    // 打印媒体信息
-    av_dump_format(format_ctx_, 0, filename.c_str(), 0);
-    
-    // 打印详细的媒体信息（调试用）
-    DebugHelper::print_media_info(format_ctx_);
-    
-    // 查找视频流和音频流
-    video_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    audio_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-    
-    // 填充媒体信息
-    media_info_.filename = filename;
-    media_info_.duration = format_ctx_->duration;
-    media_info_.bitrate = format_ctx_->bit_rate;
-    
-    if (video_stream_ >= 0) {
-        AVStream* stream = format_ctx_->streams[video_stream_];
-        media_info_.video_width = stream->codecpar->width;
-        media_info_.video_height = stream->codecpar->height;
-        media_info_.video_codec = stream->codecpar->codec_id;
-        
-        AVRational frame_rate = av_guess_frame_rate(format_ctx_, stream, nullptr);
-        media_info_.video_fps = av_q2d(frame_rate);
-    }
-    
-    if (audio_stream_ >= 0) {
-        AVStream* stream = format_ctx_->streams[audio_stream_];
-        media_info_.audio_sample_rate = stream->codecpar->sample_rate;
-        media_info_.audio_channels = stream->codecpar->ch_layout.nb_channels;
-        media_info_.audio_codec = stream->codecpar->codec_id;
-    }
-    
-    // ⚠️ 必须先创建队列，再启动解码线程！
-    // 创建数据包队列
-    video_packet_queue_ = std::make_unique<PacketQueue>();
-    audio_packet_queue_ = std::make_unique<PacketQueue>();
-    subtitle_packet_queue_ = std::make_unique<PacketQueue>();
-    
-    // 创建帧队列
-    video_queue_ = std::make_unique<FrameQueue<VideoFrame>>(config_.video_queue_size);
-    audio_queue_ = std::make_unique<FrameQueue<AudioFrame>>(config_.audio_queue_size);
-    
-    LOG_INFO("队列创建完成");
-    
-    // ⚠️ 参考 ffplay：如果配置了开始播放时间，在打开流之前先 seek
-    // 这样可以避免解码不需要的数据，显著提高启动速度
-    if (config_.start_time > 0.0) {
-        double duration = get_duration();
-        if (duration > 0 && config_.start_time < duration) {
-            int64_t seek_target = config_.start_time * AV_TIME_BASE;
-            LOG_INFO("配置了开始播放时间: ", config_.start_time, " 秒，在启动线程前先 seek...");
-            
-            // ⚠️ 使用 avformat_seek_file（比 av_seek_frame 更精确）
-            int ret = avformat_seek_file(format_ctx_, -1, 
-                                         INT64_MIN,      // min_ts
-                                         seek_target,     // ts (目标时间)
-                                         seek_target,     // max_ts
-                                         0);              // flags
-            if (ret < 0) {
-                LOG_WARNING("初始 seek 失败，将从头开始播放");
-            } else {
-                LOG_INFO("初始 seek 成功，将从 ", config_.start_time, " 秒开始播放");
-                // ⚠️ 清空解复用器的内部缓冲区
-                avformat_flush(format_ctx_);
-                // 更新时钟到 seek 目标位置，避免音视频同步判断异常
-                audio_clock_.set_clock(config_.start_time, 0);
-                video_clock_.set_clock(config_.start_time, 0);
-                external_clock_.set_clock(config_.start_time, 0);
-            }
-        } else {
-            LOG_WARNING("开始播放时间 ", config_.start_time, " 无效或超过视频时长，忽略");
-        }
-    }
-    
-    // 打开流组件（会创建解码器，但不启动线程）
-    if (config_.enable_video && video_stream_ >= 0) {
-        LOG_INFO("打开视频流...");
-        if (stream_component_open(video_stream_) < 0) {
-            LOG_ERROR("无法打开视频流");
-            emit_error(ERROR_NO_VIDEO_STREAM, "无法打开视频流");
-            // 注意：继续尝试打开音频流，不直接返回错误
-        } else {
-            LOG_INFO("视频流打开成功, 分辨率: ", media_info_.video_width, "x", media_info_.video_height);
-        }
-    }
-    
-    if (config_.enable_audio && audio_stream_ >= 0) {
-        LOG_INFO("打开音频流...");
-        if (stream_component_open(audio_stream_) < 0) {
-            LOG_ERROR("无法打开音频流");
-            emit_error(ERROR_NO_AUDIO_STREAM, "无法打开音频流");
-            // 注意：继续播放，不直接返回错误（可能是纯视频文件）
-        } else {
-            LOG_INFO("音频流打开成功, 采样率: ", media_info_.audio_sample_rate, " Hz");
-        }
-    }
-    
-    // ⚠️ 如果视频和音频都没有打开成功，则报错
-    if (!video_decoder_ && !audio_decoder_) {
-        LOG_ERROR("无法打开任何媒体流");
-        emit_error(ERROR_FIND_STREAM_INFO_FAILED, "无法打开任何视频或音频流");
-        set_state(PlayerState::Error);
-        return -1;
-    }
-    
-    // 启动读取线程（此时已经 seek 到正确位置）
-    abort_request_ = false;
-    read_thread_ = std::thread(&PlayerCore::read_thread, this);
-    
-    // ⚠️ 自动开始播放（恢复解码器）
-    if (video_decoder_) {
-        video_decoder_->resume();
-    }
-    if (audio_decoder_) {
-        audio_decoder_->resume();
-    }
-    
-    LOG_INFO("解码器已恢复，开始播放");
-    set_state(PlayerState::Playing);
-    
-    // ⚠️ 启动播放进度回调定时器线程
-    if (position_changed_callback_) {
-        progress_timer_thread_ = std::thread(&PlayerCore::progress_timer_thread, this);
-        LOG_INFO("播放进度回调定时器线程已启动");
-    }
-    
-    return 0;
+    return open_common_process(filename);
 }
 
 // 使用自定义数据源打开
@@ -634,144 +498,50 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     format_ctx_->interrupt_callback.opaque = this;
     
     LOG_INFO("开始打开输入流（使用自定义 AVIOContext）...");
-    
-    // 打开输入（URL 传 nullptr，因为数据通过 pb 提供）
-    int ret = avformat_open_input(&format_ctx_, nullptr, nullptr, nullptr);
-    
-    if (ret < 0) {
-        char errbuf[AV_ERROR_MAX_STRING_SIZE];
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        LOG_ERROR("无法打开输入流（自定义数据源）");
-        LOG_ERROR("FFmpeg 错误码: ", ret, ", 错误信息: ", errbuf);
-        emit_error(ret, "无法打开输入流（自定义数据源）: " + std::string(errbuf));
-        set_state(PlayerState::Error);
-        return -1;
-    }
-    
-    LOG_INFO("输入流打开成功（自定义数据源）");
-    
-    // 获取流信息
-    ret = avformat_find_stream_info(format_ctx_, nullptr);
-    if (ret < 0) {
-        char errbuf[AV_ERROR_MAX_STRING_SIZE];
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        emit_error(ret, "无法获取流信息 (错误: " + std::string(errbuf) + ")");
-        set_state(PlayerState::Error);
-        return -1;
-    }
-    
-    // 打印媒体信息
-    av_dump_format(format_ctx_, 0, "custom_io_stream", 0);
-    
-    // 打印详细的媒体信息（调试用）
-    DebugHelper::print_media_info(format_ctx_);
-    
-    // 查找视频流和音频流
-    video_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    audio_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-    
-    // 填充媒体信息
-    media_info_.filename = "custom_io_stream";
-    media_info_.duration = format_ctx_->duration;
-    media_info_.bitrate = format_ctx_->bit_rate;
-    
-    if (video_stream_ >= 0) {
-        AVStream* stream = format_ctx_->streams[video_stream_];
-        media_info_.video_width = stream->codecpar->width;
-        media_info_.video_height = stream->codecpar->height;
-        media_info_.video_codec = stream->codecpar->codec_id;
-        AVRational frame_rate = av_guess_frame_rate(format_ctx_, stream, nullptr);
-        media_info_.video_fps = av_q2d(frame_rate);
-        
-        LOG_INFO("视频流已找到: ", video_stream_);
-    } else {
-        LOG_WARNING("未找到视频流");
-    }
-    
-    if (audio_stream_ >= 0) {
-        AVStream* stream = format_ctx_->streams[audio_stream_];
-        media_info_.audio_sample_rate = stream->codecpar->sample_rate;
-        media_info_.audio_channels = stream->codecpar->ch_layout.nb_channels;
-        media_info_.audio_codec = stream->codecpar->codec_id;
-        
-        LOG_INFO("音频流已找到: ", audio_stream_);
-    } else {
-        LOG_WARNING("未找到音频流");
-    }
-    
-    // 创建数据包队列和帧队列（必须在启动线程前创建）
-    video_packet_queue_ = std::make_unique<PacketQueue>();
-    audio_packet_queue_ = std::make_unique<PacketQueue>();
-    subtitle_packet_queue_ = std::make_unique<PacketQueue>();
-    video_queue_ = std::make_unique<FrameQueue<VideoFrame>>(config_.video_queue_size);
-    audio_queue_ = std::make_unique<FrameQueue<AudioFrame>>(config_.audio_queue_size);
-    LOG_INFO("队列创建完成");
-    
-    // 如果配置了开始播放时间，在打开流组件之前先 seek
-    if (config_.start_time > 0.0) {
-        double duration = get_duration();
-        if (duration > 0 && config_.start_time < duration) {
-            int64_t seek_target = config_.start_time * AV_TIME_BASE;
-            LOG_INFO("配置了开始播放时间: ", config_.start_time, " 秒，在启动线程前先 seek...");
-            
-            int seek_ret = avformat_seek_file(format_ctx_, -1,
-                                              INT64_MIN,
-                                              seek_target,
-                                              seek_target,
-                                              0);
-            if (seek_ret < 0) {
-                LOG_WARNING("初始 seek 失败，将从头开始播放");
-            } else {
-                LOG_INFO("初始 seek 成功，将从 ", config_.start_time, " 秒开始播放");
-                avformat_flush(format_ctx_);
-                // 更新时钟到 seek 目标位置，避免音视频同步判断异常
-                audio_clock_.set_clock(config_.start_time, 0);
-                video_clock_.set_clock(config_.start_time, 0);
-                external_clock_.set_clock(config_.start_time, 0);
+
+    // 重试机制
+    const int MAX_RETRY = 3;
+    int retry = 0;
+    int ret = -1;
+
+    while (retry <= MAX_RETRY) {
+        if (retry > 0) {
+            LOG_WARNING("重试打开... (", retry, "/", MAX_RETRY, ")");
+            PLAYER_DELAY(1000);
+            if (abort_request_.load()) {
+                emit_error(AVERROR_EXIT, "用户取消");
+                set_state(PlayerState::Stopped);
+                return -1;
             }
-        } else {
-            LOG_WARNING("开始播放时间 ", config_.start_time, " 无效或超过视频时长，忽略");
         }
-    }
-    
-    // 打开流组件
-    if (config_.enable_video && video_stream_ >= 0) {
-        ret = stream_component_open(video_stream_);
-        if (ret < 0) {
-            LOG_ERROR("打开视频流失败");
-            return -1;
+
+        ret = avformat_open_input(&format_ctx_, nullptr, nullptr, nullptr);
+        if (ret >= 0) {
+            LOG_INFO("输入流打开成功");
+            break;
         }
+
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        LOG_ERROR("打开失败 (", retry + 1, "/", MAX_RETRY + 1, "): ", errbuf);
+        retry++;
     }
-    
-    if (config_.enable_audio && audio_stream_ >= 0) {
-        ret = stream_component_open(audio_stream_);
-        if (ret < 0) {
-            LOG_ERROR("打开音频流失败");
-            return -1;
-        }
+
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        emit_error(ret, "无法打开输入流: " + std::string(errbuf));
+        set_state(PlayerState::Error);
+        return -1;
     }
-    
-    // 启动读取线程
-    read_thread_ = std::thread(&PlayerCore::read_thread, this);
-    
-    // 恢复解码器（解码器创建时默认暂停）
-    if (video_decoder_) {
-        video_decoder_->resume();
-    }
-    if (audio_decoder_) {
-        audio_decoder_->resume();
-    }
-    LOG_INFO("解码器已恢复，开始播放");
-    
-    // 启动播放进度定时器线程
-    if (position_changed_callback_) {
-        progress_timer_thread_ = std::thread(&PlayerCore::progress_timer_thread, this);
-    }
-    
-    set_state(PlayerState::Playing);
-    LOG_INFO("播放器已启动（自定义数据源）");
-    
-    return 0;
+
+    // 创建队列
+//    video_packet_queue_ = std::make_unique<PacketQueue>();
+//    audio_packet_queue_ = std::make_unique<PacketQueue>();
+//    subtitle_packet_queue_ = std::make_unique<PacketQueue>();
+//    video_queue_ = std::make_unique<FrameQueue<VideoFrame>>(config_.video_queue_size);
+//    audio_queue_ = std::make_unique<FrameQueue<AudioFrame>>(config_.audio_queue_size);
+    return open_common_process("custom_io_stream");
 }
 
 // 使用指定数据源模式打开
@@ -872,6 +642,146 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
             set_state(PlayerState::Error);
             return -1;
     }
+}
+
+int PlayerCore::open_common_process(const std::string &filename) {
+    // 获取流信息
+    int ret = avformat_find_stream_info(format_ctx_, nullptr);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        emit_error(ERROR_FIND_STREAM_INFO_FAILED, "无法获取流信息 (错误: " + std::string(errbuf) + ")");
+        set_state(PlayerState::Error);
+        return -1;
+    }
+    
+    // 打印媒体信息
+    av_dump_format(format_ctx_, 0, filename.c_str(), 0);
+    
+    // 打印详细的媒体信息（调试用）
+    DebugHelper::print_media_info(format_ctx_);
+    
+    // 查找视频流和音频流
+    video_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    audio_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    
+    // 填充媒体信息
+    media_info_.filename = filename;
+    media_info_.duration = format_ctx_->duration;
+    media_info_.bitrate = format_ctx_->bit_rate;
+    
+    if (video_stream_ >= 0) {
+        AVStream* stream = format_ctx_->streams[video_stream_];
+        media_info_.video_width = stream->codecpar->width;
+        media_info_.video_height = stream->codecpar->height;
+        media_info_.video_codec = stream->codecpar->codec_id;
+        
+        AVRational frame_rate = av_guess_frame_rate(format_ctx_, stream, nullptr);
+        media_info_.video_fps = av_q2d(frame_rate);
+    }
+    
+    if (audio_stream_ >= 0) {
+        AVStream* stream = format_ctx_->streams[audio_stream_];
+        media_info_.audio_sample_rate = stream->codecpar->sample_rate;
+        media_info_.audio_channels = stream->codecpar->ch_layout.nb_channels;
+        media_info_.audio_codec = stream->codecpar->codec_id;
+    }
+    
+    // ⚠️ 必须先创建队列，再启动解码线程！
+    // 创建数据包队列
+    video_packet_queue_ = std::make_unique<PacketQueue>();
+    audio_packet_queue_ = std::make_unique<PacketQueue>();
+    subtitle_packet_queue_ = std::make_unique<PacketQueue>();
+    
+    // 创建帧队列
+    video_queue_ = std::make_unique<FrameQueue<VideoFrame>>(config_.video_queue_size);
+    audio_queue_ = std::make_unique<FrameQueue<AudioFrame>>(config_.audio_queue_size);
+    
+    LOG_INFO("队列创建完成");
+    
+    // ⚠️ 参考 ffplay：如果配置了开始播放时间，在打开流之前先 seek
+    // 这样可以避免解码不需要的数据，显著提高启动速度
+    if (config_.start_time > 0.0) {
+        double duration = get_duration();
+        if (duration > 0 && config_.start_time < duration) {
+            int64_t seek_target = config_.start_time * AV_TIME_BASE;
+            LOG_INFO("配置了开始播放时间: ", config_.start_time, " 秒，在启动线程前先 seek...");
+            
+            // ⚠️ 使用 avformat_seek_file（比 av_seek_frame 更精确）
+            int ret = avformat_seek_file(format_ctx_, -1,
+                                         INT64_MIN,      // min_ts
+                                         seek_target,     // ts (目标时间)
+                                         seek_target,     // max_ts
+                                         0);              // flags
+            if (ret < 0) {
+                LOG_WARNING("初始 seek 失败，将从头开始播放");
+            } else {
+                LOG_INFO("初始 seek 成功，将从 ", config_.start_time, " 秒开始播放");
+                // ⚠️ 清空解复用器的内部缓冲区
+                avformat_flush(format_ctx_);
+                // 更新时钟到 seek 目标位置，避免音视频同步判断异常
+                audio_clock_.set_clock(config_.start_time, 0);
+                video_clock_.set_clock(config_.start_time, 0);
+                external_clock_.set_clock(config_.start_time, 0);
+            }
+        } else {
+            LOG_WARNING("开始播放时间 ", config_.start_time, " 无效或超过视频时长，忽略");
+        }
+    }
+    
+    // 打开流组件（会创建解码器，但不启动线程）
+    if (config_.enable_video && video_stream_ >= 0) {
+        LOG_INFO("打开视频流...");
+        if (stream_component_open(video_stream_) < 0) {
+            LOG_ERROR("无法打开视频流");
+            emit_error(ERROR_NO_VIDEO_STREAM, "无法打开视频流");
+            // 注意：继续尝试打开音频流，不直接返回错误
+        } else {
+            LOG_INFO("视频流打开成功, 分辨率: ", media_info_.video_width, "x", media_info_.video_height);
+        }
+    }
+    
+    if (config_.enable_audio && audio_stream_ >= 0) {
+        LOG_INFO("打开音频流...");
+        if (stream_component_open(audio_stream_) < 0) {
+            LOG_ERROR("无法打开音频流");
+            emit_error(ERROR_NO_AUDIO_STREAM, "无法打开音频流");
+            // 注意：继续播放，不直接返回错误（可能是纯视频文件）
+        } else {
+            LOG_INFO("音频流打开成功, 采样率: ", media_info_.audio_sample_rate, " Hz");
+        }
+    }
+    
+    // ⚠️ 如果视频和音频都没有打开成功，则报错
+    if (!video_decoder_ && !audio_decoder_) {
+        LOG_ERROR("无法打开任何媒体流");
+        emit_error(ERROR_FIND_STREAM_INFO_FAILED, "无法打开任何视频或音频流");
+        set_state(PlayerState::Error);
+        return -1;
+    }
+    
+    // 启动读取线程（此时已经 seek 到正确位置）
+    abort_request_ = false;
+    read_thread_ = std::thread(&PlayerCore::read_thread, this);
+    
+    // ⚠️ 自动开始播放（恢复解码器）
+    if (video_decoder_) {
+        video_decoder_->resume();
+    }
+    if (audio_decoder_) {
+        audio_decoder_->resume();
+    }
+    
+    LOG_INFO("解码器已恢复，开始播放");
+    set_state(PlayerState::Playing);
+    
+    // ⚠️ 启动播放进度回调定时器线程
+    if (position_changed_callback_) {
+        progress_timer_thread_ = std::thread(&PlayerCore::progress_timer_thread, this);
+        LOG_INFO("播放进度回调定时器线程已启动");
+    }
+    
+    return 0;
 }
 
 void PlayerCore::close() {
@@ -1353,7 +1263,7 @@ int PlayerCore::stream_component_open(int stream_index) {
                      ", 通道: ", codec_ctx->ch_layout.nb_channels, ")");
         }
 #endif
-        
+
 #ifndef NO_SDL
         // 配置 SDL 音频（仅桌面平台）
         SDL_AudioSpec wanted_spec, spec;
@@ -2134,7 +2044,7 @@ void PlayerCore::set_playback_rate(double rate) {
     // 限制范围在 0.5 ~ 2.0
     if (rate < 0.5) rate = 0.5;
     if (rate > 2.0) rate = 2.0;
-    
+
     playback_rate_.store(rate, std::memory_order_release);
 
 #ifdef HAS_SOUNDTOUCH
@@ -2142,7 +2052,7 @@ void PlayerCore::set_playback_rate(double rate) {
     if (soundtouch_) {
         // 先清空缓冲区，避免旧数据影响新速度
         soundtouch_->clear();
-        
+
         // 设置新速度
         soundtouch_->setTempo(rate);
     }

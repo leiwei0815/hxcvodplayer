@@ -194,7 +194,7 @@
 //    NSString *urlString = @"https://f18c14f8-vod-tx-cdn-cskziwl-cn.tliveapp.com/1/47/mnt/g/file/20250930/b/o/u/c6ae79da0c546e0e/k43g4cz9f5c1sva3.m3u8";
 //    NSString *urlString = @"/path/to/nonexistent.mp4"; // 错误码: -1001, No such file or directory
 //    NSString *urlString = @"https://example.com/nonexistent-video.mp4";
-#if 0
+#if 1
     // ✨ 选择数据源模式（推荐使用新接口）
     HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeCustomHTTP;  // 或者 HXCPlayerDataSourceModeDefault
     

@@ -5,6 +5,7 @@
 
 #include "hxc_player_core_c_bridge.h"
 #include "hxc_player_core.h"
+#include "hxc_audio_resampler.h"
 #include <cstring>
 #include <vector>
 #include "hxc_logger.h"
@@ -27,7 +28,10 @@ struct PlayerCoreHandle {
     double audio_current_pts;           // 当前音频帧的 PTS
     int audio_current_sample_rate;      // 当前音频采样率
     int audio_current_channels;         // 当前音频通道数
-    
+
+    // 音频重采样器
+    hxcplayer::AudioResampler* resampler;
+
 #ifdef HAS_SOUNDTOUCH
     soundtouch::SoundTouch* soundtouch;
     bool soundtouch_initialized;  // 标记 SoundTouch 是否已设置采样率和通道数
@@ -99,7 +103,8 @@ struct PlayerCoreHandle {
 PlayerCoreHandle* player_core_create(void) {
     PlayerCoreHandle* handle = new PlayerCoreHandle();
     handle->core = new hxcplayer::PlayerCore();
-    
+    handle->resampler = new hxcplayer::AudioResampler();
+
     // 配置播放器（iOS 不使用 SDL 音频）
     hxcplayer::PlayerConfig config;
     config.enable_audio = true;
@@ -127,6 +132,7 @@ PlayerCoreHandle* player_core_create(void) {
 void player_core_destroy(PlayerCoreHandle* handle) {
     if (handle) {
         delete handle->core;
+        delete handle->resampler;
         delete handle;
     }
 }
@@ -456,14 +462,37 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         int samples = frame->nb_samples;
         int sample_rate = frame->sample_rate;
         double pts = af->pts;  // ⚠️ 保存 PTS，用于后续时钟更新
-        
+
         // ⚠️ 保存当前帧的时钟信息
         handle->audio_current_pts = pts;
         handle->audio_current_sample_rate = sample_rate;
         handle->audio_current_channels = channels;
-        
-        // 计算原始输出数据大小（S16 格式）
-        int raw_output_size = samples * channels * sizeof(int16_t);
+
+        // 配置重采样器（如果需要）
+        if (!handle->resampler->is_needed()) {
+            AVChannelLayout dst_layout = AV_CHANNEL_LAYOUT_STEREO;
+            if (channels == 1) {
+                dst_layout = AV_CHANNEL_LAYOUT_MONO;
+            }
+            handle->resampler->configure(&frame->ch_layout, (AVSampleFormat)frame->format, sample_rate,
+                                        &dst_layout, AV_SAMPLE_FMT_S16, sample_rate);
+        }
+
+        uint8_t* audio_data = nullptr;
+        int audio_samples = samples;
+
+        // 重采样（如果需要）
+        if (handle->resampler->is_needed()) {
+            int ret = handle->resampler->resample(frame->data, samples, &audio_data, &audio_samples);
+            if (ret < 0) {
+                audioQueue->next();
+                return 0;
+            }
+        } else {
+            audio_data = frame->data[0];
+        }
+
+        int raw_output_size = audio_samples * channels * sizeof(int16_t);
         
         // 确保临时缓冲区足够大
         if (!handle->audio_buf || handle->audio_buf_size < (unsigned int)raw_output_size * 2) {
@@ -476,113 +505,10 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
                 return 0;
             }
         }
-        
-        int16_t* dst = (int16_t*)handle->audio_buf;
-        
-        // 根据输入格式转换为 S16 交织格式
-        switch (frame->format) {
-            case AV_SAMPLE_FMT_U8:
-            {
-                uint8_t* src = frame->data[0];
-                for (int i = 0; i < samples * channels; i++) {
-                    dst[i] = (int16_t)((src[i] - 128) << 8);
-                }
-                break;
-            }
-            
-            case AV_SAMPLE_FMT_S16:
-            {
-                memcpy(dst, frame->data[0], raw_output_size);
-                break;
-            }
-            
-            case AV_SAMPLE_FMT_S32:
-            {
-                int32_t* src = (int32_t*)frame->data[0];
-                for (int i = 0; i < samples * channels; i++) {
-                    dst[i] = (int16_t)(src[i] >> 16);
-                }
-                break;
-            }
-            
-            case AV_SAMPLE_FMT_FLT:
-            {
-                float* src = (float*)frame->data[0];
-                for (int i = 0; i < samples * channels; i++) {
-                    float sample = src[i];
-                    if (sample > 1.0f) sample = 1.0f;
-                    if (sample < -1.0f) sample = -1.0f;
-                    dst[i] = (int16_t)(sample * 32767.0f);
-                }
-                break;
-            }
-            
-            case AV_SAMPLE_FMT_U8P:
-            {
-                for (int i = 0; i < samples; i++) {
-                    for (int ch = 0; ch < channels; ch++) {
-                        uint8_t* src = frame->data[ch];
-                        dst[i * channels + ch] = (int16_t)((src[i] - 128) << 8);
-                    }
-                }
-                break;
-            }
-            
-            case AV_SAMPLE_FMT_S16P:
-            {
-                for (int i = 0; i < samples; i++) {
-                    for (int ch = 0; ch < channels; ch++) {
-                        int16_t* src = (int16_t*)frame->data[ch];
-                        dst[i * channels + ch] = src[i];
-                    }
-                }
-                break;
-            }
-            
-            case AV_SAMPLE_FMT_S32P:
-            {
-                for (int i = 0; i < samples; i++) {
-                    for (int ch = 0; ch < channels; ch++) {
-                        int32_t* src = (int32_t*)frame->data[ch];
-                        dst[i * channels + ch] = (int16_t)(src[i] >> 16);
-                    }
-                }
-                break;
-            }
-            
-            case AV_SAMPLE_FMT_FLTP:
-            {
-                for (int i = 0; i < samples; i++) {
-                    for (int ch = 0; ch < channels; ch++) {
-                        float* src = (float*)frame->data[ch];
-                        float sample = src[i];
-                        if (sample > 1.0f) sample = 1.0f;
-                        if (sample < -1.0f) sample = -1.0f;
-                        dst[i * channels + ch] = (int16_t)(sample * 32767.0f);
-                    }
-                }
-                break;
-            }
-            
-            case AV_SAMPLE_FMT_DBLP:
-            {
-                for (int i = 0; i < samples; i++) {
-                    for (int ch = 0; ch < channels; ch++) {
-                        double* src = (double*)frame->data[ch];
-                        double sample = src[i];
-                        if (sample > 1.0) sample = 1.0;
-                        if (sample < -1.0) sample = -1.0;
-                        dst[i * channels + ch] = (int16_t)(sample * 32767.0);
-                    }
-                }
-                break;
-            }
-            
-            default:
-                audioQueue->next();
-                return 0;
-        }
-        
+
+        // 复制重采样后的数据
+        memcpy(handle->audio_buf, audio_data, raw_output_size);
+
         // 消费音频帧
         audioQueue->next();
         
@@ -599,13 +525,14 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             }
             
             // 转换 S16 为 float
-            std::vector<float> float_input(samples * channels);
-            for (int i = 0; i < samples * channels; i++) {
-                float_input[i] = (float)dst[i] / 32768.0f;
+            int16_t* s16_data = (int16_t*)handle->audio_buf;
+            std::vector<float> float_input(audio_samples * channels);
+            for (int i = 0; i < audio_samples * channels; i++) {
+                float_input[i] = (float)s16_data[i] / 32768.0f;
             }
-            
+
             // 送入样本到 SoundTouch
-            handle->soundtouch->putSamples(float_input.data(), samples);
+            handle->soundtouch->putSamples(float_input.data(), audio_samples);
             
             // 获取可用样本数
             uint32_t available = handle->soundtouch->numSamples();

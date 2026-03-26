@@ -95,6 +95,7 @@ set(CORE_SOURCES
     ${PROJECT_ROOT}/core/src/hxc_player_core.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_core_c_bridge.cpp
     ${PROJECT_ROOT}/core/src/hxc_custom_io.cpp
+    ${PROJECT_ROOT}/core/src/hxc_audio_resampler.cpp
 )
 
 # 核心库头文件
@@ -108,6 +109,7 @@ set(CORE_HEADERS
     ${PROJECT_ROOT}/core/include/hxc_frame_queue.h
     ${PROJECT_ROOT}/core/include/hxc_logger.h
     ${PROJECT_ROOT}/core/include/hxc_debug_helper.h
+    ${PROJECT_ROOT}/core/include/hxc_audio_resampler.h
 )
 
 # macOS 播放器控制类（使用统一的播放器）
