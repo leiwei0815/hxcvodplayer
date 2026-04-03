@@ -244,16 +244,34 @@ Java_com_hxcplayer_HXCPlayerControl_getCurrentLogFile(JNIEnv *env, jclass clazz)
 // 使用自定义 HTTP 模式打开
 JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomHTTP(
-        JNIEnv *env, jobject thiz, jlong handle, jstring url, jint timeout_ms, jint max_retries) {
+        JNIEnv *env, jobject thiz, jlong handle, jstring url, jint timeout_ms, jint max_retries, jboolean encrypted_file) {
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
     if (!player) return JNI_FALSE;
 
     const char* urlStr = env->GetStringUTFChars(url, nullptr);
-    LOGD("nativeOpenWithCustomHTTP: %s", urlStr);
+    LOGD("nativeOpenWithCustomHTTP: %s encrypted=%d", urlStr, encrypted_file ? 1 : 0);
 
-    bool result = player->openWithCustomHTTP(urlStr, timeout_ms, max_retries);
+    bool result = player->openWithCustomHTTP(urlStr, timeout_ms, max_retries, encrypted_file == JNI_TRUE);
 
     env->ReleaseStringUTFChars(url, urlStr);
+    return result ? JNI_TRUE : JNI_FALSE;
+}
+
+// 使用自定义本地文件模式打开（与 DataSourceMode::CustomFile 一致）
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomFile(
+        JNIEnv *env, jobject thiz, jlong handle, jstring path, jint avio_buffer_size, jboolean encrypted_file) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return JNI_FALSE;
+
+    const char* pathStr = env->GetStringUTFChars(path, nullptr);
+    LOGD("nativeOpenWithCustomFile: %s avio_buffer_size=%d encrypted=%d",
+         pathStr, avio_buffer_size, encrypted_file ? 1 : 0);
+
+    size_t buf = avio_buffer_size > 0 ? static_cast<size_t>(avio_buffer_size) : (64 * 1024);
+    bool result = player->openWithCustomFile(pathStr, buf, encrypted_file == JNI_TRUE);
+
+    env->ReleaseStringUTFChars(path, pathStr);
     return result ? JNI_TRUE : JNI_FALSE;
 }
 

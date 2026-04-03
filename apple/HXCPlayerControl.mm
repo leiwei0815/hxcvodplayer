@@ -178,6 +178,7 @@ static void loading_callback_c(bool is_loading, void* user_data) {
     config.maxRetries = 3;              // 重试3次
     config.cacheSize = 2 * 1024 * 1024; // 2MB
     config.avioBufferSize = 64 * 1024;  // 64KB
+    config.encryptedFile = NO;
     return config;
 }
 
@@ -189,6 +190,7 @@ static void loading_callback_c(bool is_loading, void* user_data) {
         self.maxRetries = 3;
         self.cacheSize = 2 * 1024 * 1024;
         self.avioBufferSize = 64 * 1024;
+        self.encryptedFile = NO;
     }
     return self;
 }
@@ -342,6 +344,7 @@ static void loading_callback_c(bool is_loading, void* user_data) {
     cConfig.max_retries = (int)config.maxRetries;
     cConfig.cache_size = config.cacheSize;
     cConfig.avio_buffer_size = config.avioBufferSize;
+    cConfig.encrypted_file = config.encryptedFile ? 1 : 0;
     
     // 转换模式枚举
     PlayerDataSourceModeC cMode;
@@ -351,6 +354,9 @@ static void loading_callback_c(bool is_loading, void* user_data) {
             break;
         case HXCPlayerDataSourceModeCustomHTTP:
             cMode = PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP;
+            break;
+        case HXCPlayerDataSourceModeCustomFile:
+            cMode = PLAYER_DATA_SOURCE_MODE_CUSTOM_FILE;
             break;
         default:
             cMode = PLAYER_DATA_SOURCE_MODE_DEFAULT;

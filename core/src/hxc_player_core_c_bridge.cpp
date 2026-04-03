@@ -13,6 +13,7 @@
 extern "C" {
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/samplefmt.h>
 }
 
 // PlayerCoreHandle 结构，包含音频处理所需的状态
@@ -183,6 +184,9 @@ int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, Player
         case PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP:
             cppMode = hxcplayer::DataSourceMode::CustomHTTP;
             break;
+        case PLAYER_DATA_SOURCE_MODE_CUSTOM_FILE:
+            cppMode = hxcplayer::DataSourceMode::CustomFile;
+            break;
         default:
             return -1;  // 不支持的模式
     }
@@ -194,6 +198,7 @@ int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, Player
         cppConfig.max_retries = config->max_retries;
         cppConfig.cache_size = config->cache_size;
         cppConfig.avio_buffer_size = config->avio_buffer_size;
+        cppConfig.encrypted_file = (config->encrypted_file != 0);
     }
     // 否则使用默认配置
     
@@ -461,6 +466,19 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         int channels = frame->ch_layout.nb_channels;
         int samples = frame->nb_samples;
         int sample_rate = frame->sample_rate;
+
+        // 防御性检查：部分解码器在 flush/边界时可能给出 nb_samples>0 但 data[0] 为空指针或缓冲区大小为 0 的帧；
+        // 此时直接丢弃，避免后续 memcpy / 重采样访问非法地址导致崩溃。
+        int expected_src_size = av_samples_get_buffer_size(
+            nullptr,
+            channels,
+            samples,
+            (AVSampleFormat)frame->format,
+            0);
+        if (samples <= 0 || !frame->data || !frame->data[0] || expected_src_size <= 0) {
+            audioQueue->next();
+            return 0;
+        }
         double pts = af->pts;  // ⚠️ 保存 PTS，用于后续时钟更新
 
         // ⚠️ 保存当前帧的时钟信息
@@ -468,15 +486,17 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         handle->audio_current_sample_rate = sample_rate;
         handle->audio_current_channels = channels;
 
-        // 配置重采样器（如果需要）
-        if (!handle->resampler->is_needed()) {
-            AVChannelLayout dst_layout = AV_CHANNEL_LAYOUT_STEREO;
-            if (channels == 1) {
-                dst_layout = AV_CHANNEL_LAYOUT_MONO;
-            }
-            handle->resampler->configure(&frame->ch_layout, (AVSampleFormat)frame->format, sample_rate,
-                                        &dst_layout, AV_SAMPLE_FMT_S16, sample_rate);
+        // 按当前帧的格式配置重采样器（每个新流/格式变化时重新配置）
+        AVChannelLayout dst_layout = AV_CHANNEL_LAYOUT_STEREO;
+        if (channels == 1) {
+            dst_layout = AV_CHANNEL_LAYOUT_MONO;
         }
+        handle->resampler->configure(&frame->ch_layout,
+                                     (AVSampleFormat)frame->format,
+                                     sample_rate,
+                                     &dst_layout,
+                                     AV_SAMPLE_FMT_S16,
+                                     sample_rate);
 
         uint8_t* audio_data = nullptr;
         int audio_samples = samples;

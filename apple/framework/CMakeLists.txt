@@ -34,6 +34,7 @@ set(CORE_SOURCES
     ${PROJECT_ROOT}/core/src/hxc_decoder.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_types.cpp
     ${PROJECT_ROOT}/core/src/hxc_packet_queue.cpp
+    ${PROJECT_ROOT}/core/src/hxc_audio_resampler.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_core_c_bridge.cpp
     ${PROJECT_ROOT}/core/src/hxc_custom_io.cpp
 )
@@ -44,11 +45,25 @@ set(APPLE_SOURCES
     ${PROJECT_ROOT}/apple/HXCPlayerView.mm
 )
 
+# HXCVD 下载模块（纯 Objective-C + Core Data）
+set(HXCVD_SOURCES
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadItem.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDPersistenceController.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDFileStore.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDPlaylistParser.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDHLSDownloadEngine.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadManager.m
+)
+
 # 公共头文件（对外暴露的 API）
 set(PUBLIC_HEADERS
     ${PROJECT_ROOT}/apple/HXCPlayer.h
     ${PROJECT_ROOT}/apple/HXCPlayerControl.h
     ${PROJECT_ROOT}/apple/HXCPlayerView.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownload.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadTypes.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadItem.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadManager.h
 )
 
 # 私有头文件（内部使用）
@@ -60,6 +75,7 @@ set(PRIVATE_HEADERS
     ${PROJECT_ROOT}/core/include/hxc_frame_queue.h
     ${PROJECT_ROOT}/core/include/hxc_player_core_c_bridge.h
     ${PROJECT_ROOT}/core/include/hxc_custom_io.h
+    ${PROJECT_ROOT}/core/include/hxc_audio_resampler.h
     ${PROJECT_ROOT}/core/include/hxc_logger.h
     ${PROJECT_ROOT}/core/include/hxc_debug_helper.h
 )
@@ -69,6 +85,7 @@ set(PRIVATE_HEADERS
 # 包含目录
 include_directories(
     ${PROJECT_ROOT}/core/include
+    ${PROJECT_ROOT}/apple/HXCVDownload
 )
 
 if(IOS)
@@ -115,6 +132,7 @@ endif()
 add_library(HXCPlayer SHARED
     ${CORE_SOURCES}
     ${APPLE_SOURCES}
+    ${HXCVD_SOURCES}
     ${PUBLIC_HEADERS}
     ${PRIVATE_HEADERS}
 )
@@ -155,6 +173,13 @@ set_source_files_properties(
     COMPILE_FLAGS "-x objective-c++ -fobjc-arc"
 )
 
+# HXCVDownload 为纯 Objective-C
+set_source_files_properties(
+    ${HXCVD_SOURCES}
+    PROPERTIES
+    COMPILE_FLAGS "-x objective-c -fobjc-arc"
+)
+
 # 定义编译宏（在 target 级别定义，避免被覆盖）
 target_compile_definitions(HXCPlayer PRIVATE NO_SDL=1)
 if(HAS_SOUNDTOUCH)
@@ -174,6 +199,7 @@ target_link_libraries(HXCPlayer PUBLIC
     "-framework CoreVideo"
     "-framework AudioToolbox"
     "-framework QuartzCore"
+    "-framework CoreData"
 )
 
 if(IOS)

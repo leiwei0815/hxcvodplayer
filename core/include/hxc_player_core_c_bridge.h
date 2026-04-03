@@ -78,6 +78,7 @@ typedef enum {
 typedef enum {
     PLAYER_DATA_SOURCE_MODE_DEFAULT = 0,      // 默认模式（FFmpeg 直接打开）
     PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP = 1,  // 自定义 HTTP Range 下载器
+    PLAYER_DATA_SOURCE_MODE_CUSTOM_FILE = 2,  // 本地文件自定义读取（支持加密文件头解密）
 } PlayerDataSourceModeC;
 
 // ⚠️ 自定义数据源配置（与 C++ 层 CustomDataSourceConfig 保持一致）
@@ -86,6 +87,7 @@ typedef struct {
     int max_retries;          // 最大重试次数，默认 3
     size_t cache_size;        // 缓存大小（字节），默认 2MB
     size_t avio_buffer_size;  // AVIO 缓冲区大小（字节），默认 64KB
+    int encrypted_file;       // 是否为加密文件（0/1），仅解密文件头前 100 字节
 } PlayerDataSourceConfigC;
 
 // 创建/销毁播放器

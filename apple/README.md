@@ -9,6 +9,8 @@ apple/
 ├── framework/                    # Framework 构建配置
 │   ├── CMakeLists.txt           # CMake 配置文件
 │   └── Info.plist.in            # Framework Info.plist 模板
+├── HXCVDownload/                 # HXCVD 视频下载模块（NSURLSession + Core Data）
+│   └── README.md                 # 模块说明文档
 ├── build_framework.sh           # 构建脚本
 ├── FRAMEWORK_BUILD_GUIDE.md     # 详细构建指南
 ├── ios/                         # iOS 示例 App

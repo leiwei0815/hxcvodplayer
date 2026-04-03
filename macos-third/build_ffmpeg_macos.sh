@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # FFmpeg macOS 静态库编译脚本
-# 编译最小化配置的 FFmpeg，仅包含常用解码器
+# 编译精简但覆盖常见本地/网络文件的配置（MP4/MOV/MKV/WebM/TS/HLS/AVI/FLV/WMV/MPEG-PS 等）
+# MKV/WebM 共用 matroska demuxer；需同时启用容器内常见音视频解码器
 # 输出 arm64 架构的静态库
 
 set -e
@@ -77,9 +78,30 @@ echo "🔨 配置 FFmpeg..."
     --enable-decoder=h264 \
     --enable-decoder=hevc \
     --enable-decoder=mpeg4 \
+    --enable-decoder=mpeg2video \
+    --enable-decoder=vp8 \
+    --enable-decoder=vp9 \
+    --enable-decoder=wmv3 \
+    --enable-decoder=vc1 \
+    --enable-decoder=prores \
     --enable-decoder=aac \
     --enable-decoder=mp3 \
+    --enable-decoder=ac3 \
+    --enable-decoder=eac3 \
+    --enable-decoder=truehd \
+    --enable-decoder=dca \
+    --enable-decoder=flac \
+    --enable-decoder=vorbis \
+    --enable-decoder=opus \
+    --enable-decoder=alac \
+    --enable-decoder=wmav2 \
     --enable-decoder=pcm_s16le \
+    --enable-decoder=pcm_s16be \
+    --enable-decoder=pcm_s24le \
+    --enable-decoder=pcm_s32le \
+    --enable-decoder=pcm_f32le \
+    --enable-decoder=subrip \
+    --enable-decoder=ass \
     --enable-decoder=png \
     --enable-decoder=mjpeg \
     --disable-muxers \
@@ -89,9 +111,13 @@ echo "🔨 配置 FFmpeg..."
     --enable-demuxer=m4v \
     --enable-demuxer=mpegts \
     --enable-demuxer=mpegtsraw \
+    --enable-demuxer=hls \
     --enable-demuxer=avi \
     --enable-demuxer=matroska \
     --enable-demuxer=flv \
+    --enable-demuxer=asf \
+    --enable-demuxer=ogg \
+    --enable-demuxer=mpeg \
     --enable-demuxer=aac \
     --enable-demuxer=mp3 \
     --enable-demuxer=wav \
@@ -99,8 +125,15 @@ echo "🔨 配置 FFmpeg..."
     --enable-parser=h264 \
     --enable-parser=hevc \
     --enable-parser=mpeg4video \
+    --enable-parser=mpegvideo \
+    --enable-parser=vp8 \
+    --enable-parser=vp9 \
     --enable-parser=aac \
     --enable-parser=mpegaudio \
+    --enable-parser=ac3 \
+    --enable-parser=vorbis \
+    --enable-parser=opus \
+    --enable-parser=flac \
     --disable-bsfs \
     --enable-bsf=h264_mp4toannexb \
     --enable-bsf=hevc_mp4toannexb \

@@ -41,8 +41,11 @@ public:
     bool openURL(const char* url);
     bool openURL(const char* url, double start_position);
 
-    // 使用自定义 HTTP 模式打开
-    bool openWithCustomHTTP(const char* url, int timeout_ms = 30000, int max_retries = 3);
+    // 使用自定义 HTTP 模式打开（encrypted_file：是否对文件头前 100 字节做解密，与核心层一致）
+    bool openWithCustomHTTP(const char* url, int timeout_ms = 30000, int max_retries = 3, bool encrypted_file = false);
+
+    // 使用自定义本地文件模式打开（经 CustomAVIOContext + LocalFileDataSource，支持可选文件头解密）
+    bool openWithCustomFile(const char* path, size_t avio_buffer_size = 64 * 1024, bool encrypted_file = false);
     
     // 播放控制
     void play();

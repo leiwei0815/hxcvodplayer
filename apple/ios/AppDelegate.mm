@@ -5,8 +5,13 @@
 
 #import "AppDelegate.h"
 #import "PlayerViewController.h"
+#import "../HXCVDownload/HXCVDownload.h"
 
 @implementation AppDelegate
+
+- (void)application:(UIApplication *)application handleEventsForBackgroundURLSession:(NSString *)identifier completionHandler:(void (^)(void))completionHandler {
+    [HXCVDownloadManager notifyBackgroundURLSessionEventsForIdentifier:identifier completionHandler:completionHandler];
+}
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     // 创建窗口

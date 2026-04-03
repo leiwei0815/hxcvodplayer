@@ -172,12 +172,29 @@ class HXCPlayerControl(private val context: Context) {
     }
 
     // 使用自定义 HTTP 模式打开（支持 Range 下载）
-    fun openWithCustomHTTP(url: String, timeoutMs: Int = 30000, maxRetries: Int = 3): Boolean {
-        val result = nativeOpenWithCustomHTTP(nativeHandle, url, timeoutMs, maxRetries)
+    // encryptedFile：是否与核心层约定一致，对文件头前 100 字节解密（默认 false）
+    fun openWithCustomHTTP(url: String, timeoutMs: Int = 30000, maxRetries: Int = 3, encryptedFile: Boolean = false): Boolean {
+        val result = nativeOpenWithCustomHTTP(nativeHandle, url, timeoutMs, maxRetries, encryptedFile)
         if (result) {
             callback?.onPlayerStateChanged(PlayerState.OPENING)
         } else {
             callback?.onPlayerError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开自定义 HTTP: $url")
+        }
+        return result
+    }
+
+    /**
+     * 使用自定义本地文件模式打开（核心层 CustomFile：LocalFileDataSource + CustomAVIO）。
+     * @param path 本地绝对路径（如 context.filesDir 或 Environment 下的路径）
+     * @param avioBufferSize AVIO 读缓冲，字节，默认 64KB；≤0 时 JNI 侧会退回 64KB
+     * @param encryptedFile 是否对文件头前 100 字节按核心约定解密
+     */
+    fun openWithCustomFile(path: String, avioBufferSize: Int = 64 * 1024, encryptedFile: Boolean = false): Boolean {
+        val result = nativeOpenWithCustomFile(nativeHandle, path, avioBufferSize, encryptedFile)
+        if (result) {
+            callback?.onPlayerStateChanged(PlayerState.OPENING)
+        } else {
+            callback?.onPlayerError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开本地文件(CustomFile): $path")
         }
         return result
     }
@@ -266,7 +283,8 @@ class HXCPlayerControl(private val context: Context) {
     private external fun nativeUpdateSurfaceSize(handle: Long, width: Int, height: Int)
     private external fun nativeOpenURL(handle: Long, url: String): Boolean
     private external fun nativeOpenURLWithStartPosition(handle: Long, url: String, startPosition: Double): Boolean
-    private external fun nativeOpenWithCustomHTTP(handle: Long, url: String, timeoutMs: Int, maxRetries: Int): Boolean
+    private external fun nativeOpenWithCustomHTTP(handle: Long, url: String, timeoutMs: Int, maxRetries: Int, encryptedFile: Boolean): Boolean
+    private external fun nativeOpenWithCustomFile(handle: Long, path: String, avioBufferSize: Int, encryptedFile: Boolean): Boolean
     private external fun nativePlay(handle: Long)
     private external fun nativePause(handle: Long)
     private external fun nativeStop(handle: Long)

@@ -89,6 +89,7 @@ typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
 typedef NS_ENUM(NSInteger, HXCPlayerDataSourceMode) {
     HXCPlayerDataSourceModeDefault = 0,      // 默认模式（FFmpeg 直接打开）
     HXCPlayerDataSourceModeCustomHTTP = 1,   // 自定义 HTTP Range 下载器
+    HXCPlayerDataSourceModeCustomFile = 2,   // 本地文件自定义读取（支持加密文件头解密）
 };
 
 // ⚠️ 自定义数据源配置
@@ -97,6 +98,7 @@ typedef NS_ENUM(NSInteger, HXCPlayerDataSourceMode) {
 @property (nonatomic, assign) NSInteger maxRetries;         // 最大重试次数，默认 3
 @property (nonatomic, assign) NSUInteger cacheSize;         // 缓存大小（字节），默认 2MB
 @property (nonatomic, assign) NSUInteger avioBufferSize;    // AVIO 缓冲区大小（字节），默认 64KB
+@property (nonatomic, assign) BOOL encryptedFile;           // 是否为加密文件（仅解密文件头前 100 字节）
 
 // 默认配置
 + (instancetype)defaultConfig;

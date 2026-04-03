@@ -460,7 +460,8 @@ int PlayerCore::open(const std::string& filename) {
 }
 
 // 使用自定义数据源打开
-int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io) {
+int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io,
+                                    const std::string& url_for_format) {
     if (state_ != PlayerState::Idle && state_ != PlayerState::Stopped) {
         LOG_WARNING("播放器状态错误，无法打开文件");
         set_state(PlayerState::Error);
@@ -487,8 +488,9 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     // 分配 AVFormatContext
     format_ctx_ = avformat_alloc_context();
     
-    // 使用自定义 AVIOContext
+    // 使用自定义 AVIOContext（须配合 AVFMT_FLAG_CUSTOM_IO，避免 close 时误关我们持有的 pb）
     format_ctx_->pb = custom_io_->get_avio_context();
+    format_ctx_->flags |= AVFMT_FLAG_CUSTOM_IO;
     
     // 设置中断回调
     format_ctx_->interrupt_callback.callback = [](void* ctx) -> int {
@@ -498,6 +500,10 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     format_ctx_->interrupt_callback.opaque = this;
     
     LOG_INFO("开始打开输入流（使用自定义 AVIOContext）...");
+    const char* url_for_probe = url_for_format.empty() ? nullptr : url_for_format.c_str();
+    if (url_for_probe) {
+        LOG_INFO("探测/解析用 URL（与自定义 IO 数据源一致）: ", url_for_format);
+    }
 
     // 重试机制
     const int MAX_RETRY = 3;
@@ -513,9 +519,20 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
                 set_state(PlayerState::Stopped);
                 return -1;
             }
+            if (format_ctx_) {
+                avformat_close_input(&format_ctx_);
+            }
+            format_ctx_ = avformat_alloc_context();
+            format_ctx_->pb = custom_io_->get_avio_context();
+            format_ctx_->flags |= AVFMT_FLAG_CUSTOM_IO;
+            format_ctx_->interrupt_callback.callback = [](void* ctx) -> int {
+                PlayerCore* player = static_cast<PlayerCore*>(ctx);
+                return player->abort_request_.load() ? 1 : 0;
+            };
+            format_ctx_->interrupt_callback.opaque = this;
         }
 
-        ret = avformat_open_input(&format_ctx_, nullptr, nullptr, nullptr);
+        ret = avformat_open_input(&format_ctx_, url_for_probe, nullptr, nullptr);
         if (ret >= 0) {
             LOG_INFO("输入流打开成功");
             break;
@@ -583,6 +600,7 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
                 downloader->set_timeout(config.timeout_ms / 1000); // 转换为秒
                 downloader->set_max_retries(config.max_retries);
                 dataSource->set_cache_size(config.cache_size);
+                dataSource->set_encrypted_file(config.encrypted_file);
                 
                 // 3. 设置下载进度回调
                 auto last_percent = std::make_shared<int>(-1);
@@ -625,12 +643,52 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
                 
                 LOG_INFO("CustomAVIOContext 创建成功");
                 
-                // 6. 使用自定义 IO 打开
-                return open_with_custom_io(std::move(customIO));
+                // 6. 使用自定义 IO 打开（传入 url 供 HLS 等探测扩展名并解析相对路径）
+                return open_with_custom_io(std::move(customIO), url);
                 
             } catch (const std::exception& e) {
                 LOG_ERROR("创建自定义数据源失败: ", e.what());
                 emit_error(ERROR_OPEN_INPUT_FAILED, std::string("创建自定义数据源失败: ") + e.what());
+                set_state(PlayerState::Error);
+                return -1;
+            }
+        }
+
+        case DataSourceMode::CustomFile: {
+            // 本地文件：通过自定义 IO 读取（可选：对文件头前 100 字节解密）
+            LOG_INFO("使用本地文件自定义读取模式");
+            LOG_INFO("配置参数:");
+            LOG_INFO("  - AVIO 缓冲区: ", config.avio_buffer_size / 1024, " KB");
+            LOG_INFO("  - 加密文件: ", config.encrypted_file ? "是" : "否");
+
+            try {
+                auto dataSource = std::make_unique<LocalFileDataSource>();
+                dataSource->set_encrypted_file(config.encrypted_file);
+
+                if (dataSource->open(url) < 0) {
+                    LOG_ERROR("无法打开本地数据源: ", url);
+                    emit_error(ERROR_OPEN_INPUT_FAILED, "无法打开本地数据源");
+                    set_state(PlayerState::Error);
+                    return -1;
+                }
+
+                auto customIO = std::make_unique<CustomAVIOContext>(
+                    std::move(dataSource),
+                    config.avio_buffer_size
+                );
+
+                if (!customIO->get_avio_context()) {
+                    LOG_ERROR("无法创建 AVIOContext");
+                    emit_error(ERROR_ALLOC_CONTEXT_FAILED, "无法创建 AVIOContext");
+                    set_state(PlayerState::Error);
+                    return -1;
+                }
+
+                return open_with_custom_io(std::move(customIO), url);
+
+            } catch (const std::exception& e) {
+                LOG_ERROR("创建本地自定义数据源失败: ", e.what());
+                emit_error(ERROR_OPEN_INPUT_FAILED, std::string("创建本地自定义数据源失败: ") + e.what());
                 set_state(PlayerState::Error);
                 return -1;
             }

@@ -58,8 +58,14 @@ private:
     bool need_resample_;
     uint8_t* buffer_;
     int buffer_size_;
+    int src_sample_rate_;
+    int dst_sample_rate_;
     int dst_channels_;
+    AVSampleFormat src_sample_fmt_;
     AVSampleFormat dst_sample_fmt_;
+    AVChannelLayout src_ch_layout_;
+    AVChannelLayout dst_ch_layout_;
+    bool has_config_;
 };
 
 } // namespace hxcplayer

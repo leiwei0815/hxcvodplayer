@@ -5,6 +5,8 @@
 
 #import "PlayerViewController.h"
 #import "../HXCPlayerControl.h"  // 使用统一的播放器类
+#import "../HXCVDownload/HXCVDownload.h"
+#import "HXCVDownloadViewController.h"
 //com.nuoshan.app
 
 @interface PlayerViewController () <HXCPlayerControlDelegate>
@@ -13,6 +15,8 @@
 @property (nonatomic, strong) UIView *playerContainerView;
 @property (nonatomic, strong) UISlider *progressSlider;
 @property (nonatomic, strong) UIButton *playPauseButton;
+@property (nonatomic, strong) UIButton *downloadButton;
+@property (nonatomic, strong) UIButton *completedDownloadsButton;
 @property (nonatomic, strong) UILabel *timeLabel;
 @property (nonatomic, strong) UIButton *speedButton;
 @property (nonatomic, strong) UIButton *aspectRatioButton;  // 显示模式按钮
@@ -69,60 +73,107 @@
     _playPauseButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [_playPauseButton setTitle:@"播放" forState:UIControlStateNormal];
     _playPauseButton.tintColor = [UIColor whiteColor];
-    _playPauseButton.translatesAutoresizingMaskIntoConstraints = NO;
+    _playPauseButton.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _playPauseButton.titleLabel.adjustsFontSizeToFitWidth = YES;
+    _playPauseButton.titleLabel.minimumScaleFactor = 0.75;
     [_playPauseButton addTarget:self action:@selector(playPauseButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [controlBar addSubview:_playPauseButton];
+
+    _downloadButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_downloadButton setTitle:@"下载" forState:UIControlStateNormal];
+    _downloadButton.tintColor = [UIColor whiteColor];
+    _downloadButton.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _downloadButton.titleLabel.adjustsFontSizeToFitWidth = YES;
+    _downloadButton.titleLabel.minimumScaleFactor = 0.75;
+    [_downloadButton addTarget:self action:@selector(downloadButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+    _completedDownloadsButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_completedDownloadsButton setTitle:@"已下载" forState:UIControlStateNormal];
+    _completedDownloadsButton.tintColor = [UIColor whiteColor];
+    _completedDownloadsButton.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    _completedDownloadsButton.titleLabel.adjustsFontSizeToFitWidth = YES;
+    _completedDownloadsButton.titleLabel.minimumScaleFactor = 0.75;
+    [_completedDownloadsButton addTarget:self action:@selector(completedDownloadsButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    
+    // 倍速 / 渲染 / PiP（右侧一组）
+    _speedButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_speedButton setTitle:@"1.0x" forState:UIControlStateNormal];
+    _speedButton.tintColor = [UIColor whiteColor];
+    _speedButton.titleLabel.adjustsFontSizeToFitWidth = YES;
+    _speedButton.titleLabel.minimumScaleFactor = 0.75;
+    [_speedButton addTarget:self action:@selector(speedButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    
+    _aspectRatioButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_aspectRatioButton setTitle:@"适应" forState:UIControlStateNormal];
+    _aspectRatioButton.tintColor = [UIColor whiteColor];
+    _aspectRatioButton.titleLabel.adjustsFontSizeToFitWidth = YES;
+    _aspectRatioButton.titleLabel.minimumScaleFactor = 0.75;
+    [_aspectRatioButton addTarget:self action:@selector(aspectRatioButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    
+    _pipButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_pipButton setTitle:@"PiP" forState:UIControlStateNormal];
+    _pipButton.tintColor = [UIColor whiteColor];
+    [_pipButton addTarget:self action:@selector(pipButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+    for (UIButton *b in @[_playPauseButton, _downloadButton, _completedDownloadsButton, _pipButton, _speedButton, _aspectRatioButton]) {
+        [b setContentHuggingPriority:UILayoutPriorityDefaultHigh forAxis:UILayoutConstraintAxisHorizontal];
+        [b setContentCompressionResistancePriority:UILayoutPriorityDefaultHigh forAxis:UILayoutConstraintAxisHorizontal];
+    }
+
+    UIView *topRowSpacer = [[UIView alloc] init];
+    [topRowSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    [topRowSpacer setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+
+    UIStackView *topButtonRow = [[UIStackView alloc] initWithArrangedSubviews:@[
+        _playPauseButton, _downloadButton, _completedDownloadsButton, topRowSpacer, _pipButton, _speedButton, _aspectRatioButton
+    ]];
+    topButtonRow.translatesAutoresizingMaskIntoConstraints = NO;
+    topButtonRow.axis = UILayoutConstraintAxisHorizontal;
+    topButtonRow.alignment = UIStackViewAlignmentCenter;
+    topButtonRow.distribution = UIStackViewDistributionFill;
+    topButtonRow.spacing = 6;
     
     // 进度条
     _progressSlider = [[UISlider alloc] init];
     _progressSlider.minimumValue = 0;
     _progressSlider.maximumValue = 1000;
-    _progressSlider.translatesAutoresizingMaskIntoConstraints = NO;
     [_progressSlider addTarget:self action:@selector(progressSliderChanged:) forControlEvents:UIControlEventValueChanged];
     [_progressSlider addTarget:self action:@selector(progressSliderTouchDown:) forControlEvents:UIControlEventTouchDown];
     [_progressSlider addTarget:self action:@selector(progressSliderTouchUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
-    [controlBar addSubview:_progressSlider];
     
     // 时间标签
     _timeLabel = [[UILabel alloc] init];
     _timeLabel.text = @"00:00 / 00:00";
     _timeLabel.textColor = [UIColor whiteColor];
     _timeLabel.font = [UIFont systemFontOfSize:12];
-    _timeLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    [controlBar addSubview:_timeLabel];
-    
-    // 倍速按钮
-    _speedButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_speedButton setTitle:@"1.0x" forState:UIControlStateNormal];
-    _speedButton.tintColor = [UIColor whiteColor];
-    _speedButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [_speedButton addTarget:self action:@selector(speedButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [controlBar addSubview:_speedButton];
-    
-    // 显示模式按钮
-    _aspectRatioButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_aspectRatioButton setTitle:@"适应" forState:UIControlStateNormal];
-    _aspectRatioButton.tintColor = [UIColor whiteColor];
-    _aspectRatioButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [_aspectRatioButton addTarget:self action:@selector(aspectRatioButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [controlBar addSubview:_aspectRatioButton];
-    
-    // 画中画按钮
-    _pipButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [_pipButton setTitle:@"PiP" forState:UIControlStateNormal];
-    _pipButton.tintColor = [UIColor whiteColor];
-    _pipButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [_pipButton addTarget:self action:@selector(pipButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [controlBar addSubview:_pipButton];
+    [_timeLabel setContentHuggingPriority:UILayoutPriorityDefaultHigh forAxis:UILayoutConstraintAxisHorizontal];
+    [_timeLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultHigh forAxis:UILayoutConstraintAxisHorizontal];
     
     // 音量滑块
     _volumeSlider = [[UISlider alloc] init];
     _volumeSlider.minimumValue = 0;
     _volumeSlider.maximumValue = 1.0;
     _volumeSlider.value = 1.0;
-    _volumeSlider.translatesAutoresizingMaskIntoConstraints = NO;
     [_volumeSlider addTarget:self action:@selector(volumeSliderChanged:) forControlEvents:UIControlEventValueChanged];
-    [controlBar addSubview:_volumeSlider];
+    _volumeSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    [[_volumeSlider.widthAnchor constraintEqualToConstant:140] setActive:YES];
+
+    UIView *bottomRowSpacer = [[UIView alloc] init];
+    [bottomRowSpacer setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+
+    UIStackView *timeVolumeRow = [[UIStackView alloc] initWithArrangedSubviews:@[ _timeLabel, bottomRowSpacer, _volumeSlider ]];
+    timeVolumeRow.translatesAutoresizingMaskIntoConstraints = NO;
+    timeVolumeRow.axis = UILayoutConstraintAxisHorizontal;
+    timeVolumeRow.alignment = UIStackViewAlignmentCenter;
+    timeVolumeRow.distribution = UIStackViewDistributionFill;
+    timeVolumeRow.spacing = 8;
+
+    UIStackView *controlColumn = [[UIStackView alloc] initWithArrangedSubviews:@[ topButtonRow, _progressSlider, timeVolumeRow ]];
+    controlColumn.translatesAutoresizingMaskIntoConstraints = NO;
+    controlColumn.axis = UILayoutConstraintAxisVertical;
+    controlColumn.alignment = UIStackViewAlignmentFill;
+    controlColumn.distribution = UIStackViewDistributionFill;
+    controlColumn.spacing = 8;
+    [controlBar addSubview:controlColumn];
     
     // 布局约束
     [NSLayoutConstraint activateConstraints:@[
@@ -132,45 +183,15 @@
         [_playerContainerView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [_playerContainerView.bottomAnchor constraintEqualToAnchor:controlBar.topAnchor],
         
-        // 控制栏
+        // 控制栏（高度由内部 Stack 决定）
         [controlBar.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [controlBar.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [controlBar.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor],
-        [controlBar.heightAnchor constraintEqualToConstant:120],
-        
-        // 播放按钮
-        [_playPauseButton.leadingAnchor constraintEqualToAnchor:controlBar.leadingAnchor constant:16],
-        [_playPauseButton.topAnchor constraintEqualToAnchor:controlBar.topAnchor constant:16],
-        [_playPauseButton.widthAnchor constraintEqualToConstant:60],
-        
-        // 显示模式按钮（在右上角）
-        [_aspectRatioButton.trailingAnchor constraintEqualToAnchor:controlBar.trailingAnchor constant:-16],
-        [_aspectRatioButton.topAnchor constraintEqualToAnchor:controlBar.topAnchor constant:16],
-        [_aspectRatioButton.widthAnchor constraintEqualToConstant:60],
-        
-        // 倍速按钮（在显示模式按钮左边）
-        [_speedButton.trailingAnchor constraintEqualToAnchor:_aspectRatioButton.leadingAnchor constant:-8],
-        [_speedButton.topAnchor constraintEqualToAnchor:controlBar.topAnchor constant:16],
-        [_speedButton.widthAnchor constraintEqualToConstant:60],
-        
-        // 画中画按钮（在倍速按钮左边）
-        [_pipButton.trailingAnchor constraintEqualToAnchor:_speedButton.leadingAnchor constant:-8],
-        [_pipButton.topAnchor constraintEqualToAnchor:controlBar.topAnchor constant:16],
-        [_pipButton.widthAnchor constraintEqualToConstant:60],
-        
-        // 进度条
-        [_progressSlider.leadingAnchor constraintEqualToAnchor:controlBar.leadingAnchor constant:16],
-        [_progressSlider.trailingAnchor constraintEqualToAnchor:controlBar.trailingAnchor constant:-16],
-        [_progressSlider.topAnchor constraintEqualToAnchor:_playPauseButton.bottomAnchor constant:8],
-        
-        // 时间标签
-        [_timeLabel.leadingAnchor constraintEqualToAnchor:controlBar.leadingAnchor constant:16],
-        [_timeLabel.topAnchor constraintEqualToAnchor:_progressSlider.bottomAnchor constant:8],
-        
-        // 音量滑块
-        [_volumeSlider.trailingAnchor constraintEqualToAnchor:controlBar.trailingAnchor constant:-16],
-        [_volumeSlider.topAnchor constraintEqualToAnchor:_progressSlider.bottomAnchor constant:8],
-        [_volumeSlider.widthAnchor constraintEqualToConstant:150],
+
+        [controlColumn.leadingAnchor constraintEqualToAnchor:controlBar.leadingAnchor constant:12],
+        [controlColumn.trailingAnchor constraintEqualToAnchor:controlBar.trailingAnchor constant:-12],
+        [controlColumn.topAnchor constraintEqualToAnchor:controlBar.topAnchor constant:12],
+        [controlColumn.bottomAnchor constraintEqualToAnchor:controlBar.bottomAnchor constant:-12],
     ]];
 }
 
@@ -188,13 +209,13 @@
 - (void)openTestVideo {
     // 测试网络视频
 //        NSString *urlString = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
-    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
+//    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
 //    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/4ece4b555145403697569546683/v.f1440843.mp4";//h265
-//    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
+    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
 //    NSString *urlString = @"https://f18c14f8-vod-tx-cdn-cskziwl-cn.tliveapp.com/1/47/mnt/g/file/20250930/b/o/u/c6ae79da0c546e0e/k43g4cz9f5c1sva3.m3u8";
 //    NSString *urlString = @"/path/to/nonexistent.mp4"; // 错误码: -1001, No such file or directory
 //    NSString *urlString = @"https://example.com/nonexistent-video.mp4";
-#if 1
+#if 0
     // ✨ 选择数据源模式（推荐使用新接口）
     HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeCustomHTTP;  // 或者 HXCPlayerDataSourceModeDefault
     
@@ -299,6 +320,81 @@
         [_player stopPictureInPicture];
     } else {
         [_player startPictureInPicture];
+    }
+}
+
+- (void)downloadButtonTapped:(UIButton *)sender {
+    (void)sender;
+    HXCVDownloadViewController *vc = [[HXCVDownloadViewController alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (NSString *)hxdvd_displayTitleForDownloadItem:(HXCVDownloadItem *)item {
+    NSURL *nu = [NSURL URLWithString:item.urlString];
+    NSString *name = nu.lastPathComponent ?: @"";
+    if ([name containsString:@"?"]) {
+        name = [[name componentsSeparatedByString:@"?"] firstObject];
+    }
+    if (name.length == 0) {
+        name = @"视频";
+    }
+    if (item.downloadType == HXCVDownloadTypeHLS) {
+        return [NSString stringWithFormat:@"%@（HLS）", name];
+    }
+    return name;
+}
+
+- (void)completedDownloadsButtonTapped:(UIButton *)sender {
+    NSArray<HXCVDownloadItem *> *items = [[HXCVDownloadManager sharedManager] tasksWithState:HXCVDownloadStateCompleted];
+    if (items.count == 0) {
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"已下载"
+                                                                     message:@"暂无已完成下载"
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
+    }
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"选择已下载视频"
+                                                                      message:nil
+                                                               preferredStyle:UIAlertControllerStyleActionSheet];
+    for (HXCVDownloadItem *it in items) {
+        NSString *title = [self hxdvd_displayTitleForDownloadItem:it];
+        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *_Nonnull action) {
+            (void)action;
+            [self hxdvd_playCompletedItem:it];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+        sheet.popoverPresentationController.sourceView = sender;
+        sheet.popoverPresentationController.sourceRect = sender.bounds;
+    }
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)hxdvd_playCompletedItem:(HXCVDownloadItem *)item {
+    NSURL *fileURL = [[HXCVDownloadManager sharedManager] playableFileURLForCompletedItem:item];
+    if (!fileURL) {
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"无法播放"
+                                                                     message:@"本地文件不存在或路径无效"
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
+        return;
+    }
+    [_player stop];
+    BOOL success = [_player prepareToPlay:fileURL.path];
+    if (success) {
+        [_player play];
+        [_playPauseButton setTitle:@"暂停" forState:UIControlStateNormal];
+    } else {
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"打开失败"
+                                                                     message:@"无法打开本地文件"
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:ac animated:YES completion:nil];
     }
 }
 

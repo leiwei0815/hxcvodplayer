@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # FFmpeg Android 静态库编译脚本
+# 含 HLS(m3u8) demuxer，与网络 http(s)/本地 file 协议配合使用
 # 支持 arm64-v8a、armeabi-v7a、x86_64 架构
 # arm64-v8a: 真机 + Apple Silicon 模拟器
 # armeabi-v7a: 旧真机
@@ -216,6 +217,7 @@ build_ffmpeg() {
         --enable-demuxer=m4v \
         --enable-demuxer=mpegts \
         --enable-demuxer=mpegtsraw \
+        --enable-demuxer=hls \
         --enable-demuxer=avi \
         --enable-demuxer=matroska \
         --enable-demuxer=flv \

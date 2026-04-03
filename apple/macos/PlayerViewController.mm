@@ -6,16 +6,25 @@
 #import "PlayerViewController.h"
 #import "../HXCPlayerControl.h"  // 使用统一的播放器类
 #import "SeekSlider.h"
+#import "../HXCAESUtility.h"
+#import "HXCVDownloadWindowController.h"
+#import "../HXCVDownload/HXCVDownload.h"
 
-@interface PlayerViewController () <HXCPlayerControlDelegate, SeekSliderDelegate>
+@interface PlayerViewController () <HXCPlayerControlDelegate, SeekSliderDelegate, NSTableViewDataSource, NSTableViewDelegate>
 
 @property (nonatomic, strong) HXCPlayerControl *player;
+@property (nonatomic, strong) HXCVDownloadWindowController *downloadWindowController;
 
 // UI 控件
 @property (nonatomic, strong) NSButton *openButton;
 @property (nonatomic, strong) NSButton *playPauseButton;
 @property (nonatomic, strong) NSButton *stopButton;
 @property (nonatomic, strong) NSButton *aspectRatioButton;
+@property (nonatomic, strong) NSButton *downloadButton;
+@property (nonatomic, strong) NSButton *completedDownloadsButton;
+@property (nonatomic, strong) NSPopover *completedDownloadsPopover;
+@property (nonatomic, copy) NSArray<HXCVDownloadItem *> *completedDownloadsItems;
+@property (nonatomic, strong) NSTableView *completedDownloadsTableView;
 @property (nonatomic, strong) SeekSlider *progressSlider;
 @property (nonatomic, strong) NSSlider *volumeSlider;
 @property (nonatomic, strong) NSPopUpButton *speedButton;
@@ -33,6 +42,16 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    
+//    NSString *key = @"12345678901234567890123456789012"; // 32位
+//    NSString *iv  = @"1234567890123456"; // 16位
+//    NSString *text = @"测试跨平台加密";
+//
+//    NSString *encrypted = [HXCAESUtility encryptString:text key:key iv:iv];
+//    NSLog(@"加密：%@", encrypted);
+//
+//    NSString *decrypted = [HXCAESUtility decryptString:encrypted key:key iv:iv];
+//    NSLog(@"解密：%@", decrypted);
     
     [self setupPlayer];
     [self setupUI];
@@ -249,10 +268,41 @@
     _aspectRatioButton.translatesAutoresizingMaskIntoConstraints = NO;
     [NSLayoutConstraint activateConstraints:@[
         [_aspectRatioButton.leadingAnchor constraintEqualToAnchor:_speedButton.trailingAnchor constant:10],
-        [_aspectRatioButton.trailingAnchor constraintLessThanOrEqualToAnchor:buttonContainer.trailingAnchor constant:-10],
         [_aspectRatioButton.centerYAnchor constraintEqualToAnchor:buttonContainer.centerYAnchor],
         [_aspectRatioButton.widthAnchor constraintEqualToConstant:60],
         [_aspectRatioButton.heightAnchor constraintEqualToConstant:30]
+    ]];
+
+    _downloadButton = [[NSButton alloc] init];
+    _downloadButton.title = @"下载";
+    _downloadButton.bezelStyle = NSBezelStyleRounded;
+    _downloadButton.target = self;
+    _downloadButton.action = @selector(downloadButtonClicked:);
+    [buttonContainer addSubview:_downloadButton];
+
+    _downloadButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[
+        [_downloadButton.leadingAnchor constraintEqualToAnchor:_aspectRatioButton.trailingAnchor constant:10],
+        [_downloadButton.centerYAnchor constraintEqualToAnchor:buttonContainer.centerYAnchor],
+        [_downloadButton.widthAnchor constraintEqualToConstant:72],
+        [_downloadButton.heightAnchor constraintEqualToConstant:30]
+    ]];
+
+    _completedDownloadsButton = [[NSButton alloc] init];
+    _completedDownloadsButton.title = @"已下载";
+    _completedDownloadsButton.bezelStyle = NSBezelStyleRounded;
+    _completedDownloadsButton.target = self;
+    _completedDownloadsButton.action = @selector(completedDownloadsButtonClicked:);
+    _completedDownloadsButton.toolTip = @"展开已完成列表，双击条目播放";
+    [buttonContainer addSubview:_completedDownloadsButton];
+
+    _completedDownloadsButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[
+        [_completedDownloadsButton.leadingAnchor constraintEqualToAnchor:_downloadButton.trailingAnchor constant:10],
+        [_completedDownloadsButton.trailingAnchor constraintLessThanOrEqualToAnchor:buttonContainer.trailingAnchor constant:-10],
+        [_completedDownloadsButton.centerYAnchor constraintEqualToAnchor:buttonContainer.centerYAnchor],
+        [_completedDownloadsButton.widthAnchor constraintEqualToConstant:72],
+        [_completedDownloadsButton.heightAnchor constraintEqualToConstant:30]
     ]];
 }
 
@@ -280,7 +330,7 @@
 
 - (void)openLocalFile {
     NSOpenPanel *openPanel = [NSOpenPanel openPanel];
-    openPanel.allowedFileTypes = @[@"mp4", @"mkv", @"avi", @"mov", @"flv", @"wmv", @"m4v", @"3gp", @"ts", @"m3u8"];
+    openPanel.allowedFileTypes = @[@"mp4", @"mkv", @"avi", @"mov", @"flv", @"wmv", @"m4v", @"3gp", @"ts", @"m3u8", @"bin"];
     openPanel.canChooseFiles = YES;
     openPanel.canChooseDirectories = NO;
     openPanel.allowsMultipleSelection = NO;
@@ -358,6 +408,125 @@
     }
 }
 
+- (void)downloadButtonClicked:(id)sender {
+    (void)sender;
+    if (!_downloadWindowController) {
+        _downloadWindowController = [[HXCVDownloadWindowController alloc] init];
+    }
+    [_downloadWindowController showDownloadPanel];
+}
+
+- (void)completedDownloadsButtonClicked:(id)sender {
+    (void)sender;
+    [self hxdvd_ensureCompletedDownloadsPopover];
+    self.completedDownloadsItems = [[HXCVDownloadManager sharedManager] tasksWithState:HXCVDownloadStateCompleted];
+    [self.completedDownloadsTableView reloadData];
+    if (self.completedDownloadsPopover.shown) {
+        [self.completedDownloadsPopover performClose:nil];
+        return;
+    }
+    if (self.completedDownloadsItems.count == 0) {
+        [self showErrorAlert:@"暂无已完成的下载"];
+        return;
+    }
+    [self.completedDownloadsPopover showRelativeToRect:self.completedDownloadsButton.bounds
+                                                ofView:self.completedDownloadsButton
+                                         preferredEdge:NSRectEdgeMinY];
+}
+
+- (void)hxdvd_ensureCompletedDownloadsPopover {
+    if (self.completedDownloadsPopover) {
+        return;
+    }
+    NSPopover *pop = [[NSPopover alloc] init];
+    pop.behavior = NSPopoverBehaviorTransient;
+    pop.animates = YES;
+    pop.contentSize = NSMakeSize(440, 300);
+
+    NSViewController *vc = [[NSViewController alloc] init];
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 440, 300)];
+
+    NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:container.bounds];
+    scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    scroll.hasVerticalScroller = YES;
+    scroll.autohidesScrollers = YES;
+    scroll.borderType = NSBezelBorder;
+
+    NSTableView *tv = [[NSTableView alloc] initWithFrame:scroll.bounds];
+    tv.headerView = nil;
+    NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:@"title"];
+    col.width = 400;
+    col.minWidth = 200;
+    col.title = @"";
+    [tv addTableColumn:col];
+    tv.dataSource = self;
+    tv.delegate = self;
+    tv.target = self;
+    tv.doubleAction = @selector(completedDownloadsTableDoubleAction:);
+    scroll.documentView = tv;
+    [container addSubview:scroll];
+    self.completedDownloadsTableView = tv;
+
+    vc.view = container;
+    pop.contentViewController = vc;
+    self.completedDownloadsPopover = pop;
+}
+
+- (void)completedDownloadsTableDoubleAction:(id)sender {
+    NSTableView *tv = (NSTableView *)sender;
+    NSInteger row = tv.clickedRow;
+    if (row < 0) {
+        row = tv.selectedRow;
+    }
+    if (row < 0 || row >= (NSInteger)self.completedDownloadsItems.count) {
+        return;
+    }
+    [self hxdvd_playCompletedItem:self.completedDownloadsItems[(NSUInteger)row]];
+}
+
+- (NSString *)hxdvd_displayTitleForDownloadItem:(HXCVDownloadItem *)item {
+    NSURL *nu = [NSURL URLWithString:item.urlString];
+    NSString *name = nu.lastPathComponent ?: @"";
+    if ([name containsString:@"?"]) {
+        name = [[name componentsSeparatedByString:@"?"] firstObject];
+    }
+    if (name.length == 0) {
+        name = @"视频";
+    }
+    if (item.downloadType == HXCVDownloadTypeHLS) {
+        return [NSString stringWithFormat:@"%@（HLS）", name];
+    }
+    return name;
+}
+
+- (void)hxdvd_playCompletedItem:(HXCVDownloadItem *)item {
+    NSURL *fileURL = [[HXCVDownloadManager sharedManager] playableFileURLForCompletedItem:item];
+    if (!fileURL) {
+        [self showErrorAlert:@"本地文件不存在或路径无效，请确认下载目录未改动"];
+        return;
+    }
+    if (self.completedDownloadsPopover.shown) {
+        [self.completedDownloadsPopover performClose:nil];
+    }
+    [self openURL:fileURL.path];
+}
+
+#pragma mark - NSTableViewDataSource & NSTableViewDelegate
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
+    (void)tableView;
+    return (NSInteger)self.completedDownloadsItems.count;
+}
+
+- (nullable id)tableView:(NSTableView *)tableView objectValueForTableColumn:(nullable NSTableColumn *)tableColumn row:(NSInteger)row {
+    (void)tableView;
+    (void)tableColumn;
+    if (row < 0 || row >= (NSInteger)self.completedDownloadsItems.count) {
+        return @"";
+    }
+    return [self hxdvd_displayTitleForDownloadItem:self.completedDownloadsItems[(NSUInteger)row]];
+}
+
 #pragma mark - SeekSliderDelegate
 
 - (void)seekSliderDidBeginTracking:(SeekSlider *)slider {
@@ -415,13 +584,14 @@
     [_player stop];
     BOOL success = NO;
 #if 1
-    HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeCustomHTTP;  // 或者 HXCPlayerDataSourceModeDefault
+    HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeCustomFile;  // 或者 HXCPlayerDataSourceModeDefault
     // 配置参数（可选，不传则使用默认值）
     HXCPlayerDataSourceConfig *config = [HXCPlayerDataSourceConfig defaultConfig];
     config.timeoutMs = 30000;           // 30秒超时
     config.maxRetries = 3;              // 最多重试3次
     config.cacheSize = 2 * 1024 * 1024; // 2MB 缓存
     config.avioBufferSize = 64 * 1024;  // 64KB AVIO 缓冲区
+    config.encryptedFile = NO;
     success = [_player openURL:urlString withMode:mode config:config];
 #else
     success = [_player prepareToPlay:urlString];

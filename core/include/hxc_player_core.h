@@ -83,6 +83,7 @@ enum PlayerErrorCode {
 enum class DataSourceMode {
     Default = 0,     // 默认模式（FFmpeg 直接打开）
     CustomHTTP = 1,  // 自定义 HTTP Range 下载器
+    CustomFile = 2,  // 本地文件自定义读取（支持加密文件头解密）
     // 未来可扩展：
     // Encrypted = 2,   // 加密视频
     // P2P = 3,         // P2P 数据源
@@ -95,6 +96,7 @@ struct CustomDataSourceConfig {
     int max_retries = 3;              // 最大重试次数
     size_t cache_size = 2 * 1024 * 1024;  // 缓存大小（字节）
     size_t avio_buffer_size = 64 * 1024;  // AVIO 缓冲区大小（字节）
+    bool encrypted_file = false;      // 是否为加密文件（仅解密文件头前 100 字节）
 };
 
 /**
@@ -113,8 +115,10 @@ public:
     // 打开媒体文件
     int open(const std::string& filename);
     
-    // 使用自定义数据源打开
-    int open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io);
+    // 使用自定义数据源打开。url_for_format 建议传入与数据源一致的地址（如本地 m3u8 绝对路径）：
+    // 仅用于 FFmpeg 探测格式与 HLS 解析相对分片路径；实际字节仍从 custom_io 读取。
+    int open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io,
+                            const std::string& url_for_format = {});
     
     // 使用指定数据源模式打开（新接口）
     int open_with_mode(const std::string& url, DataSourceMode mode, const CustomDataSourceConfig& config = CustomDataSourceConfig());

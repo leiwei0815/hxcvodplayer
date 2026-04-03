@@ -3,9 +3,11 @@ set(CORE_SOURCES
     hxc_player_types.cpp
     hxc_packet_queue.cpp
     hxc_decoder.cpp
+    hxc_audio_resampler.cpp
     hxc_player_core.cpp
     hxc_player_core_c_bridge.cpp
     hxc_custom_io.cpp
+    hxc_aes256_cbc.c
 )
 
 # 头文件
@@ -14,10 +16,12 @@ set(CORE_HEADERS
     ${CMAKE_SOURCE_DIR}/core/include/hxc_packet_queue.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_frame_queue.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_decoder.h
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_audio_resampler.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_player_core.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_player_core_c_bridge.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_custom_io.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_logger.h
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_aes256_cbc.h
 )
 
 # 创建静态库（包含源文件和头文件）

@@ -76,6 +76,7 @@ endif()
 # 包含目录
 include_directories(
     ${PROJECT_ROOT}/core/include
+    ${PROJECT_ROOT}/apple/HXCVDownload
     ${CMAKE_CURRENT_SOURCE_DIR}  # 包含当前目录（HXCPlayerView）
     ${FFMPEG_INCLUDE_DIR}
     ${SOUNDTOUCH_INCLUDE_DIR}
@@ -96,6 +97,7 @@ set(CORE_SOURCES
     ${PROJECT_ROOT}/core/src/hxc_player_core_c_bridge.cpp
     ${PROJECT_ROOT}/core/src/hxc_custom_io.cpp
     ${PROJECT_ROOT}/core/src/hxc_audio_resampler.cpp
+    ${PROJECT_ROOT}/core/src/hxc_aes256_cbc.c
 )
 
 # 核心库头文件
@@ -110,17 +112,42 @@ set(CORE_HEADERS
     ${PROJECT_ROOT}/core/include/hxc_logger.h
     ${PROJECT_ROOT}/core/include/hxc_debug_helper.h
     ${PROJECT_ROOT}/core/include/hxc_audio_resampler.h
+    ${PROJECT_ROOT}/core/include/hxc_aes256_cbc.h
+)
+
+# HXCVD 下载模块（Objective-C + Core Data）
+set(HXCVD_SOURCES
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadItem.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDPersistenceController.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDFileStore.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDPlaylistParser.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDHLSDownloadEngine.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadManager.m
+)
+
+set(HXCVD_HEADERS
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownload.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadTypes.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadItem.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadItem+Internal.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDPersistenceController.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDFileStore.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDPlaylistParser.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDHLSDownloadEngine.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadManager.h
 )
 
 # macOS 播放器控制类（使用统一的播放器）
 set(PLAYER_SOURCES
     ${PROJECT_ROOT}/apple/HXCPlayerControl.mm
     ${PROJECT_ROOT}/apple/HXCPlayerView.mm
+    ${PROJECT_ROOT}/apple/HXCAESUtility.m
 )
 
 set(PLAYER_HEADERS
     ${PROJECT_ROOT}/apple/HXCPlayerControl.h
     ${PROJECT_ROOT}/apple/HXCPlayerView.h
+    ${PROJECT_ROOT}/apple/HXCAESUtility.h
 )
 
 # macOS 应用源文件
@@ -129,12 +156,14 @@ set(MACOS_SOURCES
     AppDelegate.mm
     PlayerViewController.mm
     SeekSlider.mm
+    HXCVDownloadWindowController.mm
 )
 
 set(MACOS_HEADERS
     AppDelegate.h
     PlayerViewController.h
     SeekSlider.h
+    HXCVDownloadWindowController.h
 )
 
 # 为纯 C++ 文件（核心库）设置编译标志
@@ -142,6 +171,13 @@ set_source_files_properties(
     ${CORE_SOURCES}
     PROPERTIES
     COMPILE_FLAGS "-x c++ -Wno-deprecated-declarations"
+)
+
+# 纯 Objective-C（HXCVD）
+set_source_files_properties(
+    ${HXCVD_SOURCES}
+    PROPERTIES
+    COMPILE_FLAGS "-x objective-c -fobjc-arc -Wno-deprecated-declarations"
 )
 
 # 为 Objective-C++ 文件设置编译标志
@@ -152,12 +188,21 @@ set_source_files_properties(
     COMPILE_FLAGS "-x objective-c++ -fobjc-arc -Wno-deprecated-declarations"
 )
 
+# HXCAESUtility.m 为纯 Objective-C
+set_source_files_properties(
+    ${PROJECT_ROOT}/apple/HXCAESUtility.m
+    PROPERTIES
+    COMPILE_FLAGS "-x objective-c -fobjc-arc -Wno-deprecated-declarations"
+)
+
 # 创建可执行文件
 add_executable(HXCPlayer-macOS MACOSX_BUNDLE
     ${CORE_SOURCES}
     ${CORE_HEADERS}
     ${PLAYER_SOURCES}
     ${PLAYER_HEADERS}
+    ${HXCVD_SOURCES}
+    ${HXCVD_HEADERS}
     ${MACOS_SOURCES}
     ${MACOS_HEADERS}
 )
@@ -204,6 +249,7 @@ target_link_libraries(HXCPlayer-macOS
     "-framework CoreText"
     "-framework CoreImage"
     "-framework CoreGraphics"
+    "-framework CoreData"
     
     # 系统库
     bz2
@@ -247,6 +293,8 @@ source_group("Core/Sources" FILES ${CORE_SOURCES})
 source_group("Core/Headers" FILES ${CORE_HEADERS})
 source_group("Player/Sources" FILES ${PLAYER_SOURCES})
 source_group("Player/Headers" FILES ${PLAYER_HEADERS})
+source_group("HXCVD/Sources" FILES ${HXCVD_SOURCES})
+source_group("HXCVD/Headers" FILES ${HXCVD_HEADERS})
 source_group("macOS/Sources" FILES ${MACOS_SOURCES})
 source_group("macOS/Headers" FILES ${MACOS_HEADERS})
 

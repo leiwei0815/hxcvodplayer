@@ -7,6 +7,7 @@
 #include "hxc_logger.h"
 #include <cstring>
 #include <algorithm>
+#include <cerrno>
 
 // 平台相关的 HTTP 实现
 #if defined(__APPLE__)
@@ -14,12 +15,27 @@
     #include <CFNetwork/CFNetwork.h>
     #include <CoreFoundation/CoreFoundation.h>
     #define USE_CFNETWORK 1
+#elif defined(_WIN32)
+    // Windows 使用 WinHTTP（系统原生）
+    #include <windows.h>
+    #include <winhttp.h>
+    #pragma comment(lib, "winhttp.lib")
+    #define USE_WINHTTP 1
 #else
+    // Android/Linux 使用 curl
     #include <curl/curl.h>
     #define USE_CURL 1
 #endif
 
 namespace hxcplayer {
+
+static inline uint8_t decrypt_first100_byte(uint8_t b) {
+    // 解密规则（与加密 byte = ROL3(byte); byte = ~byte; 互逆）：
+    // 1) 按位取反
+    // 2) 循环右移 3 位（ROR3）
+    uint8_t x = static_cast<uint8_t>(~b);
+    return static_cast<uint8_t>((x >> 3) | (x << (8 - 3)));
+}
 
 // ==================== RangeDownloader 实现 ====================
 
@@ -212,8 +228,167 @@ int RangeDownloader::do_range_request(uint8_t* buffer, int64_t offset, int size)
     return total_read;
 }
 
+#elif defined(USE_WINHTTP)
+// ==================== Windows WinHTTP 实现 ====================
+
+int RangeDownloader::fetch_http_headers() {
+    // 解析 URL
+    URL_COMPONENTS urlComp = {0};
+    urlComp.dwStructSize = sizeof(urlComp);
+    urlComp.dwSchemeLength = (DWORD)-1;
+    urlComp.dwHostNameLength = (DWORD)-1;
+    urlComp.dwUrlPathLength = (DWORD)-1;
+
+    std::wstring wurl(url_.begin(), url_.end());
+    if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &urlComp)) {
+        LOG_ERROR("URL 解析失败");
+        return -1;
+    }
+
+    std::wstring host(urlComp.lpszHostName, urlComp.dwHostNameLength);
+    std::wstring path(urlComp.lpszUrlPath, urlComp.dwUrlPathLength);
+
+    HINTERNET hSession = WinHttpOpen(L"HXCPlayer/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) {
+        LOG_ERROR("WinHTTP 会话创建失败");
+        return -1;
+    }
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), urlComp.nPort, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"HEAD", path.c_str(), NULL,
+                                             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    if (!WinHttpReceiveResponse(hRequest, NULL)) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    // 获取 Content-Length
+    WCHAR contentLength[32] = {0};
+    DWORD size = sizeof(contentLength);
+    if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CONTENT_LENGTH,
+                            WINHTTP_HEADER_NAME_BY_INDEX, contentLength, &size, WINHTTP_NO_HEADER_INDEX)) {
+        content_length_ = _wtoi64(contentLength);
+    }
+
+    support_range_ = true;
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    return 0;
+}
+
+int RangeDownloader::do_range_request(uint8_t* buffer, int64_t offset, int size) {
+    URL_COMPONENTS urlComp = {0};
+    urlComp.dwStructSize = sizeof(urlComp);
+    urlComp.dwSchemeLength = (DWORD)-1;
+    urlComp.dwHostNameLength = (DWORD)-1;
+    urlComp.dwUrlPathLength = (DWORD)-1;
+
+    std::wstring wurl(url_.begin(), url_.end());
+    if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &urlComp)) {
+        return -1;
+    }
+
+    std::wstring host(urlComp.lpszHostName, urlComp.dwHostNameLength);
+    std::wstring path(urlComp.lpszUrlPath, urlComp.dwUrlPathLength);
+
+    HINTERNET hSession = WinHttpOpen(L"HXCPlayer/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return -1;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), urlComp.nPort, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(), NULL,
+                                             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    // 设置 Range 头
+    std::string rangeValue = "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + size - 1);
+    std::wstring wRange = L"Range: " + std::wstring(rangeValue.begin(), rangeValue.end());
+
+    if (!WinHttpSendRequest(hRequest, wRange.c_str(), -1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    if (!WinHttpReceiveResponse(hRequest, NULL)) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return -1;
+    }
+
+    // 读取数据
+    int total_read = 0;
+    DWORD bytes_read = 0;
+    while (total_read < size) {
+        if (abort_request_.load()) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            return AVERROR_EXIT;
+        }
+
+        if (!WinHttpReadData(hRequest, buffer + total_read, size - total_read, &bytes_read)) {
+            break;
+        }
+
+        if (bytes_read == 0) break;
+        total_read += bytes_read;
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    if (total_read > 0) {
+        total_downloaded_.fetch_add(total_read);
+        if (progress_callback_) {
+            progress_callback_(total_downloaded_.load(), content_length_);
+        }
+    }
+
+    return total_read;
+}
+
 #else  // USE_CURL
-// ==================== 其他平台 CURL 实现 ====================
+// ==================== Android/Linux CURL 实现 ====================
 
 int RangeDownloader::fetch_http_headers() {
     CURL* curl = curl_easy_init();
@@ -221,14 +396,14 @@ int RangeDownloader::fetch_http_headers() {
         LOG_ERROR("CURL 初始化失败");
         return -1;
     }
-    
+
     curl_easy_setopt(curl, CURLOPT_URL, url_.c_str());
     curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms_);
-    
+
     CURLcode res = curl_easy_perform(curl);
-    
+
     if (res == CURLE_OK) {
         double content_length;
         curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &content_length);
@@ -239,7 +414,7 @@ int RangeDownloader::fetch_http_headers() {
         curl_easy_cleanup(curl);
         return -1;
     }
-    
+
     curl_easy_cleanup(curl);
     return 0;
 }
@@ -249,36 +424,36 @@ int RangeDownloader::do_range_request(uint8_t* buffer, int64_t offset, int size)
     if (!curl) {
         return -1;
     }
-    
+
     std::vector<uint8_t> response_data;
-    
-    std::string range_header = "Range: bytes=" + std::to_string(offset) + "-" + 
+
+    std::string range_header = "Range: bytes=" + std::to_string(offset) + "-" +
                                 std::to_string(offset + size - 1);
-    
+
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, range_header.c_str());
-    
+
     curl_easy_setopt(curl, CURLOPT_URL, url_.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms_);
-    
+
     CURLcode res = curl_easy_perform(curl);
-    
+
     curl_slist_free_all(headers);
-    
+
     int bytes_read = -1;
-    
+
     if (res == CURLE_OK) {
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        
+
         if (http_code == 206 || http_code == 200) {
             bytes_read = std::min((int)response_data.size(), size);
             std::memcpy(buffer, response_data.data(), bytes_read);
-            
+
             total_downloaded_.fetch_add(bytes_read);
             if (progress_callback_) {
                 progress_callback_(total_downloaded_.load(), content_length_);
@@ -289,12 +464,12 @@ int RangeDownloader::do_range_request(uint8_t* buffer, int64_t offset, int size)
     } else {
         LOG_ERROR("CURL 请求失败: ", curl_easy_strerror(res));
     }
-    
+
     curl_easy_cleanup(curl);
     return bytes_read;
 }
 
-#endif  // USE_CFNETWORK vs USE_CURL
+#endif  // USE_CFNETWORK / USE_WINHTTP / USE_CURL
 
 int RangeDownloader::read_range(uint8_t* buffer, int64_t offset, int size) {
     if (abort_request_.load()) {
@@ -399,6 +574,17 @@ int HttpRangeDataSource::read(uint8_t* buffer, int size) {
             // 更新缓存范围
             cache_start_ = current_position_;
             cache_end_ = current_position_ + bytes_read;
+
+            // 如果是加密文件：对文件头 [0,99] 的数据进行解密后再写入缓存
+            if (encrypted_file_ && cache_start_ < 100) {
+                int64_t decrypt_end = std::min<int64_t>(cache_end_, 100);
+                int decrypt_len = (int)(decrypt_end - cache_start_);
+                if (decrypt_len > 0) {
+                    for (int i = 0; i < decrypt_len; ++i) {
+                        cache_buffer_.get()[i] = decrypt_first100_byte(cache_buffer_.get()[i]);
+                    }
+                }
+            }
         }
     }
     
@@ -456,6 +642,121 @@ void HttpRangeDataSource::close() {
 
 bool HttpRangeDataSource::seekable() const {
     return downloader_->support_range() && file_size_ > 0;
+}
+
+// ==================== LocalFileDataSource 实现 ====================
+
+LocalFileDataSource::LocalFileDataSource() = default;
+
+LocalFileDataSource::~LocalFileDataSource() {
+    close();
+}
+
+int LocalFileDataSource::open(const std::string& url) {
+    close();
+
+    fp_ = std::fopen(url.c_str(), "rb");
+    if (!fp_) {
+        LOG_ERROR("LocalFileDataSource 打开失败: ", url, " errno=", errno);
+        return -1;
+    }
+
+    if (std::fseek(fp_, 0, SEEK_END) != 0) {
+        LOG_ERROR("LocalFileDataSource fseek(SEEK_END) 失败 errno=", errno);
+        close();
+        return -1;
+    }
+
+    long sz = std::ftell(fp_);
+    if (sz < 0) {
+        LOG_ERROR("LocalFileDataSource ftell 失败 errno=", errno);
+        close();
+        return -1;
+    }
+    file_size_ = static_cast<int64_t>(sz);
+
+    if (std::fseek(fp_, 0, SEEK_SET) != 0) {
+        LOG_ERROR("LocalFileDataSource fseek(SEEK_SET) 失败 errno=", errno);
+        close();
+        return -1;
+    }
+
+    current_position_ = 0;
+    return 0;
+}
+
+int LocalFileDataSource::read(uint8_t* buffer, int size) {
+    if (!fp_ || size <= 0) {
+        return -1;
+    }
+
+    if (file_size_ > 0 && current_position_ >= file_size_) {
+        return 0; // EOF
+    }
+
+    int64_t before = current_position_;
+    size_t n = std::fread(buffer, 1, static_cast<size_t>(size), fp_);
+    if (n == 0) {
+        if (std::feof(fp_)) {
+            return 0;
+        }
+        if (std::ferror(fp_)) {
+            LOG_ERROR("LocalFileDataSource fread 失败 errno=", errno);
+            return -1;
+        }
+    }
+
+    current_position_ += static_cast<int64_t>(n);
+
+    // 对文件全局前 100 字节做解密（与网络模式一致）
+    if (encrypted_file_ && before < 100) {
+        int64_t end = before + static_cast<int64_t>(n);
+        int64_t decrypt_end = std::min<int64_t>(end, 100);
+        for (int64_t off = before; off < decrypt_end; ++off) {
+            int idx = static_cast<int>(off - before);
+            buffer[idx] = decrypt_first100_byte(buffer[idx]);
+        }
+    }
+
+    return static_cast<int>(n);
+}
+
+int64_t LocalFileDataSource::seek(int64_t offset, int whence) {
+    if (!fp_) return -1;
+
+    if (whence == AVSEEK_SIZE) {
+        return file_size_;
+    }
+
+    int origin;
+    switch (whence) {
+        case SEEK_SET: origin = SEEK_SET; break;
+        case SEEK_CUR: origin = SEEK_CUR; break;
+        case SEEK_END: origin = SEEK_END; break;
+        default: return -1;
+    }
+
+    if (std::fseek(fp_, static_cast<long>(offset), origin) != 0) {
+        return -1;
+    }
+
+    long pos = std::ftell(fp_);
+    if (pos < 0) return -1;
+    current_position_ = static_cast<int64_t>(pos);
+    return current_position_;
+}
+
+int64_t LocalFileDataSource::size() {
+    return file_size_;
+}
+
+void LocalFileDataSource::close() {
+    if (fp_) {
+        std::fclose(fp_);
+        fp_ = nullptr;
+    }
+    current_position_ = 0;
+    file_size_ = -1;
 }
 
 // ==================== CustomAVIOContext 实现 ====================
@@ -541,16 +842,18 @@ int CustomAVIOContext::open(const std::string& url) {
 
 void CustomAVIOContext::close() {
     if (avio_ctx_) {
-        // 注意：不要调用 avio_close，因为我们手动管理内存
-        av_free(avio_ctx_);
-        avio_ctx_ = nullptr;
-    }
-    
-    if (avio_buffer_) {
+        // FFmpeg 在探测、HLS 等路径下可能通过 ffio_realloc_buf 替换 s->buffer，
+        // 原先传入 avio_alloc_context 的缓冲区已被 libavformat 释放；
+        // 只能释放「当前」avio_ctx_->buffer，绝不能再次 av_free 成员 avio_buffer_。
+        av_free(avio_ctx_->buffer);
+        avio_ctx_->buffer = nullptr;
+        avio_context_free(&avio_ctx_);
+    } else if (avio_buffer_) {
+        // 仅构造失败或尚未创建 avio_ctx_ 时，缓冲区仍由本类独占
         av_free(avio_buffer_);
-        avio_buffer_ = nullptr;
     }
-    
+    avio_buffer_ = nullptr;
+
     if (data_source_) {
         data_source_->close();
     }

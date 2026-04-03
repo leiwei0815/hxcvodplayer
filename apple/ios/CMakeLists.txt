@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(YXVodPlayer-iOS VERSION 1.0.0 LANGUAGES CXX OBJCXX)
+project(YXVodPlayer-iOS VERSION 1.0.0 LANGUAGES C CXX OBJC OBJCXX)
 
 # iOS 平台配置
 set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "Minimum iOS deployment version")
@@ -75,43 +75,81 @@ endif()
 
 # 核心库源文件
 set(CORE_SOURCES
-    ${PROJECT_ROOT}/core/src/hxc_player_core.cpp
-    ${PROJECT_ROOT}/core/src/hxc_decoder.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_types.cpp
     ${PROJECT_ROOT}/core/src/hxc_packet_queue.cpp
+    ${PROJECT_ROOT}/core/src/hxc_decoder.cpp
+    ${PROJECT_ROOT}/core/src/hxc_player_core.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_core_c_bridge.cpp
     ${PROJECT_ROOT}/core/src/hxc_custom_io.cpp
     ${PROJECT_ROOT}/core/src/hxc_audio_resampler.cpp
+    ${PROJECT_ROOT}/core/src/hxc_aes256_cbc.c
 )
 
 # 核心库头文件
 set(CORE_HEADERS
-    ${PROJECT_ROOT}/core/include/hxc_player_core.h
-    ${PROJECT_ROOT}/core/include/hxc_decoder.h
     ${PROJECT_ROOT}/core/include/hxc_player_types.h
     ${PROJECT_ROOT}/core/include/hxc_packet_queue.h
+    ${PROJECT_ROOT}/core/include/hxc_decoder.h
+    ${PROJECT_ROOT}/core/include/hxc_player_core.h
+    ${PROJECT_ROOT}/core/include/hxc_player_core_c_bridge.h
+    ${PROJECT_ROOT}/core/include/hxc_custom_io.h
     ${PROJECT_ROOT}/core/include/hxc_frame_queue.h
     ${PROJECT_ROOT}/core/include/hxc_logger.h
     ${PROJECT_ROOT}/core/include/hxc_debug_helper.h
-    ${PROJECT_ROOT}/core/include/hxc_player_core_c_bridge.h
-    ${PROJECT_ROOT}/core/include/hxc_custom_io.h
     ${PROJECT_ROOT}/core/include/hxc_audio_resampler.h
+    ${PROJECT_ROOT}/core/include/hxc_aes256_cbc.h
+)
+
+# HXCVD 下载模块
+set(HXCVD_SOURCES
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadItem.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDPersistenceController.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDFileStore.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDPlaylistParser.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDHLSDownloadEngine.m
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadManager.m
+)
+
+set(HXCVD_HEADERS
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownload.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadTypes.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadItem.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadItem+Internal.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDPersistenceController.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDFileStore.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDPlaylistParser.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDHLSDownloadEngine.h
+    ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadManager.h
+)
+
+# Apple 播放器控制类（使用统一的播放器）
+set(PLAYER_SOURCES
+    ${PROJECT_ROOT}/apple/HXCPlayerControl.mm
+    ${PROJECT_ROOT}/apple/HXCPlayerView.mm
+)
+
+set(PLAYER_HEADERS
+    ${PROJECT_ROOT}/apple/HXCPlayerControl.h
+    ${PROJECT_ROOT}/apple/HXCPlayerView.h
+    ${PROJECT_ROOT}/apple/HXCAESUtility.h
+)
+
+set(PLAYER_OBJC_SOURCES
+    ${PROJECT_ROOT}/apple/HXCAESUtility.m
 )
 
 # iOS 源文件（使用统一的播放器类）
 set(IOS_SOURCES
-    ${PROJECT_ROOT}/apple/HXCPlayerControl.mm
-    ${PROJECT_ROOT}/apple/HXCPlayerView.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/PlayerViewController.mm
+    ${CMAKE_CURRENT_SOURCE_DIR}/HXCVDownloadViewController.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/AppDelegate.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/main.mm
 )
 
 # iOS 头文件
 set(IOS_HEADERS
-    ${PROJECT_ROOT}/apple/HXCPlayerControl.h
-    ${PROJECT_ROOT}/apple/HXCPlayerView.h
     ${CMAKE_CURRENT_SOURCE_DIR}/PlayerViewController.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/HXCVDownloadViewController.h
     ${CMAKE_CURRENT_SOURCE_DIR}/AppDelegate.h
 )
 
@@ -120,22 +158,34 @@ set(IOS_HEADERS
 set_source_files_properties(
     ${CORE_SOURCES}
     PROPERTIES
-    COMPILE_FLAGS "-x c++"
+    COMPILE_FLAGS "-x c++ -Wno-deprecated-declarations"
 )
 
-# 为 Objective-C++ 文件设置编译标志（解决 AVMediaType 冲突）
+# 纯 Objective-C 源文件
 set_source_files_properties(
-    ${PROJECT_ROOT}/apple/HXCPlayerControl.mm
-    ${PROJECT_ROOT}/apple/HXCPlayerView.mm
-    ${CMAKE_CURRENT_SOURCE_DIR}/PlayerViewController.mm
+    ${HXCVD_SOURCES}
+    ${PLAYER_OBJC_SOURCES}
     PROPERTIES
-    COMPILE_FLAGS "-Wno-ambiguous-macro"
+    COMPILE_FLAGS "-x objective-c -fobjc-arc -Wno-deprecated-declarations"
+)
+
+# Objective-C++ 源文件
+set_source_files_properties(
+    ${PLAYER_SOURCES}
+    ${IOS_SOURCES}
+    PROPERTIES
+    COMPILE_FLAGS "-x objective-c++ -fobjc-arc -Wno-deprecated-declarations"
 )
 
 # 创建可执行文件（包含源文件和头文件）
 add_executable(YXVodPlayer-iOS MACOSX_BUNDLE
     ${CORE_SOURCES}
     ${CORE_HEADERS}
+    ${PLAYER_SOURCES}
+    ${PLAYER_OBJC_SOURCES}
+    ${PLAYER_HEADERS}
+    ${HXCVD_SOURCES}
+    ${HXCVD_HEADERS}
     ${IOS_SOURCES}
     ${IOS_HEADERS}
 )
@@ -143,6 +193,7 @@ add_executable(YXVodPlayer-iOS MACOSX_BUNDLE
 # 设置包含目录（确保对所有源文件生效，包括设置了 -x c++ 的文件）
 target_include_directories(YXVodPlayer-iOS PRIVATE
     ${PROJECT_ROOT}/core/include
+    ${PROJECT_ROOT}/apple/HXCVDownload
     ${FFMPEG_INCLUDE_DIR}
 )
 
@@ -184,6 +235,7 @@ target_link_libraries(YXVodPlayer-iOS
     "-framework QuartzCore"
     "-framework Security"
     "-framework CFNetwork"
+    "-framework CoreData"
     
     # 系统库
     bz2
@@ -236,10 +288,14 @@ set_target_properties(YXVodPlayer-iOS PROPERTIES
 )
 
 # Xcode 文件组织（创建虚拟文件夹）
-source_group("Core\\Headers" FILES ${CORE_HEADERS})
-source_group("Core\\Sources" FILES ${CORE_SOURCES})
-source_group("iOS\\Headers" FILES ${IOS_HEADERS})
-source_group("iOS\\Sources" FILES ${IOS_SOURCES})
+source_group("Core/Headers" FILES ${CORE_HEADERS})
+source_group("Core/Sources" FILES ${CORE_SOURCES})
+source_group("Player/Sources" FILES ${PLAYER_SOURCES})
+source_group("Player/Headers" FILES ${PLAYER_HEADERS})
+source_group("HXCVD/Sources" FILES ${HXCVD_SOURCES})
+source_group("HXCVD/Headers" FILES ${HXCVD_HEADERS})
+source_group("iOS/Headers" FILES ${IOS_HEADERS})
+source_group("iOS/Sources" FILES ${IOS_SOURCES})
 
 # 输出信息
 message(STATUS "")

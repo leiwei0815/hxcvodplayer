@@ -15,6 +15,7 @@
 #include <memory>
 #include <functional>
 #include <atomic>
+#include <cstdio>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -178,6 +179,13 @@ public:
      * @param cache_size 缓存大小（字节），默认 1MB
      */
     void set_cache_size(size_t cache_size) { cache_size_ = cache_size; }
+
+    /**
+     * @brief 标记当前下载资源是否为加密文件
+     *
+     * 若为 true，则下载到的前 100 字节会先解密后再写入缓存（仅解密 [0,99]）。
+     */
+    void set_encrypted_file(bool encrypted) { encrypted_file_ = encrypted; }
     
     /**
      * @brief 获取下载器（用于配置）
@@ -189,11 +197,38 @@ private:
     int64_t current_position_ = 0;
     int64_t file_size_ = -1;
     size_t cache_size_ = 1024 * 1024;  // 1MB 缓存
+    bool encrypted_file_ = false;
     
     // 简单的缓存管理
     std::unique_ptr<uint8_t[]> cache_buffer_;
     int64_t cache_start_ = -1;
     int64_t cache_end_ = -1;
+};
+
+/**
+ * @brief 本地文件数据源（支持可选解密）
+ *
+ * 用于本地加密视频：仅读取文件头前 100 字节并解密后再输出给 FFmpeg。
+ */
+class LocalFileDataSource : public ICustomDataSource {
+public:
+    LocalFileDataSource();
+    ~LocalFileDataSource() override;
+
+    int open(const std::string& url) override;
+    int read(uint8_t* buffer, int size) override;
+    int64_t seek(int64_t offset, int whence) override;
+    int64_t size() override;
+    void close() override;
+    bool seekable() const override { return true; }
+
+    void set_encrypted_file(bool encrypted) { encrypted_file_ = encrypted; }
+
+private:
+    FILE* fp_ = nullptr;
+    int64_t current_position_ = 0;
+    int64_t file_size_ = -1;
+    bool encrypted_file_ = false;
 };
 
 /**
