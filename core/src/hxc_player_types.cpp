@@ -16,6 +16,7 @@ extern "C" {
 namespace hxcplayer {
 
 double Clock::get_clock() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (paused) {
         return pts;
     } else {
@@ -30,6 +31,7 @@ void Clock::set_clock(double pts, int serial) {
 }
 
 void Clock::set_clock_at(double pts, int serial, double time) {
+    std::lock_guard<std::mutex> lock(mutex_);
     this->pts = pts;
     this->last_updated = time;
     this->pts_drift = pts - time;
@@ -39,9 +41,14 @@ void Clock::set_clock_at(double pts, int serial, double time) {
 void Clock::sync_clock_to_slave(Clock* slave) {
     double clock = get_clock();
     double slave_clock = slave->get_clock();
+    int slave_serial = 0;
+    {
+        std::lock_guard<std::mutex> lock(slave->mutex_);
+        slave_serial = slave->serial;
+    }
     
     if (!isnan(slave_clock) && (isnan(clock) || fabs(clock - slave_clock) > 0.1)) {
-        set_clock(slave_clock, slave->serial);
+        set_clock(slave_clock, slave_serial);
     }
 }
 

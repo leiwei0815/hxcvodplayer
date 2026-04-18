@@ -38,6 +38,8 @@ PlayerCore::PlayerCore()
     , video_stream_(-1)
     , audio_stream_(-1)
     , subtitle_stream_(-1)
+    , video_stream_opened_(false)
+    , audio_stream_opened_(false)
     , video_codec_ctx_(nullptr)
     , audio_codec_ctx_(nullptr)
     , abort_request_(false)
@@ -124,7 +126,9 @@ PlayerCore::~PlayerCore() {
 }
 
 int PlayerCore::open(const std::string& filename) {
-    if (state_ != PlayerState::Idle && state_ != PlayerState::Stopped) {
+    auto open_begin = std::chrono::steady_clock::now();
+    PlayerState current_state = get_state();
+    if (current_state != PlayerState::Idle && current_state != PlayerState::Stopped) {
         LOG_WARNING("播放器状态错误，无法打开文件");
         set_state(PlayerState::Error);
         return -1;
@@ -134,7 +138,7 @@ int PlayerCore::open(const std::string& filename) {
     LOG_INFO("开始打开文件");
     LOG_INFO("========================================");
     LOG_INFO("URL: ", filename);
-    LOG_INFO("当前状态: ", (int)state_);
+    LOG_INFO("当前状态: ", (int)current_state);
     LOG_INFO("配置信息:");
     LOG_INFO("  - 启用音频: ", config_.enable_audio ? "是" : "否");
     LOG_INFO("  - 启用视频: ", config_.enable_video ? "是" : "否");
@@ -169,11 +173,15 @@ int PlayerCore::open(const std::string& filename) {
     // 🔧 设置网络超时和重试参数（对于网络流很重要）
     AVDictionary* options = nullptr;
     
-    // 设置超时时间（微秒）- 15 秒（缩短以快速失败）
-    av_dict_set(&options, "timeout", "15000000", 0);
-    
-    // 设置连接超时（微秒）- 5 秒  
-    av_dict_set(&options, "stimeout", "5000000", 0);
+    // 设置超时时间（微秒）
+#if defined(__ANDROID__)
+    // Android 移动网络抖动明显，适当降低默认等待时间，避免单次卡住过久。
+    av_dict_set(&options, "timeout", "8000000", 0);      // 8 秒
+    av_dict_set(&options, "stimeout", "3000000", 0);     // 3 秒
+#else
+    av_dict_set(&options, "timeout", "15000000", 0);     // 15 秒
+    av_dict_set(&options, "stimeout", "5000000", 0);     // 5 秒
+#endif
     
     // 设置重连次数
     av_dict_set(&options, "reconnect", "1", 0);
@@ -217,7 +225,11 @@ int PlayerCore::open(const std::string& filename) {
         // av_dict_set(&options, "seekable", "0", 0);
         
         // 增加超时设置（避免卡住）
-        av_dict_set(&options, "rw_timeout", "10000000", 0);     // 读写超时 10秒
+#if defined(__ANDROID__)
+        av_dict_set(&options, "rw_timeout", "6000000", 0);      // 读写超时 6 秒
+#else
+        av_dict_set(&options, "rw_timeout", "10000000", 0);     // 读写超时 10 秒
+#endif
         
         LOG_INFO("TLS 参数配置完成（证书验证已禁用）");
     }
@@ -245,7 +257,12 @@ int PlayerCore::open(const std::string& filename) {
     std::string url_with_params = filename;
     
     // 🔄 重试机制配置
-    const int MAX_RETRY_COUNT = 3;          // 最大重试次数
+    // Android 上降低重试次数，减少最坏场景等待时间
+#if defined(__ANDROID__)
+    const int MAX_RETRY_COUNT = 1;          // 最大重试次数（总尝试 2 次）
+#else
+    const int MAX_RETRY_COUNT = 3;          // 最大重试次数（总尝试 4 次）
+#endif
     const int RETRY_DELAY_MS = 1000;        // 重试间隔（毫秒）
     int retry_count = 0;
     int ret = -1;
@@ -284,8 +301,13 @@ int PlayerCore::open(const std::string& filename) {
             format_ctx_->interrupt_callback.opaque = this;
         }
         
+        auto attempt_begin = std::chrono::steady_clock::now();
         // 尝试打开
         ret = avformat_open_input(&format_ctx_, url_with_params.c_str(), nullptr, &options);
+        auto attempt_cost_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - attempt_begin).count();
+        LOG_INFO("avformat_open_input 耗时: ", attempt_cost_ms, " ms (尝试 ",
+                 retry_count + 1, "/", MAX_RETRY_COUNT + 1, ")");
         
         // 成功则退出循环
         if (ret == 0) {
@@ -401,6 +423,8 @@ int PlayerCore::open(const std::string& filename) {
     if (ret < 0) {
         char errbuf[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, errbuf, sizeof(errbuf));
+        auto open_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - open_begin).count();
         
         // 构建详细的错误消息
         std::string error_message;
@@ -449,20 +473,31 @@ int PlayerCore::open(const std::string& filename) {
         
         LOG_ERROR("无法打开文件: ", filename);
         LOG_ERROR("FFmpeg 错误码: ", ret, ", 错误信息: ", errbuf);
+        LOG_ERROR("open() 总耗时: ", open_total_ms, " ms");
         
         // 发送错误回调给外层
         emit_error(code, error_message);
         set_state(PlayerState::Error);
         return -1;
     }
-    
-    return open_common_process(filename);
+
+    auto open_common_begin = std::chrono::steady_clock::now();
+    int open_common_ret = open_common_process(filename);
+    auto open_common_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - open_common_begin).count();
+    auto open_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - open_begin).count();
+    LOG_INFO("open_common_process 耗时: ", open_common_ms, " ms");
+    LOG_INFO("open() 总耗时: ", open_total_ms, " ms");
+
+    return open_common_ret;
 }
 
 // 使用自定义数据源打开
 int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io,
                                     const std::string& url_for_format) {
-    if (state_ != PlayerState::Idle && state_ != PlayerState::Stopped) {
+    PlayerState current_state = get_state();
+    if (current_state != PlayerState::Idle && current_state != PlayerState::Stopped) {
         LOG_WARNING("播放器状态错误，无法打开文件");
         set_state(PlayerState::Error);
         return -1;
@@ -563,7 +598,8 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
 
 // 使用指定数据源模式打开
 int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, const CustomDataSourceConfig& config) {
-    if (state_ != PlayerState::Idle && state_ != PlayerState::Stopped) {
+    PlayerState current_state = get_state();
+    if (current_state != PlayerState::Idle && current_state != PlayerState::Stopped) {
         LOG_WARNING("播放器状态错误，无法打开文件");
         set_state(PlayerState::Error);
         return -1;
@@ -703,8 +739,15 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
 }
 
 int PlayerCore::open_common_process(const std::string &filename) {
+    auto common_begin = std::chrono::steady_clock::now();
+    video_stream_opened_ = false;
+    audio_stream_opened_ = false;
     // 获取流信息
+    auto find_stream_begin = std::chrono::steady_clock::now();
     int ret = avformat_find_stream_info(format_ctx_, nullptr);
+    auto find_stream_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - find_stream_begin).count();
+    LOG_INFO("avformat_find_stream_info 耗时: ", find_stream_ms, " ms");
     if (ret < 0) {
         char errbuf[AV_ERROR_MAX_STRING_SIZE];
         av_strerror(ret, errbuf, sizeof(errbuf));
@@ -790,23 +833,35 @@ int PlayerCore::open_common_process(const std::string &filename) {
     // 打开流组件（会创建解码器，但不启动线程）
     if (config_.enable_video && video_stream_ >= 0) {
         LOG_INFO("打开视频流...");
+        auto open_video_begin = std::chrono::steady_clock::now();
         if (stream_component_open(video_stream_) < 0) {
             LOG_ERROR("无法打开视频流");
             emit_error(ERROR_NO_VIDEO_STREAM, "无法打开视频流");
+            video_stream_opened_ = false;
             // 注意：继续尝试打开音频流，不直接返回错误
         } else {
+            auto open_video_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - open_video_begin).count();
             LOG_INFO("视频流打开成功, 分辨率: ", media_info_.video_width, "x", media_info_.video_height);
+            LOG_INFO("stream_component_open(video) 耗时: ", open_video_ms, " ms");
+            video_stream_opened_ = true;
         }
     }
     
     if (config_.enable_audio && audio_stream_ >= 0) {
         LOG_INFO("打开音频流...");
+        auto open_audio_begin = std::chrono::steady_clock::now();
         if (stream_component_open(audio_stream_) < 0) {
             LOG_ERROR("无法打开音频流");
             emit_error(ERROR_NO_AUDIO_STREAM, "无法打开音频流");
+            audio_stream_opened_ = false;
             // 注意：继续播放，不直接返回错误（可能是纯视频文件）
         } else {
+            auto open_audio_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - open_audio_begin).count();
             LOG_INFO("音频流打开成功, 采样率: ", media_info_.audio_sample_rate, " Hz");
+            LOG_INFO("stream_component_open(audio) 耗时: ", open_audio_ms, " ms");
+            audio_stream_opened_ = true;
         }
     }
     
@@ -838,12 +893,16 @@ int PlayerCore::open_common_process(const std::string &filename) {
         progress_timer_thread_ = std::thread(&PlayerCore::progress_timer_thread, this);
         LOG_INFO("播放进度回调定时器线程已启动");
     }
+
+    auto common_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - common_begin).count();
+    LOG_INFO("open_common_process 总耗时: ", common_total_ms, " ms");
     
     return 0;
 }
 
 void PlayerCore::close() {
-    if (state_ == PlayerState::Idle) {
+    if (get_state() == PlayerState::Idle) {
         return;
     }
     
@@ -942,7 +1001,7 @@ void PlayerCore::close() {
 }
 
 void PlayerCore::play() {
-    if (state_ == PlayerState::Paused) {
+    if (get_state() == PlayerState::Paused) {
         pause_request_ = false;
         
         LOG_INFO("恢复播放...");
@@ -970,7 +1029,7 @@ void PlayerCore::play() {
 }
 
 void PlayerCore::pause() {
-    if (state_ == PlayerState::Playing) {
+    if (get_state() == PlayerState::Playing) {
         pause_request_ = true;
         
         LOG_INFO("暂停播放...");
@@ -1059,6 +1118,8 @@ void PlayerCore::read_thread() {
     }
     
     int packet_count = 0;
+    int read_error_count = 0;
+    auto read_error_begin = std::chrono::steady_clock::time_point{};
     
     while (!abort_request_) {
         // 处理 seek
@@ -1114,10 +1175,10 @@ void PlayerCore::read_thread() {
                 }
                 
                 // ⚠️ 4. 发送刷新包（告诉解码器已清空）
-                if (video_stream_ >= 0) {
+                if (video_stream_ >= 0 && video_stream_opened_ && video_packet_queue_) {
                     video_packet_queue_->put_nullpacket(video_stream_);
                 }
-                if (audio_stream_ >= 0) {
+                if (audio_stream_ >= 0 && audio_stream_opened_ && audio_packet_queue_) {
                     audio_packet_queue_->put_nullpacket(audio_stream_);
                 }
                 
@@ -1178,10 +1239,10 @@ void PlayerCore::read_thread() {
             if (ret == AVERROR_EOF || avio_feof(format_ctx_->pb)) {
                 // 文件结束，发送结束包给解码器
                 LOG_INFO("读取线程：文件读取结束");
-                if (video_stream_ >= 0) {
+                if (video_stream_ >= 0 && video_stream_opened_ && video_packet_queue_) {
                     video_packet_queue_->put_nullpacket(video_stream_);
                 }
-                if (audio_stream_ >= 0) {
+                if (audio_stream_ >= 0 && audio_stream_opened_ && audio_packet_queue_) {
                     audio_packet_queue_->put_nullpacket(audio_stream_);
                 }
                 
@@ -1208,13 +1269,52 @@ void PlayerCore::read_thread() {
                 break;
             }
             
-            // ⚠️ 读取失败，可能是网络问题，触发加载回调
+            // 读取失败（通常是弱网/暂时断流），进入加载状态。
             if (loading_callback_) {
                 loading_callback_(true);  // 开始加载
+            }
+
+            if (read_error_count == 0) {
+                read_error_begin = std::chrono::steady_clock::now();
+            }
+            read_error_count++;
+
+            // 周期性打印失败详情，便于线上定位具体错误码
+            if (read_error_count == 1 || read_error_count % 100 == 0) {
+                char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+                av_strerror(ret, errbuf, sizeof(errbuf));
+                auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - read_error_begin).count();
+                LOG_WARNING("读取线程：av_read_frame 连续失败，ret=", ret,
+                            ", err=", errbuf,
+                            ", 连续失败次数=", read_error_count,
+                            ", 卡顿时长=", stall_ms, " ms");
+            }
+
+            // 防止无限卡死：连续读取失败超过阈值，主动上报并退出。
+            // 业务层可据此触发切源/重试，而不是无止境“卡住”。
+            const int MAX_STALL_MS = 15000;  // 15 秒
+            auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - read_error_begin).count();
+            if (stall_ms >= MAX_STALL_MS) {
+                LOG_ERROR("读取线程：连续读取失败超时，判定为卡死，退出。stall_ms=", stall_ms);
+                emit_error(ERROR_NET_CONNECTION_TIMEOUT,
+                           "网络读取超时（连续读取失败超过 15 秒），建议重试或切换线路");
+                set_state(PlayerState::Error);
+                break;
             }
             
             PLAYER_DELAY(10);
             continue;
+        }
+
+        // 读取恢复后，重置连续失败计数并结束加载状态
+        if (read_error_count > 0) {
+            auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - read_error_begin).count();
+            LOG_INFO("读取线程：读取恢复，连续失败次数=", read_error_count, ", 卡顿时长=", stall_ms, " ms");
+            read_error_count = 0;
+            read_error_begin = std::chrono::steady_clock::time_point{};
         }
         
         // ⚠️ 读取成功，结束加载状态
@@ -1223,13 +1323,13 @@ void PlayerCore::read_thread() {
         }
         
         // 分发包到对应队列
-        if (pkt->stream_index == video_stream_) {
+        if (pkt->stream_index == video_stream_ && video_stream_opened_ && video_packet_queue_) {
             video_packet_queue_->put(pkt);
             packet_count++;
 //            if (packet_count % 100 == 0) {
 //                LOG_INFO("已读取 ", packet_count, " 个视频包");
 //            }
-        } else if (pkt->stream_index == audio_stream_) {
+        } else if (pkt->stream_index == audio_stream_ && audio_stream_opened_ && audio_packet_queue_) {
             audio_packet_queue_->put(pkt);
         } else {
             av_packet_unref(pkt);
@@ -1288,6 +1388,7 @@ int PlayerCore::stream_component_open(int stream_index) {
         LOG_INFO("启动视频线程...");
         video_thread_ = std::thread(&PlayerCore::video_thread, this);
         LOG_INFO("视频线程已启动");
+        video_stream_opened_ = true;
         
     } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
         audio_codec_ctx_ = codec_ctx;
@@ -1337,6 +1438,9 @@ int PlayerCore::stream_component_open(int stream_index) {
         if (audio_dev_ == 0) {
             LOG_ERROR("SDL_OpenAudioDevice 失败: ", SDL_GetError());
             emit_error(PLAYER_ERROR_AUDIO_DEVICE_OPEN_FAILED, std::string("打开音频设备失败: ") + SDL_GetError());
+            audio_decoder_.reset();
+            avcodec_free_context(&audio_codec_ctx_);
+            audio_stream_opened_ = false;
             return -1;
         }
         
@@ -1354,6 +1458,7 @@ int PlayerCore::stream_component_open(int stream_index) {
         LOG_INFO("启动音频线程...");
         audio_thread_ = std::thread(&PlayerCore::audio_thread, this);
         LOG_INFO("音频线程已启动");
+        audio_stream_opened_ = true;
         
 #ifndef NO_SDL
         // 启动音频设备（此时解码器已就绪）
@@ -1382,6 +1487,7 @@ void PlayerCore::stream_component_close(int stream_index) {
             avcodec_free_context(&video_codec_ctx_);
             video_codec_ctx_ = nullptr;
         }
+        video_stream_opened_ = false;
         video_stream_ = -1;
         
     } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -1406,6 +1512,7 @@ void PlayerCore::stream_component_close(int stream_index) {
             audio_codec_ctx_ = nullptr;
         }
         
+        audio_stream_opened_ = false;
         audio_stream_ = -1;
     }
 }
@@ -1453,14 +1560,27 @@ void PlayerCore::video_thread() {
         int ret = video_decoder_->decode_frame(frame);
         
         if (ret < 0) {
-            // ⚠️ 解码错误，可能是队列为空或其他临时问题
-            if (ret != AVERROR(EAGAIN)) {
-                error_count++;
-                if (error_count <= 3 || error_count % 100 == 0) {
-                    LOG_ERROR("视频解码错误: ", ret, " (错误次数: ", error_count, ")");
+            // EAGAIN/中止类错误按可恢复处理，避免误报致命错误。
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EXIT || ret == -1) {
+                if (abort_request_) {
+                    break;
                 }
+                PLAYER_DELAY(10);
+                continue;
             }
-            emit_error(ERROR_DECODE_FAILED, "视频解码失败");
+
+            error_count++;
+            if (error_count <= 3 || error_count % 100 == 0) {
+                LOG_ERROR("视频解码错误: ", ret, " (错误次数: ", error_count, ")");
+            }
+
+            // 连续错误达到阈值才上报致命，避免瞬时抖动触发错误风暴。
+            const int MAX_CONSECUTIVE_FATAL_DECODE_ERRORS = 50;
+            if (error_count >= MAX_CONSECUTIVE_FATAL_DECODE_ERRORS) {
+                emit_error(ERROR_DECODE_FAILED, "视频解码持续失败，已达到错误阈值");
+                set_state(PlayerState::Error);
+                break;
+            }
             PLAYER_DELAY(10);
             continue;  // 继续尝试
         } else if (ret == 0) {
@@ -1512,6 +1632,13 @@ void PlayerCore::video_thread() {
         
         // 复制帧数据
         vf->frame = av_frame_clone(frame);
+        if (!vf->frame) {
+            LOG_ERROR("视频帧克隆失败（内存不足），丢弃当前帧");
+            emit_error(ERROR_OUT_OF_MEMORY, "视频帧克隆失败（内存不足）");
+            av_frame_unref(frame);
+            PLAYER_DELAY(5);
+            continue;
+        }
         vf->pts = pts;
         vf->duration = duration;
         vf->width = frame->width;
@@ -1611,12 +1738,27 @@ void PlayerCore::audio_thread() {
         int ret = audio_decoder_->decode_frame(frame);
         
         if (ret < 0) {
-            // ⚠️ 解码错误，可能是队列为空或其他临时问题
+            // EAGAIN 常见于队列暂时无包，不应直接当成错误上报。
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EXIT || ret == -1) {
+                if (abort_request_) {
+                    break;
+                }
+                PLAYER_DELAY(10);
+                continue;  // 继续尝试
+            }
+
             error_count++;
             if (error_count == 1 || error_count % 100 == 0) {
                 LOG_ERROR("音频解码错误: ", ret, " (连续 ", error_count, " 次)");
             }
-            emit_error(ERROR_DECODE_FAILED, "音频解码失败");
+
+            const int MAX_CONSECUTIVE_FATAL_DECODE_ERRORS = 50;
+            if (error_count >= MAX_CONSECUTIVE_FATAL_DECODE_ERRORS) {
+                emit_error(ERROR_DECODE_FAILED, "音频解码持续失败，已达到错误阈值");
+                set_state(PlayerState::Error);
+                break;
+            }
+
             PLAYER_DELAY(10);
             continue;  // 继续尝试
         } else if (ret == 0) {
@@ -1684,6 +1826,13 @@ void PlayerCore::audio_thread() {
         
         // 复制帧数据
         af->frame = av_frame_clone(frame);
+        if (!af->frame) {
+            LOG_ERROR("音频帧克隆失败（内存不足），丢弃当前帧");
+            emit_error(ERROR_OUT_OF_MEMORY, "音频帧克隆失败（内存不足）");
+            av_frame_unref(frame);
+            PLAYER_DELAY(5);
+            continue;
+        }
         af->pts = pts;
         
         // 推入队列
@@ -1711,7 +1860,8 @@ void PlayerCore::progress_timer_thread() {
 
     while (!abort_request_) {
         // 检查播放器状态
-        if (state_ == PlayerState::Playing || state_ == PlayerState::Paused) {
+        PlayerState current_state = get_state();
+        if (current_state == PlayerState::Playing || current_state == PlayerState::Paused) {
             double current_position;
             
             // ⚠️ 【关键修复】如果正在 seek，直接返回 seek 目标位置
@@ -1731,7 +1881,7 @@ void PlayerCore::progress_timer_thread() {
                 }
                 
                 // ⚠️ 检测位置是否变化
-                if (state_ == PlayerState::Playing) {  // 只在播放状态下检测
+                if (current_state == PlayerState::Playing) {  // 只在播放状态下检测
                     if (fabs(current_position - last_position) < 0.01) {  // 位置几乎没变化
                         position_unchanged_count++;
                     } else {
@@ -1749,7 +1899,7 @@ void PlayerCore::progress_timer_thread() {
                     bool near_end = duration > 0 && (duration - current_position) < 1.0;  // 最后 1 秒内
                     
                     bool condition1 = decode_finished_.load(std::memory_order_acquire) && near_end;
-                    bool condition2 = (state_ == PlayerState::Playing) && 
+                    bool condition2 = (current_state == PlayerState::Playing) && 
                                      (position_unchanged_count >= 3) && 
                                      near_end;
                     
@@ -2083,8 +2233,9 @@ void PlayerCore::update_audio_pts(double pts, int serial) {
 }
 
 void PlayerCore::set_state(PlayerState state) {
-    if (state_ != state) {
-        state_ = state;
+    PlayerState old_state = state_.load(std::memory_order_acquire);
+    if (old_state != state) {
+        state_.store(state, std::memory_order_release);
         if (state_changed_callback_) {
             state_changed_callback_(state);
         }

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file player_types.h
  * @brief 播放器核心类型定义
  */
@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <memory>
+#include <mutex>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -186,6 +187,10 @@ struct AudioFrame {
 
 // 时钟信息
 struct Clock {
+private:
+    mutable std::mutex mutex_;
+
+public:
     double pts = 0.0;               // 当前时间戳
     double pts_drift = 0.0;         // 时钟漂移
     double last_updated = 0.0;      // 上次更新时间

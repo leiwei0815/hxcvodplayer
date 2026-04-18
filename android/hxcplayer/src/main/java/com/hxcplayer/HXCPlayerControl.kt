@@ -1,10 +1,14 @@
 package com.hxcplayer
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
@@ -107,11 +111,24 @@ class HXCPlayerControl(private val context: Context) {
         fun onPlayerStateChanged(state: PlayerState)
         fun onPlayerPositionUpdated(position: Double, duration: Double)
         fun onPlayerError(errorCode: Int, errorMessage: String)  // 添加 errorCode 参数
+        // 新增：错误是否可恢复（可重试/切源）
+        fun onPlayerErrorWithRecoverability(errorCode: Int, errorMessage: String, recoverable: Boolean) {}
+        // 网络抖动/缓冲中状态变化（默认空实现，兼容旧代码）
+        fun onPlayerLoadingChanged(isLoading: Boolean) {}
     }
     
     private var nativeHandle: Long = 0
     private var callback: PlayerCallback? = null
     private var updateExecutor: ScheduledExecutorService? = null
+    private var lastLoadingState: Boolean? = null
+    private var loadingCandidateState: Boolean? = null
+    private var loadingCandidateSinceMs: Long = 0L
+    private val openExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val loadingShowDebounceMs = 300L
+    private val loadingHideDebounceMs = 150L
+    private val lifecycleLock = Any()
+    @Volatile private var isReleased = false
     
     // 视频视图（只读属性，由播放器管理）
     val videoView: SurfaceView = SurfaceView(context).apply {
@@ -139,15 +156,60 @@ class HXCPlayerControl(private val context: Context) {
     fun setCallback(callback: PlayerCallback) {
         this.callback = callback
     }
+
+    private fun currentHandle(): Long {
+        synchronized(lifecycleLock) {
+            return nativeHandle
+        }
+    }
+
+    private fun isRecoverableErrorCode(errorCode: Int): Boolean {
+        return when (errorCode) {
+            PlayerErrorCode.OPEN_INPUT_FAILED,
+            PlayerErrorCode.READ_FRAME_FAILED,
+            PlayerErrorCode.DECODE_FAILED -> true
+
+            // Core 层网络/HTTP 负数错误码（与 C 层定义对齐）
+            -2001, // PLAYER_ERROR_NET_CONNECTION_TIMEOUT
+            -2002, // PLAYER_ERROR_NET_CONNECTION_REFUSED
+            -2003, // PLAYER_ERROR_NET_UNREACHABLE
+            -3003  // PLAYER_ERROR_HTTP_SERVER_ERROR
+            -> true
+
+            // 明确不可恢复：鉴权/权限/资源不存在/参数问题
+            -3002, // PLAYER_ERROR_HTTP_NOT_FOUND
+            -3004, // PLAYER_ERROR_HTTP_UNAUTHORIZED
+            -3005, // PLAYER_ERROR_HTTP_FORBIDDEN
+            PlayerErrorCode.INVALID_URL,
+            PlayerErrorCode.ALLOC_CONTEXT_FAILED,
+            PlayerErrorCode.CODEC_NOT_FOUND,
+            PlayerErrorCode.CODEC_OPEN_FAILED,
+            PlayerErrorCode.NO_VIDEO_STREAM,
+            PlayerErrorCode.NO_AUDIO_STREAM
+            -> false
+
+            else -> false
+        }
+    }
+
+    private fun dispatchError(errorCode: Int, errorMessage: String) {
+        val recoverable = isRecoverableErrorCode(errorCode)
+        callback?.onPlayerError(errorCode, errorMessage)
+        callback?.onPlayerErrorWithRecoverability(errorCode, errorMessage, recoverable)
+    }
     
     // 内部方法：设置渲染 Surface
     private fun setSurface(surface: Surface?) {
-        nativeSetSurface(nativeHandle, surface)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeSetSurface(handle, surface)
     }
     
     // 内部方法：更新 Surface 尺寸
     private fun updateSurfaceSize(width: Int, height: Int) {
-        nativeUpdateSurfaceSize(nativeHandle, width, height)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeUpdateSurfaceSize(handle, width, height)
     }
     
     // 打开 URL
@@ -156,29 +218,81 @@ class HXCPlayerControl(private val context: Context) {
     }
 
     // 打开 URL 并指定起始位置（秒）
+    // 注意：该接口为同步调用，可能阻塞调用线程（例如网络抖动时）
     fun openURL(url: String, startPosition: Double): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) {
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
+            return false
+        }
+
         val result = if (startPosition > 0.0) {
-            nativeOpenURLWithStartPosition(nativeHandle, url, startPosition)
+            nativeOpenURLWithStartPosition(handle, url, startPosition)
         } else {
-            nativeOpenURL(nativeHandle, url)
+            nativeOpenURL(handle, url)
         }
 
         if (result) {
             callback?.onPlayerStateChanged(PlayerState.OPENING)
         } else {
-            callback?.onPlayerError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
         }
         return result
+    }
+
+    /**
+     * 异步打开 URL，避免阻塞 UI 线程。
+     * 结果通过已有 callback 回调返回：
+     * - 成功：onPlayerStateChanged(OPENING)
+     * - 失败：onPlayerError(...)
+     */
+    fun openURLAsync(url: String, startPosition: Double = 0.0) {
+        if (isReleased) {
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
+            return
+        }
+        // 先通知进入 opening 状态，便于上层显示 loading
+        callback?.onPlayerStateChanged(PlayerState.OPENING)
+        try {
+            openExecutor.execute {
+                val handle = currentHandle()
+                if (handle == 0L || isReleased) {
+                    mainHandler.post {
+                        dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
+                    }
+                    return@execute
+                }
+
+                val result = if (startPosition > 0.0) {
+                    nativeOpenURLWithStartPosition(handle, url, startPosition)
+                } else {
+                    nativeOpenURL(handle, url)
+                }
+
+                if (!result && !isReleased) {
+                    mainHandler.post {
+                        dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
+                    }
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器线程已关闭，无法打开 URL: $url")
+        }
     }
 
     // 使用自定义 HTTP 模式打开（支持 Range 下载）
     // encryptedFile：是否与核心层约定一致，对文件头前 100 字节解密（默认 false）
     fun openWithCustomHTTP(url: String, timeoutMs: Int = 30000, maxRetries: Int = 3, encryptedFile: Boolean = false): Boolean {
-        val result = nativeOpenWithCustomHTTP(nativeHandle, url, timeoutMs, maxRetries, encryptedFile)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) {
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开自定义 HTTP: $url")
+            return false
+        }
+        val result = nativeOpenWithCustomHTTP(handle, url, timeoutMs, maxRetries, encryptedFile)
         if (result) {
             callback?.onPlayerStateChanged(PlayerState.OPENING)
         } else {
-            callback?.onPlayerError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开自定义 HTTP: $url")
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开自定义 HTTP: $url")
         }
         return result
     }
@@ -190,66 +304,91 @@ class HXCPlayerControl(private val context: Context) {
      * @param encryptedFile 是否对文件头前 100 字节按核心约定解密
      */
     fun openWithCustomFile(path: String, avioBufferSize: Int = 64 * 1024, encryptedFile: Boolean = false): Boolean {
-        val result = nativeOpenWithCustomFile(nativeHandle, path, avioBufferSize, encryptedFile)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) {
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开本地文件(CustomFile): $path")
+            return false
+        }
+        val result = nativeOpenWithCustomFile(handle, path, avioBufferSize, encryptedFile)
         if (result) {
             callback?.onPlayerStateChanged(PlayerState.OPENING)
         } else {
-            callback?.onPlayerError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开本地文件(CustomFile): $path")
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开本地文件(CustomFile): $path")
         }
         return result
     }
     
     // 播放
     fun play() {
-        nativePlay(nativeHandle)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativePlay(handle)
         callback?.onPlayerStateChanged(PlayerState.PLAYING)
     }
     
     // 暂停
     fun pause() {
-        nativePause(nativeHandle)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativePause(handle)
         callback?.onPlayerStateChanged(PlayerState.PAUSED)
     }
     
     // 停止
     fun stop() {
-        nativeStop(nativeHandle)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeStop(handle)
         callback?.onPlayerStateChanged(PlayerState.STOPPED)
     }
     
     // 跳转
     fun seekTo(position: Double) {
-        nativeSeekTo(nativeHandle, position)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeSeekTo(handle, position)
     }
     
     // 设置播放速度
     fun setPlaybackRate(rate: Float) {
-        nativeSetPlaybackRate(nativeHandle, rate)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeSetPlaybackRate(handle, rate)
     }
     
     // 设置音量
     fun setVolume(volume: Float) {
-        nativeSetVolume(nativeHandle, volume)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeSetVolume(handle, volume)
     }
     
     // 设置比例模式
     fun setAspectRatioMode(fill: Boolean) {
-        nativeSetAspectRatioMode(nativeHandle, if (fill) 1 else 0)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeSetAspectRatioMode(handle, if (fill) 1 else 0)
     }
     
     // 获取时长
     fun getDuration(): Double {
-        return nativeGetDuration(nativeHandle)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return 0.0
+        return nativeGetDuration(handle)
     }
     
     // 获取当前位置
     fun getPosition(): Double {
-        return nativeGetPosition(nativeHandle)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return 0.0
+        return nativeGetPosition(handle)
     }
     
     // 获取状态
     fun getState(): PlayerState {
-        val state = nativeGetState(nativeHandle)
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return PlayerState.IDLE
+        val state = nativeGetState(handle)
         return PlayerState.values().getOrElse(state) { PlayerState.IDLE }
     }
     
@@ -258,10 +397,39 @@ class HXCPlayerControl(private val context: Context) {
         updateExecutor = Executors.newSingleThreadScheduledExecutor()
         updateExecutor?.scheduleAtFixedRate({
             try {
+                val handle = currentHandle()
+                if (handle == 0L || isReleased) {
+                    return@scheduleAtFixedRate
+                }
+
                 val position = getPosition()
                 val duration = getDuration()
                 if (duration > 0) {
                     callback?.onPlayerPositionUpdated(position, duration)
+                }
+
+                val loading = isLoading()
+                val now = SystemClock.elapsedRealtime()
+                if (loadingCandidateState == null || loadingCandidateState != loading) {
+                    loadingCandidateState = loading
+                    loadingCandidateSinceMs = now
+                } else {
+                    val debounceMs = if (loading) loadingShowDebounceMs else loadingHideDebounceMs
+                    if (lastLoadingState != loading && (now - loadingCandidateSinceMs) >= debounceMs) {
+                        lastLoadingState = loading
+                        mainHandler.post {
+                            callback?.onPlayerLoadingChanged(loading)
+                        }
+                    }
+                }
+
+                // 透传播放中错误（由 core 错误回调写入，Java 侧轮询消费）
+                val outCode = IntArray(1)
+                val errorMessage = nativeConsumeLastError(handle, outCode)
+                if (errorMessage != null && !isReleased) {
+                    mainHandler.post {
+                        dispatchError(outCode[0], errorMessage)
+                    }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -271,9 +439,32 @@ class HXCPlayerControl(private val context: Context) {
     
     // 释放资源
     fun release() {
-        updateExecutor?.shutdown()
-        nativeRelease(nativeHandle)
-        nativeHandle = 0
+        synchronized(lifecycleLock) {
+            if (isReleased) return
+            isReleased = true
+        }
+
+        updateExecutor?.shutdownNow()
+        openExecutor.shutdownNow()
+        try {
+            updateExecutor?.awaitTermination(800, TimeUnit.MILLISECONDS)
+            openExecutor.awaitTermination(800, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+
+        val handle: Long
+        synchronized(lifecycleLock) {
+            handle = nativeHandle
+            nativeHandle = 0
+        }
+        if (handle != 0L) {
+            nativeRelease(handle)
+        }
+
+        lastLoadingState = null
+        loadingCandidateState = null
+        loadingCandidateSinceMs = 0L
     }
     
     // Native 方法声明
@@ -295,4 +486,15 @@ class HXCPlayerControl(private val context: Context) {
     private external fun nativeGetDuration(handle: Long): Double
     private external fun nativeGetPosition(handle: Long): Double
     private external fun nativeGetState(handle: Long): Int
+    private external fun nativeIsLoading(handle: Long): Boolean
+    private external fun nativeConsumeLastError(handle: Long, outCode: IntArray): String?
+
+    // 获取当前是否处于加载中（可用于主动查询 UI 状态）
+    fun isLoading(): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) {
+            return false
+        }
+        return nativeIsLoading(handle)
+    }
 }

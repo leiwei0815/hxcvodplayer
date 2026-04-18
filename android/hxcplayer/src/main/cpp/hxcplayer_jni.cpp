@@ -194,6 +194,40 @@ Java_com_hxcplayer_HXCPlayerControl_nativeGetState(
     return 0; // IDLE
 }
 
+// 获取加载状态（网络波动时用于展示 loading 动画）
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeIsLoading(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        return player->isLoading() ? JNI_TRUE : JNI_FALSE;
+    }
+    return JNI_FALSE;
+}
+
+// 消费一次播放中错误（有错误返回 message；无错误返回 null）
+JNIEXPORT jstring JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeConsumeLastError(
+        JNIEnv *env, jobject thiz, jlong handle, jintArray out_code) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player || !out_code) {
+        return nullptr;
+    }
+
+    int error_code = 0;
+    std::string error_message;
+    if (!player->consumeLastError(error_code, error_message)) {
+        return nullptr;
+    }
+
+    if (env->GetArrayLength(out_code) > 0) {
+        jint code = static_cast<jint>(error_code);
+        env->SetIntArrayRegion(out_code, 0, 1, &code);
+    }
+
+    return env->NewStringUTF(error_message.c_str());
+}
+
 // ========== 日志配置方法 ==========
 
 // 启用文件日志

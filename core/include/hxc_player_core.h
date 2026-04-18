@@ -133,7 +133,7 @@ public:
     void seek(double pos);  // 秒
     
     // 获取状态
-    PlayerState get_state() const { return state_; }
+    PlayerState get_state() const { return state_.load(std::memory_order_acquire); }
     const MediaInfo& get_media_info() const { return media_info_; }
     double get_position() const;    // 当前播放位置（秒）
     double get_duration() const;    // 总时长（秒）
@@ -232,7 +232,7 @@ private:
 
 private:
     PlayerConfig config_;
-    PlayerState state_;
+    std::atomic<PlayerState> state_;
     MediaInfo media_info_;
     
     // FFmpeg 对象
@@ -240,6 +240,8 @@ private:
     int video_stream_;
     int audio_stream_;
     int subtitle_stream_;
+    bool video_stream_opened_;   // 视频流组件是否成功打开
+    bool audio_stream_opened_;   // 音频流组件是否成功打开
     
     AVCodecContext* video_codec_ctx_;
     AVCodecContext* audio_codec_ctx_;

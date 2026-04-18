@@ -62,6 +62,8 @@ public:
     double getDuration() const;
     double getPosition() const;
     int getState() const;
+    bool isLoading() const;
+    bool consumeLastError(int& error_code, std::string& error_message);
     
 private:
     // 核心播放器句柄
@@ -88,9 +90,10 @@ private:
     std::thread render_thread_;
     std::atomic<bool> render_running_;
     void renderLoop();
-    void renderFrame(void* y_data, void* u_data, void* v_data,
-                    int y_linesize, int u_linesize, int v_linesize,
-                    int width, int height);
+    // 返回 swscale 耗时（ms），失败时返回 -1
+    int renderFrame(void* y_data, void* u_data, void* v_data,
+                   int y_linesize, int u_linesize, int v_linesize,
+                   int width, int height);
     
     // OpenSL ES 音频输出
     SLObjectItf engineObject_;
@@ -114,6 +117,17 @@ private:
     uint8_t audio_buffer_[MAX_AUDIO_BUFFER_SIZE];
     int audio_buffer_size_;   // 实际使用的缓冲区大小
     std::mutex audio_mutex_;
+
+    // 加载状态（用于业务层显示 loading 动画）
+    std::atomic<bool> is_loading_;
+    static void loadingStateCallback(bool is_loading, void* user_data);
+
+    // 播放中错误透传（由 core 回调写入，JNI 轮询消费）
+    std::mutex error_mutex_;
+    std::atomic<bool> has_pending_error_;
+    int last_error_code_;
+    std::string last_error_message_;
+    static void errorStateCallback(int error_code, const char* error_msg, void* user_data);
 };
 
 #endif // ANDROID_PLAYER_H

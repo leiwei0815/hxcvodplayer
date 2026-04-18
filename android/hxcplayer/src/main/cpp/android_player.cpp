@@ -2,6 +2,7 @@
 #include "hxc_player_core_c_bridge.h"
 #include <android/log.h>
 #include <cstring>
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -37,6 +38,9 @@ AndroidPlayer::AndroidPlayer()
     , audio_sample_rate_(0)
     , audio_channels_(0)
     , audio_buffer_size_(0)
+    , is_loading_(false)
+    , has_pending_error_(false)
+    , last_error_code_(0)
 {
     LOGD("AndroidPlayer created");
     
@@ -44,6 +48,11 @@ AndroidPlayer::AndroidPlayer()
     player_core_ = player_core_create();
     if (!player_core_) {
         LOGE("Failed to create player core");
+    } else {
+        // 注册底层加载状态回调（网络抖动时用于显示 loading）
+        player_core_set_loading_callback(player_core_, loadingStateCallback, this);
+        // 注册底层错误回调（播放中错误透传给业务层）
+        player_core_set_error_callback(player_core_, errorStateCallback, this);
     }
     
     // ⚠️ 不在这里初始化音频，等到打开视频后根据实际音频参数初始化
@@ -216,6 +225,7 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
 
         if (sample_rate > 0 && channels > 0 && !audio_initialized_) {
             if (initAudioOutput(sample_rate, channels)) {
+                audio_initialized_ = true;
                 LOGI("Audio initialized: %d Hz, %d channels", sample_rate, channels);
             }
         }
@@ -254,6 +264,7 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
 
         if (sample_rate > 0 && channels > 0 && !audio_initialized_) {
             if (initAudioOutput(sample_rate, channels)) {
+                audio_initialized_ = true;
                 LOGI("Audio initialized: %d Hz, %d channels", sample_rate, channels);
             }
         }
@@ -375,6 +386,48 @@ int AndroidPlayer::getState() const {
     return (int)player_core_get_state(player_core_);
 }
 
+bool AndroidPlayer::isLoading() const {
+    return is_loading_.load(std::memory_order_acquire);
+}
+
+void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
+    auto* player = static_cast<AndroidPlayer*>(user_data);
+    if (!player) {
+        return;
+    }
+    player->is_loading_.store(is_loading, std::memory_order_release);
+}
+
+bool AndroidPlayer::consumeLastError(int& error_code, std::string& error_message) {
+    if (!has_pending_error_.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    if (!has_pending_error_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+
+    error_code = last_error_code_;
+    error_message = last_error_message_;
+    has_pending_error_.store(false, std::memory_order_release);
+    return true;
+}
+
+void AndroidPlayer::errorStateCallback(int error_code, const char* error_msg, void* user_data) {
+    auto* player = static_cast<AndroidPlayer*>(user_data);
+    if (!player) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(player->error_mutex_);
+        player->last_error_code_ = error_code;
+        player->last_error_message_ = error_msg ? error_msg : "unknown error";
+    }
+    player->has_pending_error_.store(true, std::memory_order_release);
+}
+
 // ========== 视频渲染 ==========
 
 void AndroidPlayer::renderLoop() {
@@ -382,6 +435,10 @@ void AndroidPlayer::renderLoop() {
     
     int frame_count = 0;
     int empty_count = 0;
+    int frame_seq = 0;
+    int drop_count = 0;
+    int overload_score = 0;
+    int adaptive_level = 0; // 0=关闭，1=轻度（丢1/2），2=中度（丢2/3）
 
     while (render_running_) {
         if (!player_core_) {
@@ -394,14 +451,60 @@ void AndroidPlayer::renderLoop() {
         int result = player_core_get_video_frame(player_core_, &frame_data);
         if (result == 0) {
             frame_count++;
+            frame_seq++;
             // if (frame_count % 30 == 0) {  // 关闭
             //     LOGI("Rendered %d frames", frame_count);
             // }
-            
-            // ✅ 直接渲染帧，renderFrame 内部会处理锁
-            renderFrame(frame_data.y_data, frame_data.u_data, frame_data.v_data,
-                       frame_data.y_linesize, frame_data.u_linesize, frame_data.v_linesize,
-                       frame_data.width, frame_data.height);
+
+            bool should_drop = false;
+            if (adaptive_level == 1) {
+                should_drop = (frame_seq % 2 == 0);      // 约丢 50%
+            } else if (adaptive_level == 2) {
+                should_drop = (frame_seq % 3 != 0);      // 约丢 66%
+            }
+
+            if (should_drop) {
+                drop_count++;
+            } else {
+                // ✅ 直接渲染帧，renderFrame 内部会处理锁
+                int render_cost_ms = renderFrame(frame_data.y_data, frame_data.u_data, frame_data.v_data,
+                                                 frame_data.y_linesize, frame_data.u_linesize, frame_data.v_linesize,
+                                                 frame_data.width, frame_data.height);
+
+                if (render_cost_ms < 0) {
+                    overload_score += 2;
+                } else if (render_cost_ms >= 24) {
+                    overload_score += 3;
+                } else if (render_cost_ms >= 20) {
+                    overload_score += 2;
+                } else if (render_cost_ms >= 17) {
+                    overload_score += 1;
+                } else {
+                    overload_score -= 2;
+                }
+            }
+
+            if (overload_score < 0) {
+                overload_score = 0;
+            }
+            if (overload_score > 40) {
+                overload_score = 40;
+            }
+
+            int new_level = adaptive_level;
+            if (overload_score >= 16) {
+                new_level = 2;
+            } else if (overload_score >= 8) {
+                new_level = 1;
+            } else if (overload_score <= 3) {
+                new_level = 0;
+            }
+
+            if (new_level != adaptive_level) {
+                adaptive_level = new_level;
+                LOGW("🎛️ Adaptive render level -> %d (overload_score=%d, dropped=%d/%d)",
+                     adaptive_level, overload_score, drop_count, frame_count);
+            }
 
             // 通知核心播放器帧已消费
             player_core_consume_video_frame(player_core_);
@@ -420,9 +523,9 @@ void AndroidPlayer::renderLoop() {
     // LOGD("Render loop stopped, total frames rendered: %d", frame_count);  // 关闭
 }
 
-void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
-                                int y_linesize, int u_linesize, int v_linesize,
-                                int width, int height) {
+int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
+                               int y_linesize, int u_linesize, int v_linesize,
+                               int width, int height) {
     // 🔒 获取 window 和 surface 尺寸
     ANativeWindow* window = nullptr;
     int surface_w = 0;
@@ -432,7 +535,7 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     {
         std::lock_guard<std::mutex> lock(window_mutex_);
         if (!native_window_ || !y_data) {
-            return;
+            return -1;
         }
         
         window = native_window_;
@@ -442,61 +545,82 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         needs_configure = !surface_configured_;
     }
     
-    // 📐 根据 aspect_ratio_mode_ 计算实际渲染尺寸
-    // FIT (0): 保持视频宽高比，适配到 Surface 内（可能有黑边）
-    // FILL (1): 等比例填充整个 Surface（保持宽高比，裁剪超出部分）
-    int target_width = surface_w;
-    int target_height = surface_h;
+    // 📐 成熟播放器常用策略：
+    // - FIT：完整源帧等比缩放到 surface 内（留黑边）
+    // - FILL：先对源帧中心裁剪到目标宽高比，再缩放到 surface（不先放大后裁剪）
+    // 这样可避免目标尺寸膨胀导致内存抖动和黑屏。
+    int dst_width = surface_w;
+    int dst_height = surface_h;
+    int draw_offset_x = 0;
+    int draw_offset_y = 0;
+    int src_crop_x = 0;
+    int src_crop_y = 0;
+    int src_crop_w = width;
+    int src_crop_h = height;
     
     static int last_logged_mode = -1;  // 记录上次日志的模式
+    float video_aspect = (float)width / (float)height;
+    float surface_aspect = (float)surface_w / (float)surface_h;
     
     if (aspect_ratio_mode_ == 0) {
-        // FIT 模式：计算适配尺寸（保持宽高比，不裁剪）
-        float video_aspect = (float)width / (float)height;
-        float surface_aspect = (float)surface_w / (float)surface_h;
-        
+        // FIT：完整视频缩放到 surface 内，黑边由后续清屏填充
         if (video_aspect > surface_aspect) {
-            // 视频更宽，以宽度为准
-            target_width = surface_w;
-            target_height = (int)(surface_w / video_aspect);
+            dst_width = surface_w;
+            dst_height = (int)(surface_w / video_aspect);
         } else {
-            // 视频更高，以高度为准
-            target_height = surface_h;
-            target_width = (int)(surface_h * video_aspect);
+            dst_height = surface_h;
+            dst_width = (int)(surface_h * video_aspect);
         }
+        draw_offset_x = (surface_w - dst_width) / 2;
+        draw_offset_y = (surface_h - dst_height) / 2;
         
-        // 模式切换时输出日志
         if (last_logged_mode != 0) {
-            LOGI("📐 FIT mode: video=%dx%d (%.2f), surface=%dx%d (%.2f) -> target=%dx%d", 
-                 width, height, video_aspect, surface_w, surface_h, surface_aspect, target_width, target_height);
+            LOGI("📐 FIT mode: video=%dx%d (%.2f), surface=%dx%d (%.2f) -> draw=%dx%d",
+                 width, height, video_aspect, surface_w, surface_h, surface_aspect, dst_width, dst_height);
             last_logged_mode = 0;
         }
     } else {
-        // FILL 模式：等比例填充整个 Surface（保持宽高比，裁剪超出部分）
-        float video_aspect = (float)width / (float)height;
-        float surface_aspect = (float)surface_w / (float)surface_h;
+        // FILL：先裁剪源帧，再缩放到 surface，避免 target > surface 的放大开销。
+        dst_width = surface_w;
+        dst_height = surface_h;
         
         if (video_aspect > surface_aspect) {
-            // 视频更宽，以高度为准（左右会被裁剪）
-            target_height = surface_h;
-            target_width = (int)(surface_h * video_aspect);
+            // 视频更宽，裁左右
+            src_crop_w = (int)(height * surface_aspect);
+            src_crop_h = height;
+            src_crop_x = (width - src_crop_w) / 2;
+            src_crop_y = 0;
         } else {
-            // 视频更高，以宽度为准（上下会被裁剪）
-            target_width = surface_w;
-            target_height = (int)(surface_w / video_aspect);
+            // 视频更高，裁上下
+            src_crop_w = width;
+            src_crop_h = (int)(width / surface_aspect);
+            src_crop_x = 0;
+            src_crop_y = (height - src_crop_h) / 2;
         }
         
-        // 模式切换时输出日志
+        // YUV420 对齐到偶数，避免 UV 平面偏移错误
+        src_crop_x = std::max(0, src_crop_x & ~1);
+        src_crop_y = std::max(0, src_crop_y & ~1);
+        src_crop_w = std::max(2, src_crop_w & ~1);
+        src_crop_h = std::max(2, src_crop_h & ~1);
+        
+        if (src_crop_x + src_crop_w > width) {
+            src_crop_w = (width - src_crop_x) & ~1;
+        }
+        if (src_crop_y + src_crop_h > height) {
+            src_crop_h = (height - src_crop_y) & ~1;
+        }
+        
         if (last_logged_mode != 1) {
-            LOGI("📐 FILL mode: video=%dx%d (%.2f), surface=%dx%d (%.2f) -> target=%dx%d (crop)", 
-                 width, height, video_aspect, surface_w, surface_h, surface_aspect, target_width, target_height);
+            LOGI("📐 FILL mode: video=%dx%d (%.2f), surface=%dx%d (%.2f) -> src_crop=%dx%d@(%d,%d), draw=%dx%d",
+                 width, height, video_aspect, surface_w, surface_h, surface_aspect,
+                 src_crop_w, src_crop_h, src_crop_x, src_crop_y, dst_width, dst_height);
             last_logged_mode = 1;
         }
     }
     
-    // 确保尺寸有效
-    if (target_width <= 0) target_width = surface_w;
-    if (target_height <= 0) target_height = surface_h;
+    if (dst_width <= 0) dst_width = surface_w;
+    if (dst_height <= 0) dst_height = surface_h;
     
     // ✅ 只在首次或尺寸变化时配置 Surface
     if (needs_configure && surface_w > 0 && surface_h > 0) {
@@ -507,7 +631,7 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         if (result != 0) {
             LOGE("❌ Failed to configure surface: %d", result);
             ANativeWindow_release(window);
-            return;
+            return -1;
         }
         
         std::lock_guard<std::mutex> lock(window_mutex_);
@@ -521,23 +645,23 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     if (lock_result != 0) {
         LOGE("❌ Failed to lock window buffer: %d", lock_result);
         ANativeWindow_release(window);
-        return;
+        return -1;
     }
     
     if (!buffer.bits) {
         LOGE("❌ Buffer bits is null");
         ANativeWindow_unlockAndPost(window);
         ANativeWindow_release(window);
-        return;
+        return -1;
     }
     
     // 🖼️ 使用 FFmpeg swscale 进行硬件加速的 YUV->RGB 转换和缩放
     // 类似 iOS 的 AVSampleBufferDisplayLayer，但在软件层面实现
     
     // 检查是否需要重新创建 swscale context（只在视频尺寸或目标尺寸变化时）
-    if (!sws_ctx_ || 
-        width != last_video_width_ || height != last_video_height_ ||
-        target_width != last_target_width_ || target_height != last_target_height_) {
+    if (!sws_ctx_ ||
+        src_crop_w != last_video_width_ || src_crop_h != last_video_height_ ||
+        dst_width != last_target_width_ || dst_height != last_target_height_) {
         
         if (sws_ctx_) {
             sws_freeContext(sws_ctx_);
@@ -545,8 +669,8 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         
         // 创建 swscale context (YUV420P -> RGB565)
         sws_ctx_ = sws_getContext(
-            width, height, AV_PIX_FMT_YUV420P,
-            target_width, target_height, AV_PIX_FMT_RGB565LE,
+            src_crop_w, src_crop_h, AV_PIX_FMT_YUV420P,
+            dst_width, dst_height, AV_PIX_FMT_RGB565LE,
             SWS_FAST_BILINEAR,  // 快速双线性插值
             nullptr, nullptr, nullptr
         );
@@ -555,38 +679,38 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
             LOGE("Failed to create swscale context");
             ANativeWindow_unlockAndPost(window);
             ANativeWindow_release(window);
-            return;
+            return -1;
         }
         
         // 记录当前尺寸
-        last_video_width_ = width;
-        last_video_height_ = height;
-        last_target_width_ = target_width;
-        last_target_height_ = target_height;
+        last_video_width_ = src_crop_w;
+        last_video_height_ = src_crop_h;
+        last_target_width_ = dst_width;
+        last_target_height_ = dst_height;
         
-        LOGI("✅ Created swscale context: %dx%d -> %dx%d", width, height, target_width, target_height);
+        LOGI("✅ Created swscale context: src_crop=%dx%d -> dst=%dx%d", src_crop_w, src_crop_h, dst_width, dst_height);
     }
     
-    // 准备源数据 (YUV420P)
+    // 准备源数据（YUV420P，带源裁剪）
     const uint8_t* src_data[4] = { 
-        (uint8_t*)y_data, 
-        (uint8_t*)u_data, 
-        (uint8_t*)v_data,
+        ((uint8_t*)y_data) + src_crop_y * y_linesize + src_crop_x,
+        ((uint8_t*)u_data) + (src_crop_y / 2) * u_linesize + (src_crop_x / 2),
+        ((uint8_t*)v_data) + (src_crop_y / 2) * v_linesize + (src_crop_x / 2),
         nullptr
     };
     int src_linesize[4] = { y_linesize, u_linesize, v_linesize, 0 };
     
     // 分配临时缓冲区（避免直接写入 ANativeWindow buffer）
-    int temp_stride = target_width * 2;  // RGB565 = 2 bytes per pixel
-    int temp_size = temp_stride * target_height;
+    int temp_stride = dst_width * 2;  // RGB565 = 2 bytes per pixel
+    int temp_size = temp_stride * dst_height;
     
-    // ⚠️ 限制最大分配大小，防止内存泄漏
-    const int MAX_RGB_BUFFER_SIZE = 1920 * 1080 * 2;  // 限制为 1080p (约 4MB)
+    // ⚠️ 限制最大分配大小，防止异常参数导致 OOM
+    const int MAX_RGB_BUFFER_SIZE = 3840 * 2160 * 2;  // 4K RGB565 约 16MB
     if (temp_size > MAX_RGB_BUFFER_SIZE) {
-        LOGE("❌ Frame too large: %dx%d (max: 1920x1080)", target_width, target_height);
+        LOGE("❌ Frame too large after fallback: %dx%d (max: 3840x2160)", dst_width, dst_height);
         ANativeWindow_unlockAndPost(window);
         ANativeWindow_release(window);
-        return;
+        return -1;
     }
     
     if (!rgb_buffer_ || rgb_buffer_size_ < temp_size) {
@@ -598,10 +722,10 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
             LOGE("❌ Failed to allocate RGB buffer: %d bytes", temp_size);
             ANativeWindow_unlockAndPost(window);
             ANativeWindow_release(window);
-            return;
+            return -1;
         }
         rgb_buffer_size_ = temp_size;
-        LOGI("📦 Allocated RGB buffer: %d bytes (%dx%d)", temp_size, target_width, target_height);
+        LOGI("📦 Allocated RGB buffer: %d bytes (%dx%d)", temp_size, dst_width, dst_height);
     }
     
     // 准备目标数据（渲染到临时缓冲区）
@@ -610,22 +734,22 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     
     // 执行转换和缩放
     auto start_time = std::chrono::high_resolution_clock::now();
-    int result = sws_scale(sws_ctx_, src_data, src_linesize, 0, height, dst_data, dst_linesize);
+    int result = sws_scale(sws_ctx_, src_data, src_linesize, 0, src_crop_h, dst_data, dst_linesize);
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
     
-    if (result != target_height) {
-        LOGE("❌ swscale failed: expected %d lines, got %d", target_height, result);
+    if (result != dst_height) {
+        LOGE("❌ swscale failed: expected %d lines, got %d", dst_height, result);
         ANativeWindow_unlockAndPost(window);
         ANativeWindow_release(window);
-        return;
+        return -1;
     }
     
     if (duration > 16) {  // 超过一帧时间（60fps）
         LOGW("⚠️ swscale slow: %lld ms", duration);
     }
     
-    // 复制到 ANativeWindow buffer（居中渲染，处理黑边或裁剪）
+    // 复制到 ANativeWindow buffer（FIT 留黑边；FILL 全屏）
     uint16_t* dst_buffer = (uint16_t*)buffer.bits;
     uint16_t* src_buffer = (uint16_t*)rgb_buffer_;
     
@@ -634,60 +758,24 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         LOGE("❌ Buffer stride too small: %d < %d", buffer.stride, surface_w);
         ANativeWindow_unlockAndPost(window);
         ANativeWindow_release(window);
-        return;
+        return -1;
     }
     
-    // 计算居中偏移和裁剪区域
-    int offset_x = 0;
-    int offset_y = 0;
-    int src_offset_x = 0;
-    int src_offset_y = 0;
-    int copy_width = target_width;
-    int copy_height = target_height;
+    int copy_width = dst_width;
+    int copy_height = dst_height;
+    int offset_x = draw_offset_x;
+    int offset_y = draw_offset_y;
     
-    if (aspect_ratio_mode_ == 0) {
-        // FIT 模式：居中显示，可能有黑边
-        offset_x = (surface_w - target_width) / 2;
-        offset_y = (surface_h - target_height) / 2;
-        
-        // 清空整个 buffer（黑色背景）
-        if (offset_x > 0 || offset_y > 0) {
-            memset(buffer.bits, 0, buffer.stride * surface_h * 2);
-        }
-    } else {
-        // FILL 模式：裁剪超出部分
-        if (target_width > surface_w) {
-            // 视频宽度超出，需要裁剪左右
-            src_offset_x = (target_width - surface_w) / 2;
-            copy_width = surface_w;
-            offset_x = 0;
-        } else {
-            // 视频宽度未超出，居中显示
-            offset_x = (surface_w - target_width) / 2;
-            copy_width = target_width;
-        }
-        
-        if (target_height > surface_h) {
-            // 视频高度超出，需要裁剪上下
-            src_offset_y = (target_height - surface_h) / 2;
-            copy_height = surface_h;
-            offset_y = 0;
-        } else {
-            // 视频高度未超出，居中显示
-            offset_y = (surface_h - target_height) / 2;
-            copy_height = target_height;
-        }
-        
-        // 如果有未填充区域，清空为黑色
-        if (offset_x > 0 || offset_y > 0) {
-            memset(buffer.bits, 0, buffer.stride * surface_h * 2);
-        }
+    // FIT 模式下需要黑边背景
+    if (aspect_ratio_mode_ == 0 && (offset_x > 0 || offset_y > 0 ||
+                                    copy_width < surface_w || copy_height < surface_h)) {
+        memset(buffer.bits, 0, buffer.stride * surface_h * 2);
     }
     
-    // 逐行复制到目标位置（带裁剪）
+    // 逐行复制到目标位置
     for (int i = 0; i < copy_height; i++) {
         uint16_t* dst_line = dst_buffer + (offset_y + i) * buffer.stride + offset_x;
-        uint16_t* src_line = src_buffer + (src_offset_y + i) * target_width + src_offset_x;
+        uint16_t* src_line = src_buffer + i * dst_width;
         memcpy(dst_line, src_line, copy_width * 2);
     }
     
@@ -699,6 +787,7 @@ void AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     
     ANativeWindow_unlockAndPost(window);
     ANativeWindow_release(window);
+    return (int)duration;
 }
 
 // ========== OpenSL ES 音频输出 ==========
