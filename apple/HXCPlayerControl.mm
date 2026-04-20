@@ -67,6 +67,8 @@ static void loading_callback_c(bool is_loading, void* user_data);
     // 视频渲染定时器（平台特定）
 #if TARGET_OS_IOS
     CADisplayLink *_displayLink;
+    CMSampleBufferRef _lastRenderedSampleBuffer;
+    BOOL _hxcWasPausedBeforeBackground;
 #else  // macOS
     CVDisplayLinkRef _displayLink;
 #endif
@@ -106,6 +108,16 @@ static void loading_callback_c(bool is_loading, void* user_data);
 
 + (void)hxc_applyDefaultFileLoggingIfNeeded;
 + (BOOL)hxc_installFileLoggingAtPath:(NSString *)dir error:(NSError *__autoreleasing *)outError;
+
+#if TARGET_OS_IOS
+- (void)hxc_registerAppLifecycleNotifications;
+- (void)hxc_unregisterAppLifecycleNotifications;
+- (void)hxc_appWillResignActive:(NSNotification *)note;
+- (void)hxc_appDidBecomeActive:(NSNotification *)note;
+- (void)hxc_cacheLastRenderedSampleBuffer:(CMSampleBufferRef)sampleBuffer;
+- (void)hxc_clearLastRenderedSampleBuffer;
+- (void)hxc_restorePausedFrameIfNeeded;
+#endif
 
 @end
 
@@ -303,6 +315,7 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
         
         // 初始化画中画
         [self setupPictureInPicture];
+        [self hxc_registerAppLifecycleNotifications];
 #else
         // macOS 需要设置 controlTimebase
         AVSampleBufferDisplayLayer *videoLayer = _videoView.videoLayer;
@@ -331,6 +344,10 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
 
 - (void)dealloc {
     NSLog(@"[播放器] HXCPlayerControl 正在销毁...");
+#if TARGET_OS_IOS
+    [self hxc_unregisterAppLifecycleNotifications];
+    [self hxc_clearLastRenderedSampleBuffer];
+#endif
     
     [self stop];
     
@@ -565,6 +582,10 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
     }
 
     [_videoView.videoLayer flushAndRemoveImage];
+#if TARGET_OS_IOS
+    [self hxc_clearLastRenderedSampleBuffer];
+    _hxcWasPausedBeforeBackground = NO;
+#endif
 
     _state = HXCPlayerStateIdle;
     _duration = 0;
@@ -926,6 +947,9 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     }
     
     if (sampleBuffer) {
+#if TARGET_OS_IOS
+        [self hxc_cacheLastRenderedSampleBuffer:sampleBuffer];
+#endif
         dispatch_async(dispatch_get_main_queue(), ^{
             if (self->_videoView.videoLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
                 [self->_videoView.videoLayer flush];
@@ -1104,6 +1128,77 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 #pragma mark - Picture in Picture (iOS only)
 
 #if TARGET_OS_IOS
+
+- (void)hxc_registerAppLifecycleNotifications {
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center addObserver:self
+               selector:@selector(hxc_appWillResignActive:)
+                   name:UIApplicationWillResignActiveNotification
+                 object:nil];
+    [center addObserver:self
+               selector:@selector(hxc_appDidBecomeActive:)
+                   name:UIApplicationDidBecomeActiveNotification
+                 object:nil];
+}
+
+- (void)hxc_unregisterAppLifecycleNotifications {
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center removeObserver:self name:UIApplicationWillResignActiveNotification object:nil];
+    [center removeObserver:self name:UIApplicationDidBecomeActiveNotification object:nil];
+}
+
+- (void)hxc_appWillResignActive:(NSNotification *)note {
+    (void)note;
+    _hxcWasPausedBeforeBackground = (_state == HXCPlayerStatePaused);
+}
+
+- (void)hxc_appDidBecomeActive:(NSNotification *)note {
+    (void)note;
+    // 仅处理“进入后台前就是暂停”的场景，避免打扰播放中状态
+    if (_hxcWasPausedBeforeBackground && _state == HXCPlayerStatePaused) {
+        [self hxc_restorePausedFrameIfNeeded];
+    }
+    _hxcWasPausedBeforeBackground = NO;
+}
+
+- (void)hxc_cacheLastRenderedSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    if (!sampleBuffer) return;
+    @synchronized(self) {
+        if (_lastRenderedSampleBuffer) {
+            CFRelease(_lastRenderedSampleBuffer);
+            _lastRenderedSampleBuffer = NULL;
+        }
+        _lastRenderedSampleBuffer = (CMSampleBufferRef)CFRetain(sampleBuffer);
+    }
+}
+
+- (void)hxc_clearLastRenderedSampleBuffer {
+    @synchronized(self) {
+        if (_lastRenderedSampleBuffer) {
+            CFRelease(_lastRenderedSampleBuffer);
+            _lastRenderedSampleBuffer = NULL;
+        }
+    }
+}
+
+- (void)hxc_restorePausedFrameIfNeeded {
+    AVSampleBufferDisplayLayer *layer = _videoView.videoLayer;
+    if (!layer) return;
+    CMSampleBufferRef cached = NULL;
+    @synchronized(self) {
+        if (_lastRenderedSampleBuffer) {
+            cached = (CMSampleBufferRef)CFRetain(_lastRenderedSampleBuffer);
+        }
+    }
+    if (!cached) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+            [layer flush];
+        }
+        [layer enqueueSampleBuffer:cached];
+        CFRelease(cached);
+    });
+}
 
 /// 通知系统重新查询 Sample Buffer PiP 的播放/暂停状态（依赖 pictureInPictureControllerIsPlaybackPaused:）
 - (void)invalidatePictureInPicturePlaybackStateIfNeeded {
