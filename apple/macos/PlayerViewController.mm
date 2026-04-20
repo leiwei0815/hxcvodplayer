@@ -5,10 +5,15 @@
 
 #import "PlayerViewController.h"
 #import "../HXCPlayerControl.h"  // 使用统一的播放器类
+#import <dispatch/dispatch.h>
 #import "SeekSlider.h"
 #import "../HXCAESUtility.h"
 #import "HXCVDownloadWindowController.h"
 #import "../HXCVDownload/HXCVDownload.h"
+#import "../HXCPlayerLicenseManager.h"
+
+#define HXCVODPLAYER_LICENSE_URL    @"https://console-api.huaxiacloud.net/license/getMobileLicense/111453136245362688"
+#define HXCVODPLAYER_LICENSE_KEY    @"JNlhoUFDoLeDwNJEcoCS4GxAWk3Z2b8K"
 
 @interface PlayerViewController () <HXCPlayerControlDelegate, SeekSliderDelegate, NSTableViewDataSource, NSTableViewDelegate>
 
@@ -52,7 +57,10 @@
 //
 //    NSString *decrypted = [HXCAESUtility decryptString:encrypted key:key iv:iv];
 //    NSLog(@"解密：%@", decrypted);
-    
+//    [HXCPlayerLicenseManager setPlaybackLicenseGateEnabled:YES];
+    [HXCPlayerLicenseManager checkLicenseWithLicenseKey:HXCVODPLAYER_LICENSE_KEY licenseURL:HXCVODPLAYER_LICENSE_URL completionHandler:^(BOOL success, NSError * _Nullable error) {
+        NSLog(@"error: %@", error);
+    }];
     [self setupPlayer];
     [self setupUI];
 }
@@ -356,6 +364,7 @@
     input.placeholderString = @"https://example.com/video.mp4";
 //    input.stringValue = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
     input.stringValue = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
+//    input.stringValue = @"rtmp://liveplay.shanhuketang.com/live/2619_tenghuiwangxiao_live_560021_1";
 //    input.stringValue = @"https://v.shkt.online/772388bdvodtranscq1317978474/4ece4b555145403697569546683/v.f1440843.mp4";
 //    input.stringValue = @"https://vod.tenwiseacademy.cn/111453136245362688/0e19tzp2z8r2y8qqrhec87qqougy9hcg/hhAFpacIYZ4A.mp4";//h265
     alert.accessoryView = input;
@@ -584,15 +593,22 @@
     [_player stop];
     BOOL success = NO;
 #if 1
-    HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeCustomFile;  // 或者 HXCPlayerDataSourceModeDefault
-    // 配置参数（可选，不传则使用默认值）
-    HXCPlayerDataSourceConfig *config = [HXCPlayerDataSourceConfig defaultConfig];
-    config.timeoutMs = 30000;           // 30秒超时
-    config.maxRetries = 3;              // 最多重试3次
-    config.cacheSize = 2 * 1024 * 1024; // 2MB 缓存
-    config.avioBufferSize = 64 * 1024;  // 64KB AVIO 缓冲区
-    config.encryptedFile = NO;
-    success = [_player openURL:urlString withMode:mode config:config];
+    HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeDefault;  // 或者 HXCPlayerDataSourceModeDefault
+    BOOL encryptedFile = NO;
+    // 其它配置只需播放前设置一次（通过 configureDefaultConfig 缓存）。
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        HXCPlayerDataSourceConfig *base = [HXCPlayerDataSourceConfig defaultConfig];
+        base.timeoutMs = 30000;           // 30秒超时
+        base.maxRetries = 3;              // 最多重试3次
+        base.cacheSize = 2 * 1024 * 1024; // 2MB 缓存
+        base.avioBufferSize = 64 * 1024;  // 64KB AVIO 缓冲区
+        [HXCPlayerDataSourceConfig configureDefaultConfig:base];
+    });
+    HXCPlayerDataSourcePlayModel *model = [HXCPlayerDataSourcePlayModel modelWithURL:urlString
+                                                                                 mode:mode
+                                                                          encryptedFile:encryptedFile];
+    success = [_player openWithPlayModel:model];
 #else
     success = [_player prepareToPlay:urlString];
 #endif

@@ -124,17 +124,31 @@ class MyActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // 创建播放器
+        // 创建播放器（可选第二参数：VideoRenderViewType.TEXTURE_VIEW）
         player = HXCPlayerControl(this)
         player.setCallback(this)
         
-        // 添加视频视图
+        // 添加视频视图（renderView / videoView 为同一实例）
         val container = findViewById<FrameLayout>(R.id.videoContainer)
-        container.addView(player.videoView)
+        container.addView(player.renderView)
         
-        // 播放视频
-        player.openURL("http://example.com/video.mp4")
-        player.play()
+        // License 校验通过后再播放（Android SDK 当前为强制校验）
+        player.checkLicense(
+            licenseKey = "你的32位licenseKey",
+            licenseUrl = "https://console-api.huaxiacloud.net/license/getLicense/111453136245362688"
+        ) { success, error ->
+            if (success) {
+                val model = HXCPlayerControl.PlayerDataSourcePlayModel.modelWithURL(
+                    url = "http://example.com/video.mp4",
+                    mode = HXCPlayerControl.PlayerDataSourceMode.DEFAULT,
+                    encryptedFile = false
+                )
+                player.openWithPlayModel(model)
+                player.play()
+            } else {
+                // 校验失败，建议提示用户
+            }
+        }
     }
     
     override fun onDestroy() {
@@ -144,6 +158,19 @@ class MyActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
     
     // 实现回调接口...
 }
+```
+
+### License 校验说明（Android）
+
+- 调用 `openURL(...)` / `openWithPlayModel(...)` / `play()` / `seekTo(...)` 前，需先 `checkLicense(...)`
+- 校验通过条件：解密后的 License 数组里存在记录满足：
+  - `package_name == context.packageName`
+  - `finished_at > 当前 Unix 时间戳`
+- `checkLicense(...)` 失败时会自动尝试本地缓存；缓存仍有效则返回成功
+- 如需清空缓存并重置状态，可调用：
+
+```kotlin
+player.resetLicenseState()
 ```
 
 ## API 文档
@@ -184,7 +211,7 @@ class MyActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
 | 架构 | arm64, x86_64 | arm64-v8a, armeabi-v7a, x86_64 |
 | 集成方式 | 拖入 Xcode | Gradle 依赖 |
 | API 设计 | HXCPlayerControl | HXCPlayerControl |
-| 视图管理 | videoView 属性 | videoView 属性 |
+| 视图管理 | videoView | `renderView` / `videoView`（SurfaceView 或 TextureView） |
 
 ## 故障排查
 

@@ -8,7 +8,9 @@
 
 // 包含 Objective-C 头文件
 #import "HXCPlayerControl.h"
+#import "HXCPlayerLog.h"
 #import "HXCPlayerView.h"
+#import "HXCPlayerLicenseManager.h"
 
 // 包含 AVFoundation（没有冲突）
 #import <AVFoundation/AVFoundation.h>
@@ -41,6 +43,10 @@ private:
 // AudioQueue 缓冲区数量
 static const int kNumberOfBuffers = 3;
 
+// 文件日志：避免每个播放器 init 都覆盖用户通过 +setLogDir: 指定的路径；默认路径仅在「用户未显式设置」时安装一次。
+static BOOL gHXCUserSetLogDirExplicitly = NO;
+static BOOL gHXCDefaultFileLoggingInstalled = NO;
+
 // ========== C 回调函数前向声明 ==========
 static void state_changed_callback_c(PlayerStateC state, void* user_data);
 static void error_callback_c(int error_code, const char* error_msg, void* user_data);
@@ -61,6 +67,8 @@ static void loading_callback_c(bool is_loading, void* user_data);
     // 视频渲染定时器（平台特定）
 #if TARGET_OS_IOS
     CADisplayLink *_displayLink;
+    CMSampleBufferRef _lastRenderedSampleBuffer;
+    BOOL _hxcWasPausedBeforeBackground;
 #else  // macOS
     CVDisplayLinkRef _displayLink;
 #endif
@@ -94,6 +102,22 @@ static void loading_callback_c(bool is_loading, void* user_data);
 
 -(void)playerStateChange:(PlayerStateC)state;
 -(void)playerPositionChange:(double)position;
+
+/// 门禁开启且未通过 License 校验时回调 delegate 并返回 NO
+- (BOOL)hxc_licenseAllowedOrNotifyForAction:(NSString *)action;
+
++ (void)hxc_applyDefaultFileLoggingIfNeeded;
++ (BOOL)hxc_installFileLoggingAtPath:(NSString *)dir error:(NSError *__autoreleasing *)outError;
+
+#if TARGET_OS_IOS
+- (void)hxc_registerAppLifecycleNotifications;
+- (void)hxc_unregisterAppLifecycleNotifications;
+- (void)hxc_appWillResignActive:(NSNotification *)note;
+- (void)hxc_appDidBecomeActive:(NSNotification *)note;
+- (void)hxc_cacheLastRenderedSampleBuffer:(CMSampleBufferRef)sampleBuffer;
+- (void)hxc_clearLastRenderedSampleBuffer;
+- (void)hxc_restorePausedFrameIfNeeded;
+#endif
 
 @end
 
@@ -172,13 +196,33 @@ static void loading_callback_c(bool is_loading, void* user_data) {
 // ========== HXCPlayerDataSourceConfig 实现 ==========
 @implementation HXCPlayerDataSourceConfig
 
+// 全局缓存的默认字段
+static NSInteger g_timeoutMs = 30000;
+static NSInteger g_maxRetries = 3;
+static NSUInteger g_cacheSize = 2 * 1024 * 1024;
+static NSUInteger g_avioBufferSize = 64 * 1024;
+static BOOL g_hasConfigured = NO;
+
++ (void)configureDefaultConfig:(HXCPlayerDataSourceConfig *)config {
+    @synchronized(self) {
+        if (!config) {
+            g_hasConfigured = NO;
+            return;
+        }
+        g_timeoutMs = config.timeoutMs;
+        g_maxRetries = config.maxRetries;
+        g_cacheSize = config.cacheSize;
+        g_avioBufferSize = config.avioBufferSize;
+        g_hasConfigured = YES;
+    }
+}
+
 + (instancetype)defaultConfig {
     HXCPlayerDataSourceConfig *config = [[HXCPlayerDataSourceConfig alloc] init];
     config.timeoutMs = 30000;           // 30秒
     config.maxRetries = 3;              // 重试3次
     config.cacheSize = 2 * 1024 * 1024; // 2MB
     config.avioBufferSize = 64 * 1024;  // 64KB
-    config.encryptedFile = NO;
     return config;
 }
 
@@ -190,20 +234,50 @@ static void loading_callback_c(bool is_loading, void* user_data) {
         self.maxRetries = 3;
         self.cacheSize = 2 * 1024 * 1024;
         self.avioBufferSize = 64 * 1024;
-        self.encryptedFile = NO;
     }
     return self;
 }
 
 @end
 
+@implementation HXCPlayerVideo
+
+@end
+
+@implementation HXCPlayerDataSourcePlayModel
+
++ (instancetype)modelWithURL:(NSString *)url
+                         mode:(HXCPlayerDataSourceMode)mode
+                  encryptedFile:(BOOL)encryptedFile {
+    HXCPlayerDataSourcePlayModel *m = [[HXCPlayerDataSourcePlayModel alloc] init];
+    m.url = url;
+    m.mode = mode;
+    m.encryptedFile = encryptedFile;
+    return m;
+}
+
+@end
+
 @implementation HXCPlayerControl
+
+static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
+    HXCPlayerDataSourceConfig *config = [HXCPlayerDataSourceConfig defaultConfig];
+    @synchronized([HXCPlayerDataSourceConfig class]) {
+        if (g_hasConfigured) {
+            config.timeoutMs = g_timeoutMs;
+            config.maxRetries = g_maxRetries;
+            config.cacheSize = g_cacheSize;
+            config.avioBufferSize = g_avioBufferSize;
+        }
+    }
+    return config;
+}
 
 - (instancetype)init {
     self = [super init];
     if (self) {
-        // ========== 配置日志系统 ==========
-        [self setupLogging];
+        // 若外部未调用 +setLogDir:，则在此安装默认 Documents/HXCPlayerLogs（仅一次）
+        [HXCPlayerControl hxc_applyDefaultFileLoggingIfNeeded];
         
         _wrapper = new PlayerCoreWrapper();
         _state = HXCPlayerStateIdle;
@@ -241,6 +315,7 @@ static void loading_callback_c(bool is_loading, void* user_data) {
         
         // 初始化画中画
         [self setupPictureInPicture];
+        [self hxc_registerAppLifecycleNotifications];
 #else
         // macOS 需要设置 controlTimebase
         AVSampleBufferDisplayLayer *videoLayer = _videoView.videoLayer;
@@ -269,12 +344,12 @@ static void loading_callback_c(bool is_loading, void* user_data) {
 
 - (void)dealloc {
     NSLog(@"[播放器] HXCPlayerControl 正在销毁...");
+#if TARGET_OS_IOS
+    [self hxc_unregisterAppLifecycleNotifications];
+    [self hxc_clearLastRenderedSampleBuffer];
+#endif
     
     [self stop];
-    
-    // 禁用文件日志（会自动刷新队列并停止后台线程）
-    player_core_disable_file_logging();
-    NSLog(@"📝 日志系统已关闭");
     
     if (_wrapper) {
         delete _wrapper;
@@ -284,8 +359,28 @@ static void loading_callback_c(bool is_loading, void* user_data) {
 
 #pragma mark - Public Methods
 
+- (BOOL)hxc_licenseAllowedOrNotifyForAction:(NSString *)action {
+//    if (![HXCPlayerLicenseManager isPlaybackLicenseGateEnabled]) {
+//        return YES;
+//    }
+    if ([HXCPlayerLicenseManager isLicenseCheckPassed]) {
+        return YES;
+    }
+    NSError *err = [NSError errorWithDomain:@"HXCPlayerErrorDomain"
+                                       code:HXCPlayerErrorLicenseValidationFailed
+                                   userInfo:@{NSLocalizedDescriptionKey: @"License校验失败"}];
+    if ([self.delegate respondsToSelector:@selector(player:didFailWithError:)]) {
+        [self.delegate player:self didFailWithError:err];
+    }
+    NSLog(@"[HXCPlayer] License校验失败 (%@)", action ?: @"");
+    return NO;
+}
+
 - (BOOL)openURL:(NSString *)url {
     if (!url || url.length == 0) {
+        return NO;
+    }
+    if (![self hxc_licenseAllowedOrNotifyForAction:@"openURL"]) {
         return NO;
     }
     [self stop];
@@ -324,31 +419,31 @@ static void loading_callback_c(bool is_loading, void* user_data) {
     return YES;
 }
 
-// ✨ 使用指定数据源模式打开（推荐方式）
-- (BOOL)openURL:(NSString *)url withMode:(HXCPlayerDataSourceMode)mode config:(HXCPlayerDataSourceConfig *)config {
-    if (!url || url.length == 0) {
+- (BOOL)openWithPlayModel:(HXCPlayerDataSourcePlayModel *)model {
+    if (!model || model.url.length == 0) {
         return NO;
     }
-    
-    [self stop];
-    _playerUrl = [url copy];
-    
-    // 使用默认配置（如果没有提供）
-    if (!config) {
-        config = [HXCPlayerDataSourceConfig defaultConfig];
+    if (![self hxc_licenseAllowedOrNotifyForAction:@"openWithPlayModel"]) {
+        return NO;
     }
-    
-    // 转换配置参数到 C 结构
+    HXCPlayerDataSourceConfig *config = hxc_build_effective_data_source_config();
+    // 复用旧实现来完成 stop/url/state 等逻辑，但把 encrypted_file 走 model 传入
+    // 这里直接复制 openURL:withMode:config: 的关键配置段到 C 结构，避免改动旧签名行为过多。
+    if (!model.url || model.url.length == 0) {
+        return NO;
+    }
+    [self stop];
+    _playerUrl = [model.url copy];
+
     PlayerDataSourceConfigC cConfig;
     cConfig.timeout_ms = (int)config.timeoutMs;
     cConfig.max_retries = (int)config.maxRetries;
     cConfig.cache_size = config.cacheSize;
     cConfig.avio_buffer_size = config.avioBufferSize;
-    cConfig.encrypted_file = config.encryptedFile ? 1 : 0;
-    
-    // 转换模式枚举
+    cConfig.encrypted_file = model.encryptedFile ? 1 : 0;
+
     PlayerDataSourceModeC cMode;
-    switch (mode) {
+    switch (model.mode) {
         case HXCPlayerDataSourceModeDefault:
             cMode = PLAYER_DATA_SOURCE_MODE_DEFAULT;
             break;
@@ -362,31 +457,27 @@ static void loading_callback_c(bool is_loading, void* user_data) {
             cMode = PLAYER_DATA_SOURCE_MODE_DEFAULT;
             break;
     }
-    
-    // 调用底层 C 接口
-    int ret = player_core_open_with_mode(_wrapper->handle(), url.UTF8String, cMode, &cConfig, _startPosition);
-    
+
+    int ret = player_core_open_with_mode(_wrapper->handle(), model.url.UTF8String, cMode, &cConfig, _startPosition);
     if (ret != 0) {
-        NSLog(@"❌ 打开失败: mode=%ld, ret=%d", (long)mode, ret);
+        NSLog(@"❌ 打开失败: mode=%ld, ret=%d", (long)model.mode, ret);
         return NO;
     }
-    
-    // 获取媒体信息
+
     int sampleRate = player_core_get_audio_sample_rate(_wrapper->handle());
     int channels = player_core_get_audio_channels(_wrapper->handle());
     _duration = player_core_get_duration(_wrapper->handle());
     _videoWidth = player_core_get_video_width(_wrapper->handle());
     _videoHeight = player_core_get_video_height(_wrapper->handle());
-    
-    NSLog(@"✅ 使用模式 %ld 打开成功", (long)mode);
-    NSLog(@"   URL: %@", url);
+
+    NSLog(@"✅ 使用模式 %ld 打开成功", (long)model.mode);
+    NSLog(@"   URL: %@", model.url);
     NSLog(@"   时长: %.2f 秒", _duration);
     NSLog(@"   分辨率: %d x %d", _videoWidth, _videoHeight);
     NSLog(@"   音频: %d Hz, %d 通道", sampleRate, channels);
-    
+
     [self setupAudioQueue:sampleRate channels:channels];
-    
-    // 如果设置了起始播放位置，更新 controlTimebase
+
     if (_startPosition > 0) {
         if (_videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
             CMTime newTime = CMTimeMake((int64_t)(_startPosition * 1000000), 1000000);
@@ -394,19 +485,16 @@ static void loading_callback_c(bool is_loading, void* user_data) {
             CMTimebaseSetRate(_videoView.videoLayer.controlTimebase, 1.0);
         }
     }
-    
-    // 启动视频渲染定时器
+
     [self startDisplayLink];
-    
     return YES;
 }
 
-- (BOOL)prepareToPlay:(NSString *)url {
-    // prepareToPlay: 是 openURL: 的别名，都是打开文件但不自动播放
-    return [self openURL:url];
-}
 
 - (void)play {
+    if (![self hxc_licenseAllowedOrNotifyForAction:@"play"]) {
+        return;
+    }
     if (!_playerUrl && _state == HXCPlayerStateIdle) {
         NSLog(@"警告: 请先调用 openURL:");
         return;
@@ -458,11 +546,16 @@ static void loading_callback_c(bool is_loading, void* user_data) {
     }
 
     NSString *url = [_playerUrl copy];
-    [self openURL:url];
+    if (![self openURL:url]) {
+        return;
+    }
     [self play];
 }
 
 - (void)seekToPosition:(double)position {
+    if (![self hxc_licenseAllowedOrNotifyForAction:@"seekToPosition"]) {
+        return;
+    }
     player_core_seek(_wrapper->handle(), position);
     
     // iOS 和 macOS 都需要更新 controlTimebase
@@ -489,6 +582,10 @@ static void loading_callback_c(bool is_loading, void* user_data) {
     }
 
     [_videoView.videoLayer flushAndRemoveImage];
+#if TARGET_OS_IOS
+    [self hxc_clearLastRenderedSampleBuffer];
+    _hxcWasPausedBeforeBackground = NO;
+#endif
 
     _state = HXCPlayerStateIdle;
     _duration = 0;
@@ -850,6 +947,9 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     }
     
     if (sampleBuffer) {
+#if TARGET_OS_IOS
+        [self hxc_cacheLastRenderedSampleBuffer:sampleBuffer];
+#endif
         dispatch_async(dispatch_get_main_queue(), ^{
             if (self->_videoView.videoLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
                 [self->_videoView.videoLayer flush];
@@ -923,61 +1023,182 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     player_core_set_log_level((int)level);
 }
 
++ (HXCPlayerLogLevel)currentLogLevel {
+    int v = player_core_get_log_level();
+    if (v < 0 || v > (int)HXCPlayerLogLevelError) {
+        return HXCPlayerLogLevelInfo;
+    }
+    return (HXCPlayerLogLevel)v;
+}
+
++ (NSString *)currentLogDirectory {
+    const char *p = player_core_get_log_directory();
+    if (p && p[0]) {
+        return [NSString stringWithUTF8String:p];
+    }
+    return @"";
+}
+
++ (NSString *)currentLogFilePath {
+    const char *p = player_core_get_current_log_file();
+    if (p && p[0]) {
+        return [NSString stringWithUTF8String:p];
+    }
+    return @"";
+}
+
++ (BOOL)hxc_installFileLoggingAtPath:(NSString *)dir error:(NSError *__autoreleasing *)outError {
+    if (dir.length == 0) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:@"HXCPlayerControl" code:-1 userInfo:@{NSLocalizedDescriptionKey: @"日志目录为空"}];
+        }
+        return NO;
+    }
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    if (![fileManager fileExistsAtPath:dir]) {
+        if (![fileManager createDirectoryAtPath:dir
+                     withIntermediateDirectories:YES
+                                      attributes:nil
+                                           error:outError]) {
+            return NO;
+        }
+    }
+    player_core_enable_file_logging([dir UTF8String], "hxcplayer");
+    return YES;
+}
+
++ (void)hxc_applyDefaultFileLoggingIfNeeded {
+    @synchronized([self class]) {
+        if (gHXCUserSetLogDirExplicitly || gHXCDefaultFileLoggingInstalled) {
+            return;
+        }
+        NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *documentsDirectory = paths.firstObject;
+        if (documentsDirectory.length == 0) {
+            NSLog(@"⚠️ 无法解析 Documents 目录，跳过默认文件日志");
+            return;
+        }
+        NSString *logDir = [documentsDirectory stringByAppendingPathComponent:@"HXCPlayerLogs"];
+        NSError *error = nil;
+        if (![self hxc_installFileLoggingAtPath:logDir error:&error]) {
+            NSLog(@"❌ 默认日志目录启用失败: %@", error.localizedDescription);
+            return;
+        }
+        gHXCDefaultFileLoggingInstalled = YES;
+        [HXCPlayerControl setLogLevel:HXCPlayerLogLevelDebug];
+        player_core_set_log_retention_days(7);
+        player_core_set_max_log_file_size(10 * 1024 * 1024);
+        const char *logFile = player_core_get_current_log_file();
+        NSString *logFilePath = logFile ? [NSString stringWithUTF8String:logFile] : @"未知";
+        NSLog(@"========================================");
+        NSLog(@"📝 HXCPlayer 默认文件日志已启用（未调用 +setLogDir:）");
+        NSLog(@"========================================");
+        NSLog(@"日志级别: DEBUG");
+        NSLog(@"日志目录: %@", logDir);
+        NSLog(@"日志文件: %@", logFilePath);
+        NSLog(@"保留天数: 7 天");
+        NSLog(@"最大大小: 10 MB");
+        NSLog(@"========================================");
+    }
+}
+
 +(void)setLogDir:(NSString *)dir {
     if (!dir) {
         NSLog(@"日志路径设置不能为空");
         return;
     }
-    NSFileManager *fileManager = [NSFileManager defaultManager];
     NSError *error = nil;
-    if (![fileManager fileExistsAtPath:dir]) {
-        [fileManager createDirectoryAtPath:dir
-               withIntermediateDirectories:YES
-                                attributes:nil
-                                     error:&error];
-        if (error) {
-            NSLog(@"❌ 创建日志目录失败: %@", error.localizedDescription);
+    @synchronized([self class]) {
+        if (![self hxc_installFileLoggingAtPath:dir error:&error]) {
+            NSLog(@"❌ 设置日志目录失败: %@", error.localizedDescription);
             return;
         }
+        gHXCUserSetLogDirExplicitly = YES;
+        // 与默认安装策略一致，避免仅显式 setLogDir 时保留天数/单文件上限未初始化
+        player_core_set_log_retention_days(7);
+        player_core_set_max_log_file_size(10 * 1024 * 1024);
     }
-    player_core_enable_file_logging([dir UTF8String], "hxcplayer");
 }
 
-- (void)setupLogging {
-    // 设置日志级别为 DEBUG
-    [HXCPlayerControl setLogLevel:HXCPlayerLogLevelDebug];
-    // 获取 Documents 目录
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *documentsDirectory = [paths firstObject];
-    NSString *logDir = [documentsDirectory stringByAppendingPathComponent:@"HXCPlayerLogs"];
-    [HXCPlayerControl setLogDir:logDir];
-    // 设置日志保留天数（默认7天）
-    player_core_set_log_retention_days(7);
-    
-    // 启用文件日志（会自动清理超过7天的旧日志）
-//    player_core_enable_file_logging([logDir UTF8String], "hxcplayer");
-    
-    // 设置最大文件大小为 10MB
-    player_core_set_max_log_file_size(10 * 1024 * 1024);
-    
-    // 获取当前日志文件路径
-    const char* logFile = player_core_get_current_log_file();
-    NSString *logFilePath = logFile ? [NSString stringWithUTF8String:logFile] : @"未知";
-    
-    NSLog(@"========================================");
-    NSLog(@"📝 HXCPlayer 日志系统已启用");
-    NSLog(@"========================================");
-    NSLog(@"日志级别: DEBUG");
-    NSLog(@"日志目录: %@", logDir);
-    NSLog(@"日志文件: %@", logFilePath);
-    NSLog(@"保留天数: 7 天");
-    NSLog(@"最大大小: 10 MB");
-    NSLog(@"========================================");
++ (void)disableFileLogging {
+    player_core_disable_file_logging();
+    NSLog(@"📝 文件日志已关闭（全局）");
 }
 
 #pragma mark - Picture in Picture (iOS only)
 
 #if TARGET_OS_IOS
+
+- (void)hxc_registerAppLifecycleNotifications {
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center addObserver:self
+               selector:@selector(hxc_appWillResignActive:)
+                   name:UIApplicationWillResignActiveNotification
+                 object:nil];
+    [center addObserver:self
+               selector:@selector(hxc_appDidBecomeActive:)
+                   name:UIApplicationDidBecomeActiveNotification
+                 object:nil];
+}
+
+- (void)hxc_unregisterAppLifecycleNotifications {
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center removeObserver:self name:UIApplicationWillResignActiveNotification object:nil];
+    [center removeObserver:self name:UIApplicationDidBecomeActiveNotification object:nil];
+}
+
+- (void)hxc_appWillResignActive:(NSNotification *)note {
+    (void)note;
+    _hxcWasPausedBeforeBackground = (_state == HXCPlayerStatePaused);
+}
+
+- (void)hxc_appDidBecomeActive:(NSNotification *)note {
+    (void)note;
+    // 仅处理“进入后台前就是暂停”的场景，避免打扰播放中状态
+    if (_hxcWasPausedBeforeBackground && _state == HXCPlayerStatePaused) {
+        [self hxc_restorePausedFrameIfNeeded];
+    }
+    _hxcWasPausedBeforeBackground = NO;
+}
+
+- (void)hxc_cacheLastRenderedSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    if (!sampleBuffer) return;
+    @synchronized(self) {
+        if (_lastRenderedSampleBuffer) {
+            CFRelease(_lastRenderedSampleBuffer);
+            _lastRenderedSampleBuffer = NULL;
+        }
+        _lastRenderedSampleBuffer = (CMSampleBufferRef)CFRetain(sampleBuffer);
+    }
+}
+
+- (void)hxc_clearLastRenderedSampleBuffer {
+    @synchronized(self) {
+        if (_lastRenderedSampleBuffer) {
+            CFRelease(_lastRenderedSampleBuffer);
+            _lastRenderedSampleBuffer = NULL;
+        }
+    }
+}
+
+- (void)hxc_restorePausedFrameIfNeeded {
+    AVSampleBufferDisplayLayer *layer = _videoView.videoLayer;
+    if (!layer) return;
+    CMSampleBufferRef cached = NULL;
+    @synchronized(self) {
+        if (_lastRenderedSampleBuffer) {
+            cached = (CMSampleBufferRef)CFRetain(_lastRenderedSampleBuffer);
+        }
+    }
+    if (!cached) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+            [layer flush];
+        }
+        [layer enqueueSampleBuffer:cached];
+        CFRelease(cached);
+    });
+}
 
 /// 通知系统重新查询 Sample Buffer PiP 的播放/暂停状态（依赖 pictureInPictureControllerIsPlaybackPaused:）
 - (void)invalidatePictureInPicturePlaybackStateIfNeeded {
@@ -1081,6 +1302,9 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 }
 
 - (void)startPictureInPicture {
+    if (![self hxc_licenseAllowedOrNotifyForAction:@"startPictureInPicture"]) {
+        return;
+    }
     // 检查 iOS 版本
     if (@available(iOS 15.0, *)) {
         // iOS 15.0+ 支持
@@ -1222,5 +1446,41 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 }
 
 #endif // TARGET_OS_IOS
+
+@end
+
+@implementation HXCPlayerControl (HXCAppLog)
+
++ (void)hxc_logDebugAtFile:(const char *)file line:(int)line function:(const char *)func format:(NSString *)format, ... {
+    va_list ap;
+    va_start(ap, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format locale:nil arguments:ap];
+    va_end(ap);
+    player_core_log_line(0, file, line, func, msg.UTF8String ?: "");
+}
+
++ (void)hxc_logInfoAtFile:(const char *)file line:(int)line function:(const char *)func format:(NSString *)format, ... {
+    va_list ap;
+    va_start(ap, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format locale:nil arguments:ap];
+    va_end(ap);
+    player_core_log_line(1, file, line, func, msg.UTF8String ?: "");
+}
+
++ (void)hxc_logWarningAtFile:(const char *)file line:(int)line function:(const char *)func format:(NSString *)format, ... {
+    va_list ap;
+    va_start(ap, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format locale:nil arguments:ap];
+    va_end(ap);
+    player_core_log_line(2, file, line, func, msg.UTF8String ?: "");
+}
+
++ (void)hxc_logErrorAtFile:(const char *)file line:(int)line function:(const char *)func format:(NSString *)format, ... {
+    va_list ap;
+    va_start(ap, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format locale:nil arguments:ap];
+    va_end(ap);
+    player_core_log_line(3, file, line, func, msg.UTF8String ?: "");
+}
 
 @end

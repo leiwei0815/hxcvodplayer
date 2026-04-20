@@ -4,9 +4,13 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.graphics.SurfaceTexture
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.TextureView
+import android.view.View
+import kotlin.jvm.JvmOverloads
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
@@ -15,29 +19,53 @@ import java.util.concurrent.TimeUnit
 /**
  * HXC Player 控制类
  * 类似 iOS 的 HXCPlayerControl，内部管理视频渲染视图
- * 
+ *
  * 用法:
  * ```
+ * // 默认 SurfaceView
  * val player = HXCPlayerControl(context)
- * 
- * // 获取视频视图并添加到布局
- * val videoView = player.videoView
- * containerLayout.addView(videoView)
- * 
- * // 播放视频
+ *
+ * // 或选用 TextureView（适合列表、转场、与 View 变换联动等场景）
+ * val playerTex = HXCPlayerControl(context, VideoRenderViewType.TEXTURE_VIEW)
+ *
+ * val view = player.renderView
+ * containerLayout.addView(view)
+ *
  * player.openURL("http://example.com/video.mp4")
  * player.play()
  * ```
  */
-class HXCPlayerControl(private val context: Context) {
-    
+class HXCPlayerControl @JvmOverloads constructor(
+    private val context: Context,
+    private val renderViewType: VideoRenderViewType = VideoRenderViewType.SURFACE_VIEW
+) {
+
+    /** 视频输出目标：SurfaceView（默认）或 TextureView */
+    enum class VideoRenderViewType {
+        /**
+         * 独立 Surface，系统合成层上显示；全屏、功耗与兼容性通常更好。
+         */
+        SURFACE_VIEW,
+
+        /**
+         * 与窗口普通 View 同一图层，可做位移、透明度、动画；适合 RecyclerView、共享元素转场等。
+         */
+        TEXTURE_VIEW
+    }
+
     companion object {
         init {
             System.loadLibrary("hxcplayer")
         }
         
+        private val dataSourceConfigLock = Any()
+        private var gTimeoutMs: Int = 30000
+        private var gMaxRetries: Int = 3
+        private var gAvioBufferSize: Int = 64 * 1024
+        private var gHasConfigured: Boolean = false
+
         // ========== 日志配置（静态方法） ==========
-        
+
         /**
          * 启用文件日志
          * @param logDir 日志文件目录
@@ -45,34 +73,69 @@ class HXCPlayerControl(private val context: Context) {
          */
         @JvmStatic
         external fun enableFileLogging(logDir: String, prefix: String = "hxcplayer")
-        
+
         /**
          * 禁用文件日志
          */
         @JvmStatic
         external fun disableFileLogging()
-        
+
         /**
          * 设置日志级别
          * @param level 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
          */
         @JvmStatic
         external fun setLogLevel(level: Int)
-        
+
+        /**
+         * 当前日志级别（与 [setLogLevel] 一致：0~3）
+         */
+        @JvmStatic
+        external fun getLogLevel(): Int
+
         /**
          * 设置日志保留天数
          * @param days 保留天数（默认 7 天）
          */
         @JvmStatic
         external fun setLogRetentionDays(days: Int)
-        
+
+        /**
+         * 当前文件日志目录（未启用文件日志时为空字符串）
+         */
+        @JvmStatic
+        external fun getLogDirectory(): String
+
         /**
          * 获取当前日志文件路径
          */
         @JvmStatic
         external fun getCurrentLogFile(): String
+
+        /**
+         * 在播放前调用一次，用全局默认值覆盖数据源配置字段（对齐 iOS 的 configureDefaultConfig）。
+         * 传 null 表示恢复内置默认值。
+         */
+        @JvmStatic
+        fun configureDefaultConfig(config: PlayerDataSourceConfig?) {
+            synchronized(dataSourceConfigLock) {
+                if (config == null) {
+                    gHasConfigured = false
+                    return
+                }
+                gTimeoutMs = config.timeoutMs
+                gMaxRetries = config.maxRetries
+                gAvioBufferSize = config.avioBufferSize
+                gHasConfigured = true
+            }
+        }
+
+        @JvmStatic
+        fun defaultConfig(): PlayerDataSourceConfig {
+            return PlayerDataSourceConfig.defaultConfig()
+        }
     }
-    
+
     // 播放器状态
     enum class PlayerState {
         IDLE,
@@ -82,30 +145,104 @@ class HXCPlayerControl(private val context: Context) {
         STOPPED,
         ERROR
     }
-    
-    // 错误码（对应 C 层的 PlayerErrorCodeC）
+
+    /** 与 iOS 对齐的数据源模式 */
+    enum class PlayerDataSourceMode {
+        DEFAULT,
+        CUSTOM_HTTP,
+        CUSTOM_FILE
+    }
+
+    /** 对齐 iOS 的视频模型（fileid + appid + sign） */
+    class PlayerVideo {
+        var videoId: Int = 0
+        var sign: String = ""
+        var appId: Int = 0
+    }
+
+    /** 对齐 iOS：全局数据源默认配置 */
+    class PlayerDataSourceConfig {
+        var timeoutMs: Int = 30000
+        var maxRetries: Int = 3
+        var avioBufferSize: Int = 64 * 1024
+
+        companion object {
+            @JvmStatic
+            fun defaultConfig(): PlayerDataSourceConfig {
+                return PlayerDataSourceConfig()
+            }
+        }
+    }
+
+    /**
+     * 对外统一播放模型：只传一个 model 即可。
+     *
+     * - [url] 必填
+     * - [mode] 对应默认/自定义 HTTP/自定义本地文件
+     * - [encryptedFile] 是否按核心约定解密文件头
+     * - [video] 对齐 iOS：通过 fileid+appid+sign 播放（Android 当前未实现该分支，预留）
+     */
+    class PlayerDataSourcePlayModel {
+        var url: String = ""
+        var mode: PlayerDataSourceMode = PlayerDataSourceMode.DEFAULT
+        var encryptedFile: Boolean = false
+        var video: PlayerVideo? = null
+
+        companion object {
+            @JvmStatic
+            fun modelWithURL(
+                url: String,
+                mode: PlayerDataSourceMode,
+                encryptedFile: Boolean
+            ): PlayerDataSourcePlayModel {
+                return PlayerDataSourcePlayModel().apply {
+                    this.url = url
+                    this.mode = mode
+                    this.encryptedFile = encryptedFile
+                }
+            }
+        }
+    }
+
+    /**
+     * 与 `hxc_player_core_c_bridge.h` 中 `PlayerErrorCodeC` 数值一致（HTTP / 网络段亦同）。
+     * 其它负数可能为 FFmpeg `AVERROR_*` 等，请结合 [PlayerCallback.onPlayerError] 的 message。
+     *
+     * iOS 的 `HXCPlayerErrorCode` 另有画中画、音频会话等**平台独有**错误码（如 -1015、-1016），Android 核心不会返回，此处不定义。
+     */
     object PlayerErrorCode {
         const val NONE = 0
-        const val INVALID_URL = 1
-        const val OPEN_INPUT_FAILED = 2
-        const val FIND_STREAM_INFO_FAILED = 3
-        const val NO_VIDEO_STREAM = 4
-        const val NO_AUDIO_STREAM = 5
-        const val CODEC_NOT_FOUND = 6
-        const val CODEC_OPEN_FAILED = 7
-        const val ALLOC_CONTEXT_FAILED = 8
-        const val SDL_INIT_FAILED = 9
-        const val AUDIO_DEVICE_OPEN_FAILED = 10
-        const val SEEK_FAILED = 11
-        const val READ_FRAME_FAILED = 12
-        const val DECODE_FAILED = 13
-        const val OUT_OF_MEMORY = 14
-        const val UNKNOWN = 999
-        
-        // FFmpeg 错误码范围 (负数)
-        // 使用 FFmpeg 原始错误码
+        const val INVALID_URL = -1001
+        const val OPEN_INPUT_FAILED = -1002
+        const val FIND_STREAM_INFO_FAILED = -1003
+        const val NO_VIDEO_STREAM = -1004
+        const val NO_AUDIO_STREAM = -1005
+        const val CODEC_NOT_FOUND = -1006
+        const val CODEC_OPEN_FAILED = -1007
+        const val ALLOC_CONTEXT_FAILED = -1008
+        const val SDL_INIT_FAILED = -1009
+        const val AUDIO_DEVICE_OPEN_FAILED = -1010
+        const val SEEK_FAILED = -1011
+        const val READ_FRAME_FAILED = -1012
+        const val DECODE_FAILED = -1013
+        const val OUT_OF_MEMORY = -1014
+        const val INPUT_INVALID_DATA = -1018
+        const val NOT_SUPPORT = -1019
+        const val UNKNOWN = -1099
+
+        const val NET_CONNECTION_TIMEOUT = -2001
+        const val NET_CONNECTION_REFUSED = -2002
+        const val NET_UNREACHABLE = -2003
+
+        const val HTTP_BAD_REQUEST = -3001
+        const val HTTP_NOT_FOUND = -3002
+        const val HTTP_SERVER_ERROR = -3003
+        const val HTTP_UNAUTHORIZED = -3004
+        const val HTTP_FORBIDDEN = -3005
+
+        const val LICENSE_VALIDATION_FAILED = -4001
     }
-    
+
     // 回调接口
     interface PlayerCallback {
         fun onPlayerStateChanged(state: PlayerState)
@@ -116,7 +253,7 @@ class HXCPlayerControl(private val context: Context) {
         // 网络抖动/缓冲中状态变化（默认空实现，兼容旧代码）
         fun onPlayerLoadingChanged(isLoading: Boolean) {}
     }
-    
+
     private var nativeHandle: Long = 0
     private var callback: PlayerCallback? = null
     private var updateExecutor: ScheduledExecutorService? = null
@@ -129,29 +266,26 @@ class HXCPlayerControl(private val context: Context) {
     private val loadingHideDebounceMs = 150L
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
-    
-    // 视频视图（只读属性，由播放器管理）
-    val videoView: SurfaceView = SurfaceView(context).apply {
-        holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                setSurface(holder.surface)
-            }
-            
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                updateSurfaceSize(width, height)
-            }
-            
-            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                setSurface(null)
-            }
-        })
-    }
-    
+
+    /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
+    private var textureDecoderSurface: Surface? = null
+
+    /**
+     * 用于承载解码输出的视图（[SurfaceView] 或 [TextureView]），请加入布局。
+     */
+    val renderView: View
+
+    /**
+     * 与 [renderView] 为同一实例；保留该属性以兼容旧代码（类型由 [SurfaceView] 变为通用 [View]）。
+     */
+    val videoView: View
+        get() = renderView
     init {
         nativeHandle = nativeCreate()
+        renderView = createRenderView()
         startPositionUpdates()
     }
-    
+
     // 设置回调
     fun setCallback(callback: PlayerCallback) {
         this.callback = callback
@@ -197,21 +331,107 @@ class HXCPlayerControl(private val context: Context) {
         callback?.onPlayerError(errorCode, errorMessage)
         callback?.onPlayerErrorWithRecoverability(errorCode, errorMessage, recoverable)
     }
-    
+
+    private fun createRenderView(): View {
+        return when (renderViewType) {
+            VideoRenderViewType.SURFACE_VIEW -> createSurfaceRenderView()
+            VideoRenderViewType.TEXTURE_VIEW -> createTextureRenderView()
+        }
+    }
+
+    private fun effectiveDataSourceConfig(): PlayerDataSourceConfig {
+        val cfg = PlayerDataSourceConfig.defaultConfig()
+        synchronized(dataSourceConfigLock) {
+            if (gHasConfigured) {
+                cfg.timeoutMs = gTimeoutMs
+                cfg.maxRetries = gMaxRetries
+                cfg.avioBufferSize = gAvioBufferSize
+            }
+        }
+        return cfg
+    }
+
+    /**
+     * 执行 License 校验（网络优先，失败回退缓存）。
+     * 成功后当前进程会被标记为通过，后续播放门禁可直接放行。
+     */
+    fun checkLicense(licenseKey: String, licenseUrl: String, callback: (Boolean, Throwable?) -> Unit) {
+        HXCPlayerLicenseManager.checkLicenseWithLicenseKey(context, licenseKey, licenseUrl) { success, error ->
+            callback(success, error)
+        }
+    }
+
+    fun resetLicenseState() {
+        HXCPlayerLicenseManager.resetLicenseState(context)
+    }
+
+    private fun licenseAllowedOrNotify(action: String): Boolean {
+        if (HXCPlayerLicenseManager.isLicenseCheckPassed(context)) return true
+        callback?.onPlayerError(PlayerErrorCode.LICENSE_VALIDATION_FAILED, "License 校验失败: $action")
+        return false
+    }
+
+    private fun createSurfaceRenderView(): View {
+        return SurfaceView(context).apply {
+            holder.addCallback(object : SurfaceHolder.Callback {
+                override fun surfaceCreated(holder: SurfaceHolder) {
+                    setSurface(holder.surface)
+                }
+
+                override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+                    updateSurfaceSize(width, height)
+                }
+
+                override fun surfaceDestroyed(holder: SurfaceHolder) {
+                    setSurface(null)
+                }
+            })
+        }
+    }
+
+    private fun createTextureRenderView(): View {
+        return TextureView(context).apply {
+            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+                    textureDecoderSurface?.release()
+                    textureDecoderSurface = Surface(surface)
+                    setSurface(textureDecoderSurface)
+                    if (width > 0 && height > 0) {
+                        updateSurfaceSize(width, height)
+                    }
+                }
+
+                override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+                    updateSurfaceSize(width, height)
+                }
+
+                override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                    setSurface(null)
+                    textureDecoderSurface?.release()
+                    textureDecoderSurface = null
+                    return true
+                }
+
+                override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+                }
+            }
+        }
+    }
+
     // 内部方法：设置渲染 Surface
     private fun setSurface(surface: Surface?) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         nativeSetSurface(handle, surface)
     }
-    
+
     // 内部方法：更新 Surface 尺寸
     private fun updateSurfaceSize(width: Int, height: Int) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         nativeUpdateSurfaceSize(handle, width, height)
     }
-    
+
     // 打开 URL
     fun openURL(url: String): Boolean {
         return openURL(url, 0.0)
@@ -225,7 +445,9 @@ class HXCPlayerControl(private val context: Context) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
             return false
         }
-
+        if (!licenseAllowedOrNotify("openURL")) {
+            return false
+        }
         val result = if (startPosition > 0.0) {
             nativeOpenURLWithStartPosition(handle, url, startPosition)
         } else {
@@ -280,12 +502,71 @@ class HXCPlayerControl(private val context: Context) {
         }
     }
 
+    /**
+     * 统一入口：使用播放模型打开（对齐 iOS 的 openWithPlayModel）。
+     */
+    fun openWithPlayModel(model: PlayerDataSourcePlayModel): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) {
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开播放模型")
+            return false
+        }
+        if (model.url.isBlank()) {
+            dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+            return false
+        }
+        if (!licenseAllowedOrNotify("openWithPlayModel")) {
+            return false
+        }
+        val result = when (model.mode) {
+            PlayerDataSourceMode.DEFAULT -> {
+                if (model.url.isBlank()) {
+                    dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+                    false
+                } else {
+                    nativeOpenURL(handle, model.url)
+                }
+            }
+            PlayerDataSourceMode.CUSTOM_HTTP -> {
+                val cfg = effectiveDataSourceConfig()
+                nativeOpenWithCustomHTTP(
+                    handle,
+                    model.url,
+                    cfg.timeoutMs,
+                    cfg.maxRetries,
+                    model.encryptedFile
+                )
+            }
+            PlayerDataSourceMode.CUSTOM_FILE -> {
+                val cfg = effectiveDataSourceConfig()
+                nativeOpenWithCustomFile(
+                    handle,
+                    model.url,
+                    cfg.avioBufferSize,
+                    model.encryptedFile
+                )
+            }
+        }
+        if (result) {
+            callback?.onPlayerStateChanged(PlayerState.OPENING)
+        } else {
+            dispatchError(
+                PlayerErrorCode.OPEN_INPUT_FAILED,
+                "打开失败: mode=${model.mode}, url=${model.url}"
+            )
+        }
+        return result
+    }
+
     // 使用自定义 HTTP 模式打开（支持 Range 下载）
     // encryptedFile：是否与核心层约定一致，对文件头前 100 字节解密（默认 false）
     fun openWithCustomHTTP(url: String, timeoutMs: Int = 30000, maxRetries: Int = 3, encryptedFile: Boolean = false): Boolean {
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开自定义 HTTP: $url")
+            return false
+        }
+        if (!licenseAllowedOrNotify("openWithCustomHTTP")) {
             return false
         }
         val result = nativeOpenWithCustomHTTP(handle, url, timeoutMs, maxRetries, encryptedFile)
@@ -309,6 +590,9 @@ class HXCPlayerControl(private val context: Context) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开本地文件(CustomFile): $path")
             return false
         }
+        if (!licenseAllowedOrNotify("openWithCustomFile")) {
+            return false
+        }
         val result = nativeOpenWithCustomFile(handle, path, avioBufferSize, encryptedFile)
         if (result) {
             callback?.onPlayerStateChanged(PlayerState.OPENING)
@@ -317,15 +601,18 @@ class HXCPlayerControl(private val context: Context) {
         }
         return result
     }
-    
+
     // 播放
     fun play() {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
+        if (!licenseAllowedOrNotify("play")) {
+            return
+        }
         nativePlay(handle)
         callback?.onPlayerStateChanged(PlayerState.PLAYING)
     }
-    
+
     // 暂停
     fun pause() {
         val handle = currentHandle()
@@ -333,7 +620,7 @@ class HXCPlayerControl(private val context: Context) {
         nativePause(handle)
         callback?.onPlayerStateChanged(PlayerState.PAUSED)
     }
-    
+
     // 停止
     fun stop() {
         val handle = currentHandle()
@@ -341,49 +628,52 @@ class HXCPlayerControl(private val context: Context) {
         nativeStop(handle)
         callback?.onPlayerStateChanged(PlayerState.STOPPED)
     }
-    
+
     // 跳转
     fun seekTo(position: Double) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
+        if (!licenseAllowedOrNotify("seekTo")) {
+            return
+        }
         nativeSeekTo(handle, position)
     }
-    
+
     // 设置播放速度
     fun setPlaybackRate(rate: Float) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         nativeSetPlaybackRate(handle, rate)
     }
-    
+
     // 设置音量
     fun setVolume(volume: Float) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         nativeSetVolume(handle, volume)
     }
-    
+
     // 设置比例模式
     fun setAspectRatioMode(fill: Boolean) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         nativeSetAspectRatioMode(handle, if (fill) 1 else 0)
     }
-    
+
     // 获取时长
     fun getDuration(): Double {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return 0.0
         return nativeGetDuration(handle)
     }
-    
+
     // 获取当前位置
     fun getPosition(): Double {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return 0.0
         return nativeGetPosition(handle)
     }
-    
+
     // 获取状态
     fun getState(): PlayerState {
         val handle = currentHandle()
@@ -391,7 +681,7 @@ class HXCPlayerControl(private val context: Context) {
         val state = nativeGetState(handle)
         return PlayerState.values().getOrElse(state) { PlayerState.IDLE }
     }
-    
+
     // 启动位置更新定时器
     private fun startPositionUpdates() {
         updateExecutor = Executors.newSingleThreadScheduledExecutor()
@@ -436,7 +726,7 @@ class HXCPlayerControl(private val context: Context) {
             }
         }, 0, 100, TimeUnit.MILLISECONDS)
     }
-    
+
     // 释放资源
     fun release() {
         synchronized(lifecycleLock) {
@@ -459,6 +749,9 @@ class HXCPlayerControl(private val context: Context) {
             nativeHandle = 0
         }
         if (handle != 0L) {
+            nativeSetSurface(handle, null)
+            textureDecoderSurface?.release()
+            textureDecoderSurface = null
             nativeRelease(handle)
         }
 
@@ -466,7 +759,7 @@ class HXCPlayerControl(private val context: Context) {
         loadingCandidateState = null
         loadingCandidateSinceMs = 0L
     }
-    
+
     // Native 方法声明
     private external fun nativeCreate(): Long
     private external fun nativeRelease(handle: Long)

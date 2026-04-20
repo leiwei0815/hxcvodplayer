@@ -121,6 +121,14 @@ public:
     bool support_range() const { return support_range_; }
     
     /**
+     * @brief HTTP 重定向后的最终 URL（与打开时一致时等同于请求 URL）
+     *
+     * 供 FFmpeg 在 CUSTOM_IO 下解析 HLS 等：相对分片路径需以「实际拉取到 m3u8 的 URL」为基址，
+     * 若仍用短链/入口 URL，相对路径会拼错导致分片 404。
+     */
+    const std::string& effective_url() const { return effective_url_.empty() ? url_ : effective_url_; }
+    
+    /**
      * @brief 关闭下载器
      */
     void close();
@@ -144,6 +152,8 @@ public:
 
 private:
     std::string url_;
+    /** 重定向后的最终地址；为空表示尚未探测或与 url_ 相同 */
+    std::string effective_url_;
     int64_t content_length_ = -1;
     bool support_range_ = false;
     int timeout_ms_ = 30000;

@@ -40,10 +40,18 @@ set(CORE_SOURCES
 )
 
 # Apple 平台 Objective-C++ 源文件
-set(APPLE_SOURCES
+set(APPLE_MM_SOURCES
     ${PROJECT_ROOT}/apple/HXCPlayerControl.mm
     ${PROJECT_ROOT}/apple/HXCPlayerView.mm
 )
+
+# License（纯 Objective-C）
+set(APPLE_LICENSE_SOURCES
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseManager.m
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseCrypto.m
+)
+
+set(APPLE_SOURCES ${APPLE_MM_SOURCES} ${APPLE_LICENSE_SOURCES})
 
 # HXCVD 下载模块（纯 Objective-C + Core Data）
 set(HXCVD_SOURCES
@@ -59,7 +67,10 @@ set(HXCVD_SOURCES
 set(PUBLIC_HEADERS
     ${PROJECT_ROOT}/apple/HXCPlayer.h
     ${PROJECT_ROOT}/apple/HXCPlayerControl.h
+    ${PROJECT_ROOT}/apple/HXCPlayerTypes.h
+    ${PROJECT_ROOT}/apple/HXCPlayerLog.h
     ${PROJECT_ROOT}/apple/HXCPlayerView.h
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseManager.h
     ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownload.h
     ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadTypes.h
     ${PROJECT_ROOT}/apple/HXCVDownload/HXCVDownloadItem.h
@@ -78,6 +89,7 @@ set(PRIVATE_HEADERS
     ${PROJECT_ROOT}/core/include/hxc_audio_resampler.h
     ${PROJECT_ROOT}/core/include/hxc_logger.h
     ${PROJECT_ROOT}/core/include/hxc_debug_helper.h
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseCrypto.h
 )
 
 # ==================== 依赖配置 ====================
@@ -168,14 +180,15 @@ set_source_files_properties(
 
 # 为 Objective-C++ 文件设置编译标志
 set_source_files_properties(
-    ${APPLE_SOURCES}
+    ${APPLE_MM_SOURCES}
     PROPERTIES
     COMPILE_FLAGS "-x objective-c++ -fobjc-arc"
 )
 
-# HXCVDownload 为纯 Objective-C
+# HXCVDownload、License 为纯 Objective-C
 set_source_files_properties(
     ${HXCVD_SOURCES}
+    ${APPLE_LICENSE_SOURCES}
     PROPERTIES
     COMPILE_FLAGS "-x objective-c -fobjc-arc"
 )

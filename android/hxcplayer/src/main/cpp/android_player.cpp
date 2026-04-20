@@ -103,6 +103,7 @@ void AndroidPlayer::setSurface(ANativeWindow* window) {
     }
     
     native_window_ = window;
+    surface_generation_.fetch_add(1, std::memory_order_relaxed);
     
     if (native_window_) {
         ANativeWindow_acquire(native_window_);
@@ -136,6 +137,7 @@ void AndroidPlayer::updateSurfaceSize(int width, int height) {
         surface_width_ = width;
         surface_height_ = height;
         surface_configured_ = false;  // 标记需要重新配置
+        surface_generation_.fetch_add(1, std::memory_order_relaxed);
         
         LOGI("✅ Surface size updated (will reconfigure on next frame)");
     }
@@ -531,6 +533,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     int surface_w = 0;
     int surface_h = 0;
     bool needs_configure = false;
+    uint64_t captured_gen = 0;
     
     {
         std::lock_guard<std::mutex> lock(window_mutex_);
@@ -543,6 +546,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         surface_w = surface_width_;
         surface_h = surface_height_;
         needs_configure = !surface_configured_;
+        captured_gen = surface_generation_.load(std::memory_order_relaxed);
     }
     
     // 📐 成熟播放器常用策略：
@@ -623,10 +627,34 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     if (dst_height <= 0) dst_height = surface_h;
     
     // ✅ 只在首次或尺寸变化时配置 Surface
+    // 注意：swap/分屏切换时 setSurface/updateSurfaceSize 可能与渲染线程并发发生，
+    // 若这里使用旧尺寸去 setBuffersGeometry，会导致后续 lock 的 buffer stride 与预期不一致并闪烁。
     if (needs_configure && surface_w > 0 && surface_h > 0) {
-        LOGI("🔧 Configuring surface: %dx%d", surface_w, surface_h);
+        // 在真正配置前再读一次“最新尺寸 + generation”，避免使用旧 snapshot 配置
+        int cfg_w = surface_w;
+        int cfg_h = surface_h;
+        uint64_t cfg_gen = captured_gen;
+        {
+            std::lock_guard<std::mutex> lock(window_mutex_);
+            // 若窗口已被替换/清空，直接丢帧，等待下一帧拿到正确 window
+            if (!native_window_ || native_window_ != window) {
+                ANativeWindow_release(window);
+                return;
+            }
+            cfg_w = surface_width_;
+            cfg_h = surface_height_;
+            cfg_gen = surface_generation_.load(std::memory_order_relaxed);
+        }
+
+        // generation 变化说明期间发生过 setSurface/resize：丢弃本帧，避免配置错
+        if (cfg_gen != captured_gen) {
+            ANativeWindow_release(window);
+            return;
+        }
+
+        LOGI("🔧 Configuring surface: %dx%d", cfg_w, cfg_h);
         int result = ANativeWindow_setBuffersGeometry(
-            window, surface_w, surface_h, WINDOW_FORMAT_RGB_565);
+            window, cfg_w, cfg_h, WINDOW_FORMAT_RGB_565);
         
         if (result != 0) {
             LOGE("❌ Failed to configure surface: %d", result);
@@ -635,7 +663,10 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         }
         
         std::lock_guard<std::mutex> lock(window_mutex_);
-        surface_configured_ = true;
+        // 只有 generation 未变化时才认为配置成功
+        if (surface_generation_.load(std::memory_order_relaxed) == captured_gen) {
+            surface_configured_ = true;
+        }
         LOGI("✅ Surface configured successfully");
     }
     
@@ -754,8 +785,15 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     uint16_t* src_buffer = (uint16_t*)rgb_buffer_;
     
     // 安全检查
+    // stride < surface_w 说明 surface 缓冲区尚未按最新尺寸配置（常见于 swap/分屏切换的竞态）。
+    // 此时丢帧并强制下帧重新配置，避免连续报错与画面闪烁。
     if (buffer.stride < surface_w) {
-        LOGE("❌ Buffer stride too small: %d < %d", buffer.stride, surface_w);
+        LOGW("⚠️ Buffer stride too small (drop frame): stride=%d < expected_w=%d", buffer.stride, surface_w);
+        {
+            std::lock_guard<std::mutex> lock(window_mutex_);
+            surface_configured_ = false;
+            surface_generation_.fetch_add(1, std::memory_order_relaxed);
+        }
         ANativeWindow_unlockAndPost(window);
         ANativeWindow_release(window);
         return -1;

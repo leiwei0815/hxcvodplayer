@@ -130,12 +130,17 @@ set(PLAYER_SOURCES
 
 set(PLAYER_HEADERS
     ${PROJECT_ROOT}/apple/HXCPlayerControl.h
+    ${PROJECT_ROOT}/apple/HXCPlayerTypes.h
+    ${PROJECT_ROOT}/apple/HXCPlayerLog.h
     ${PROJECT_ROOT}/apple/HXCPlayerView.h
     ${PROJECT_ROOT}/apple/HXCAESUtility.h
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseManager.h
 )
 
 set(PLAYER_OBJC_SOURCES
     ${PROJECT_ROOT}/apple/HXCAESUtility.m
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseManager.m
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseCrypto.m
 )
 
 # iOS 源文件（使用统一的播放器类）

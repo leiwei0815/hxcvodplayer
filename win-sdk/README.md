@@ -279,11 +279,20 @@ void player_core_set_playback_completed_callback(
 // 设置日志级别（0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR）
 void player_core_set_log_level(int level);
 
+// 获取当前日志级别（返回值与 set_log_level 一致）
+int player_core_get_log_level(void);
+
 // 启用文件日志
 void player_core_enable_file_logging(const char* log_dir, const char* prefix);
 
 // 禁用文件日志
 void player_core_disable_file_logging(void);
+
+// 当前正在写入的日志文件完整路径
+const char* player_core_get_current_log_file(void);
+
+// 当前文件日志目录（未启用时为空字符串）
+const char* player_core_get_log_directory(void);
 ```
 
 ## ⚠️ 注意事项

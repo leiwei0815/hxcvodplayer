@@ -7,6 +7,8 @@
 #include "hxc_player_core.h"
 #include "hxc_audio_resampler.h"
 #include <cstring>
+#include <sstream>
+#include <string>
 #include <vector>
 #include "hxc_logger.h"
 
@@ -768,8 +770,9 @@ void player_core_set_loading_callback(PlayerCoreHandle* handle, LoadingCallbackC
 
 // ========== 日志配置实现 ==========
 
-// 静态变量存储日志文件路径
+// 静态变量存储日志文件路径 / 目录（供 C 接口返回稳定指针）
 static std::string g_current_log_file;
+static std::string g_log_directory;
 
 void player_core_set_log_level(int level) {
     hxcplayer::LogLevel log_level;
@@ -781,6 +784,16 @@ void player_core_set_log_level(int level) {
         default: log_level = hxcplayer::LogLevel::INFO; break;
     }
     hxcplayer::Logger::instance().set_level(log_level);
+}
+
+int player_core_get_log_level(void) {
+    switch (hxcplayer::Logger::instance().get_level()) {
+        case hxcplayer::LogLevel::DEBUG: return 0;
+        case hxcplayer::LogLevel::INFO: return 1;
+        case hxcplayer::LogLevel::WARNING: return 2;
+        case hxcplayer::LogLevel::ERROR_LEVEL: return 3;
+        default: return 1;
+    }
 }
 
 void player_core_enable_file_logging(const char* log_dir, const char* prefix) {
@@ -827,6 +840,50 @@ int player_core_cleanup_old_logs(void) {
 const char* player_core_get_current_log_file(void) {
     g_current_log_file = hxcplayer::Logger::instance().get_current_log_file();
     return g_current_log_file.c_str();
+}
+
+const char* player_core_get_log_directory(void) {
+    g_log_directory = hxcplayer::Logger::instance().get_log_dir();
+    return g_log_directory.c_str();
+}
+
+static const char *hxc_c_log_basename(const char *path) {
+    if (!path) {
+        return "";
+    }
+    const char *p = strrchr(path, '/');
+    if (!p) {
+        p = strrchr(path, '\\');
+    }
+    return p ? (p + 1) : path;
+}
+
+void player_core_log_line(int level, const char *file, int line, const char *func, const char *utf8_message) {
+    const char *f = file ? file : "";
+    const char *fn = func ? func : "";
+    const char *m = utf8_message ? utf8_message : "";
+    using hxcplayer::Logger;
+    switch (level) {
+        case 0:
+            Logger::instance().debug_with_location(f, line, fn, m);
+            break;
+        case 1: {
+            std::ostringstream oss;
+            oss << "[" << hxc_c_log_basename(f) << ":" << line << " " << fn << "()] " << m;
+            Logger::instance().info(oss.str());
+            break;
+        }
+        case 2: {
+            std::ostringstream oss;
+            oss << "[" << hxc_c_log_basename(f) << ":" << line << " " << fn << "()] " << m;
+            Logger::instance().warning(oss.str());
+            break;
+        }
+        case 3:
+        default:
+            Logger::instance().error_with_location(f, line, fn, m);
+            break;
+    }
 }
 
 // ========== 视频渲染 API ==========

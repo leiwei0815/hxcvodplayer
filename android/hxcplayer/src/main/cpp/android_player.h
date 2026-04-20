@@ -76,6 +76,8 @@ private:
     int surface_height_;
     int aspect_ratio_mode_; // 0=FIT, 1=FILL
     bool surface_configured_;  // Surface 是否已配置
+    // Surface/尺寸变更代数：用于避免 setSurface/updateSurfaceSize 与 renderLoop 的竞态
+    std::atomic<uint64_t> surface_generation_{0};
     
     // FFmpeg swscale context for YUV->RGB conversion
     SwsContext* sws_ctx_;
