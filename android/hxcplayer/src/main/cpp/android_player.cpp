@@ -639,7 +639,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
             // 若窗口已被替换/清空，直接丢帧，等待下一帧拿到正确 window
             if (!native_window_ || native_window_ != window) {
                 ANativeWindow_release(window);
-                return;
+                return -1;
             }
             cfg_w = surface_width_;
             cfg_h = surface_height_;
@@ -649,7 +649,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         // generation 变化说明期间发生过 setSurface/resize：丢弃本帧，避免配置错
         if (cfg_gen != captured_gen) {
             ANativeWindow_release(window);
-            return;
+            return -1;
         }
 
         LOGI("🔧 Configuring surface: %dx%d", cfg_w, cfg_h);
