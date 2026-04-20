@@ -81,6 +81,12 @@ typedef enum {
     PLAYER_DATA_SOURCE_MODE_CUSTOM_FILE = 2,  // 本地文件自定义读取（支持加密文件头解密）
 } PlayerDataSourceModeC;
 
+// 解码模式（播放前设置；默认软解）
+typedef enum {
+    PLAYER_DECODE_MODE_SOFTWARE = 0,
+    PLAYER_DECODE_MODE_HARDWARE = 1,
+} PlayerDecodeModeC;
+
 // ⚠️ 自定义数据源配置（与 C++ 层 CustomDataSourceConfig 保持一致）
 typedef struct {
     int timeout_ms;           // 超时时间（毫秒），默认 30000
@@ -113,6 +119,8 @@ void player_core_seek(PlayerCoreHandle* handle, double pos);
 void player_core_set_volume(PlayerCoreHandle* handle, float volume);
 void player_core_set_playback_rate(PlayerCoreHandle* handle, float rate);
 float player_core_get_playback_rate(PlayerCoreHandle* handle);
+void player_core_set_decode_mode(PlayerCoreHandle* handle, PlayerDecodeModeC mode);
+PlayerDecodeModeC player_core_get_decode_mode(PlayerCoreHandle* handle);
 
 // 视频显示模式
 void player_core_set_aspect_ratio_mode(PlayerCoreHandle* handle, AspectRatioModeC mode);

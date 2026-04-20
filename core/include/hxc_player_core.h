@@ -111,6 +111,8 @@ public:
     // 设置配置
     void set_config(const PlayerConfig& config) { config_ = config; }
     const PlayerConfig& get_config() const { return config_; }
+    void set_decode_mode(DecodeMode mode) { config_.decode_mode = mode; }
+    DecodeMode get_decode_mode() const { return config_.decode_mode; }
     
     // 打开媒体文件
     int open(const std::string& filename);

@@ -64,6 +64,12 @@ enum class PixelFormat {
     NV21
 };
 
+// 解码模式（默认软解）
+enum class DecodeMode {
+    Software = 0,
+    Hardware = 1
+};
+
 // 播放器配置
 struct PlayerConfig {
     SyncMode sync_mode = SyncMode::AudioMaster;
@@ -84,6 +90,9 @@ struct PlayerConfig {
     // 0.5 = 0.5x慢速, 1.0 = 正常速度, 2.0 = 2x快速
     // 支持范围：0.5 ~ 2.0
     double playback_rate = 1.0;
+
+    // 解码模式（默认软解；外层可在 open 前设置硬解优先）
+    DecodeMode decode_mode = DecodeMode::Software;
 };
 
 // 媒体信息

@@ -59,7 +59,6 @@ static int hxc_calc_retry_delay_ms(int retry_count, int base_delay_ms, int max_d
     int candidate = base_delay_ms << capped_power;
     return std::min(candidate, max_delay_ms);
 }
-
 static enum AVHWDeviceType hxc_platform_hw_device_type() {
 #if defined(__ANDROID__)
     return av_hwdevice_find_type_by_name("mediacodec");
@@ -108,7 +107,6 @@ static enum AVPixelFormat hxc_hw_get_format(AVCodecContext *ctx, const enum AVPi
 static bool hxc_codec_supports_hw_device(const AVCodec *codec, enum AVHWDeviceType device_type) {
     return hxc_find_hw_pix_fmt_for_codec(codec, device_type) != AV_PIX_FMT_NONE;
 }
-
 static bool hxc_try_enable_hw_decode(AVCodecContext *codec_ctx, const AVCodec *codec) {
     if (!codec_ctx || !codec) {
         return false;
@@ -138,6 +136,7 @@ static bool hxc_try_enable_hw_decode(AVCodecContext *codec_ctx, const AVCodec *c
 }
 
 }  // namespace
+} // namespace
 
 PlayerCore::PlayerCore()
     : state_(PlayerState::Idle)
@@ -1537,15 +1536,19 @@ int PlayerCore::stream_component_open(int stream_index) {
         return -1;
     }
 
+    bool request_video_hw_decode =
+        (codecpar->codec_type == AVMEDIA_TYPE_VIDEO && config_.decode_mode == DecodeMode::Hardware);
     bool hw_decode_enabled = false;
-    if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+    if (request_video_hw_decode) {
         hw_decode_enabled = hxc_try_enable_hw_decode(codec_ctx, codec);
-        LOG_INFO("视频解码模式尝试结果: ", hw_decode_enabled ? "硬解优先" : "软解");
+        LOG_INFO("视频解码模式：请求硬解，启用结果=", hw_decode_enabled ? 1 : 0);
+    } else if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        LOG_INFO("视频解码模式：软解");
     }
 
     // 打开解码器（若硬解打开失败，自动回退软解）
     int open_ret = avcodec_open2(codec_ctx, codec, nullptr);
-    if (open_ret < 0 && hw_decode_enabled) {
+    if (open_ret < 0 && request_video_hw_decode && hw_decode_enabled) {
         LOG_WARNING("硬解打开失败，自动回退软解。ret=", open_ret);
         avcodec_free_context(&codec_ctx);
         codec_ctx = alloc_codec_context();
@@ -1563,7 +1566,7 @@ int PlayerCore::stream_component_open(int stream_index) {
         avcodec_free_context(&codec_ctx);
         return -1;
     }
-    
+
     if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
         video_codec_ctx_ = codec_ctx;
         video_hw_decode_active_.store(hw_decode_enabled, std::memory_order_release);

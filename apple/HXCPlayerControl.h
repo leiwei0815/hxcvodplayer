@@ -128,6 +128,7 @@ reconnectCount:(NSInteger)reconnectCount;
 @property (nonatomic, assign) double playbackRate;     // 播放速度 (0.5-2.0)
 @property (nonatomic, assign) double startPosition;    // 起始播放位置（秒）
 @property (nonatomic, assign) HXCAspectRatioMode aspectRatioMode;  // 视频显示模式
+@property (nonatomic, assign) HXCPlayerDecodeMode decodeMode;  // 解码模式（默认软解，需在 open 前设置）
 @property (nonatomic, readonly) HXCPlayerState state;
 @property (nonatomic, readonly) double duration;
 @property (nonatomic, readonly) double position;

@@ -289,6 +289,26 @@ float player_core_get_playback_rate(PlayerCoreHandle* handle) {
     return handle->core->get_playback_rate();
 }
 
+void player_core_set_decode_mode(PlayerCoreHandle* handle, PlayerDecodeModeC mode) {
+    if (!handle || !handle->core) return;
+    switch (mode) {
+        case PLAYER_DECODE_MODE_HARDWARE:
+            handle->core->set_decode_mode(hxcplayer::DecodeMode::Hardware);
+            break;
+        case PLAYER_DECODE_MODE_SOFTWARE:
+        default:
+            handle->core->set_decode_mode(hxcplayer::DecodeMode::Software);
+            break;
+    }
+}
+
+PlayerDecodeModeC player_core_get_decode_mode(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return PLAYER_DECODE_MODE_SOFTWARE;
+    return handle->core->get_decode_mode() == hxcplayer::DecodeMode::Hardware
+               ? PLAYER_DECODE_MODE_HARDWARE
+               : PLAYER_DECODE_MODE_SOFTWARE;
+}
+
 int player_core_get_video_frame(PlayerCoreHandle* handle, VideoFrameDataC* frame_data) {
     if (!handle || !handle->core || !frame_data) {
         return -1;

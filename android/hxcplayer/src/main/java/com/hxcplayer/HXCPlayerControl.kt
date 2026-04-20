@@ -153,6 +153,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         CUSTOM_FILE
     }
 
+    /** 解码模式（默认软解，播放前设置） */
+    enum class DecodeMode {
+        SOFTWARE,
+        HARDWARE
+    }
+
     /** 对齐 iOS 的视频模型（fileid + appid + sign） */
     class PlayerVideo {
         var videoId: Int = 0
@@ -278,6 +284,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastOpenUrl: String? = null
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
+    @Volatile private var decodeMode: DecodeMode = DecodeMode.SOFTWARE
 
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
     private var textureDecoderSurface: Surface? = null
@@ -330,6 +337,19 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
     }
 
+    fun setDecodeMode(mode: DecodeMode) {
+        decodeMode = mode
+        val handle = currentHandle()
+        if (handle != 0L && !isReleased) {
+            nativeSetDecodeMode(handle, if (mode == DecodeMode.HARDWARE) 1 else 0)
+        }
+    }
+
+    fun getDecodeMode(): DecodeMode = decodeMode
+
+    private fun applyDecodeModeForHandle(handle: Long) {
+        nativeSetDecodeMode(handle, if (decodeMode == DecodeMode.HARDWARE) 1 else 0)
+    }
     private fun isRecoverableErrorCode(errorCode: Int): Boolean {
         return when (errorCode) {
             PlayerErrorCode.OPEN_INPUT_FAILED,
@@ -523,6 +543,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             networkTotalStallMs = 0L
             networkReconnectCount = 0
         }
+        applyDecodeModeForHandle(handle)
         val result = if (startPosition > 0.0) {
             nativeOpenURLWithStartPosition(handle, url, startPosition)
         } else {
@@ -567,6 +588,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     }
                     return@execute
                 }
+                applyDecodeModeForHandle(handle)
 
                 val result = if (startPosition > 0.0) {
                     nativeOpenURLWithStartPosition(handle, url, startPosition)
@@ -609,6 +631,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             networkTotalStallMs = 0L
             networkReconnectCount = 0
         }
+        applyDecodeModeForHandle(handle)
         val result = when (model.mode) {
             PlayerDataSourceMode.DEFAULT -> {
                 if (model.url.isBlank()) {
@@ -660,6 +683,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("openWithCustomHTTP")) {
             return false
         }
+        applyDecodeModeForHandle(handle)
         val result = nativeOpenWithCustomHTTP(handle, url, timeoutMs, maxRetries, encryptedFile)
         if (result) {
             callback?.onPlayerStateChanged(PlayerState.OPENING)
@@ -684,6 +708,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("openWithCustomFile")) {
             return false
         }
+        applyDecodeModeForHandle(handle)
         val result = nativeOpenWithCustomFile(handle, path, avioBufferSize, encryptedFile)
         if (result) {
             callback?.onPlayerStateChanged(PlayerState.OPENING)
@@ -899,6 +924,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeSetPlaybackRate(handle: Long, rate: Float)
     private external fun nativeSetVolume(handle: Long, volume: Float)
     private external fun nativeSetAspectRatioMode(handle: Long, mode: Int)
+    private external fun nativeSetDecodeMode(handle: Long, mode: Int)
     private external fun nativeGetDuration(handle: Long): Double
     private external fun nativeGetPosition(handle: Long): Double
     private external fun nativeGetState(handle: Long): Int

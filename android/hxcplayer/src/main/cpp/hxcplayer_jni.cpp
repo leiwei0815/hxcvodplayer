@@ -161,6 +161,15 @@ Java_com_hxcplayer_HXCPlayerControl_nativeSetAspectRatioMode(
     }
 }
 
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeSetDecodeMode(
+        JNIEnv *env, jobject thiz, jlong handle, jint mode) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        player->setDecodeMode(mode);
+    }
+}
+
 // 获取时长
 JNIEXPORT jdouble JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeGetDuration(

@@ -291,6 +291,16 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
     return config;
 }
 
+static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
+    switch (mode) {
+        case HXCPlayerDecodeModeHardware:
+            return PLAYER_DECODE_MODE_HARDWARE;
+        case HXCPlayerDecodeModeSoftware:
+        default:
+            return PLAYER_DECODE_MODE_SOFTWARE;
+    }
+}
+
 - (instancetype)init {
     self = [super init];
     if (self) {
@@ -303,6 +313,7 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
         _playbackRate = 1.0;
         _startPosition = 0.0;
         _aspectRatioMode = HXCAspectRatioModeFit;
+        _decodeMode = HXCPlayerDecodeModeSoftware;
         _audioQueueRunning = NO;
         _lastPositionUpdateTime = 0;
         _autoReopenOnRecoverableErrorEnabled = NO;
@@ -417,6 +428,7 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
         _networkTotalStallMs = 0;
         _networkReconnectCount = 0;
     }
+    player_core_set_decode_mode(_wrapper->handle(), hxc_to_c_decode_mode(_decodeMode));
     int ret;
     if (_startPosition > 0) {
         ret = player_core_open_with_start_position(_wrapper->handle(), url.UTF8String, _startPosition);
@@ -472,6 +484,7 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
         _networkTotalStallMs = 0;
         _networkReconnectCount = 0;
     }
+    player_core_set_decode_mode(_wrapper->handle(), hxc_to_c_decode_mode(_decodeMode));
 
     PlayerDataSourceConfigC cConfig;
     cConfig.timeout_ms = (int)config.timeoutMs;

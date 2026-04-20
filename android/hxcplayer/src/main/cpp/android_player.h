@@ -57,6 +57,8 @@ public:
     void setPlaybackRate(float rate);
     void setVolume(float volume);
     void setAspectRatioMode(int mode);
+    void setDecodeMode(int mode);
+    int getDecodeMode() const;
     
     // 获取状态
     double getDuration() const;
@@ -76,6 +78,7 @@ private:
     int surface_width_;
     int surface_height_;
     int aspect_ratio_mode_; // 0=FIT, 1=FILL
+    int decode_mode_;       // 0=software, 1=hardware
     bool surface_configured_;  // Surface 是否已配置
     // Surface/尺寸变更代数：用于避免 setSurface/updateSurfaceSize 与 renderLoop 的竞态
     std::atomic<uint64_t> surface_generation_{0};

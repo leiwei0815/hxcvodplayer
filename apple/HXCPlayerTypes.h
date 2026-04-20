@@ -86,6 +86,12 @@ typedef NS_ENUM(NSInteger, HXCPlayerDataSourceMode) {
     HXCPlayerDataSourceModeCustomFile = 2,   // 本地文件自定义读取（支持加密文件头解密）
 };
 
+/// 解码模式（播放前设置，默认软解）
+typedef NS_ENUM(NSInteger, HXCPlayerDecodeMode) {
+    HXCPlayerDecodeModeSoftware = 0,
+    HXCPlayerDecodeModeHardware = 1,
+};
+
 #if TARGET_OS_IOS
 /// 画中画状态（仅 iOS）
 typedef NS_ENUM(NSInteger, HXCPlayerPIPState) {

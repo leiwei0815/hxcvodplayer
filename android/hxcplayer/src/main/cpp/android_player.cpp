@@ -18,6 +18,7 @@ AndroidPlayer::AndroidPlayer()
     , surface_width_(0)
     , surface_height_(0)
     , aspect_ratio_mode_(0) // FIT
+    , decode_mode_(0) // 默认软解
     , surface_configured_(false)
     , sws_ctx_(nullptr)
     , rgb_buffer_(nullptr)
@@ -155,6 +156,10 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     
     LOGI("Opening URL: %s, start_position: %.2f", url, start_position);
     
+    player_core_set_decode_mode(player_core_,
+                                decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
+                                                  : PLAYER_DECODE_MODE_SOFTWARE);
+
     int result;
     if (start_position > 0.0) {
         // 使用带起始位置的打开方法
@@ -207,6 +212,9 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
         LOGE("Player core not initialized");
         return false;
     }
+    player_core_set_decode_mode(player_core_,
+                                decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
+                                                  : PLAYER_DECODE_MODE_SOFTWARE);
 
     LOGI("Opening with custom HTTP: %s (encrypted_file=%d)", url, encrypted_file ? 1 : 0);
 
@@ -245,6 +253,9 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
         LOGE("Player core not initialized");
         return false;
     }
+    player_core_set_decode_mode(player_core_,
+                                decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
+                                                  : PLAYER_DECODE_MODE_SOFTWARE);
 
     LOGI("Opening with custom file: %s (avio_buffer_size=%zu, encrypted_file=%d)",
          path, static_cast<size_t>(avio_buffer_size), encrypted_file ? 1 : 0);
@@ -371,6 +382,19 @@ void AndroidPlayer::setAspectRatioMode(int mode) {
         last_target_height_ = 0;
         LOGI("🔄 Reset swscale context to apply new aspect ratio mode");
     }
+}
+
+void AndroidPlayer::setDecodeMode(int mode) {
+    decode_mode_ = (mode == 1) ? 1 : 0;
+    if (player_core_) {
+        player_core_set_decode_mode(player_core_,
+                                    decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
+                                                      : PLAYER_DECODE_MODE_SOFTWARE);
+    }
+}
+
+int AndroidPlayer::getDecodeMode() const {
+    return decode_mode_;
 }
 
 double AndroidPlayer::getDuration() const {
