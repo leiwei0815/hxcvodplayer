@@ -167,6 +167,14 @@ static size_t pkcs7_pad(uint8_t* data, size_t len) {
 static size_t pkcs7_unpad(const uint8_t* data, size_t len) {
     if (len == 0) return 0;
     uint8_t pad = data[len - 1];
+    // PKCS#7 padding 校验：
+    // - pad 必须在 1..AES_BLOCK_SIZE
+    // - 末尾 pad 个字节必须都等于 pad
+    if (pad == 0 || pad > AES_BLOCK_SIZE) return 0;
+    if (pad > len) return 0;
+    for (size_t i = 0; i < pad; i++) {
+        if (data[len - 1 - i] != pad) return 0;
+    }
     return len - pad;
 }
 

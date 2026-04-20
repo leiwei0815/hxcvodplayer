@@ -568,6 +568,12 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
         set_state(PlayerState::Error);
         return -1;
     }
+
+    auto looks_like_hls = [](const std::string& u) -> bool {
+        // HLS playlist 典型为 .m3u8（也可能带 query）
+        auto pos = u.find(".m3u8");
+        return pos != std::string::npos;
+    };
     
     LOG_INFO("========================================");
     LOG_INFO("使用数据源模式打开文件");
@@ -583,6 +589,15 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
             return open(url);
             
         case DataSourceMode::CustomHTTP: {
+            // ⚠️ CustomHTTP 目前仅提供“单一自定义 AVIOContext(pb)”读取能力。
+            // 对 HLS（m3u8）这类“主清单 + 多分片 URL”场景，FFmpeg demuxer 仍会用自身的 http(s)
+            // 去打开分片请求，无法复用我们这里的 RangeDownloader/自定义 IO。
+            // 因此遇到 m3u8 时自动降级到 Default，让 FFmpeg 自己完成所有网络请求。
+            if (looks_like_hls(url)) {
+                LOG_WARNING("CustomHTTP 不支持 HLS(m3u8) 多请求分片读取，已自动降级到 Default 模式");
+                return open(url);
+            }
+
             // 自动创建 HttpRangeDataSource 和 CustomAVIOContext
             LOG_INFO("使用自定义 HTTP Range 下载器模式");
             LOG_INFO("配置参数:");
@@ -604,9 +619,9 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
                 
                 // 3. 设置下载进度回调
                 auto last_percent = std::make_shared<int>(-1);
-                downloader->set_progress_callback([this, last_percent](size_t downloaded, size_t total) {
-                    if (total > 0) {
-                        int percent = (int)((double)downloaded / total * 100.0);
+                downloader->set_progress_callback([this, last_percent](int64_t downloaded, int64_t total) {
+                    if (total > 0 && downloaded >= 0) {
+                        int percent = (int)((double)downloaded / (double)total * 100.0);
                         if (percent != *last_percent) {
                             *last_percent = percent;
                             LOG_DEBUG("下载进度: ", percent, "% (", 
@@ -624,9 +639,13 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
                     return -1;
                 }
                 
+                // 重定向后的 URL：HLS 分片多为相对路径，须与 m3u8 实际地址一致（否则 FFmpeg 拼错分片 URL 会 404）
+                const std::string format_url = downloader->effective_url();
+                
                 LOG_INFO("数据源打开成功");
                 LOG_INFO("  - 文件大小: ", dataSource->size() / 1024 / 1024, " MB");
                 LOG_INFO("  - 支持 Seek: ", dataSource->seekable() ? "是" : "否");
+                LOG_INFO("  - 解析/基址 URL: ", format_url);
                 
                 // 5. 创建 CustomAVIOContext
                 auto customIO = std::make_unique<CustomAVIOContext>(
@@ -643,8 +662,8 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
                 
                 LOG_INFO("CustomAVIOContext 创建成功");
                 
-                // 6. 使用自定义 IO 打开（传入 url 供 HLS 等探测扩展名并解析相对路径）
-                return open_with_custom_io(std::move(customIO), url);
+                // 6. 使用自定义 IO 打开（传入与数据源一致的最终 URL，供 HLS 等解析相对分片路径）
+                return open_with_custom_io(std::move(customIO), format_url);
                 
             } catch (const std::exception& e) {
                 LOG_ERROR("创建自定义数据源失败: ", e.what());

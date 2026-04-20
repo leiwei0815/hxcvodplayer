@@ -529,6 +529,12 @@ player_core_set_log_retention_days(7);
 // 手动清理旧日志
 int deleted = player_core_cleanup_old_logs();
 printf("删除了 %d 个旧日志文件\n", deleted);
+
+// 查询当前日志级别与路径（便于 UI 展示或上报）
+int level = player_core_get_log_level();
+const char* logDir = player_core_get_log_directory();
+const char* logFile = player_core_get_current_log_file();
+printf("log level=%d dir=%s file=%s\n", level, logDir ? logDir : "", logFile ? logFile : "");
 ```
 
 ## 平台差异

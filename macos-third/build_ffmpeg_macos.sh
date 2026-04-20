@@ -73,6 +73,10 @@ echo "🔨 配置 FFmpeg..."
     --enable-protocol=https \
     --enable-protocol=tcp \
     --enable-protocol=tls \
+    --enable-protocol=rtmp \
+    --enable-protocol=rtmps \
+    --enable-protocol=rtmpt \
+    --enable-protocol=rtmpts \
     --disable-encoders \
     --disable-decoders \
     --enable-decoder=h264 \

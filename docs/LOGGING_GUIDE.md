@@ -24,6 +24,9 @@
 // 设置日志级别（0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR）
 void player_core_set_log_level(int level);
 
+// 获取当前日志级别（返回值与 set_log_level 一致）
+int player_core_get_log_level(void);
+
 // 启用文件日志（会自动清理超过保留期限的旧日志）
 void player_core_enable_file_logging(const char* log_dir, const char* prefix);
 
@@ -41,6 +44,9 @@ int player_core_cleanup_old_logs(void);
 
 // 获取当前日志文件路径
 const char* player_core_get_current_log_file(void);
+
+// 获取当前文件日志目录（未启用文件日志时返回空字符串）
+const char* player_core_get_log_directory(void);
 ```
 
 ## 使用示例

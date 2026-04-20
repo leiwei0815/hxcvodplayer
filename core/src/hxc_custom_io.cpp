@@ -8,6 +8,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cerrno>
+#include <vector>
 
 // 平台相关的 HTTP 实现
 #if defined(__APPLE__)
@@ -28,6 +29,24 @@
 #endif
 
 namespace hxcplayer {
+
+#ifdef USE_CFNETWORK
+static void cfurl_to_utf8_string(CFURLRef u, std::string& out) {
+    if (!u) {
+        return;
+    }
+    CFStringRef s = CFURLGetString(u);
+    if (!s) {
+        return;
+    }
+    CFIndex len = CFStringGetLength(s);
+    CFIndex max = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+    std::vector<char> buf(static_cast<size_t>(max));
+    if (CFStringGetCString(s, buf.data(), static_cast<CFIndex>(buf.size()), kCFStringEncodingUTF8)) {
+        out.assign(buf.data());
+    }
+}
+#endif
 
 static inline uint8_t decrypt_first100_byte(uint8_t b) {
     // 解密规则（与加密 byte = ROL3(byte); byte = ~byte; 互逆）：
@@ -69,6 +88,7 @@ RangeDownloader::~RangeDownloader() {
 
 int RangeDownloader::open(const std::string& url) {
     url_ = url;
+    effective_url_.clear();
     
     int ret = fetch_http_headers();
     if (ret < 0) {
@@ -151,6 +171,14 @@ int RangeDownloader::fetch_http_headers() {
         return -1;
     }
     
+    {
+        CFURLRef finalURL = (CFURLRef)CFReadStreamCopyProperty(stream, kCFStreamPropertyHTTPFinalURL);
+        if (finalURL) {
+            cfurl_to_utf8_string(finalURL, effective_url_);
+            CFRelease(finalURL);
+        }
+    }
+    
     CFReadStreamClose(stream);
     CFRelease(stream);
     return 0;
@@ -195,6 +223,7 @@ int RangeDownloader::do_range_request(uint8_t* buffer, int64_t offset, int size)
     
     // 读取数据
     int total_read = 0;
+    bool captured_effective_url = false;
     while (total_read < size) {
         if (abort_request_.load()) {
             CFReadStreamClose(stream);
@@ -204,6 +233,14 @@ int RangeDownloader::do_range_request(uint8_t* buffer, int64_t offset, int size)
         
         CFIndex bytesRead = CFReadStreamRead(stream, buffer + total_read, size - total_read);
         if (bytesRead > 0) {
+            if (offset == 0 && !captured_effective_url) {
+                CFURLRef finalURL = (CFURLRef)CFReadStreamCopyProperty(stream, kCFStreamPropertyHTTPFinalURL);
+                if (finalURL) {
+                    cfurl_to_utf8_string(finalURL, effective_url_);
+                    CFRelease(finalURL);
+                }
+                captured_effective_url = true;
+            }
             total_read += (int)bytesRead;
         } else if (bytesRead == 0) {
             break;  // EOF
@@ -295,6 +332,23 @@ int RangeDownloader::fetch_http_headers() {
 
     support_range_ = true;
 
+    {
+        DWORD optLen = 0;
+        WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, nullptr, &optLen);
+        if (optLen >= sizeof(WCHAR)) {
+            std::vector<wchar_t> wbuf(optLen / sizeof(WCHAR));
+            DWORD optLen2 = optLen;
+            if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, wbuf.data(), &optLen2)) {
+                int n = WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), -1, nullptr, 0, nullptr, nullptr);
+                if (n > 1) {
+                    std::string u8(static_cast<size_t>(n - 1), '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), -1, &u8[0], n, nullptr, nullptr);
+                    effective_url_ = std::move(u8);
+                }
+            }
+        }
+    }
+
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
@@ -354,6 +408,23 @@ int RangeDownloader::do_range_request(uint8_t* buffer, int64_t offset, int size)
         return -1;
     }
 
+    if (offset == 0) {
+        DWORD optLen = 0;
+        WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, nullptr, &optLen);
+        if (optLen >= sizeof(WCHAR)) {
+            std::vector<wchar_t> wbuf(optLen / sizeof(WCHAR));
+            DWORD optLen2 = optLen;
+            if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, wbuf.data(), &optLen2)) {
+                int n = WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), -1, nullptr, 0, nullptr, nullptr);
+                if (n > 1) {
+                    std::string u8(static_cast<size_t>(n - 1), '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, wbuf.data(), -1, &u8[0], n, nullptr, nullptr);
+                    effective_url_ = std::move(u8);
+                }
+            }
+        }
+    }
+
     // 读取数据
     int total_read = 0;
     DWORD bytes_read = 0;
@@ -405,6 +476,11 @@ int RangeDownloader::fetch_http_headers() {
     CURLcode res = curl_easy_perform(curl);
 
     if (res == CURLE_OK) {
+        char* eff = nullptr;
+        curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff);
+        if (eff && eff[0]) {
+            effective_url_ = eff;
+        }
         double content_length;
         curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &content_length);
         content_length_ = static_cast<int64_t>(content_length);
@@ -447,6 +523,13 @@ int RangeDownloader::do_range_request(uint8_t* buffer, int64_t offset, int size)
     int bytes_read = -1;
 
     if (res == CURLE_OK) {
+        if (offset == 0) {
+            char* eff = nullptr;
+            curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff);
+            if (eff && eff[0]) {
+                effective_url_ = eff;
+            }
+        }
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
@@ -500,6 +583,7 @@ int RangeDownloader::read_range(uint8_t* buffer, int64_t offset, int size) {
 
 void RangeDownloader::close() {
     url_.clear();
+    effective_url_.clear();
     content_length_ = -1;
     support_range_ = false;
     total_downloaded_.store(0);

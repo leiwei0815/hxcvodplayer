@@ -149,6 +149,12 @@ public:
         return current_log_file_;
     }
     
+    /** 当前文件日志目录（未调用 enable_file_logging 时为空） */
+    std::string get_log_dir() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return log_dir_;
+    }
+    
     // 手动清理旧日志文件
     int cleanup_old_logs() {
         std::lock_guard<std::mutex> lock(mutex_);

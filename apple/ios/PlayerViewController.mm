@@ -211,29 +211,24 @@
 //        NSString *urlString = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
 //    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
 //    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/4ece4b555145403697569546683/v.f1440843.mp4";//h265
-    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
-//    NSString *urlString = @"https://f18c14f8-vod-tx-cdn-cskziwl-cn.tliveapp.com/1/47/mnt/g/file/20250930/b/o/u/c6ae79da0c546e0e/k43g4cz9f5c1sva3.m3u8";
-//    NSString *urlString = @"/path/to/nonexistent.mp4"; // 错误码: -1001, No such file or directory
+//    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
+//    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/34ab23701397757895318581301/v.f1440843.mp4";
+    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/3b5133951397757895318833144/v.f1440843.mp4"; // 错误码: -1001, No such file or directory
 //    NSString *urlString = @"https://example.com/nonexistent-video.mp4";
-#if 0
+#if 1
     // ✨ 选择数据源模式（推荐使用新接口）
-    HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeCustomHTTP;  // 或者 HXCPlayerDataSourceModeDefault
-    
-    // 配置参数（可选，不传则使用默认值）
-    HXCPlayerDataSourceConfig *config = [HXCPlayerDataSourceConfig defaultConfig];
-    config.timeoutMs = 30000;           // 30秒超时
-    config.maxRetries = 3;              // 最多重试3次
-    config.cacheSize = 2 * 1024 * 1024; // 2MB 缓存
-    config.avioBufferSize = 64 * 1024;  // 64KB AVIO 缓冲区
-    
+    HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeDefault;  // 或者 HXCPlayerDataSourceModeDefault
     NSLog(@"========================================");
     NSLog(@"🎬 打开视频");
     NSLog(@"   URL: %@", urlString);
     NSLog(@"   模式: %@", mode == HXCPlayerDataSourceModeDefault ? @"默认" : @"自定义HTTP");
     NSLog(@"========================================");
-    
+    HXCPlayerDataSourcePlayModel *model = [[HXCPlayerDataSourcePlayModel alloc] init];
+    model.url = urlString;
+    model.encryptedFile = NO;
+    model.mode = mode;
     // 使用统一接口打开（底层自动处理数据源创建）
-    BOOL success = [_player openURL:urlString withMode:mode config:config];
+    BOOL success = [_player openWithPlayModel:model];
 #else
     BOOL success = [_player openURL:urlString];
 #endif
@@ -385,7 +380,7 @@
         return;
     }
     [_player stop];
-    BOOL success = [_player prepareToPlay:fileURL.path];
+    BOOL success = [_player openURL:fileURL.path];
     if (success) {
         [_player play];
         [_playPauseButton setTitle:@"暂停" forState:UIControlStateNormal];

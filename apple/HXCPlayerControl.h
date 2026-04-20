@@ -15,82 +15,12 @@
 #import <AppKit/AppKit.h>
 #endif
 
+// 对外枚举/类型
+#import "HXCPlayerTypes.h"
+
 // 导入播放器视图
 #import "HXCPlayerView.h"
 @class HXCPlayerControl;
-
-// 日志等级，默认debug会记录所有日志，release模式下建议开启infoLevel
-typedef NS_ENUM(NSInteger, HXCPlayerLogLevel) {
-    HXCPlayerLogLevelDebug,
-    HXCPlayerLogLevelInfo,
-    HXCPlayerLogLevelWarning,
-    HXCPlayerLogLevelError
-};
-
-// 播放器状态
-typedef NS_ENUM(NSInteger, HXCPlayerState) {
-    HXCPlayerStateIdle = 0,      // 空闲
-    HXCPlayerStateOpening,       // 正在打开
-    HXCPlayerStateReady,         // 准备就绪
-    HXCPlayerStatePlaying,       // 播放中
-    HXCPlayerStatePaused,        // 暂停
-    HXCPlayerStateStopped,       // 停止
-    HXCPlayerStateError          // 错误
-};
-
-// 视频显示模式
-typedef NS_ENUM(NSInteger, HXCAspectRatioMode) {
-    HXCAspectRatioModeFit = 0,   // 适应（保持宽高比，黑边）
-    HXCAspectRatioModeFill       // 填充（裁剪）
-};
-
-// ⚠️ 播放器错误码定义（与 C++ 层 PlayerErrorCode 保持一致，全部使用负数）
-typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
-    // 自定义错误码（负数）
-    HXCPlayerErrorNone = 0,                             // 无错误
-    HXCPlayerErrorInvalidURL = -1001,                   // 无效的 URL
-    HXCPlayerErrorOpenInputFailed = -1002,              // 打开输入失败
-    HXCPlayerErrorFindStreamInfoFailed = -1003,         // 查找流信息失败
-    HXCPlayerErrorNoVideoStream = -1004,                // 没有视频流
-    HXCPlayerErrorNoAudioStream = -1005,                // 没有音频流
-    HXCPlayerErrorCodecNotFound = -1006,                // 找不到解码器
-    HXCPlayerErrorCodecOpenFailed = -1007,              // 打开解码器失败
-    HXCPlayerErrorAllocContextFailed = -1008,           // 分配上下文失败
-    HXCPlayerErrorSDLInitFailed = -1009,                // SDL 初始化失败
-    HXCPlayerErrorAudioDeviceOpenFailed = -1010,        // 音频设备打开失败
-    HXCPlayerErrorSeekFailed = -1011,                   // Seek 操作失败
-    HXCPlayerErrorReadFrameFailed = -1012,              // 读取帧失败
-    HXCPlayerErrorDecodeFailed = -1013,                 // 解码失败
-    HXCPlayerErrorOutOfMemory = -1014,                  // 内存不足
-    HXCPlayerErrorNotSupportPIPPlayer = -1015,          // 当前设备不支持画中画播放 (iOS特有)
-    HXCPlayerErrorAudioSessionConfigFail = -1016,       // 音频会话配置失败 (iOS特有)
-    HXCPlayerErrorInputInvalidData = -1018,             // 无效数据
-    HXCPlayerErrorNotSupport = -1019,                   // 不支持的格式或协议
-    HXCPlayerErrorUnknown = -1099,                      // 未知错误
-    
-    // 网络相关错误 (-2001 ~ -2999)
-    HXCPlayerErrorNetConnectionTimeout = -2001,         // 网络连接超时
-    HXCPlayerErrorNetConnectionRefused = -2002,         // 服务器拒绝连接
-    HXCPlayerErrorNetUnreachable = -2003,               // 网络不可达
-    
-    // HTTP 相关错误 (-3001 ~ -3999)
-    HXCPlayerErrorHTTPBadRequest = -3001,               // HTTP 请求错误（400）
-    HXCPlayerErrorHTTPNotFound = -3002,                 // HTTP 404 文件不存在
-    HXCPlayerErrorHTTPServerError = -3003,              // HTTP 服务器错误（5xx）
-    HXCPlayerErrorHTTPUnauthorized = -3004,             // 需要身份验证（401）
-    HXCPlayerErrorHTTPForbidden = -3005,                // 访问被禁止（403）
-    
-    // FFmpeg 错误码范围 (负数)
-    // 例如：AVERROR_EOF, AVERROR(ENOMEM), AVERROR(EINVAL) 等
-    // 可以通过 NSError.code 获取具体的 FFmpeg 错误码
-};
-
-// ⚠️ 数据源模式
-typedef NS_ENUM(NSInteger, HXCPlayerDataSourceMode) {
-    HXCPlayerDataSourceModeDefault = 0,      // 默认模式（FFmpeg 直接打开）
-    HXCPlayerDataSourceModeCustomHTTP = 1,   // 自定义 HTTP Range 下载器
-    HXCPlayerDataSourceModeCustomFile = 2,   // 本地文件自定义读取（支持加密文件头解密）
-};
 
 // ⚠️ 自定义数据源配置
 @interface HXCPlayerDataSourceConfig : NSObject
@@ -98,10 +28,37 @@ typedef NS_ENUM(NSInteger, HXCPlayerDataSourceMode) {
 @property (nonatomic, assign) NSInteger maxRetries;         // 最大重试次数，默认 3
 @property (nonatomic, assign) NSUInteger cacheSize;         // 缓存大小（字节），默认 2MB
 @property (nonatomic, assign) NSUInteger avioBufferSize;    // AVIO 缓冲区大小（字节），默认 64KB
-@property (nonatomic, assign) BOOL encryptedFile;           // 是否为加密文件（仅解密文件头前 100 字节）
 
 // 默认配置
 + (instancetype)defaultConfig;
+
+/// 在播放前调用一次，用你自己的全局默认值覆盖 `defaultConfig` 的字段。
+/// 之后每次播放只需要通过 `HXCPlayerDataSourcePlayModel` 传入 `url/mode/encryptedFile`。
++ (void)configureDefaultConfig:(HXCPlayerDataSourceConfig *)config;
+@end
+
+/// 视频模型
+@interface HXCPlayerVideo: NSObject
+/// 视频id
+@property (nonatomic, assign) int videoId;
+/// 签名
+@property (nonatomic, copy) NSString *sign;
+/// appid
+@property (nonatomic, assign) int appId;
+
+@end
+
+/// 对外的播放模型：统一把 `url + mode + encryptedFile` 收敛到一次传参里。
+@interface HXCPlayerDataSourcePlayModel : NSObject
+@property (nonatomic, copy) NSString *url;
+@property (nonatomic, assign) HXCPlayerDataSourceMode mode;
+@property (nonatomic, assign) BOOL encryptedFile;
+/// 通过fileid+appid+sign播放
+@property (nonatomic, strong) HXCPlayerVideo *video;
+
++ (instancetype)modelWithURL:(NSString *)url
+                         mode:(HXCPlayerDataSourceMode)mode
+                  encryptedFile:(BOOL)encryptedFile;
 @end
 
 // 播放器回调协议
@@ -127,22 +84,6 @@ typedef NS_ENUM(NSInteger, HXCPlayerDataSourceMode) {
 
 #if TARGET_OS_IOS
 
-/// 画中画状态
-typedef NS_ENUM(NSInteger, HXCPlayerPIPState) {
-    //未开始
-    HXCPlayerPIPStateNone = 0,
-    //即将开始
-    HXCPlayerPIPStateWillStart,
-    //已经开始
-    HXCPlayerPIPStateDidStart,
-    //即将停止
-    HXCPlayerPIPStateWillStop,
-    //已经停止
-    HXCPlayerPIPStateDidStop,
-    //已经恢复
-    HXCPlayerPIPStateRestore
-};
-
 // 画中画状态回调
 - (void)player:(HXCPlayerControl *)player pictureInPictureStateDidChange:(HXCPlayerPIPState)state;
 
@@ -159,6 +100,10 @@ typedef NS_ENUM(NSInteger, HXCPlayerPIPState) {
 
 /**
  * @brief Apple 平台统一播放器控制类
+ *
+ * License：若启用 `HXCPlayerLicenseManager` 的门禁（`setPlaybackLicenseGateEnabled:YES`），
+ * 需先成功执行 `checkLicenseWithLicenseKey:licenseURL:completionHandler:`（回调仅告知成功/失败），否则
+ * `openURL:` / `openWithPlayModel:` / `play` / `replay` / `seekToPosition:` / 画中画启动 等接口会失败并通过 delegate 返回 `HXCPlayerErrorLicenseValidationFailed`。
  * 
  * 支持 iOS 和 macOS 平台，使用系统原生的音视频渲染：
  * - 视频: AVSampleBufferDisplayLayer
@@ -189,10 +134,9 @@ typedef NS_ENUM(NSInteger, HXCPlayerPIPState) {
 
 // 播放控制
 - (BOOL)openURL:(NSString *)url;                      // 打开 URL（不自动播放）
-- (BOOL)prepareToPlay:(NSString *)url;                // 准备播放（等同于 openURL，不自动播放）
 
-// 使用指定数据源模式打开（推荐方式）
-- (BOOL)openURL:(NSString *)url withMode:(HXCPlayerDataSourceMode)mode config:(HXCPlayerDataSourceConfig *)config;
+/// 使用播放模型打开：内部自动构建 `HXCPlayerDataSourceConfig`（仅通过 `encryptedFile` 差异化）。
+- (BOOL)openWithPlayModel:(HXCPlayerDataSourcePlayModel *)model;
 
 - (void)play;                                          // 开始播放
 - (void)pause;                                         // 暂停
@@ -210,8 +154,20 @@ typedef NS_ENUM(NSInteger, HXCPlayerPIPState) {
 /// 设置日志等级 需要在播放之前设置
 +(void)setLogLevel:(HXCPlayerLogLevel)level;
 
-/// 设置日志存储路径，默认在document/HXCPlayerLogs。需要在播放之前设置
+/// 当前日志等级（与 `setLogLevel:` 枚举一致；未设置时与核心默认一致，一般为 Info）
++(HXCPlayerLogLevel)currentLogLevel;
+
+/// 当前文件日志目录（与 `setLogDir:` 一致；未启用文件日志时为空字符串）
++(NSString *)currentLogDirectory;
+
+/// 当前正在写入的日志文件完整路径（未轮转前；未启用文件日志时为空字符串）
++(NSString *)currentLogFilePath;
+
+/// 设置日志存储路径（会创建目录并启用文件日志）。若未调用，则在首个 `HXCPlayerControl` 初始化时使用默认路径 `Documents/HXCPlayerLogs`。
 +(void)setLogDir:(NSString *)dir;
+
+/// 关闭文件日志并刷新队列（全局单例）；通常在 App 退出或不再需要写文件时调用。不要在每个播放器 `dealloc` 里调用。
++(void)disableFileLogging;
 
 @end
 

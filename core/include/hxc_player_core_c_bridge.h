@@ -275,6 +275,9 @@ void player_core_set_loading_callback(PlayerCoreHandle* handle, LoadingCallbackC
 // 设置日志级别（0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR）
 void player_core_set_log_level(int level);
 
+// 获取当前日志级别（返回值与 set_log_level 一致）
+int player_core_get_log_level(void);
+
 // 启用文件日志
 // log_dir: 日志文件目录（如 "/tmp" 或 Android 的 getExternalFilesDir().getAbsolutePath()）
 // prefix: 日志文件前缀（默认 "hxcplayer"）
@@ -294,6 +297,19 @@ int player_core_cleanup_old_logs(void);
 
 // 获取当前日志文件路径
 const char* player_core_get_current_log_file(void);
+
+// 获取当前文件日志目录（未启用文件日志时返回空字符串）
+const char* player_core_get_log_directory(void);
+
+/**
+ * 写入与 core 内 LOG_DEBUG / LOG_INFO 等相同的 Logger（含文件异步队列）。
+ * @param level 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR（与 player_core_set_log_level 一致）
+ * @param file 源文件路径，可传 __FILE__
+ * @param line 行号，可传 __LINE__
+ * @param func 函数名，可传 __FUNCTION__ 或 __func__
+ * @param utf8_message UTF-8 文本，可为 NULL
+ */
+void player_core_log_line(int level, const char *file, int line, const char *func, const char *utf8_message);
 
 // ========== Windows SDK 内部辅助函数（不对外使用） ==========
 #ifdef _WIN32

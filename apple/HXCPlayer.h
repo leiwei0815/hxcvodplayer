@@ -16,5 +16,8 @@ FOUNDATION_EXPORT const unsigned char HXCPlayerVersionString[];
 
 // 导入所有公共头文件
 #import <HXCPlayer/HXCPlayerControl.h>
+#import <HXCPlayer/HXCPlayerTypes.h>
 #import <HXCPlayer/HXCPlayerView.h>
+#import <HXCPlayer/HXCPlayerLicenseManager.h>
+#import <HXCPlayer/HXCPlayerLog.h>
 #import <HXCPlayer/HXCVDownload.h>

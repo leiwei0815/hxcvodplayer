@@ -235,8 +235,12 @@ class MainActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
             .setPositiveButton(getString(R.string.ok)) { _, _ ->
                 val url = editText.text.toString()
                 if (url.isNotEmpty()) {
-                    player.openURL(url)
-                    player.openWithCustomHTTP(url);
+                    val playModel = HXCPlayerControl.PlayerDataSourcePlayModel.modelWithURL(
+                        url = url,
+                        mode = HXCPlayerControl.PlayerDataSourceMode.CUSTOM_HTTP,
+                        encryptedFile = false
+                    )
+                    player.openWithPlayModel(playModel)
                 }
             }
             .setNeutralButton("诊断") { _, _ ->

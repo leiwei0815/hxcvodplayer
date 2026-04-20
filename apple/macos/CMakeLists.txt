@@ -142,12 +142,17 @@ set(PLAYER_SOURCES
     ${PROJECT_ROOT}/apple/HXCPlayerControl.mm
     ${PROJECT_ROOT}/apple/HXCPlayerView.mm
     ${PROJECT_ROOT}/apple/HXCAESUtility.m
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseManager.m
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseCrypto.m
 )
 
 set(PLAYER_HEADERS
     ${PROJECT_ROOT}/apple/HXCPlayerControl.h
+    ${PROJECT_ROOT}/apple/HXCPlayerTypes.h
+    ${PROJECT_ROOT}/apple/HXCPlayerLog.h
     ${PROJECT_ROOT}/apple/HXCPlayerView.h
     ${PROJECT_ROOT}/apple/HXCAESUtility.h
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseManager.h
 )
 
 # macOS 应用源文件
@@ -191,6 +196,8 @@ set_source_files_properties(
 # HXCAESUtility.m 为纯 Objective-C
 set_source_files_properties(
     ${PROJECT_ROOT}/apple/HXCAESUtility.m
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseManager.m
+    ${PROJECT_ROOT}/apple/HXCPlayerLicenseCrypto.m
     PROPERTIES
     COMPILE_FLAGS "-x objective-c -fobjc-arc -Wno-deprecated-declarations"
 )

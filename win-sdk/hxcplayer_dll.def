@@ -36,12 +36,14 @@ EXPORTS
     
     ; 日志配置
     player_core_set_log_level
+    player_core_get_log_level
     player_core_enable_file_logging
     player_core_disable_file_logging
     player_core_set_max_log_file_size
     player_core_set_log_retention_days
     player_core_cleanup_old_logs
     player_core_get_current_log_file
+    player_core_get_log_directory
     
     ; SDK 工具函数
     hxcplayer_get_version

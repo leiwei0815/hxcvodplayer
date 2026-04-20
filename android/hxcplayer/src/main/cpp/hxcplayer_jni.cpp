@@ -226,6 +226,14 @@ Java_com_hxcplayer_HXCPlayerControl_setLogLevel(JNIEnv *env, jclass clazz, jint 
     player_core_set_log_level(level);
 }
 
+// 获取日志级别（0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR）
+JNIEXPORT jint JNICALL
+Java_com_hxcplayer_HXCPlayerControl_getLogLevel(JNIEnv *env, jclass clazz) {
+    jint level = static_cast<jint>(player_core_get_log_level());
+    LOGD("getLogLevel: %d", level);
+    return level;
+}
+
 // 设置日志保留天数
 JNIEXPORT void JNICALL
 Java_com_hxcplayer_HXCPlayerControl_setLogRetentionDays(JNIEnv *env, jclass clazz, jint days) {
@@ -237,8 +245,16 @@ Java_com_hxcplayer_HXCPlayerControl_setLogRetentionDays(JNIEnv *env, jclass claz
 JNIEXPORT jstring JNICALL
 Java_com_hxcplayer_HXCPlayerControl_getCurrentLogFile(JNIEnv *env, jclass clazz) {
     const char* logFile = player_core_get_current_log_file();
-    LOGD("getCurrentLogFile: %s", logFile);
-    return env->NewStringUTF(logFile);
+    LOGD("getCurrentLogFile: %s", logFile ? logFile : "");
+    return env->NewStringUTF(logFile ? logFile : "");
+}
+
+// 获取当前文件日志目录
+JNIEXPORT jstring JNICALL
+Java_com_hxcplayer_HXCPlayerControl_getLogDirectory(JNIEnv *env, jclass clazz) {
+    const char* dir = player_core_get_log_directory();
+    LOGD("getLogDirectory: %s", dir ? dir : "");
+    return env->NewStringUTF(dir ? dir : "");
 }
 
 // 使用自定义 HTTP 模式打开
