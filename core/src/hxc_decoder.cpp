@@ -54,6 +54,36 @@ int Decoder::init(AVCodecContext* codec_ctx, PacketQueue* packet_queue) {
 
 int Decoder::decode_frame(AVFrame* frame) {
     int ret;
+    auto convert_hw_frame_if_needed = [&](AVFrame* target_frame) -> int {
+        // 若为硬件帧，先转成软件帧，保持后续渲染链路（YUV 读取）兼容
+        // 注意：部分平台下 frame->format 可能不是 HWACCEL 标记格式，但 hw_frames_ctx 仍有效。
+        bool needs_hw_transfer = (target_frame->hw_frames_ctx != nullptr) ||
+                                 hxc_is_hwaccel_frame_format(static_cast<AVPixelFormat>(target_frame->format)) ||
+                                 (codec_ctx_ && codec_ctx_->hw_device_ctx != nullptr) ||
+                                 (target_frame->data[0] == nullptr);
+        if (!needs_hw_transfer) {
+            return 0;
+        }
+
+        AVFrame* sw_frame = av_frame_alloc();
+        if (!sw_frame) {
+            return AVERROR(ENOMEM);
+        }
+        int transfer_ret = av_hwframe_transfer_data(sw_frame, target_frame, 0);
+        if (transfer_ret < 0) {
+            av_frame_free(&sw_frame);
+            return transfer_ret;
+        }
+        transfer_ret = av_frame_copy_props(sw_frame, target_frame);
+        if (transfer_ret < 0) {
+            av_frame_free(&sw_frame);
+            return transfer_ret;
+        }
+        av_frame_unref(target_frame);
+        av_frame_move_ref(target_frame, sw_frame);
+        av_frame_free(&sw_frame);
+        return 0;
+    };
     
     // ⚠️ 检查有效性，防止崩溃
     if (!codec_ctx_ || !packet_queue_ || !pkt_) {
@@ -73,25 +103,9 @@ int Decoder::decode_frame(AVFrame* frame) {
         }
         
         if (ret == 0) {
-            // 若为硬件帧，先转成软件帧，保持后续渲染链路（YUV 读取）兼容
-            if (hxc_is_hwaccel_frame_format(static_cast<AVPixelFormat>(frame->format))) {
-                AVFrame* sw_frame = av_frame_alloc();
-                if (!sw_frame) {
-                    return AVERROR(ENOMEM);
-                }
-                int transfer_ret = av_hwframe_transfer_data(sw_frame, frame, 0);
-                if (transfer_ret < 0) {
-                    av_frame_free(&sw_frame);
-                    return transfer_ret;
-                }
-                transfer_ret = av_frame_copy_props(sw_frame, frame);
-                if (transfer_ret < 0) {
-                    av_frame_free(&sw_frame);
-                    return transfer_ret;
-                }
-                av_frame_unref(frame);
-                av_frame_move_ref(frame, sw_frame);
-                av_frame_free(&sw_frame);
+            int convert_ret = convert_hw_frame_if_needed(frame);
+            if (convert_ret < 0) {
+                return convert_ret;
             }
             // 成功获取一帧
             return 1;
@@ -167,6 +181,10 @@ int Decoder::decode_frame(AVFrame* frame) {
         }
         
         if (ret == 0) {
+            int convert_ret = convert_hw_frame_if_needed(frame);
+            if (convert_ret < 0) {
+                return convert_ret;
+            }
             return 1;
         } else if (ret == AVERROR(EAGAIN)) {
             continue;

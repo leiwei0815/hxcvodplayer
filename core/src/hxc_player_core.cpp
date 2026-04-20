@@ -62,43 +62,40 @@ static int hxc_calc_retry_delay_ms(int retry_count, int base_delay_ms, int max_d
 
 static enum AVHWDeviceType hxc_platform_hw_device_type() {
 #if defined(__ANDROID__)
-#ifdef AV_HWDEVICE_TYPE_MEDIACODEC
-    return AV_HWDEVICE_TYPE_MEDIACODEC;
-#else
-    return AV_HWDEVICE_TYPE_NONE;
-#endif
+    return av_hwdevice_find_type_by_name("mediacodec");
 #elif defined(__APPLE__)
-#ifdef AV_HWDEVICE_TYPE_VIDEOTOOLBOX
-    return AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-#else
-    return AV_HWDEVICE_TYPE_NONE;
-#endif
+    return av_hwdevice_find_type_by_name("videotoolbox");
 #else
     return AV_HWDEVICE_TYPE_NONE;
 #endif
 }
 
-static enum AVPixelFormat hxc_platform_hw_pixel_format() {
-#if defined(__ANDROID__)
-#ifdef AV_PIX_FMT_MEDIACODEC
-    return AV_PIX_FMT_MEDIACODEC;
-#else
+static enum AVPixelFormat hxc_find_hw_pix_fmt_for_codec(const AVCodec *codec, enum AVHWDeviceType device_type) {
+    if (!codec || device_type == AV_HWDEVICE_TYPE_NONE) {
+        return AV_PIX_FMT_NONE;
+    }
+    for (int i = 0;; i++) {
+        const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
+        if (!config) {
+            break;
+        }
+        if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+            config->device_type == device_type) {
+            return config->pix_fmt;
+        }
+    }
     return AV_PIX_FMT_NONE;
-#endif
-#elif defined(__APPLE__)
-#ifdef AV_PIX_FMT_VIDEOTOOLBOX
-    return AV_PIX_FMT_VIDEOTOOLBOX;
-#else
-    return AV_PIX_FMT_NONE;
-#endif
-#else
-    return AV_PIX_FMT_NONE;
-#endif
+}
+
+static enum AVPixelFormat hxc_find_hw_pix_fmt_from_codec_ctx(const AVCodecContext *ctx) {
+    if (!ctx || !ctx->codec) {
+        return AV_PIX_FMT_NONE;
+    }
+    return hxc_find_hw_pix_fmt_for_codec(ctx->codec, hxc_platform_hw_device_type());
 }
 
 static enum AVPixelFormat hxc_hw_get_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
-    (void)ctx;
-    enum AVPixelFormat hw_fmt = hxc_platform_hw_pixel_format();
+    enum AVPixelFormat hw_fmt = hxc_find_hw_pix_fmt_from_codec_ctx(ctx);
     for (const enum AVPixelFormat *p = pix_fmts; p && *p != AV_PIX_FMT_NONE; ++p) {
         if (*p == hw_fmt) {
             return *p;
@@ -109,20 +106,7 @@ static enum AVPixelFormat hxc_hw_get_format(AVCodecContext *ctx, const enum AVPi
 }
 
 static bool hxc_codec_supports_hw_device(const AVCodec *codec, enum AVHWDeviceType device_type) {
-    if (!codec || device_type == AV_HWDEVICE_TYPE_NONE) {
-        return false;
-    }
-    for (int i = 0;; i++) {
-        const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
-        if (!config) {
-            break;
-        }
-        if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
-            config->device_type == device_type) {
-            return true;
-        }
-    }
-    return false;
+    return hxc_find_hw_pix_fmt_for_codec(codec, device_type) != AV_PIX_FMT_NONE;
 }
 
 static bool hxc_try_enable_hw_decode(AVCodecContext *codec_ctx, const AVCodec *codec) {

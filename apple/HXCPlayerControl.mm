@@ -1100,6 +1100,9 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 }
 
 - (CVPixelBufferRef)createPixelBufferFromFrameData:(VideoFrameDataC *)frameData {
+    if (!frameData || !frameData->y_data || frameData->width <= 0 || frameData->height <= 0) {
+        return NULL;
+    }
     NSDictionary *options = @{
         (NSString *)kCVPixelBufferCGImageCompatibilityKey: @YES,
         (NSString *)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
@@ -1124,9 +1127,11 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     uint8_t *yPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0);
     size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
     uint8_t *ySrc = (uint8_t *)frameData->y_data;
+    int ySrcStride = frameData->y_linesize > 0 ? frameData->y_linesize : frameData->width;
     
     for (int i = 0; i < frameData->height; i++) {
-        memcpy(yPlane + i * yStride, ySrc + i * frameData->y_linesize, frameData->width);
+        size_t copyBytes = (size_t)MIN(frameData->width, ySrcStride);
+        memcpy(yPlane + i * yStride, ySrc + i * ySrcStride, copyBytes);
     }
     
     // UV 平面（NV12 交织）
@@ -1134,14 +1139,27 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     size_t uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
     uint8_t *uSrc = (uint8_t *)frameData->u_data;
     uint8_t *vSrc = (uint8_t *)frameData->v_data;
+    int uSrcStride = frameData->u_linesize > 0 ? frameData->u_linesize : frameData->width;
+    int vSrcStride = frameData->v_linesize > 0 ? frameData->v_linesize : (frameData->width / 2);
     
     int uvHeight = frameData->height / 2;
     int uvWidth = frameData->width / 2;
-    
-    for (int i = 0; i < uvHeight; i++) {
-        for (int j = 0; j < uvWidth; j++) {
-            uvPlane[i * uvStride + j * 2] = uSrc[i * frameData->u_linesize + j];
-            uvPlane[i * uvStride + j * 2 + 1] = vSrc[i * frameData->v_linesize + j];
+
+    if (uSrc) {
+        if (!vSrc || frameData->v_linesize <= 0) {
+            // NV12：u_data 即 UV 交织平面，直接按行拷贝 width 字节
+            for (int i = 0; i < uvHeight; i++) {
+                size_t copyBytes = (size_t)MIN(frameData->width, uSrcStride);
+                memcpy(uvPlane + i * uvStride, uSrc + i * uSrcStride, copyBytes);
+            }
+        } else {
+            // YUV420P：U/V 分离平面，手动交织成 NV12
+            for (int i = 0; i < uvHeight; i++) {
+                for (int j = 0; j < uvWidth; j++) {
+                    uvPlane[i * uvStride + j * 2] = uSrc[i * uSrcStride + j];
+                    uvPlane[i * uvStride + j * 2 + 1] = vSrc[i * vSrcStride + j];
+                }
+            }
         }
     }
     
