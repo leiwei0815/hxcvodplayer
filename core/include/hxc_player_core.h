@@ -137,6 +137,7 @@ public:
     const MediaInfo& get_media_info() const { return media_info_; }
     double get_position() const;    // 当前播放位置（秒）
     double get_duration() const;    // 总时长（秒）
+    bool is_video_hardware_decoding() const { return video_hw_decode_active_.load(std::memory_order_acquire); }
     
     // 获取帧队列（用于渲染）
     FrameQueue<VideoFrame>* get_video_queue() { return video_queue_.get(); }
@@ -285,6 +286,7 @@ private:
     std::atomic<bool> seeking_;  // ⚠️ 标识正在 seek，暂停进度回调
     std::atomic<double> seek_target_pos_;  // ⚠️ seek 的目标位置，在 seek 期间返回此值
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
+    std::atomic<bool> video_hw_decode_active_{false}; // 当前视频流是否在硬解
     bool playback_completed_notified_;  // ⚠️ 是否已通知播放完成（避免重复通知）
     
 #ifndef NO_SDL

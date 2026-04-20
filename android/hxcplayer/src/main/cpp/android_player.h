@@ -63,6 +63,7 @@ public:
     double getPosition() const;
     int getState() const;
     bool isLoading() const;
+    bool isHardwareDecodingActive() const;
     bool consumeLastError(int& error_code, std::string& error_message);
     
 private:

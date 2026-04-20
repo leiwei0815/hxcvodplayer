@@ -205,6 +205,17 @@ Java_com_hxcplayer_HXCPlayerControl_nativeIsLoading(
     return JNI_FALSE;
 }
 
+// 当前是否启用硬解（1=硬解，0=软解或未知）
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeIsHardwareDecodingActive(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        return player->isHardwareDecodingActive() ? JNI_TRUE : JNI_FALSE;
+    }
+    return JNI_FALSE;
+}
+
 // 消费一次播放中错误（有错误返回 message；无错误返回 null）
 JNIEXPORT jstring JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeConsumeLastError(

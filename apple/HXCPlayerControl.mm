@@ -78,12 +78,23 @@ static void loading_callback_c(bool is_loading, void* user_data);
     double _duration;
     double _position;
     NSString *_playerUrl;
+    HXCPlayerDataSourcePlayModel *_lastOpenPlayModel;
     HXCAspectRatioMode _aspectRatioMode;
     int _videoWidth;
     int _videoHeight;
     
     // 进度更新回调限流
     CFTimeInterval _lastPositionUpdateTime;
+
+    // 弱网恢复与 QoE
+    BOOL _autoReopenOnRecoverableErrorEnabled;
+    NSInteger _autoReopenMaxAttempts;
+    NSInteger _autoReopenAttemptCount;
+    BOOL _autoReopenInFlight;
+    BOOL _networkLoading;
+    CFTimeInterval _networkLoadingBeginTime;
+    NSInteger _networkTotalStallMs;
+    NSInteger _networkReconnectCount;
 }
 
 #if TARGET_OS_IOS
@@ -108,6 +119,11 @@ static void loading_callback_c(bool is_loading, void* user_data);
 
 + (void)hxc_applyDefaultFileLoggingIfNeeded;
 + (BOOL)hxc_installFileLoggingAtPath:(NSString *)dir error:(NSError *__autoreleasing *)outError;
+
+- (BOOL)hxc_isRecoverableErrorCode:(NSInteger)errorCode;
+- (void)hxc_tryAutoReopenForErrorCode:(NSInteger)errorCode;
+- (void)hxc_onLoadingStateChanged:(BOOL)isLoading;
+- (void)hxc_notifyNetworkQoEWithCurrentStallMs:(NSInteger)currentStallMs;
 
 #if TARGET_OS_IOS
 - (void)hxc_registerAppLifecycleNotifications;
@@ -143,6 +159,7 @@ static void error_callback_c(int error_code, const char* error_msg, void* user_d
     NSString* errorStr = error_msg ? [NSString stringWithUTF8String:error_msg] : @"Unknown error";
 
     dispatch_async(dispatch_get_main_queue(), ^{
+        [self hxc_tryAutoReopenForErrorCode:error_code];
         if ([self.delegate respondsToSelector:@selector(player:didFailWithError:)]) {
             NSError* nsError = [NSError errorWithDomain:@"HXCPlayerErrorDomain"
                                                    code:error_code
@@ -187,6 +204,7 @@ static void loading_callback_c(bool is_loading, void* user_data) {
     HXCPlayerControl* self = (__bridge HXCPlayerControl*)user_data;
     
     dispatch_async(dispatch_get_main_queue(), ^{
+        [self hxc_onLoadingStateChanged:is_loading];
         if ([self.delegate respondsToSelector:@selector(player:didChangeLoadingState:)]) {
             [self.delegate player:self didChangeLoadingState:is_loading];
         }
@@ -287,6 +305,14 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
         _aspectRatioMode = HXCAspectRatioModeFit;
         _audioQueueRunning = NO;
         _lastPositionUpdateTime = 0;
+        _autoReopenOnRecoverableErrorEnabled = NO;
+        _autoReopenMaxAttempts = 1;
+        _autoReopenAttemptCount = 0;
+        _autoReopenInFlight = NO;
+        _networkLoading = NO;
+        _networkLoadingBeginTime = 0;
+        _networkTotalStallMs = 0;
+        _networkReconnectCount = 0;
         
         // ========== 设置播放器回调 ==========
         player_core_set_state_changed_callback(_wrapper->handle(), state_changed_callback_c, (__bridge void*)self);
@@ -385,6 +411,12 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
     }
     [self stop];
     _playerUrl = [url copy];
+    _lastOpenPlayModel = nil;
+    if (!_autoReopenInFlight) {
+        _autoReopenAttemptCount = 0;
+        _networkTotalStallMs = 0;
+        _networkReconnectCount = 0;
+    }
     int ret;
     if (_startPosition > 0) {
         ret = player_core_open_with_start_position(_wrapper->handle(), url.UTF8String, _startPosition);
@@ -434,6 +466,12 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
     }
     [self stop];
     _playerUrl = [model.url copy];
+    _lastOpenPlayModel = [HXCPlayerDataSourcePlayModel modelWithURL:model.url mode:model.mode encryptedFile:model.encryptedFile];
+    if (!_autoReopenInFlight) {
+        _autoReopenAttemptCount = 0;
+        _networkTotalStallMs = 0;
+        _networkReconnectCount = 0;
+    }
 
     PlayerDataSourceConfigC cConfig;
     cConfig.timeout_ms = (int)config.timeoutMs;
@@ -593,6 +631,9 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
     _playerUrl = nil;
     _videoWidth = 0;
     _videoHeight = 0;
+    _networkLoading = NO;
+    _networkLoadingBeginTime = 0;
+    _autoReopenInFlight = NO;
 #if TARGET_OS_IOS
     if (previousState != HXCPlayerStateIdle) {
         [self invalidatePictureInPicturePlaybackStateIfNeeded];
@@ -600,8 +641,100 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
 #endif
 }
 
+- (BOOL)isHardwareDecodingActive {
+    if (!_wrapper || !_wrapper->handle()) {
+        return NO;
+    }
+    return player_core_is_video_hardware_decoding(_wrapper->handle()) != 0;
+}
+
 
 #pragma mark - private method
+
+- (BOOL)hxc_isRecoverableErrorCode:(NSInteger)errorCode {
+    switch (errorCode) {
+        case HXCPlayerErrorOpenInputFailed:
+        case HXCPlayerErrorReadFrameFailed:
+        case HXCPlayerErrorDecodeFailed:
+        case -2001: // PLAYER_ERROR_NET_CONNECTION_TIMEOUT
+        case -2002: // PLAYER_ERROR_NET_CONNECTION_REFUSED
+        case -2003: // PLAYER_ERROR_NET_UNREACHABLE
+        case -3003: // PLAYER_ERROR_HTTP_SERVER_ERROR
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+- (void)hxc_notifyNetworkQoEWithCurrentStallMs:(NSInteger)currentStallMs {
+    if ([self.delegate respondsToSelector:@selector(player:didUpdateNetworkQoEWithCurrentStallMs:totalStallMs:reconnectCount:)]) {
+        [self.delegate player:self
+didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
+                  totalStallMs:_networkTotalStallMs
+                reconnectCount:_networkReconnectCount];
+    }
+}
+
+- (void)hxc_onLoadingStateChanged:(BOOL)isLoading {
+    CFTimeInterval now = CACurrentMediaTime();
+    if (isLoading && !_networkLoading) {
+        _networkLoading = YES;
+        _networkLoadingBeginTime = now;
+        [self hxc_notifyNetworkQoEWithCurrentStallMs:0];
+        return;
+    }
+    if (!isLoading && _networkLoading) {
+        NSInteger stallMs = (NSInteger)((now - _networkLoadingBeginTime) * 1000.0);
+        if (stallMs < 0) stallMs = 0;
+        _networkTotalStallMs += stallMs;
+        _networkLoading = NO;
+        _networkLoadingBeginTime = 0;
+        [self hxc_notifyNetworkQoEWithCurrentStallMs:stallMs];
+    }
+}
+
+- (void)hxc_tryAutoReopenForErrorCode:(NSInteger)errorCode {
+    if (!_autoReopenOnRecoverableErrorEnabled) {
+        return;
+    }
+    if (_autoReopenInFlight) {
+        return;
+    }
+    if (![self hxc_isRecoverableErrorCode:errorCode]) {
+        return;
+    }
+    NSInteger maxAttempts = MAX(0, _autoReopenMaxAttempts);
+    if (_autoReopenAttemptCount >= maxAttempts) {
+        return;
+    }
+    if (!_playerUrl.length) {
+        return;
+    }
+
+    _autoReopenInFlight = YES;
+    _autoReopenAttemptCount += 1;
+    _networkReconnectCount += 1;
+    [self hxc_notifyNetworkQoEWithCurrentStallMs:0];
+
+    HXCPlayerDataSourcePlayModel *retryModel = nil;
+    if (_lastOpenPlayModel) {
+        retryModel = [HXCPlayerDataSourcePlayModel modelWithURL:_lastOpenPlayModel.url
+                                                           mode:_lastOpenPlayModel.mode
+                                                  encryptedFile:_lastOpenPlayModel.encryptedFile];
+    }
+    NSString *retryURL = [_playerUrl copy];
+    double retryStartPosition = _position > 0 ? _position : _startPosition;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        self->_startPosition = retryStartPosition;
+        BOOL ok = retryModel ? [self openWithPlayModel:retryModel] : [self openURL:retryURL];
+        if (ok) {
+            [self play];
+        }
+        self->_autoReopenInFlight = NO;
+    });
+}
 
 -(void)playerPositionChange:(double)position {
     self->_position = position;

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <vector>
+#include <chrono>
 
 // 平台相关的 HTTP 实现
 #if defined(__APPLE__)
@@ -569,9 +570,14 @@ int RangeDownloader::read_range(uint8_t* buffer, int64_t offset, int size) {
         }
         
         if (retry_count < max_retries_) {
-            LOG_WARNING("Range 请求失败，重试 ", retry_count + 1, "/", max_retries_);
+            int backoff_ms = std::min(4000, 300 * (1 << std::min(retry_count, 4)));
+            LOG_WARNING("Range 请求失败，重试 ", retry_count + 1, "/", max_retries_,
+                        "，退避 ", backoff_ms, " ms");
             retry_count++;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+            if (abort_request_.load()) {
+                return AVERROR_EXIT;
+            }
         } else {
             LOG_ERROR("Range 请求失败，已达到最大重试次数");
             return result;

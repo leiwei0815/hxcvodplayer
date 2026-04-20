@@ -82,6 +82,15 @@
 // 网络加载状态通知（isLoading: YES=加载中，NO=加载完成）
 - (void)player:(HXCPlayerControl *)player didChangeLoadingState:(BOOL)isLoading;
 
+/// 弱网 QoE 指标回调：
+/// - currentStallMs: 当前这次 loading 的持续时长（毫秒，结束时为本次总时长）
+/// - totalStallMs:   本次播放会话累计卡顿时长（毫秒）
+/// - reconnectCount: 已触发的自动恢复次数（仅统计 SDK 内部自动恢复）
+- (void)player:(HXCPlayerControl *)player
+didUpdateNetworkQoEWithCurrentStallMs:(NSInteger)currentStallMs
+  totalStallMs:(NSInteger)totalStallMs
+reconnectCount:(NSInteger)reconnectCount;
+
 #if TARGET_OS_IOS
 
 // 画中画状态回调
@@ -122,7 +131,14 @@
 @property (nonatomic, readonly) HXCPlayerState state;
 @property (nonatomic, readonly) double duration;
 @property (nonatomic, readonly) double position;
+@property (nonatomic, readonly) BOOL isHardwareDecodingActive; // 当前视频是否使用硬解（失败回退软解后为 NO）
 @property (nonatomic, strong, readonly) HXCPlayerView *videoView;  // 视频视图（自动管理布局）
+
+/// 是否启用“可恢复错误后自动重开一次”（默认 NO）
+@property (nonatomic, assign) BOOL autoReopenOnRecoverableErrorEnabled;
+
+/// 自动重开最大次数（默认 1，最小 0）
+@property (nonatomic, assign) NSInteger autoReopenMaxAttempts;
 
 #if TARGET_OS_IOS
 // 画中画相关属性（仅 iOS）

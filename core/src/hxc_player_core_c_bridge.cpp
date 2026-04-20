@@ -250,6 +250,11 @@ double player_core_get_position(PlayerCoreHandle* handle) {
     return handle->core->get_position();
 }
 
+int player_core_is_video_hardware_decoding(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return 0;
+    return handle->core->is_video_hardware_decoding() ? 1 : 0;
+}
+
 void player_core_seek(PlayerCoreHandle* handle, double pos) {
     if (handle && handle->core) {
         handle->core->seek(pos);

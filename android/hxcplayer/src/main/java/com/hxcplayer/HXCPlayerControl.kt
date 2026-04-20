@@ -252,6 +252,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         fun onPlayerErrorWithRecoverability(errorCode: Int, errorMessage: String, recoverable: Boolean) {}
         // 网络抖动/缓冲中状态变化（默认空实现，兼容旧代码）
         fun onPlayerLoadingChanged(isLoading: Boolean) {}
+        // 弱网 QoE 指标：当前卡顿时长/累计卡顿时长/自动恢复次数
+        fun onNetworkQoEUpdated(currentStallMs: Long, totalStallMs: Long, reconnectCount: Int) {}
     }
 
     private var nativeHandle: Long = 0
@@ -266,6 +268,16 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val loadingHideDebounceMs = 150L
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
+    private var autoReopenOnRecoverableErrorEnabled: Boolean = false
+    private var autoReopenMaxAttempts: Int = 1
+    private var autoReopenAttemptCount: Int = 0
+    private var autoReopenInFlight: Boolean = false
+    private var networkLoadingSinceMs: Long = 0L
+    private var networkTotalStallMs: Long = 0L
+    private var networkReconnectCount: Int = 0
+    private var lastOpenUrl: String? = null
+    private var lastOpenStartPosition: Double = 0.0
+    private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
 
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
     private var textureDecoderSurface: Surface? = null
@@ -289,6 +301,27 @@ class HXCPlayerControl @JvmOverloads constructor(
     // 设置回调
     fun setCallback(callback: PlayerCallback) {
         this.callback = callback
+    }
+
+    /**
+     * 配置“可恢复错误后自动重开”能力（默认关闭）。
+     */
+    fun configureWeakNetworkRecovery(enabled: Boolean, maxAttempts: Int = 1) {
+        autoReopenOnRecoverableErrorEnabled = enabled
+        autoReopenMaxAttempts = maxAttempts.coerceAtLeast(0)
+    }
+
+    private fun clonePlayModel(model: PlayerDataSourcePlayModel): PlayerDataSourcePlayModel {
+        return PlayerDataSourcePlayModel().apply {
+            url = model.url
+            mode = model.mode
+            encryptedFile = model.encryptedFile
+            video = model.video
+        }
+    }
+
+    private fun notifyNetworkQoE(currentStallMs: Long) {
+        callback?.onNetworkQoEUpdated(currentStallMs, networkTotalStallMs, networkReconnectCount)
     }
 
     private fun currentHandle(): Long {
@@ -328,8 +361,42 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     private fun dispatchError(errorCode: Int, errorMessage: String) {
         val recoverable = isRecoverableErrorCode(errorCode)
+        maybeAutoReopen(errorCode, recoverable)
         callback?.onPlayerError(errorCode, errorMessage)
         callback?.onPlayerErrorWithRecoverability(errorCode, errorMessage, recoverable)
+    }
+
+    private fun maybeAutoReopen(errorCode: Int, recoverable: Boolean) {
+        if (!recoverable) return
+        if (!autoReopenOnRecoverableErrorEnabled) return
+        if (autoReopenInFlight) return
+        if (autoReopenAttemptCount >= autoReopenMaxAttempts) return
+
+        val retryModel = lastOpenPlayModel?.let { clonePlayModel(it) }
+        val retryUrl = lastOpenUrl
+        if (retryModel == null && retryUrl.isNullOrBlank()) return
+
+        autoReopenInFlight = true
+        autoReopenAttemptCount += 1
+        networkReconnectCount += 1
+        notifyNetworkQoE(0L)
+
+        val retryStart = getPosition().takeIf { it > 0.0 } ?: lastOpenStartPosition
+        mainHandler.postDelayed({
+            if (isReleased) {
+                autoReopenInFlight = false
+                return@postDelayed
+            }
+            val ok = if (retryModel != null) {
+                openWithPlayModel(retryModel)
+            } else {
+                openURL(retryUrl!!, retryStart)
+            }
+            if (ok) {
+                play()
+            }
+            autoReopenInFlight = false
+        }, 300L)
     }
 
     private fun createRenderView(): View {
@@ -448,6 +515,14 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("openURL")) {
             return false
         }
+        lastOpenUrl = url
+        lastOpenStartPosition = startPosition
+        lastOpenPlayModel = null
+        if (!autoReopenInFlight) {
+            autoReopenAttemptCount = 0
+            networkTotalStallMs = 0L
+            networkReconnectCount = 0
+        }
         val result = if (startPosition > 0.0) {
             nativeOpenURLWithStartPosition(handle, url, startPosition)
         } else {
@@ -475,6 +550,14 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         // 先通知进入 opening 状态，便于上层显示 loading
         callback?.onPlayerStateChanged(PlayerState.OPENING)
+        lastOpenUrl = url
+        lastOpenStartPosition = startPosition
+        lastOpenPlayModel = null
+        if (!autoReopenInFlight) {
+            autoReopenAttemptCount = 0
+            networkTotalStallMs = 0L
+            networkReconnectCount = 0
+        }
         try {
             openExecutor.execute {
                 val handle = currentHandle()
@@ -517,6 +600,14 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         if (!licenseAllowedOrNotify("openWithPlayModel")) {
             return false
+        }
+        lastOpenUrl = model.url
+        lastOpenStartPosition = 0.0
+        lastOpenPlayModel = clonePlayModel(model)
+        if (!autoReopenInFlight) {
+            autoReopenAttemptCount = 0
+            networkTotalStallMs = 0L
+            networkReconnectCount = 0
         }
         val result = when (model.mode) {
             PlayerDataSourceMode.DEFAULT -> {
@@ -626,6 +717,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         nativeStop(handle)
+        networkLoadingSinceMs = 0L
         callback?.onPlayerStateChanged(PlayerState.STOPPED)
     }
 
@@ -682,6 +774,15 @@ class HXCPlayerControl @JvmOverloads constructor(
         return PlayerState.values().getOrElse(state) { PlayerState.IDLE }
     }
 
+    /**
+     * 当前视频是否处于硬解状态（硬解失败回退软解后返回 false）。
+     */
+    fun isHardwareDecodingActive(): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return false
+        return nativeIsHardwareDecodingActive(handle)
+    }
+
     // 启动位置更新定时器
     private fun startPositionUpdates() {
         updateExecutor = Executors.newSingleThreadScheduledExecutor()
@@ -709,6 +810,20 @@ class HXCPlayerControl @JvmOverloads constructor(
                         lastLoadingState = loading
                         mainHandler.post {
                             callback?.onPlayerLoadingChanged(loading)
+                            if (loading) {
+                                networkLoadingSinceMs = SystemClock.elapsedRealtime()
+                                notifyNetworkQoE(0L)
+                            } else {
+                                val nowMs = SystemClock.elapsedRealtime()
+                                val currentStall = if (networkLoadingSinceMs > 0L) {
+                                    (nowMs - networkLoadingSinceMs).coerceAtLeast(0L)
+                                } else {
+                                    0L
+                                }
+                                networkLoadingSinceMs = 0L
+                                networkTotalStallMs += currentStall
+                                notifyNetworkQoE(currentStall)
+                            }
                         }
                     }
                 }
@@ -758,6 +873,14 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastLoadingState = null
         loadingCandidateState = null
         loadingCandidateSinceMs = 0L
+        networkLoadingSinceMs = 0L
+        networkTotalStallMs = 0L
+        networkReconnectCount = 0
+        autoReopenAttemptCount = 0
+        autoReopenInFlight = false
+        lastOpenUrl = null
+        lastOpenPlayModel = null
+        lastOpenStartPosition = 0.0
     }
 
     // Native 方法声明
@@ -780,6 +903,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeGetPosition(handle: Long): Double
     private external fun nativeGetState(handle: Long): Int
     private external fun nativeIsLoading(handle: Long): Boolean
+    private external fun nativeIsHardwareDecodingActive(handle: Long): Boolean
     private external fun nativeConsumeLastError(handle: Long, outCode: IntArray): String?
 
     // 获取当前是否处于加载中（可用于主动查询 UI 状态）

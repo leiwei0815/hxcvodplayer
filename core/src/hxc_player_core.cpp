@@ -15,6 +15,7 @@
 extern "C" {
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
+#include <libavutil/hwcontext.h>
 #include <libavformat/avformat.h>
 }
 
@@ -31,6 +32,128 @@ extern "C" {
 #endif
 
 namespace hxcplayer {
+
+namespace {
+
+static bool hxc_is_http_client_error(int ret) {
+    return ret == AVERROR_HTTP_BAD_REQUEST ||
+           ret == AVERROR_HTTP_NOT_FOUND ||
+           ret == AVERROR_HTTP_UNAUTHORIZED ||
+           ret == AVERROR_HTTP_FORBIDDEN;
+}
+
+static bool hxc_is_retryable_network_error(int ret) {
+    return ret == AVERROR(ETIMEDOUT) ||
+           ret == AVERROR(ECONNREFUSED) ||
+           ret == AVERROR(ENETUNREACH) ||
+           ret == AVERROR(EIO) ||
+           ret == AVERROR(EAGAIN) ||
+           ret == AVERROR_HTTP_SERVER_ERROR;
+}
+
+static int hxc_calc_retry_delay_ms(int retry_count, int base_delay_ms, int max_delay_ms) {
+    if (retry_count <= 0) {
+        return base_delay_ms;
+    }
+    int capped_power = retry_count > 6 ? 6 : retry_count;
+    int candidate = base_delay_ms << capped_power;
+    return std::min(candidate, max_delay_ms);
+}
+
+static enum AVHWDeviceType hxc_platform_hw_device_type() {
+#if defined(__ANDROID__)
+#ifdef AV_HWDEVICE_TYPE_MEDIACODEC
+    return AV_HWDEVICE_TYPE_MEDIACODEC;
+#else
+    return AV_HWDEVICE_TYPE_NONE;
+#endif
+#elif defined(__APPLE__)
+#ifdef AV_HWDEVICE_TYPE_VIDEOTOOLBOX
+    return AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+#else
+    return AV_HWDEVICE_TYPE_NONE;
+#endif
+#else
+    return AV_HWDEVICE_TYPE_NONE;
+#endif
+}
+
+static enum AVPixelFormat hxc_platform_hw_pixel_format() {
+#if defined(__ANDROID__)
+#ifdef AV_PIX_FMT_MEDIACODEC
+    return AV_PIX_FMT_MEDIACODEC;
+#else
+    return AV_PIX_FMT_NONE;
+#endif
+#elif defined(__APPLE__)
+#ifdef AV_PIX_FMT_VIDEOTOOLBOX
+    return AV_PIX_FMT_VIDEOTOOLBOX;
+#else
+    return AV_PIX_FMT_NONE;
+#endif
+#else
+    return AV_PIX_FMT_NONE;
+#endif
+}
+
+static enum AVPixelFormat hxc_hw_get_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+    (void)ctx;
+    enum AVPixelFormat hw_fmt = hxc_platform_hw_pixel_format();
+    for (const enum AVPixelFormat *p = pix_fmts; p && *p != AV_PIX_FMT_NONE; ++p) {
+        if (*p == hw_fmt) {
+            return *p;
+        }
+    }
+    LOG_WARNING("硬解像素格式不可用，回退到解码器首选软解格式");
+    return pix_fmts ? pix_fmts[0] : AV_PIX_FMT_NONE;
+}
+
+static bool hxc_codec_supports_hw_device(const AVCodec *codec, enum AVHWDeviceType device_type) {
+    if (!codec || device_type == AV_HWDEVICE_TYPE_NONE) {
+        return false;
+    }
+    for (int i = 0;; i++) {
+        const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
+        if (!config) {
+            break;
+        }
+        if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+            config->device_type == device_type) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool hxc_try_enable_hw_decode(AVCodecContext *codec_ctx, const AVCodec *codec) {
+    if (!codec_ctx || !codec) {
+        return false;
+    }
+    enum AVHWDeviceType device_type = hxc_platform_hw_device_type();
+    if (device_type == AV_HWDEVICE_TYPE_NONE) {
+        return false;
+    }
+    if (!hxc_codec_supports_hw_device(codec, device_type)) {
+        return false;
+    }
+
+    AVBufferRef *hw_device_ctx = nullptr;
+    int ret = av_hwdevice_ctx_create(&hw_device_ctx, device_type, nullptr, nullptr, 0);
+    if (ret < 0 || !hw_device_ctx) {
+        LOG_WARNING("创建硬件解码设备失败，回退软解 ret=", ret);
+        return false;
+    }
+    codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+    av_buffer_unref(&hw_device_ctx);
+    if (!codec_ctx->hw_device_ctx) {
+        LOG_WARNING("硬件解码设备引用失败，回退软解");
+        return false;
+    }
+    codec_ctx->get_format = hxc_hw_get_format;
+    return true;
+}
+
+}  // namespace
 
 PlayerCore::PlayerCore()
     : state_(PlayerState::Idle)
@@ -157,6 +280,7 @@ int PlayerCore::open(const std::string& filename) {
     // ⚠️ 重置终止标志（重要！否则之前 close() 设置的 true 会导致新线程立即退出）
     abort_request_ = false;
     decode_finished_ = false;  // ⚠️ 重置解码结束标志
+    video_hw_decode_active_.store(false, std::memory_order_release);
     playback_completed_notified_ = false;  // ⚠️ 重置播放完成通知标志
 
     set_state(PlayerState::Opening);
@@ -263,7 +387,8 @@ int PlayerCore::open(const std::string& filename) {
 #else
     const int MAX_RETRY_COUNT = 3;          // 最大重试次数（总尝试 4 次）
 #endif
-    const int RETRY_DELAY_MS = 1000;        // 重试间隔（毫秒）
+    const int RETRY_DELAY_MS = 500;         // 重试基础间隔（毫秒）
+    const int RETRY_DELAY_MAX_MS = 3000;    // 重试最大间隔（毫秒）
     int retry_count = 0;
     int ret = -1;
     
@@ -272,8 +397,10 @@ int PlayerCore::open(const std::string& filename) {
         if (retry_count > 0) {
             LOG_WARNING("正在重试打开文件... (第 ", retry_count, "/", MAX_RETRY_COUNT, " 次)");
             
-            // 重试前等待一段时间
-            PLAYER_DELAY(RETRY_DELAY_MS);
+            // 重试前等待一段时间（指数退避，避免弱网时高频请求）
+            int delay_ms = hxc_calc_retry_delay_ms(retry_count - 1, RETRY_DELAY_MS, RETRY_DELAY_MAX_MS);
+            LOG_INFO("打开重试退避等待: ", delay_ms, " ms");
+            PLAYER_DELAY(delay_ms);
             
             // 检查是否被中止
             if (abort_request_.load()) {
@@ -331,22 +458,17 @@ int PlayerCore::open(const std::string& filename) {
         std::string error_category = "未知错误";
         
         // 网络相关错误应该重试
-        if (ret == AVERROR(ETIMEDOUT) ||        // 超时
-            ret == AVERROR(ECONNREFUSED) ||     // 连接被拒绝
-            ret == AVERROR(ENETUNREACH) ||      // 网络不可达
-            ret == AVERROR(EIO) ||              // I/O 错误
-            ret == AVERROR(EAGAIN)) {           // 资源暂时不可用
+        if (hxc_is_retryable_network_error(ret)) {
             should_retry = true;
             error_category = "网络错误";
             LOG_INFO("检测到网络错误，将进行重试");
         }
         
-        // 服务器错误可能需要重试
-        if (ret == AVERROR_HTTP_BAD_REQUEST ||
-            ret == AVERROR_HTTP_SERVER_ERROR) {
-            should_retry = true;
-            error_category = "服务器错误";
-            LOG_INFO("检测到服务器错误，将进行重试");
+        // HTTP 4xx 通常为请求或鉴权问题，不建议重试
+        if (hxc_is_http_client_error(ret)) {
+            should_retry = false;
+            error_category = "客户端请求错误";
+            LOG_ERROR("检测到不可恢复 HTTP 4xx，停止重试");
         }
         
         // 某些错误不应该重试 - 立即回调并退出
@@ -648,7 +770,8 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
                 
                 // 2. 配置下载器参数
                 auto* downloader = dataSource->get_downloader();
-                downloader->set_timeout(config.timeout_ms / 1000); // 转换为秒
+                // RangeDownloader 的 timeout 单位就是毫秒，直接透传。
+                downloader->set_timeout(config.timeout_ms);
                 downloader->set_max_retries(config.max_retries);
                 dataSource->set_cache_size(config.cache_size);
                 dataSource->set_encrypted_file(config.encrypted_file);
@@ -1282,12 +1405,41 @@ void PlayerCore::read_thread() {
                 continue;
             }
             
+            int io_error = 0;
             if (format_ctx_->pb && format_ctx_->pb->error) {
-                LOG_ERROR("读取线程：IO 错误，退出");
-                emit_error(PLAYER_ERROR_READ_FRAME_FAILED, "读取数据包失败：IO 错误");
+                io_error = format_ctx_->pb->error;
+            }
+            int effective_ret = (ret != 0) ? ret : io_error;
+
+            bool retryable_error = hxc_is_retryable_network_error(effective_ret);
+            bool non_retryable_error = (effective_ret == AVERROR(ENOENT) ||
+                                        effective_ret == AVERROR(EACCES) ||
+                                        effective_ret == AVERROR_INVALIDDATA ||
+                                        effective_ret == AVERROR_PATCHWELCOME ||
+                                        hxc_is_http_client_error(effective_ret));
+
+            if (non_retryable_error) {
+                char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+                av_strerror(effective_ret, errbuf, sizeof(errbuf));
+                LOG_ERROR("读取线程：检测到不可恢复错误，停止读取。ret=", effective_ret, ", err=", errbuf);
+
+                if (effective_ret == AVERROR_HTTP_NOT_FOUND || effective_ret == AVERROR(ENOENT)) {
+                    emit_error(ERROR_HTTP_NOT_FOUND, "读取失败：资源不存在或已失效");
+                } else if (effective_ret == AVERROR_HTTP_FORBIDDEN || effective_ret == AVERROR(EACCES)) {
+                    emit_error(ERROR_HTTP_FORBIDDEN, "读取失败：访问被拒绝");
+                } else if (effective_ret == AVERROR_HTTP_UNAUTHORIZED) {
+                    emit_error(ERROR_HTTP_UNAUTHORIZED, "读取失败：鉴权失效");
+                } else if (effective_ret == AVERROR_HTTP_BAD_REQUEST) {
+                    emit_error(ERROR_HTTP_BAD_REQUEST, "读取失败：请求参数非法");
+                } else if (effective_ret == AVERROR_INVALIDDATA) {
+                    emit_error(ERROR_INPUT_INVALID_DATA, "读取失败：输入数据无效");
+                } else {
+                    emit_error(ERROR_READ_FRAME_FAILED, std::string("读取失败：") + errbuf);
+                }
+                set_state(PlayerState::Error);
                 break;
             }
-            
+
             // 读取失败（通常是弱网/暂时断流），进入加载状态。
             if (loading_callback_) {
                 loading_callback_(true);  // 开始加载
@@ -1299,31 +1451,36 @@ void PlayerCore::read_thread() {
             read_error_count++;
 
             // 周期性打印失败详情，便于线上定位具体错误码
-            if (read_error_count == 1 || read_error_count % 100 == 0) {
+            if (read_error_count == 1 || read_error_count % 20 == 0) {
                 char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
-                av_strerror(ret, errbuf, sizeof(errbuf));
+                av_strerror(effective_ret, errbuf, sizeof(errbuf));
                 auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - read_error_begin).count();
-                LOG_WARNING("读取线程：av_read_frame 连续失败，ret=", ret,
+                LOG_WARNING("读取线程：av_read_frame 连续失败，ret=", effective_ret,
                             ", err=", errbuf,
                             ", 连续失败次数=", read_error_count,
-                            ", 卡顿时长=", stall_ms, " ms");
+                            ", 卡顿时长=", stall_ms, " ms",
+                            ", 是否可重试=", retryable_error ? "是" : "未知按可重试");
             }
 
-            // 防止无限卡死：连续读取失败超过阈值，主动上报并退出。
-            // 业务层可据此触发切源/重试，而不是无止境“卡住”。
-            const int MAX_STALL_MS = 15000;  // 15 秒
+            // 网络类错误给更长恢复窗口；未知错误维持较短窗口，避免无限挂起。
+            const int MAX_STALL_MS_RETRYABLE = 30000;      // 可重试错误最多等 30 秒
+            const int MAX_STALL_MS_NON_CLASSIFIED = 15000; // 其它错误最多等 15 秒
+            const int MAX_STALL_MS = retryable_error ? MAX_STALL_MS_RETRYABLE : MAX_STALL_MS_NON_CLASSIFIED;
             auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - read_error_begin).count();
             if (stall_ms >= MAX_STALL_MS) {
-                LOG_ERROR("读取线程：连续读取失败超时，判定为卡死，退出。stall_ms=", stall_ms);
+                LOG_ERROR("读取线程：连续读取失败超时，退出。stall_ms=", stall_ms,
+                          ", threshold=", MAX_STALL_MS);
                 emit_error(ERROR_NET_CONNECTION_TIMEOUT,
-                           "网络读取超时（连续读取失败超过 15 秒），建议重试或切换线路");
+                           "网络读取超时（连续读取失败），建议重试或切换线路");
                 set_state(PlayerState::Error);
                 break;
             }
-            
-            PLAYER_DELAY(10);
+
+            // 指数退避，避免弱网场景忙等抢占 CPU；首次快速重试，后续逐步拉长。
+            int retry_delay_ms = hxc_calc_retry_delay_ms(read_error_count - 1, 10, 800);
+            PLAYER_DELAY(retry_delay_ms);
             continue;
         }
 
@@ -1376,23 +1533,48 @@ int PlayerCore::stream_component_open(int stream_index) {
         return -1;
     }
     
+    auto alloc_codec_context = [&]() -> AVCodecContext* {
+        AVCodecContext* ctx = avcodec_alloc_context3(codec);
+        if (!ctx) {
+            return nullptr;
+        }
+        if (avcodec_parameters_to_context(ctx, codecpar) < 0) {
+            avcodec_free_context(&ctx);
+            return nullptr;
+        }
+        return ctx;
+    };
+
     // 创建解码器上下文
-    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+    AVCodecContext* codec_ctx = alloc_codec_context();
     if (!codec_ctx) {
         emit_error(ERROR_ALLOC_CONTEXT_FAILED, "创建解码器上下文失败");
-        LOG_ERROR("创建解码器上下文失败 codecID:", codec->id, " codecName:", codec->long_name);
+        LOG_ERROR("创建或初始化解码器上下文失败 codecID:", codec->id, " codecName:", codec->long_name);
         return -1;
     }
-    
-    if (avcodec_parameters_to_context(codec_ctx, codecpar) < 0) {
-        LOG_ERROR("初始化解码器上下文参数失败 codecID:", codec->id, " codecName:", codec->long_name);
+
+    bool hw_decode_enabled = false;
+    if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        hw_decode_enabled = hxc_try_enable_hw_decode(codec_ctx, codec);
+        LOG_INFO("视频解码模式尝试结果: ", hw_decode_enabled ? "硬解优先" : "软解");
+    }
+
+    // 打开解码器（若硬解打开失败，自动回退软解）
+    int open_ret = avcodec_open2(codec_ctx, codec, nullptr);
+    if (open_ret < 0 && hw_decode_enabled) {
+        LOG_WARNING("硬解打开失败，自动回退软解。ret=", open_ret);
         avcodec_free_context(&codec_ctx);
-        return -1;
+        codec_ctx = alloc_codec_context();
+        if (!codec_ctx) {
+            emit_error(ERROR_ALLOC_CONTEXT_FAILED, "硬解回退软解时创建解码器失败");
+            LOG_ERROR("硬解回退软解失败：无法重新创建解码器上下文");
+            return -1;
+        }
+        open_ret = avcodec_open2(codec_ctx, codec, nullptr);
+        hw_decode_enabled = false;
     }
-    
-    // 打开解码器
-    if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
-        LOG_ERROR("打开解码器失败~");
+    if (open_ret < 0) {
+        LOG_ERROR("打开解码器失败~ ret=", open_ret);
         emit_error(ERROR_CODEC_OPEN_FAILED, "打开解码器失败");
         avcodec_free_context(&codec_ctx);
         return -1;
@@ -1400,6 +1582,8 @@ int PlayerCore::stream_component_open(int stream_index) {
     
     if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
         video_codec_ctx_ = codec_ctx;
+        video_hw_decode_active_.store(hw_decode_enabled, std::memory_order_release);
+        LOG_INFO("视频解码最终模式: ", hw_decode_enabled ? "硬解" : "软解");
         
         LOG_INFO("创建视频解码器...");
         video_decoder_ = std::make_unique<VideoDecoder>();
@@ -1508,6 +1692,7 @@ void PlayerCore::stream_component_close(int stream_index) {
         }
         video_stream_opened_ = false;
         video_stream_ = -1;
+        video_hw_decode_active_.store(false, std::memory_order_release);
         
     } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
 #ifndef NO_SDL

@@ -106,6 +106,7 @@ void player_core_stop(PlayerCoreHandle* handle);
 PlayerStateC player_core_get_state(PlayerCoreHandle* handle);
 double player_core_get_duration(PlayerCoreHandle* handle);
 double player_core_get_position(PlayerCoreHandle* handle);
+int player_core_is_video_hardware_decoding(PlayerCoreHandle* handle); // 1=硬解, 0=软解/未知
 
 // 控制
 void player_core_seek(PlayerCoreHandle* handle, double pos);

@@ -392,6 +392,11 @@ bool AndroidPlayer::isLoading() const {
     return is_loading_.load(std::memory_order_acquire);
 }
 
+bool AndroidPlayer::isHardwareDecodingActive() const {
+    if (!player_core_) return false;
+    return player_core_is_video_hardware_decoding(player_core_) != 0;
+}
+
 void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
     auto* player = static_cast<AndroidPlayer*>(user_data);
     if (!player) {

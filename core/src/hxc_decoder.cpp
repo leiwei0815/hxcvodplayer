@@ -8,9 +8,18 @@
 
 extern "C" {
 #include <libavutil/time.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/pixdesc.h>
 }
 
 namespace hxcplayer {
+
+namespace {
+static bool hxc_is_hwaccel_frame_format(AVPixelFormat fmt) {
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(fmt);
+    return desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL);
+}
+}
 
 Decoder::Decoder()
     : codec_ctx_(nullptr)
@@ -64,6 +73,26 @@ int Decoder::decode_frame(AVFrame* frame) {
         }
         
         if (ret == 0) {
+            // 若为硬件帧，先转成软件帧，保持后续渲染链路（YUV 读取）兼容
+            if (hxc_is_hwaccel_frame_format(static_cast<AVPixelFormat>(frame->format))) {
+                AVFrame* sw_frame = av_frame_alloc();
+                if (!sw_frame) {
+                    return AVERROR(ENOMEM);
+                }
+                int transfer_ret = av_hwframe_transfer_data(sw_frame, frame, 0);
+                if (transfer_ret < 0) {
+                    av_frame_free(&sw_frame);
+                    return transfer_ret;
+                }
+                transfer_ret = av_frame_copy_props(sw_frame, frame);
+                if (transfer_ret < 0) {
+                    av_frame_free(&sw_frame);
+                    return transfer_ret;
+                }
+                av_frame_unref(frame);
+                av_frame_move_ref(frame, sw_frame);
+                av_frame_free(&sw_frame);
+            }
             // 成功获取一帧
             return 1;
         } else if (ret == AVERROR(EAGAIN)) {
