@@ -1125,7 +1125,13 @@ void PlayerCore::close() {
     set_io_loading(false);
     
     LOG_INFO("播放器已关闭");
-    set_state(PlayerState::Idle);
+    // 若由 stop() 触发 close，则外层应只感知一次 Stopped 回调；
+    // 此处仅静默回落到 Idle，避免再触发一次 didChangeState(Idle)。
+    if (get_state() == PlayerState::Stopped) {
+        state_.store(PlayerState::Idle, std::memory_order_release);
+    } else {
+        set_state(PlayerState::Idle);
+    }
 }
 
 void PlayerCore::play() {
@@ -1185,8 +1191,13 @@ void PlayerCore::pause() {
 }
 
 void PlayerCore::stop() {
-    close();
+    PlayerState current = get_state();
+    if (current == PlayerState::Idle || current == PlayerState::Stopped) {
+        return;
+    }
+    // 先对外发布停止态，再执行资源回收；close() 内会静默落回 Idle。
     set_state(PlayerState::Stopped);
+    close();
 }
 
 void PlayerCore::seek(double pos) {
@@ -1323,6 +1334,25 @@ void PlayerCore::read_thread() {
                     LOG_INFO("视频时钟已更新到 seek 位置: ", target_pos);
                 }
                 external_clock_.set_clock(target_pos, 0);
+
+#ifndef NO_SDL
+                // 清理音频输出侧残留，避免 seek 后短暂回放到旧时钟位置。
+                if (audio_dev_) {
+                    SDL_LockAudioDevice(audio_dev_);
+                }
+                audio_buf_index_ = 0;
+                audio_buf_size_ = 0;
+                audio_current_pts_ = target_pos;
+                audio_current_pts_drift_ = audio_current_pts_ - av_gettime_relative() / 1000000.0;
+#ifdef HAS_SOUNDTOUCH
+                if (soundtouch_) {
+                    soundtouch_->clear();
+                }
+#endif
+                if (audio_dev_) {
+                    SDL_UnlockAudioDevice(audio_dev_);
+                }
+#endif
                 
                 // ⚠️ 6. 【关键修复】立即触发一次进度回调，通知 UI 新位置
                 if (position_changed_callback_) {
@@ -1804,15 +1834,22 @@ void PlayerCore::video_thread() {
             continue;
         }
         
-        // ⚠️ 【关键修复】如果是 seek 后的第一帧，清除 seeking 标志
-        if (seeking_.load(std::memory_order_acquire)) {
-            seeking_.store(false, std::memory_order_release);
-            LOG_INFO("视频线程：检测到 seek 后首帧，清除 seeking 标志，恢复进度回调");
-            set_seek_loading(false);
-        }
-        
         // 计算帧时间戳
         pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(format_ctx_->streams[video_stream_]->time_base);
+        if (seeking_.load(std::memory_order_acquire) && !isnan(pts)) {
+            // 无音频流时，使用视频首帧判断 seek 完成，避免 seeking 状态卡住。
+            bool use_video_as_seek_anchor = (audio_stream_ < 0 || !audio_stream_opened_);
+            if (use_video_as_seek_anchor) {
+                double target = seek_target_pos_.load(std::memory_order_acquire);
+                bool in_seek_window = (pts >= (target - 30.0) && pts <= (target + 5.0));
+                if (in_seek_window) {
+                    seeking_.store(false, std::memory_order_release);
+                    set_seek_loading(false);
+                    LOG_INFO("视频线程：检测到 seek 后有效首帧，结束 seeking。target=",
+                             target, ", pts=", pts);
+                }
+            }
+        }
         
         // 计算帧持续时间
         duration = av_q2d(format_ctx_->streams[video_stream_]->time_base);
@@ -1838,6 +1875,7 @@ void PlayerCore::video_thread() {
         vf->duration = duration;
         vf->width = frame->width;
         vf->height = frame->height;
+        vf->serial = video_packet_queue_ ? video_packet_queue_->get_serial() : 0;
         
         // 推入队列
         video_queue_->push();
@@ -1982,13 +2020,6 @@ void PlayerCore::audio_thread() {
         // 解码成功，重置错误计数
         error_count = 0;
         
-        // ⚠️ 【关键修复】如果是 seek 后的第一帧，清除 seeking 标志
-        if (seeking_.load(std::memory_order_acquire)) {
-            seeking_.store(false, std::memory_order_release);
-            // LOG_INFO("音频线程：检测到 seek 后首帧，清除 seeking 标志，恢复进度回调");
-            set_seek_loading(false);
-        }
-        
         frame_count++;
 //        if (frame_count == 1 || frame_count % 100 == 0) {
 //            LOG_INFO("已解码 ", frame_count, " 个音频帧");
@@ -2002,6 +2033,17 @@ void PlayerCore::audio_thread() {
         // 计算时间戳
         double pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : 
                      frame->pts * av_q2d(format_ctx_->streams[audio_stream_]->time_base);
+        if (seeking_.load(std::memory_order_acquire) && !isnan(pts)) {
+            // 默认 AudioMaster：以音频首个有效帧作为 seek 完成锚点。
+            double target = seek_target_pos_.load(std::memory_order_acquire);
+            bool in_seek_window = (pts >= (target - 30.0) && pts <= (target + 5.0));
+            if (in_seek_window) {
+                seeking_.store(false, std::memory_order_release);
+                set_seek_loading(false);
+                LOG_INFO("音频线程：检测到 seek 后有效首帧，结束 seeking。target=",
+                         target, ", pts=", pts);
+            }
+        }
         
         // ⚠️ 注意：不要在这里更新音频时钟！
         // 音频时钟应该在 audio_callback_impl 中，音频数据真正被消费时更新
@@ -2030,6 +2072,7 @@ void PlayerCore::audio_thread() {
             continue;
         }
         af->pts = pts;
+        af->serial = audio_packet_queue_ ? audio_packet_queue_->get_serial() : 0;
         
         // 推入队列
         audio_queue_->push();

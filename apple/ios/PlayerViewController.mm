@@ -7,6 +7,9 @@
 #import "../HXCPlayerControl.h"  // 使用统一的播放器类
 #import "../HXCVDownload/HXCVDownload.h"
 #import "HXCVDownloadViewController.h"
+#import "../HXCPlayerLicenseManager.h"
+#define HXCVOD_LICENSE_URL @"https://console-api.huaxiacloud.net/license/getMobileLicense/111453136245362688"
+#define HXCVOD_LICENSE_KEY @"JNlhoUFDoLeDwNJEcoCS4GxAWk3Z2b8K"
 //com.nuoshan.app
 
 @interface PlayerViewController () <HXCPlayerControlDelegate>
@@ -45,10 +48,18 @@
     _player.delegate = self;
     
     [self setupUI];
-    // 自动播放测试视频
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self openTestVideo];
-    });
+    
+    [HXCPlayerLicenseManager checkLicenseWithLicenseKey:HXCVOD_LICENSE_KEY licenseURL:HXCVOD_LICENSE_URL completionHandler:^(BOOL success, NSError * _Nullable error) {
+        if (error) {
+            NSLog(@"license check faild...");
+            return;
+        }
+        // 自动播放测试视频
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self openTestVideo];
+        });
+    }];
+    
 }
 
 - (void)setupUI {
@@ -209,11 +220,11 @@
 - (void)openTestVideo {
     // 测试网络视频
 //        NSString *urlString = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
-//    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
+    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
 //    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/4ece4b555145403697569546683/v.f1440843.mp4";//h265
 //    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
 //    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/34ab23701397757895318581301/v.f1440843.mp4";
-    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/3b5133951397757895318833144/v.f1440843.mp4"; // 错误码: -1001, No such file or directory
+//    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/3b5133951397757895318833144/v.f1440843.mp4"; // 错误码: -1001, No such file or directory
 //    NSString *urlString = @"https://example.com/nonexistent-video.mp4";
 #if 1
     // ✨ 选择数据源模式（推荐使用新接口）
@@ -228,13 +239,12 @@
     model.encryptedFile = NO;
     model.mode = mode;
     // 使用统一接口打开（底层自动处理数据源创建）
-    BOOL success = [_player openWithPlayModel:model];
+    BOOL success = [_player playWithModel:model];
 #else
-    BOOL success = [_player openURL:urlString];
+    BOOL success = [_player playURL:urlString];
 #endif
     if (success) {
         NSLog(@"✅ 视频打开成功");
-        [_player play];
     } else {
         NSLog(@"❌ 视频打开失败");
     }
@@ -380,9 +390,8 @@
         return;
     }
     [_player stop];
-    BOOL success = [_player openURL:fileURL.path];
+    BOOL success = [_player playURL:fileURL.path];
     if (success) {
-        [_player play];
         [_playPauseButton setTitle:@"暂停" forState:UIControlStateNormal];
     } else {
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"打开失败"
@@ -434,7 +443,7 @@
     }
     
     double duration = player.duration;
-    
+//    NSLog(@"didUpdatePosition: %f", position);
     if (duration > 0) {
         _progressSlider.value = (position / duration) * 1000;
         _timeLabel.text = [NSString stringWithFormat:@"%@ / %@",
@@ -450,6 +459,14 @@
 }
 
 #pragma mark - Picture in Picture Delegate
+
+-(void)player:(HXCPlayerControl *)player didChangeLoadingState:(BOOL)isLoading {
+    if (isLoading) {
+        NSLog(@"正在加载中");
+    } else {
+        NSLog(@"加载完成");
+    }
+}
 
 -(void)player:(HXCPlayerControl *)player pictureInPictureStateDidChange:(HXCPlayerPIPState)state {
     switch (state) {

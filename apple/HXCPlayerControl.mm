@@ -95,6 +95,12 @@ static void loading_callback_c(bool is_loading, void* user_data);
     CFTimeInterval _networkLoadingBeginTime;
     NSInteger _networkTotalStallMs;
     NSInteger _networkReconnectCount;
+    int64_t _renderGeneration;      // 渲染代数：用于丢弃 seek/stop 前的异步入队任务
+    double _lastEnqueuedVideoPTS;   // 上次入队到 displayLayer 的 PTS
+    BOOL _hasRenderedFirstVideoFrame;
+    BOOL _deferAudioStartUntilFirstVideoFrame;
+    int64_t _audioStartGeneration;
+    BOOL _firstFrameBootstrapActive;
 }
 
 #if TARGET_OS_IOS
@@ -301,6 +307,25 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
     }
 }
 
+static HXCPlayerState hxc_to_objc_state(PlayerStateC state) {
+    switch (state) {
+        case PLAYER_STATE_IDLE:
+            return HXCPlayerStateIdle;
+        case PLAYER_STATE_OPENING:
+            return HXCPlayerStateOpening;
+        case PLAYER_STATE_PLAYING:
+            return HXCPlayerStatePlaying;
+        case PLAYER_STATE_PAUSED:
+            return HXCPlayerStatePaused;
+        case PLAYER_STATE_STOPPED:
+            return HXCPlayerStateStopped;
+        case PLAYER_STATE_ERROR:
+            return HXCPlayerStateError;
+        default:
+            return HXCPlayerStateIdle;
+    }
+}
+
 - (instancetype)init {
     self = [super init];
     if (self) {
@@ -314,6 +339,7 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
         _startPosition = 0.0;
         _aspectRatioMode = HXCAspectRatioModeFit;
         _decodeMode = HXCPlayerDecodeModeSoftware;
+        _autoPlayer = YES;
         _audioQueueRunning = NO;
         _lastPositionUpdateTime = 0;
         _autoReopenOnRecoverableErrorEnabled = NO;
@@ -324,6 +350,12 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
         _networkLoadingBeginTime = 0;
         _networkTotalStallMs = 0;
         _networkReconnectCount = 0;
+        _renderGeneration = 1;
+        _lastEnqueuedVideoPTS = NAN;
+        _hasRenderedFirstVideoFrame = NO;
+        _deferAudioStartUntilFirstVideoFrame = NO;
+        _audioStartGeneration = 1;
+        _firstFrameBootstrapActive = NO;
         
         // ========== 设置播放器回调 ==========
         player_core_set_state_changed_callback(_wrapper->handle(), state_changed_callback_c, (__bridge void*)self);
@@ -413,11 +445,11 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
     return NO;
 }
 
-- (BOOL)openURL:(NSString *)url {
+- (BOOL)playURL:(NSString *)url {
     if (!url || url.length == 0) {
         return NO;
     }
-    if (![self hxc_licenseAllowedOrNotifyForAction:@"openURL"]) {
+    if (![self hxc_licenseAllowedOrNotifyForAction:@"playURL"]) {
         return NO;
     }
     [self stop];
@@ -447,6 +479,9 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
     _videoHeight = player_core_get_video_height(_wrapper->handle());
     
     [self setupAudioQueue:sampleRate channels:channels];
+    _hasRenderedFirstVideoFrame = NO;
+    _deferAudioStartUntilFirstVideoFrame = NO;
+    _firstFrameBootstrapActive = YES;
 
     // 如果设置了起始播放位置，更新 controlTimebase
     if (_startPosition > 0) {
@@ -459,15 +494,23 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
 
     // 启动视频渲染定时器
     [self startDisplayLink];
+    // 主动拉一次渲染，减少等待下一帧 display tick 的首帧延迟。
+    [self renderVideoFrame];
+
+    if (self.autoPlayer) {
+        [self play];
+    } else {
+        [self pause];
+    }
 
     return YES;
 }
 
-- (BOOL)openWithPlayModel:(HXCPlayerDataSourcePlayModel *)model {
+- (BOOL)playWithModel:(HXCPlayerDataSourcePlayModel *)model {
     if (!model || model.url.length == 0) {
         return NO;
     }
-    if (![self hxc_licenseAllowedOrNotifyForAction:@"openWithPlayModel"]) {
+    if (![self hxc_licenseAllowedOrNotifyForAction:@"playWithModel"]) {
         return NO;
     }
     HXCPlayerDataSourceConfig *config = hxc_build_effective_data_source_config();
@@ -528,6 +571,9 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
     NSLog(@"   音频: %d Hz, %d 通道", sampleRate, channels);
 
     [self setupAudioQueue:sampleRate channels:channels];
+    _hasRenderedFirstVideoFrame = NO;
+    _deferAudioStartUntilFirstVideoFrame = NO;
+    _firstFrameBootstrapActive = YES;
 
     if (_startPosition > 0) {
         if (_videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
@@ -538,51 +584,56 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
     }
 
     [self startDisplayLink];
+    // 主动拉一次渲染，减少等待下一帧 display tick 的首帧延迟。
+    [self renderVideoFrame];
+    if (self.autoPlayer) {
+        [self play];
+    } else {
+        [self pause];
+    }
     return YES;
 }
-
 
 - (void)play {
     if (![self hxc_licenseAllowedOrNotifyForAction:@"play"]) {
         return;
     }
     if (!_playerUrl && _state == HXCPlayerStateIdle) {
-        NSLog(@"警告: 请先调用 openURL:");
+        NSLog(@"警告: 请先调用 playURL:");
         return;
     }
-    HXCPlayerState previousState = _state;
     player_core_play(_wrapper->handle());
     if (_audioQueue && !_audioQueueRunning) {
-        AudioQueueStart(_audioQueue, NULL);
-        _audioQueueRunning = YES;
-    }
-    // 立即与底层一致，避免画中画依赖异步 state 回调时读到旧状态
-    _state = HXCPlayerStatePlaying;
-    if (previousState != HXCPlayerStatePlaying) {
-        if ([_delegate respondsToSelector:@selector(player:didChangeState:)]) {
-            [_delegate player:self didChangeState:_state];
+        // 首帧优先：有视频轨时优先等待首帧，避免出现“先听到声音还没画面”。
+        if (!_hasRenderedFirstVideoFrame && _videoWidth > 0 && _videoHeight > 0) {
+            _deferAudioStartUntilFirstVideoFrame = YES;
+            _firstFrameBootstrapActive = YES;
+            _audioStartGeneration += 1;
+            int64_t generation = _audioStartGeneration;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)),
+                           dispatch_get_main_queue(), ^{
+                if (generation != self->_audioStartGeneration) return;
+                if (!self->_audioQueue || self->_audioQueueRunning) return;
+                if (!self->_deferAudioStartUntilFirstVideoFrame) return;
+                // 超时兜底：若首帧仍未到，先起音频避免长时间静音。
+                AudioQueueStart(self->_audioQueue, NULL);
+                self->_audioQueueRunning = YES;
+                self->_deferAudioStartUntilFirstVideoFrame = NO;
+                self->_firstFrameBootstrapActive = NO;
+            });
+        } else {
+            AudioQueueStart(_audioQueue, NULL);
+            _audioQueueRunning = YES;
+            _firstFrameBootstrapActive = NO;
         }
-#if TARGET_OS_IOS
-        [self invalidatePictureInPicturePlaybackStateIfNeeded];
-#endif
     }
 }
 
 - (void)pause {
-    HXCPlayerState previousState = _state;
     player_core_pause(_wrapper->handle());
     if (_audioQueue && _audioQueueRunning) {
         AudioQueuePause(_audioQueue);
         _audioQueueRunning = NO;
-    }
-    _state = HXCPlayerStatePaused;
-    if (previousState != HXCPlayerStatePaused) {
-        if ([_delegate respondsToSelector:@selector(player:didChangeState:)]) {
-            [_delegate player:self didChangeState:_state];
-        }
-#if TARGET_OS_IOS
-        [self invalidatePictureInPicturePlaybackStateIfNeeded];
-#endif
     }
 }
 
@@ -597,10 +648,12 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
     }
 
     NSString *url = [_playerUrl copy];
-    if (![self openURL:url]) {
+    if (![self playURL:url]) {
         return;
     }
-    [self play];
+    if (!self.autoPlayer) {
+        [self play];
+    }
 }
 
 - (void)seekToPosition:(double)position {
@@ -608,15 +661,19 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
         return;
     }
     player_core_seek(_wrapper->handle(), position);
+    _renderGeneration++;
+    _lastEnqueuedVideoPTS = NAN;
     
     // iOS 和 macOS 都需要更新 controlTimebase
     if (_videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
+        // seek 时优先保画面：先做轻量 flush，不主动移除当前已显示帧。
+        [_videoView.videoLayer flush];
         CMTime newTime = CMTimeMake(position * 1000000, 1000000);
         CMTimebaseSetTime(_videoView.videoLayer.controlTimebase, newTime);
         
         // 确保 timebase 在运行
         if (CMTimebaseGetRate(_videoView.videoLayer.controlTimebase) == 0.0) {
-            CMTimebaseSetRate(_videoView.videoLayer.controlTimebase, 1.0);
+            CMTimebaseSetRate(_videoView.videoLayer.controlTimebase, _playbackRate > 0 ? _playbackRate : 1.0);
         }
         
         NSLog(@"[Seek] 更新 controlTimebase 到: %.2f 秒", position);
@@ -632,6 +689,8 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
         player_core_stop(_wrapper->handle());
     }
 
+    _renderGeneration++;
+    _lastEnqueuedVideoPTS = NAN;
     [_videoView.videoLayer flushAndRemoveImage];
 #if TARGET_OS_IOS
     [self hxc_clearLastRenderedSampleBuffer];
@@ -647,6 +706,10 @@ static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
     _networkLoading = NO;
     _networkLoadingBeginTime = 0;
     _autoReopenInFlight = NO;
+    _hasRenderedFirstVideoFrame = NO;
+    _deferAudioStartUntilFirstVideoFrame = NO;
+    _audioStartGeneration += 1;
+    _firstFrameBootstrapActive = NO;
 #if TARGET_OS_IOS
     if (previousState != HXCPlayerStateIdle) {
         [self invalidatePictureInPicturePlaybackStateIfNeeded];
@@ -741,7 +804,7 @@ didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)),
                    dispatch_get_main_queue(), ^{
         self->_startPosition = retryStartPosition;
-        BOOL ok = retryModel ? [self openWithPlayModel:retryModel] : [self openURL:retryURL];
+        BOOL ok = retryModel ? [self playWithModel:retryModel] : [self playURL:retryURL];
         if (ok) {
             [self play];
         }
@@ -757,30 +820,7 @@ didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
 }
 
 -(void)playerStateChange:(PlayerStateC)state {
-    HXCPlayerState objcState;
-    switch (state) {
-        case PLAYER_STATE_IDLE:
-            objcState = HXCPlayerStateIdle;
-            break;
-        case PLAYER_STATE_OPENING:
-            objcState = HXCPlayerStateOpening;
-            break;
-        case PLAYER_STATE_PLAYING:
-            objcState = HXCPlayerStatePlaying;
-            break;
-        case PLAYER_STATE_PAUSED:
-            objcState = HXCPlayerStatePaused;
-            break;
-        case PLAYER_STATE_STOPPED:
-            objcState = HXCPlayerStateStopped;
-            break;
-        case PLAYER_STATE_ERROR:
-            objcState = HXCPlayerStateError;
-            break;
-        default:
-            objcState = HXCPlayerStateIdle;
-            break;
-    }
+    HXCPlayerState objcState = hxc_to_objc_state(state);
     HXCPlayerState previous = _state;
     self->_state = objcState;
     // 与 play/pause/openURL 的乐观更新对齐：仅在核心状态真的变化时通知，避免重复回调
@@ -805,6 +845,10 @@ didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
 #pragma mark - Properties
 
 - (HXCPlayerState)state {
+    if (_wrapper && _wrapper->handle()) {
+        PlayerStateC coreState = player_core_get_state(_wrapper->handle());
+        _state = hxc_to_objc_state(coreState);
+    }
     return _state;
 }
 
@@ -1000,6 +1044,13 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     
     double currentPTS = frame_data.pts;
     double masterClock = player_core_get_position(_wrapper->handle());
+
+    // 首帧快速通道：首帧阶段不等待 A/V 阈值，避免“有声无画”。
+    if (_firstFrameBootstrapActive && !_hasRenderedFirstVideoFrame) {
+        [self displayVideoFrameData:&frame_data];
+        player_core_consume_video_frame(_wrapper->handle());
+        return;
+    }
     
     if (isnan(currentPTS)) {
         [self displayVideoFrameData:&frame_data];
@@ -1074,6 +1125,11 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     }
     
     CMTime presentationTime = CMTimeMake(frameData->pts * 1000000, 1000000);
+    if (_firstFrameBootstrapActive && !_hasRenderedFirstVideoFrame &&
+        _videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
+        // 首帧阶段直接贴当前 timebase，避免首帧因 PTS 偏前被延后显示。
+        presentationTime = CMTimebaseGetTime(_videoView.videoLayer.controlTimebase);
+    }
     CMSampleTimingInfo timing = {
         .duration = kCMTimeInvalid,
         .presentationTimeStamp = presentationTime,
@@ -1093,14 +1149,40 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     }
     
     if (sampleBuffer) {
+        const int64_t generation = _renderGeneration;
+        const double framePTS = frameData->pts;
 #if TARGET_OS_IOS
         [self hxc_cacheLastRenderedSampleBuffer:sampleBuffer];
 #endif
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation != self->_renderGeneration) {
+                CFRelease(sampleBuffer);
+                return;
+            }
             if (self->_videoView.videoLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+                // 异常态：强复位，避免 layer 卡住后持续不出图。
+                [self->_videoView.videoLayer flushAndRemoveImage];
+            }
+            // PTS 发生回退时先 flush，避免 AVSampleBufferDisplayLayer 因时序倒退而卡住不出图。
+            if (!isnan(framePTS) && !isnan(self->_lastEnqueuedVideoPTS) &&
+                framePTS + 0.001 < self->_lastEnqueuedVideoPTS) {
+                // 时序异常先轻量复位，优先保画面；若后续仍异常再走 failed 分支强复位。
                 [self->_videoView.videoLayer flush];
+                self->_lastEnqueuedVideoPTS = NAN;
             }
             [self->_videoView.videoLayer enqueueSampleBuffer:sampleBuffer];
+            if (!self->_hasRenderedFirstVideoFrame) {
+                self->_hasRenderedFirstVideoFrame = YES;
+                self->_firstFrameBootstrapActive = NO;
+                if (self->_deferAudioStartUntilFirstVideoFrame && self->_audioQueue && !self->_audioQueueRunning) {
+                    AudioQueueStart(self->_audioQueue, NULL);
+                    self->_audioQueueRunning = YES;
+                    self->_deferAudioStartUntilFirstVideoFrame = NO;
+                }
+            }
+            if (!isnan(framePTS)) {
+                self->_lastEnqueuedVideoPTS = framePTS;
+            }
             CFRelease(sampleBuffer);
         });
     }

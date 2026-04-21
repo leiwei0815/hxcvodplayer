@@ -608,13 +608,12 @@
     HXCPlayerDataSourcePlayModel *model = [HXCPlayerDataSourcePlayModel modelWithURL:urlString
                                                                                  mode:mode
                                                                           encryptedFile:encryptedFile];
-    success = [_player openWithPlayModel:model];
+    success = [_player playWithModel:model];
 #else
     success = [_player prepareToPlay:urlString];
 #endif
     
     if (success) {
-        [_player play];
     } else {
         NSAlert *alert = [[NSAlert alloc] init];
         alert.messageText = @"打开失败";

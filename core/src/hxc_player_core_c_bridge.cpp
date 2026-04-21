@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <atomic>
 #include "hxc_logger.h"
 
 extern "C" {
@@ -31,6 +32,8 @@ struct PlayerCoreHandle {
     double audio_current_pts;           // 当前音频帧的 PTS
     int audio_current_sample_rate;      // 当前音频采样率
     int audio_current_channels;         // 当前音频通道数
+    std::atomic<uint64_t> audio_seek_serial; // seek 代数，用于丢弃 seek 前旧回调
+    int audio_buf_serial;               // 当前桥接音频缓冲对应的 serial
 
     // 音频重采样器
     hxcplayer::AudioResampler* resampler;
@@ -70,6 +73,8 @@ struct PlayerCoreHandle {
         , audio_current_pts(0.0)
         , audio_current_sample_rate(0)
         , audio_current_channels(0)
+        , audio_seek_serial(0)
+        , audio_buf_serial(0)
 #ifdef HAS_SOUNDTOUCH
         , soundtouch(nullptr)
         , soundtouch_initialized(false)
@@ -257,6 +262,18 @@ int player_core_is_video_hardware_decoding(PlayerCoreHandle* handle) {
 
 void player_core_seek(PlayerCoreHandle* handle, double pos) {
     if (handle && handle->core) {
+        handle->audio_seek_serial.fetch_add(1, std::memory_order_acq_rel);
+        // iOS/macOS/Android 通过 C bridge 拉取音频数据时，先清空桥接层音频残留，
+        // 避免 seek 后短暂输出旧缓冲导致主时钟回跳。
+        handle->audio_buf_index = 0;
+        handle->audio_buf_size = 0;
+        handle->audio_current_pts = pos;
+        handle->audio_buf_serial = 0;
+#ifdef HAS_SOUNDTOUCH
+        if (handle->soundtouch) {
+            handle->soundtouch->clear();
+        }
+#endif
         handle->core->seek(pos);
     }
 }
@@ -320,6 +337,18 @@ int player_core_get_video_frame(PlayerCoreHandle* handle, VideoFrameDataC* frame
     }
     
     auto* vf = videoQueue->peek_readable();
+    if (!vf || !vf->frame) {
+        return -1;
+    }
+
+    int latest_video_serial = handle->core->get_video_packet_serial();
+    while (vf && vf->frame && vf->serial != latest_video_serial) {
+        videoQueue->next();
+        if (videoQueue->size() <= 0) {
+            return -1;
+        }
+        vf = videoQueue->peek_readable();
+    }
     if (!vf || !vf->frame) {
         return -1;
     }
@@ -440,9 +469,23 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
     if (!handle || !handle->core || !buffer || buffer_size <= 0) {
         return 0;
     }
+
+    uint64_t call_seek_serial = handle->audio_seek_serial.load(std::memory_order_acquire);
     
     // 从缓冲区复制数据（如果有的话）
     while (buffer_size > 0) {
+        int latest_audio_serial = handle->core->get_audio_packet_serial();
+        if (call_seek_serial != handle->audio_seek_serial.load(std::memory_order_acquire)) {
+            handle->audio_buf_index = 0;
+            handle->audio_buf_size = 0;
+            return 0;
+        }
+
+        if (handle->audio_buf_serial != latest_audio_serial) {
+            handle->audio_buf_index = 0;
+            handle->audio_buf_size = 0;
+        }
+
         // 如果缓冲区有数据，直接复制
         if (handle->audio_buf_index < handle->audio_buf_size) {
             int len1 = handle->audio_buf_size - handle->audio_buf_index;
@@ -455,6 +498,9 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             
             // ⚠️ 【关键修复】在数据被复制给平台层后，更新音频时钟
             if (handle->audio_current_sample_rate > 0 && handle->audio_current_channels > 0) {
+                if (call_seek_serial != handle->audio_seek_serial.load(std::memory_order_acquire)) {
+                    return 0;
+                }
                 // 计算实际消费的样本数
                 int consumed_samples = len1 / (handle->audio_current_channels * sizeof(int16_t));
                 
@@ -488,6 +534,17 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         if (!af || !af->frame) {
             return 0;
         }
+
+        while (af && af->frame && af->serial != latest_audio_serial) {
+            audioQueue->next();
+            if (audioQueue->size() <= 0) {
+                return 0;
+            }
+            af = audioQueue->peek_readable();
+        }
+        if (!af || !af->frame) {
+            return 0;
+        }
         
         AVFrame* frame = af->frame;
         int channels = frame->ch_layout.nb_channels;
@@ -512,6 +569,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         handle->audio_current_pts = pts;
         handle->audio_current_sample_rate = sample_rate;
         handle->audio_current_channels = channels;
+        handle->audio_buf_serial = af->serial;
 
         // 按当前帧的格式配置重采样器（每个新流/格式变化时重新配置）
         AVChannelLayout dst_layout = AV_CHANNEL_LAYOUT_STEREO;

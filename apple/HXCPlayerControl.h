@@ -112,7 +112,7 @@ reconnectCount:(NSInteger)reconnectCount;
  *
  * License：若启用 `HXCPlayerLicenseManager` 的门禁（`setPlaybackLicenseGateEnabled:YES`），
  * 需先成功执行 `checkLicenseWithLicenseKey:licenseURL:completionHandler:`（回调仅告知成功/失败），否则
- * `openURL:` / `openWithPlayModel:` / `play` / `replay` / `seekToPosition:` / 画中画启动 等接口会失败并通过 delegate 返回 `HXCPlayerErrorLicenseValidationFailed`。
+ * `playURL:` / `playWithModel:` / `play` / `replay` / `seekToPosition:` / 画中画启动 等接口会失败并通过 delegate 返回 `HXCPlayerErrorLicenseValidationFailed`。
  * 
  * 支持 iOS 和 macOS 平台，使用系统原生的音视频渲染：
  * - 视频: AVSampleBufferDisplayLayer
@@ -129,6 +129,7 @@ reconnectCount:(NSInteger)reconnectCount;
 @property (nonatomic, assign) double startPosition;    // 起始播放位置（秒）
 @property (nonatomic, assign) HXCAspectRatioMode aspectRatioMode;  // 视频显示模式
 @property (nonatomic, assign) HXCPlayerDecodeMode decodeMode;  // 解码模式（默认软解，需在 open 前设置）
+@property (nonatomic, assign) BOOL autoPlayer; // 是否在打开成功后自动播放，默认 YES
 @property (nonatomic, readonly) HXCPlayerState state;
 @property (nonatomic, readonly) double duration;
 @property (nonatomic, readonly) double position;
@@ -150,10 +151,10 @@ reconnectCount:(NSInteger)reconnectCount;
 #endif
 
 // 播放控制
-- (BOOL)openURL:(NSString *)url;                      // 打开 URL（不自动播放）
+- (BOOL)playURL:(NSString *)url;                      // 打开 URL（按 autoPlayer 决定是否自动播放）
 
-/// 使用播放模型打开：内部自动构建 `HXCPlayerDataSourceConfig`（仅通过 `encryptedFile` 差异化）。
-- (BOOL)openWithPlayModel:(HXCPlayerDataSourcePlayModel *)model;
+/// 使用播放模型打开：内部自动构建 `HXCPlayerDataSourceConfig`（仅通过 `encryptedFile` 差异化），并按 autoPlayer 决定是否自动播放。
+- (BOOL)playWithModel:(HXCPlayerDataSourcePlayModel *)model;
 
 - (void)play;                                          // 开始播放
 - (void)pause;                                         // 暂停

@@ -6,9 +6,9 @@
 #import "AppDelegate.h"
 #import "PlayerViewController.h"
 #import "../HXCVDownload/HXCVDownload.h"
-#import "../HXCPlayerLicenseManager.h"
-#define HXCVOD_LICENSE_URL @"https://console-api.huaxiacloud.net/license/getMobileLicense/111453136245362688"
-#define HXCVOD_LICENSE_KEY @"JNlhoUFDoLeDwNJEcoCS4GxAWk3Z2b8K"
+//#import "../HXCPlayerLicenseManager.h"
+//#define HXCVOD_LICENSE_URL @"https://console-api.huaxiacloud.net/license/getMobileLicense/111453136245362688"
+//#define HXCVOD_LICENSE_KEY @"JNlhoUFDoLeDwNJEcoCS4GxAWk3Z2b8K"
 
 @implementation AppDelegate
 
@@ -31,16 +31,16 @@
     [self.window makeKeyAndVisible];
     
     
-    [self checkLicense];
+//    [self checkLicense];
     return YES;
 }
 
 -(void)checkLicense {
-    [HXCPlayerLicenseManager checkLicenseWithLicenseKey:HXCVOD_LICENSE_KEY licenseURL:HXCVOD_LICENSE_URL completionHandler:^(BOOL success, NSError * _Nullable error) {
-        if (error) {
-            NSLog(@"license check faild...");
-        }
-    }];
+//    [HXCPlayerLicenseManager checkLicenseWithLicenseKey:HXCVOD_LICENSE_KEY licenseURL:HXCVOD_LICENSE_URL completionHandler:^(BOOL success, NSError * _Nullable error) {
+//        if (error) {
+//            NSLog(@"license check faild...");
+//        }
+//    }];
 }
 
 @end

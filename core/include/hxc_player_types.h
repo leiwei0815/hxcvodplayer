@@ -123,6 +123,7 @@ struct VideoFrame {
     double duration = 0.0;
     int width = 0;
     int height = 0;
+    int serial = 0;                 // 对应 packet queue serial（用于 seek 后丢弃旧帧）
     
     VideoFrame() = default;
     ~VideoFrame() {
@@ -142,6 +143,7 @@ struct VideoFrame {
         duration = other.duration;
         width = other.width;
         height = other.height;
+        serial = other.serial;
         other.frame = nullptr;
     }
     
@@ -153,6 +155,7 @@ struct VideoFrame {
             duration = other.duration;
             width = other.width;
             height = other.height;
+            serial = other.serial;
             other.frame = nullptr;
         }
         return *this;
@@ -164,6 +167,7 @@ struct AudioFrame {
     AVFrame* frame = nullptr;
     double pts = 0.0;
     int nb_samples = 0;
+    int serial = 0;                 // 对应 packet queue serial（用于 seek 后丢弃旧帧）
     
     AudioFrame() = default;
     ~AudioFrame() {
@@ -179,6 +183,7 @@ struct AudioFrame {
         frame = other.frame;
         pts = other.pts;
         nb_samples = other.nb_samples;
+        serial = other.serial;
         other.frame = nullptr;
     }
     
@@ -188,6 +193,7 @@ struct AudioFrame {
             frame = other.frame;
             pts = other.pts;
             nb_samples = other.nb_samples;
+            serial = other.serial;
             other.frame = nullptr;
         }
         return *this;

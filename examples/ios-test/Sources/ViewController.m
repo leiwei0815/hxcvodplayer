@@ -54,7 +54,7 @@
     NSString *testURL = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
     
     // 打开视频
-    [self.player openURL:testURL];
+    [self.player playURL:testURL];
 }
 
 - (void)setupUI {

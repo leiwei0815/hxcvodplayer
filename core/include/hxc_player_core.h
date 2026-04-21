@@ -144,6 +144,8 @@ public:
     // 获取帧队列（用于渲染）
     FrameQueue<VideoFrame>* get_video_queue() { return video_queue_.get(); }
     FrameQueue<AudioFrame>* get_audio_queue() { return audio_queue_.get(); }
+    int get_video_packet_serial() const { return video_packet_queue_ ? video_packet_queue_->get_serial() : 0; }
+    int get_audio_packet_serial() const { return audio_packet_queue_ ? audio_packet_queue_->get_serial() : 0; }
     
     // 音量控制
     void set_volume(int volume);  // 0-100

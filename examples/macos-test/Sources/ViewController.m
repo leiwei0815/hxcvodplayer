@@ -65,7 +65,7 @@
     // 默认打开测试视频
     NSString *testURL = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
 //    NSString *testURL = @"http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
-    [self.player openURL:testURL];
+    [self.player playURL:testURL];
 }
 
 - (void)setupUI {
