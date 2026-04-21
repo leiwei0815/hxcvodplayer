@@ -232,6 +232,9 @@ private:
     // 状态更新
     void set_state(PlayerState state);
     void emit_error(int error_code, const std::string& error_msg);
+    void set_seek_loading(bool is_loading);
+    void set_io_loading(bool is_loading);
+    void refresh_loading_state();
 
 private:
     PlayerConfig config_;
@@ -286,6 +289,9 @@ private:
     std::atomic<bool> seek_request_;
     std::atomic<double> seek_pos_;
     std::atomic<bool> seeking_;  // ⚠️ 标识正在 seek，暂停进度回调
+    std::atomic<bool> seek_loading_{false};  // seek 触发的 loading
+    std::atomic<bool> io_loading_{false};    // 网络读取失败触发的 loading
+    std::atomic<bool> loading_notified_{false};  // 对外已通知的 loading 状态
     std::atomic<double> seek_target_pos_;  // ⚠️ seek 的目标位置，在 seek 期间返回此值
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
     std::atomic<bool> video_hw_decode_active_{false}; // 当前视频流是否在硬解

@@ -136,7 +136,6 @@ static bool hxc_try_enable_hw_decode(AVCodecContext *codec_ctx, const AVCodec *c
 }
 
 }  // namespace
-} // namespace
 
 PlayerCore::PlayerCore()
     : state_(PlayerState::Idle)
@@ -1120,6 +1119,10 @@ void PlayerCore::close() {
         swr_free(&swr_ctx_);
         swr_ctx_ = nullptr;
     }
+
+    // 关闭时确保结束 loading 回调，避免上层 UI 长时间停留在 loading。
+    set_seek_loading(false);
+    set_io_loading(false);
     
     LOG_INFO("播放器已关闭");
     set_state(PlayerState::Idle);
@@ -1210,6 +1213,7 @@ void PlayerCore::seek(double pos) {
     // ⚠️ 使用 store(Release) 确保 seeking_ 的修改对其他线程立即可见
     seeking_.store(true, std::memory_order_release);
     LOG_INFO("设置 seeking 标志（Release），暂停进度回调");
+    set_seek_loading(true);
     
     seek_pos_ = pos;
     seek_request_ = true;
@@ -1263,6 +1267,7 @@ void PlayerCore::read_thread() {
                 LOG_ERROR("Seek 失败");
                 emit_error(PLAYER_ERROR_SEEK_FAILED, "跳转到指定位置失败");
                 seeking_.store(false, std::memory_order_release);  // Seek 失败也要清除标志
+                set_seek_loading(false);
             } else {
                 LOG_INFO("Seek 成功");
                 
@@ -1419,14 +1424,13 @@ void PlayerCore::read_thread() {
                 } else {
                     emit_error(ERROR_READ_FRAME_FAILED, std::string("读取失败：") + errbuf);
                 }
+                set_io_loading(false);
                 set_state(PlayerState::Error);
                 break;
             }
 
             // 读取失败（通常是弱网/暂时断流），进入加载状态。
-            if (loading_callback_) {
-                loading_callback_(true);  // 开始加载
-            }
+            set_io_loading(true);
 
             if (read_error_count == 0) {
                 read_error_begin = std::chrono::steady_clock::now();
@@ -1457,6 +1461,7 @@ void PlayerCore::read_thread() {
                           ", threshold=", MAX_STALL_MS);
                 emit_error(ERROR_NET_CONNECTION_TIMEOUT,
                            "网络读取超时（连续读取失败），建议重试或切换线路");
+                set_io_loading(false);
                 set_state(PlayerState::Error);
                 break;
             }
@@ -1477,9 +1482,7 @@ void PlayerCore::read_thread() {
         }
         
         // ⚠️ 读取成功，结束加载状态
-        if (loading_callback_) {
-            loading_callback_(false);  // 加载完成
-        }
+        set_io_loading(false);
         
         // 分发包到对应队列
         if (pkt->stream_index == video_stream_ && video_stream_opened_ && video_packet_queue_) {
@@ -1805,6 +1808,7 @@ void PlayerCore::video_thread() {
         if (seeking_.load(std::memory_order_acquire)) {
             seeking_.store(false, std::memory_order_release);
             LOG_INFO("视频线程：检测到 seek 后首帧，清除 seeking 标志，恢复进度回调");
+            set_seek_loading(false);
         }
         
         // 计算帧时间戳
@@ -1982,6 +1986,7 @@ void PlayerCore::audio_thread() {
         if (seeking_.load(std::memory_order_acquire)) {
             seeking_.store(false, std::memory_order_release);
             // LOG_INFO("音频线程：检测到 seek 后首帧，清除 seeking 标志，恢复进度回调");
+            set_seek_loading(false);
         }
         
         frame_count++;
@@ -2430,6 +2435,26 @@ void PlayerCore::set_state(PlayerState state) {
         if (state_changed_callback_) {
             state_changed_callback_(state);
         }
+    }
+}
+
+void PlayerCore::set_seek_loading(bool is_loading) {
+    seek_loading_.store(is_loading, std::memory_order_release);
+    refresh_loading_state();
+}
+
+void PlayerCore::set_io_loading(bool is_loading) {
+    io_loading_.store(is_loading, std::memory_order_release);
+    refresh_loading_state();
+}
+
+void PlayerCore::refresh_loading_state() {
+    const bool merged_loading =
+        seek_loading_.load(std::memory_order_acquire) ||
+        io_loading_.load(std::memory_order_acquire);
+    const bool prev = loading_notified_.exchange(merged_loading, std::memory_order_acq_rel);
+    if (prev != merged_loading && loading_callback_) {
+        loading_callback_(merged_loading);
     }
 }
 
