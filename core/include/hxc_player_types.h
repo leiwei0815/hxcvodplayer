@@ -31,6 +31,19 @@ enum class PlayerState {
     Error
 };
 
+// 底层流水线状态（参考主流播放器）
+// - playWhenReady: 用户意图（想不想播）
+// - pipelineState: 底层是否就绪/缓冲/结束
+// - isPlaying = playWhenReady && pipelineState == Ready
+enum class PipelineState {
+    Idle = 0,
+    Preparing = 1,
+    Buffering = 2,
+    Ready = 3,
+    Ended = 4,
+    Error = 5
+};
+
 // 媒体类型
 enum class MediaType {
     Unknown,

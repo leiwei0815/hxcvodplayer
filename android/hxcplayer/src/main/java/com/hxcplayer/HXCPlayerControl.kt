@@ -140,9 +140,20 @@ class HXCPlayerControl @JvmOverloads constructor(
     enum class PlayerState {
         IDLE,
         OPENING,
+        LOADING,
         PLAYING,
         PAUSED,
         STOPPED,
+        ERROR
+    }
+
+    /** 底层流水线状态（参考主流播放器） */
+    enum class PipelineState {
+        IDLE,
+        PREPARING,
+        BUFFERING,
+        READY,
+        ENDED,
         ERROR
     }
 
@@ -264,6 +275,9 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     private var nativeHandle: Long = 0
     private var callback: PlayerCallback? = null
+    private var lastPlayerState: PlayerState? = null
+    private var lastPipelineState: PipelineState? = null
+    private var lastIsPlayingState: Boolean? = null
     private var updateExecutor: ScheduledExecutorService? = null
     private var lastLoadingState: Boolean? = null
     private var loadingCandidateState: Boolean? = null
@@ -550,9 +564,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             nativeOpenURL(handle, url)
         }
 
-        if (result) {
-            callback?.onPlayerStateChanged(PlayerState.OPENING)
-        } else {
+        if (!result) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
         }
         return result
@@ -560,17 +572,13 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     /**
      * 异步打开 URL，避免阻塞 UI 线程。
-     * 结果通过已有 callback 回调返回：
-     * - 成功：onPlayerStateChanged(OPENING)
-     * - 失败：onPlayerError(...)
+     * 结果通过已有 callback 回调返回（失败会触发 onPlayerError）。
      */
     fun openURLAsync(url: String, startPosition: Double = 0.0) {
         if (isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
             return
         }
-        // 先通知进入 opening 状态，便于上层显示 loading
-        callback?.onPlayerStateChanged(PlayerState.OPENING)
         lastOpenUrl = url
         lastOpenStartPosition = startPosition
         lastOpenPlayModel = null
@@ -661,9 +669,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 )
             }
         }
-        if (result) {
-            callback?.onPlayerStateChanged(PlayerState.OPENING)
-        } else {
+        if (!result) {
             dispatchError(
                 PlayerErrorCode.OPEN_INPUT_FAILED,
                 "打开失败: mode=${model.mode}, url=${model.url}"
@@ -685,9 +691,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         applyDecodeModeForHandle(handle)
         val result = nativeOpenWithCustomHTTP(handle, url, timeoutMs, maxRetries, encryptedFile)
-        if (result) {
-            callback?.onPlayerStateChanged(PlayerState.OPENING)
-        } else {
+        if (!result) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开自定义 HTTP: $url")
         }
         return result
@@ -710,9 +714,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         applyDecodeModeForHandle(handle)
         val result = nativeOpenWithCustomFile(handle, path, avioBufferSize, encryptedFile)
-        if (result) {
-            callback?.onPlayerStateChanged(PlayerState.OPENING)
-        } else {
+        if (!result) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开本地文件(CustomFile): $path")
         }
         return result
@@ -726,7 +728,6 @@ class HXCPlayerControl @JvmOverloads constructor(
             return
         }
         nativePlay(handle)
-        callback?.onPlayerStateChanged(PlayerState.PLAYING)
     }
 
     // 暂停
@@ -734,7 +735,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         nativePause(handle)
-        callback?.onPlayerStateChanged(PlayerState.PAUSED)
     }
 
     // 停止
@@ -743,7 +743,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (handle == 0L || isReleased) return
         nativeStop(handle)
         networkLoadingSinceMs = 0L
-        callback?.onPlayerStateChanged(PlayerState.STOPPED)
     }
 
     // 跳转
@@ -795,8 +794,91 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun getState(): PlayerState {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return PlayerState.IDLE
-        val state = nativeGetState(handle)
-        return PlayerState.values().getOrElse(state) { PlayerState.IDLE }
+        val coreState = nativeGetState(handle)
+        val pipelineState = nativeGetPipelineState(handle)
+        val playWhenReady = nativeGetPlayWhenReady(handle)
+        val isPlaying = nativeIsPlaying(handle)
+        return resolveUnifiedState(coreState, pipelineState, playWhenReady, isPlaying)
+    }
+
+    fun getPipelineState(): PipelineState {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return PipelineState.IDLE
+        return mapPipelineState(nativeGetPipelineState(handle))
+    }
+
+    fun getPlayWhenReady(): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return false
+        return nativeGetPlayWhenReady(handle)
+    }
+
+    fun isPlaying(): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return false
+        return nativeIsPlaying(handle)
+    }
+
+    fun setPlayWhenReady(playWhenReady: Boolean) {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeSetPlayWhenReady(handle, playWhenReady)
+    }
+
+    // 仅映射 core 主状态（PlayerStateC）。
+    // LOADING 不来自 core 主状态枚举，而是由 pipelineState=BUFFERING 在 resolveUnifiedState() 中推导。
+    private fun mapPlayerState(raw: Int): PlayerState {
+        return when (raw) {
+            -1 -> PlayerState.ERROR
+            0 -> PlayerState.IDLE
+            1 -> PlayerState.OPENING
+            2 -> PlayerState.PLAYING
+            3 -> PlayerState.PAUSED
+            4 -> PlayerState.STOPPED
+            else -> PlayerState.IDLE
+        }
+    }
+
+    private fun mapPipelineState(raw: Int): PipelineState {
+        return when (raw) {
+            0 -> PipelineState.IDLE
+            1 -> PipelineState.PREPARING
+            2 -> PipelineState.BUFFERING
+            3 -> PipelineState.READY
+            4 -> PipelineState.ENDED
+            5 -> PipelineState.ERROR
+            else -> PipelineState.IDLE
+        }
+    }
+
+    private fun resolveUnifiedState(
+        coreStateRaw: Int,
+        pipelineStateRaw: Int,
+        playWhenReady: Boolean,
+        isPlayingNow: Boolean
+    ): PlayerState {
+        if (coreStateRaw == -1 || pipelineStateRaw == 5) {
+            return PlayerState.ERROR
+        }
+        if (coreStateRaw == 4 || pipelineStateRaw == 4) {
+            return PlayerState.STOPPED
+        }
+        if (coreStateRaw == 0 || pipelineStateRaw == 0) {
+            return PlayerState.IDLE
+        }
+        if (coreStateRaw == 1 || pipelineStateRaw == 1) {
+            return PlayerState.OPENING
+        }
+        if (pipelineStateRaw == 2) {
+            return PlayerState.LOADING
+        }
+        if (isPlayingNow) {
+            return PlayerState.PLAYING
+        }
+        if (coreStateRaw == 3 || !playWhenReady) {
+            return PlayerState.PAUSED
+        }
+        return mapPlayerState(coreStateRaw)
     }
 
     /**
@@ -820,6 +902,18 @@ class HXCPlayerControl @JvmOverloads constructor(
 
                 val position = getPosition()
                 val duration = getDuration()
+                val coreStateRaw = nativeGetState(handle)
+                val pipelineStateRaw = nativeGetPipelineState(handle)
+                val playWhenReady = nativeGetPlayWhenReady(handle)
+                val isPlaying = nativeIsPlaying(handle)
+                val state = resolveUnifiedState(coreStateRaw, pipelineStateRaw, playWhenReady, isPlaying)
+
+                if (lastPlayerState != state) {
+                    lastPlayerState = state
+                    mainHandler.post { callback?.onPlayerStateChanged(state) }
+                }
+                lastPipelineState = mapPipelineState(pipelineStateRaw)
+                lastIsPlayingState = isPlaying
                 if (duration > 0) {
                     callback?.onPlayerPositionUpdated(position, duration)
                 }
@@ -906,6 +1000,9 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastOpenUrl = null
         lastOpenPlayModel = null
         lastOpenStartPosition = 0.0
+        lastPlayerState = null
+        lastPipelineState = null
+        lastIsPlayingState = null
     }
 
     // Native 方法声明
@@ -928,6 +1025,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeGetDuration(handle: Long): Double
     private external fun nativeGetPosition(handle: Long): Double
     private external fun nativeGetState(handle: Long): Int
+    private external fun nativeGetPipelineState(handle: Long): Int
+    private external fun nativeGetPlayWhenReady(handle: Long): Boolean
+    private external fun nativeIsPlaying(handle: Long): Boolean
+    private external fun nativeSetPlayWhenReady(handle: Long, playWhenReady: Boolean)
     private external fun nativeIsLoading(handle: Long): Boolean
     private external fun nativeIsHardwareDecodingActive(handle: Long): Boolean
     private external fun nativeConsumeLastError(handle: Long, outCode: IntArray): String?

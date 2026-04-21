@@ -415,6 +415,9 @@
         case HXCPlayerStatePaused:
             [_playPauseButton setTitle:@"播放" forState:UIControlStateNormal];
             break;
+        case HXCPlayerStateLoading:
+            [_playPauseButton setTitle:@"暂停" forState:UIControlStateNormal];
+            break;
         case HXCPlayerStateStopped:
             [_playPauseButton setTitle:@"播放" forState:UIControlStateNormal];
             _progressSlider.value = 0;

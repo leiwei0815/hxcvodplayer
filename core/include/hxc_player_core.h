@@ -136,6 +136,9 @@ public:
     
     // 获取状态
     PlayerState get_state() const { return state_.load(std::memory_order_acquire); }
+    PipelineState get_pipeline_state() const { return pipeline_state_.load(std::memory_order_acquire); }
+    bool get_play_when_ready() const { return play_when_ready_.load(std::memory_order_acquire); }
+    bool is_playing() const;
     const MediaInfo& get_media_info() const { return media_info_; }
     double get_position() const;    // 当前播放位置（秒）
     double get_duration() const;    // 总时长（秒）
@@ -180,6 +183,8 @@ public:
     using BufferProgressCallback = std::function<void(double)>;   // 缓冲进度（解码位置）
     using PlaybackCompletedCallback = std::function<void()>;      // 播放完成
     using LoadingCallback = std::function<void(bool)>;            // 网络加载状态（true=加载中，false=加载完成）
+    using PipelineStateChangedCallback = std::function<void(PipelineState)>;
+    using PlayingChangedCallback = std::function<void(bool)>;
     
     void set_state_changed_callback(StateChangedCallback callback) {
         state_changed_callback_ = callback;
@@ -203,6 +208,12 @@ public:
     
     void set_loading_callback(LoadingCallback callback) {
         loading_callback_ = callback;
+    }
+    void set_pipeline_state_changed_callback(PipelineStateChangedCallback callback) {
+        pipeline_state_changed_callback_ = callback;
+    }
+    void set_playing_changed_callback(PlayingChangedCallback callback) {
+        playing_changed_callback_ = callback;
     }
 
 private:
@@ -233,6 +244,11 @@ private:
     
     // 状态更新
     void set_state(PlayerState state);
+    void set_pipeline_state(PipelineState state);
+    void set_play_when_ready_internal(bool play_when_ready);
+    void refresh_effective_playing_state();
+    void update_pipeline_state_from_runtime();
+    bool has_first_renderable_frame_ready() const;
     void emit_error(int error_code, const std::string& error_msg);
     void set_seek_loading(bool is_loading);
     void set_io_loading(bool is_loading);
@@ -241,6 +257,11 @@ private:
 private:
     PlayerConfig config_;
     std::atomic<PlayerState> state_;
+    std::atomic<PipelineState> pipeline_state_{PipelineState::Idle};
+    std::atomic<bool> play_when_ready_{false};
+    std::atomic<bool> first_video_frame_ready_{false};
+    std::atomic<bool> first_audio_frame_ready_{false};
+    std::atomic<bool> effective_is_playing_{false};
     MediaInfo media_info_;
     
     // FFmpeg 对象
@@ -350,6 +371,8 @@ private:
     BufferProgressCallback buffer_progress_callback_;    // 缓冲进度回调
     PlaybackCompletedCallback playback_completed_callback_;  // 播放完成回调
     LoadingCallback loading_callback_;                   // 网络加载回调
+    PipelineStateChangedCallback pipeline_state_changed_callback_;
+    PlayingChangedCallback playing_changed_callback_;
     
     // 自定义数据源
     std::unique_ptr<CustomAVIOContext> custom_io_;       // 自定义 AVIOContext

@@ -64,6 +64,10 @@ public:
     double getDuration() const;
     double getPosition() const;
     int getState() const;
+    int getPipelineState() const;
+    bool getPlayWhenReady() const;
+    bool isPlaying() const;
+    void setPlayWhenReady(bool play_when_ready);
     bool isLoading() const;
     bool isHardwareDecodingActive() const;
     bool consumeLastError(int& error_code, std::string& error_message);

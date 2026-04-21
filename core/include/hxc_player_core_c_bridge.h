@@ -25,6 +25,16 @@ typedef enum {
     PLAYER_STATE_ERROR = -1
 } PlayerStateC;
 
+// 流水线状态（参考主流播放器）
+typedef enum {
+    PLAYER_PIPELINE_STATE_IDLE = 0,
+    PLAYER_PIPELINE_STATE_PREPARING = 1,
+    PLAYER_PIPELINE_STATE_BUFFERING = 2,
+    PLAYER_PIPELINE_STATE_READY = 3,
+    PLAYER_PIPELINE_STATE_ENDED = 4,
+    PLAYER_PIPELINE_STATE_ERROR = 5
+} PlayerPipelineStateC;
+
 // 视频显示模式（宽高比模式）
 typedef enum {
     ASPECT_RATIO_FIT = 0,   // 适应模式：等比缩放，保持完整画面，可能有黑边（默认）
@@ -110,6 +120,9 @@ void player_core_stop(PlayerCoreHandle* handle);
 
 // 状态查询
 PlayerStateC player_core_get_state(PlayerCoreHandle* handle);
+PlayerPipelineStateC player_core_get_pipeline_state(PlayerCoreHandle* handle);
+int player_core_get_play_when_ready(PlayerCoreHandle* handle); // 1=true, 0=false
+int player_core_is_playing(PlayerCoreHandle* handle);          // 1=true, 0=false
 double player_core_get_duration(PlayerCoreHandle* handle);
 double player_core_get_position(PlayerCoreHandle* handle);
 int player_core_is_video_hardware_decoding(PlayerCoreHandle* handle); // 1=硬解, 0=软解/未知
@@ -119,6 +132,7 @@ void player_core_seek(PlayerCoreHandle* handle, double pos);
 void player_core_set_volume(PlayerCoreHandle* handle, float volume);
 void player_core_set_playback_rate(PlayerCoreHandle* handle, float rate);
 float player_core_get_playback_rate(PlayerCoreHandle* handle);
+void player_core_set_play_when_ready(PlayerCoreHandle* handle, int play_when_ready); // 0/1
 void player_core_set_decode_mode(PlayerCoreHandle* handle, PlayerDecodeModeC mode);
 PlayerDecodeModeC player_core_get_decode_mode(PlayerCoreHandle* handle);
 
@@ -270,6 +284,8 @@ typedef void (*PositionChangedCallbackC)(double position, void* user_data);  // 
 typedef void (*BufferProgressCallbackC)(double position, void* user_data);   // 缓冲进度（解码位置）
 typedef void (*PlaybackCompletedCallbackC)(void* user_data);                 // 播放完成
 typedef void (*LoadingCallbackC)(bool is_loading, void* user_data);          // 网络加载状态
+typedef void (*PipelineStateChangedCallbackC)(PlayerPipelineStateC state, void* user_data);
+typedef void (*PlayingChangedCallbackC)(int is_playing, void* user_data);    // 1=true,0=false
 
 // 设置回调函数
 void player_core_set_state_changed_callback(PlayerCoreHandle* handle, StateChangedCallbackC callback, void* user_data);
@@ -278,6 +294,8 @@ void player_core_set_position_changed_callback(PlayerCoreHandle* handle, Positio
 void player_core_set_buffer_progress_callback(PlayerCoreHandle* handle, BufferProgressCallbackC callback, void* user_data);
 void player_core_set_playback_completed_callback(PlayerCoreHandle* handle, PlaybackCompletedCallbackC callback, void* user_data);
 void player_core_set_loading_callback(PlayerCoreHandle* handle, LoadingCallbackC callback, void* user_data);
+void player_core_set_pipeline_state_changed_callback(PlayerCoreHandle* handle, PipelineStateChangedCallbackC callback, void* user_data);
+void player_core_set_playing_changed_callback(PlayerCoreHandle* handle, PlayingChangedCallbackC callback, void* user_data);
 
 // ========== 日志配置 ==========
 

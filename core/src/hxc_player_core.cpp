@@ -266,6 +266,9 @@ int PlayerCore::open(const std::string& filename) {
     playback_completed_notified_ = false;  // ⚠️ 重置播放完成通知标志
 
     set_state(PlayerState::Opening);
+    set_play_when_ready_internal(true);
+    first_video_frame_ready_.store(false, std::memory_order_release);
+    first_audio_frame_ready_.store(false, std::memory_order_release);
     // 打开输入文件
     format_ctx_ = avformat_alloc_context();
     // 🔧 设置中断回调（防止网络卡住导致无限等待）
@@ -623,6 +626,9 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     custom_io_ = std::move(custom_io);
     
     set_state(PlayerState::Opening);
+    set_play_when_ready_internal(true);
+    first_video_frame_ready_.store(false, std::memory_order_release);
+    first_audio_frame_ready_.store(false, std::memory_order_release);
     
     // 分配 AVFormatContext
     format_ctx_ = avformat_alloc_context();
@@ -1009,8 +1015,9 @@ int PlayerCore::open_common_process(const std::string &filename) {
         audio_decoder_->resume();
     }
     
-    LOG_INFO("解码器已恢复，开始播放");
-    set_state(PlayerState::Playing);
+    LOG_INFO("解码器已恢复，等待首帧就绪后进入 Playing");
+    set_pipeline_state(PipelineState::Buffering);
+    refresh_effective_playing_state();
     
     // ⚠️ 启动播放进度回调定时器线程
     if (position_changed_callback_) {
@@ -1123,71 +1130,83 @@ void PlayerCore::close() {
     // 关闭时确保结束 loading 回调，避免上层 UI 长时间停留在 loading。
     set_seek_loading(false);
     set_io_loading(false);
+    set_play_when_ready_internal(false);
+    first_video_frame_ready_.store(false, std::memory_order_release);
+    first_audio_frame_ready_.store(false, std::memory_order_release);
     
     LOG_INFO("播放器已关闭");
     // 若由 stop() 触发 close，则外层应只感知一次 Stopped 回调；
     // 此处仅静默回落到 Idle，避免再触发一次 didChangeState(Idle)。
     if (get_state() == PlayerState::Stopped) {
         state_.store(PlayerState::Idle, std::memory_order_release);
+        set_pipeline_state(PipelineState::Idle);
     } else {
         set_state(PlayerState::Idle);
     }
 }
 
 void PlayerCore::play() {
-    if (get_state() == PlayerState::Paused) {
-        pause_request_ = false;
-        
-        LOG_INFO("恢复播放...");
-        
-        // 恢复解码器
-        if (video_decoder_) {
-            video_decoder_->resume();
-            LOG_INFO("视频解码器已恢复");
-        }
-        if (audio_decoder_) {
-            audio_decoder_->resume();
-            LOG_INFO("音频解码器已恢复");
-        }
-        
-        // 恢复音频设备
-#ifndef NO_SDL
-        if (audio_dev_) {
-            SDL_PauseAudioDevice(audio_dev_, 0);
-        }
-#endif
-        
-        set_state(PlayerState::Playing);
-        LOG_INFO("播放已恢复");
+    PlayerState st = get_state();
+    if (st == PlayerState::Idle || st == PlayerState::Stopped || st == PlayerState::Error) {
+        return;
     }
+
+    pause_request_ = false;
+    set_play_when_ready_internal(true);
+    LOG_INFO("恢复播放/设置 playWhenReady=true ...");
+
+    // 恢复解码器
+    if (video_decoder_) {
+        video_decoder_->resume();
+        LOG_INFO("视频解码器已恢复");
+    }
+    if (audio_decoder_) {
+        audio_decoder_->resume();
+        LOG_INFO("音频解码器已恢复");
+    }
+
+    // 恢复音频设备
+#ifndef NO_SDL
+    if (audio_dev_) {
+        SDL_PauseAudioDevice(audio_dev_, 0);
+    }
+#endif
+
+    update_pipeline_state_from_runtime();
+    refresh_effective_playing_state();
+    LOG_INFO("playWhenReady 已置为 true，等待流水线 Ready 后进入 Playing");
 }
 
 void PlayerCore::pause() {
-    if (get_state() == PlayerState::Playing) {
-        pause_request_ = true;
-        
-        LOG_INFO("暂停播放...");
-        
-        // 暂停解码器（停止解码，节省 CPU）
-        if (video_decoder_) {
-            video_decoder_->pause();
-            LOG_INFO("视频解码器已暂停");
-        }
-        if (audio_decoder_) {
-            audio_decoder_->pause();
-            LOG_INFO("音频解码器已暂停");
-        }
-        
-        // 暂停音频设备
-#ifndef NO_SDL
-        if (audio_dev_) {
-            SDL_PauseAudioDevice(audio_dev_, 1);
-        }
-#endif
-        
-        set_state(PlayerState::Paused);
-        LOG_INFO("播放已暂停");
+    PlayerState st = get_state();
+    if (st == PlayerState::Idle || st == PlayerState::Stopped || st == PlayerState::Error) {
+        return;
     }
+
+    pause_request_ = true;
+    set_play_when_ready_internal(false);
+    LOG_INFO("暂停播放（playWhenReady=false）...");
+
+    // 暂停解码器（停止解码，节省 CPU）
+    if (video_decoder_) {
+        video_decoder_->pause();
+        LOG_INFO("视频解码器已暂停");
+    }
+    if (audio_decoder_) {
+        audio_decoder_->pause();
+        LOG_INFO("音频解码器已暂停");
+    }
+
+    // 暂停音频设备
+#ifndef NO_SDL
+    if (audio_dev_) {
+        SDL_PauseAudioDevice(audio_dev_, 1);
+    }
+#endif
+
+    set_state(PlayerState::Paused);
+    refresh_effective_playing_state();
+    LOG_INFO("播放已暂停");
 }
 
 void PlayerCore::stop() {
@@ -1195,6 +1214,7 @@ void PlayerCore::stop() {
     if (current == PlayerState::Idle || current == PlayerState::Stopped) {
         return;
     }
+    set_play_when_ready_internal(false);
     // 先对外发布停止态，再执行资源回收；close() 内会静默落回 Idle。
     set_state(PlayerState::Stopped);
     close();
@@ -1225,6 +1245,13 @@ void PlayerCore::seek(double pos) {
     seeking_.store(true, std::memory_order_release);
     LOG_INFO("设置 seeking 标志（Release），暂停进度回调");
     set_seek_loading(true);
+    set_pipeline_state(PipelineState::Buffering);
+    if (video_stream_opened_) {
+        first_video_frame_ready_.store(false, std::memory_order_release);
+    }
+    if (audio_stream_opened_) {
+        first_audio_frame_ready_.store(false, std::memory_order_release);
+    }
     
     seek_pos_ = pos;
     seek_request_ = true;
@@ -1879,6 +1906,10 @@ void PlayerCore::video_thread() {
         
         // 推入队列
         video_queue_->push();
+        if (!first_video_frame_ready_.exchange(true, std::memory_order_acq_rel)) {
+            LOG_INFO("视频首帧已就绪");
+            update_pipeline_state_from_runtime();
+        }
         
         // 更新视频时钟
         update_video_pts(pts, video_packet_queue_->get_serial());
@@ -2076,6 +2107,10 @@ void PlayerCore::audio_thread() {
         
         // 推入队列
         audio_queue_->push();
+        if (!first_audio_frame_ready_.exchange(true, std::memory_order_acq_rel)) {
+            LOG_INFO("音频首帧已就绪");
+            update_pipeline_state_from_runtime();
+        }
         
         av_frame_unref(frame);
         
@@ -2144,6 +2179,8 @@ void PlayerCore::progress_timer_thread() {
                     
                     if (condition1 || condition2) {
                         playback_completed_notified_ = true;  // 避免重复通知
+                        set_pipeline_state(PipelineState::Ended);
+                        refresh_effective_playing_state();
                         LOG_INFO("检测到播放完成: 当前位置=", current_position, 
                                 ", 时长=", duration, 
                                 ", decode_finished=", decode_finished_.load(),
@@ -2471,6 +2508,21 @@ void PlayerCore::update_audio_pts(double pts, int serial) {
     audio_clock_.set_clock(pts, serial);
 }
 
+bool PlayerCore::has_first_renderable_frame_ready() const {
+    if (video_stream_opened_) {
+        return first_video_frame_ready_.load(std::memory_order_acquire);
+    }
+    if (audio_stream_opened_) {
+        return first_audio_frame_ready_.load(std::memory_order_acquire);
+    }
+    return false;
+}
+
+bool PlayerCore::is_playing() const {
+    return play_when_ready_.load(std::memory_order_acquire) &&
+           pipeline_state_.load(std::memory_order_acquire) == PipelineState::Ready;
+}
+
 void PlayerCore::set_state(PlayerState state) {
     PlayerState old_state = state_.load(std::memory_order_acquire);
     if (old_state != state) {
@@ -2478,6 +2530,87 @@ void PlayerCore::set_state(PlayerState state) {
         if (state_changed_callback_) {
             state_changed_callback_(state);
         }
+    }
+    if (state == PlayerState::Opening) {
+        set_pipeline_state(PipelineState::Preparing);
+    } else if (state == PlayerState::Idle || state == PlayerState::Stopped) {
+        set_pipeline_state(PipelineState::Idle);
+    } else if (state == PlayerState::Error) {
+        set_pipeline_state(PipelineState::Error);
+    } else {
+        refresh_effective_playing_state();
+    }
+}
+
+void PlayerCore::set_pipeline_state(PipelineState state) {
+    PipelineState old_state = pipeline_state_.load(std::memory_order_acquire);
+    if (old_state != state) {
+        pipeline_state_.store(state, std::memory_order_release);
+        if (pipeline_state_changed_callback_) {
+            pipeline_state_changed_callback_(state);
+        }
+    }
+    refresh_effective_playing_state();
+}
+
+void PlayerCore::set_play_when_ready_internal(bool play_when_ready) {
+    bool old = play_when_ready_.exchange(play_when_ready, std::memory_order_acq_rel);
+    if (old != play_when_ready) {
+        refresh_effective_playing_state();
+    }
+}
+
+void PlayerCore::refresh_effective_playing_state() {
+    const bool playing_now = is_playing();
+    const bool old_playing = effective_is_playing_.exchange(playing_now, std::memory_order_acq_rel);
+    if (old_playing != playing_now && playing_changed_callback_) {
+        playing_changed_callback_(playing_now);
+    }
+
+    PlayerState st = get_state();
+    if (st == PlayerState::Idle || st == PlayerState::Stopped || st == PlayerState::Error) {
+        return;
+    }
+
+    if (playing_now && st != PlayerState::Playing) {
+        set_state(PlayerState::Playing);
+        return;
+    }
+    PipelineState ps = pipeline_state_.load(std::memory_order_acquire);
+    if (!playing_now && st == PlayerState::Playing &&
+        (!play_when_ready_.load(std::memory_order_acquire) || ps == PipelineState::Ended)) {
+        set_state(PlayerState::Paused);
+    }
+}
+
+void PlayerCore::update_pipeline_state_from_runtime() {
+    PlayerState st = get_state();
+    if (st == PlayerState::Idle || st == PlayerState::Stopped) {
+        set_pipeline_state(PipelineState::Idle);
+        return;
+    }
+    if (st == PlayerState::Error) {
+        set_pipeline_state(PipelineState::Error);
+        return;
+    }
+    if (pipeline_state_.load(std::memory_order_acquire) == PipelineState::Ended) {
+        return;
+    }
+
+    const bool loading =
+        seek_loading_.load(std::memory_order_acquire) ||
+        io_loading_.load(std::memory_order_acquire);
+    if (loading) {
+        set_pipeline_state(PipelineState::Buffering);
+        return;
+    }
+
+    if (has_first_renderable_frame_ready()) {
+        set_pipeline_state(PipelineState::Ready);
+    } else if (st == PlayerState::Opening) {
+        set_pipeline_state(PipelineState::Preparing);
+    } else {
+        set_pipeline_state(PipelineState::Buffering);
     }
 }
 
@@ -2496,6 +2629,7 @@ void PlayerCore::refresh_loading_state() {
         seek_loading_.load(std::memory_order_acquire) ||
         io_loading_.load(std::memory_order_acquire);
     const bool prev = loading_notified_.exchange(merged_loading, std::memory_order_acq_rel);
+    update_pipeline_state_from_runtime();
     if (prev != merged_loading && loading_callback_) {
         loading_callback_(merged_loading);
     }

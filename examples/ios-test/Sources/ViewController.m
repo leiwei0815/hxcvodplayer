@@ -232,6 +232,9 @@
         case HXCPlayerStateOpening:
             stateText = @"正在打开...";
             break;
+        case HXCPlayerStateLoading:
+            stateText = @"⏳ 加载中...";
+            break;
         case HXCPlayerStatePlaying:
             stateText = @"▶️ 播放中";
             self.isPlaying = YES;

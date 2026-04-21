@@ -64,6 +64,12 @@ struct PlayerCoreHandle {
     
     LoadingCallbackC loading_callback;
     void* loading_user_data;
+
+    PipelineStateChangedCallbackC pipeline_state_changed_callback;
+    void* pipeline_state_user_data;
+
+    PlayingChangedCallbackC playing_changed_callback;
+    void* playing_changed_user_data;
     
     PlayerCoreHandle() 
         : core(nullptr)
@@ -92,6 +98,10 @@ struct PlayerCoreHandle {
         , playback_completed_user_data(nullptr)
         , loading_callback(nullptr)
         , loading_user_data(nullptr)
+        , pipeline_state_changed_callback(nullptr)
+        , pipeline_state_user_data(nullptr)
+        , playing_changed_callback(nullptr)
+        , playing_changed_user_data(nullptr)
     {}
     
     ~PlayerCoreHandle() {
@@ -107,6 +117,32 @@ struct PlayerCoreHandle {
 #endif
     }
 };
+
+static PlayerStateC hxc_to_c_player_state(hxcplayer::PlayerState state) {
+    switch (state) {
+        case hxcplayer::PlayerState::Idle: return PLAYER_STATE_IDLE;
+        case hxcplayer::PlayerState::Opening: return PLAYER_STATE_OPENING;
+        case hxcplayer::PlayerState::Playing: return PLAYER_STATE_PLAYING;
+        case hxcplayer::PlayerState::Paused: return PLAYER_STATE_PAUSED;
+        case hxcplayer::PlayerState::Stopped: return PLAYER_STATE_STOPPED;
+        case hxcplayer::PlayerState::Error:
+        default:
+            return PLAYER_STATE_ERROR;
+    }
+}
+
+static PlayerPipelineStateC hxc_to_c_pipeline_state(hxcplayer::PipelineState state) {
+    switch (state) {
+        case hxcplayer::PipelineState::Idle: return PLAYER_PIPELINE_STATE_IDLE;
+        case hxcplayer::PipelineState::Preparing: return PLAYER_PIPELINE_STATE_PREPARING;
+        case hxcplayer::PipelineState::Buffering: return PLAYER_PIPELINE_STATE_BUFFERING;
+        case hxcplayer::PipelineState::Ready: return PLAYER_PIPELINE_STATE_READY;
+        case hxcplayer::PipelineState::Ended: return PLAYER_PIPELINE_STATE_ENDED;
+        case hxcplayer::PipelineState::Error:
+        default:
+            return PLAYER_PIPELINE_STATE_ERROR;
+    }
+}
 
 PlayerCoreHandle* player_core_create(void) {
     PlayerCoreHandle* handle = new PlayerCoreHandle();
@@ -232,17 +268,22 @@ void player_core_stop(PlayerCoreHandle* handle) {
 
 PlayerStateC player_core_get_state(PlayerCoreHandle* handle) {
     if (!handle || !handle->core) return PLAYER_STATE_ERROR;
-    
-    hxcplayer::PlayerState state = handle->core->get_state();
-    switch (state) {
-        case hxcplayer::PlayerState::Idle: return PLAYER_STATE_IDLE;
-        case hxcplayer::PlayerState::Opening: return PLAYER_STATE_OPENING;
-        case hxcplayer::PlayerState::Playing: return PLAYER_STATE_PLAYING;
-        case hxcplayer::PlayerState::Paused: return PLAYER_STATE_PAUSED;
-        case hxcplayer::PlayerState::Stopped: return PLAYER_STATE_STOPPED;
-        case hxcplayer::PlayerState::Error: return PLAYER_STATE_ERROR;
-        default: return PLAYER_STATE_ERROR;
-    }
+    return hxc_to_c_player_state(handle->core->get_state());
+}
+
+PlayerPipelineStateC player_core_get_pipeline_state(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return PLAYER_PIPELINE_STATE_ERROR;
+    return hxc_to_c_pipeline_state(handle->core->get_pipeline_state());
+}
+
+int player_core_get_play_when_ready(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return 0;
+    return handle->core->get_play_when_ready() ? 1 : 0;
+}
+
+int player_core_is_playing(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return 0;
+    return handle->core->is_playing() ? 1 : 0;
 }
 
 double player_core_get_duration(PlayerCoreHandle* handle) {
@@ -304,6 +345,15 @@ void player_core_set_playback_rate(PlayerCoreHandle* handle, float rate) {
 float player_core_get_playback_rate(PlayerCoreHandle* handle) {
     if (!handle || !handle->core) return 1.0f;
     return handle->core->get_playback_rate();
+}
+
+void player_core_set_play_when_ready(PlayerCoreHandle* handle, int play_when_ready) {
+    if (!handle || !handle->core) return;
+    if (play_when_ready != 0) {
+        handle->core->play();
+    } else {
+        handle->core->pause();
+    }
 }
 
 void player_core_set_decode_mode(PlayerCoreHandle* handle, PlayerDecodeModeC mode) {
@@ -749,8 +799,7 @@ void player_core_set_state_changed_callback(PlayerCoreHandle* handle, StateChang
     if (callback) {
         handle->core->set_state_changed_callback([handle](hxcplayer::PlayerState state) {
             if (handle->state_changed_callback) {
-                // 将 C++ 枚举转换为 C 枚举
-                PlayerStateC c_state = static_cast<PlayerStateC>(state);
+                PlayerStateC c_state = hxc_to_c_player_state(state);
                 handle->state_changed_callback(c_state, handle->state_changed_user_data);
             }
         });
@@ -848,6 +897,43 @@ void player_core_set_loading_callback(PlayerCoreHandle* handle, LoadingCallbackC
         });
     } else {
         handle->core->set_loading_callback(nullptr);
+    }
+}
+
+void player_core_set_pipeline_state_changed_callback(PlayerCoreHandle* handle, PipelineStateChangedCallbackC callback, void* user_data) {
+    if (!handle || !handle->core) return;
+
+    handle->pipeline_state_changed_callback = callback;
+    handle->pipeline_state_user_data = user_data;
+
+    if (callback) {
+        handle->core->set_pipeline_state_changed_callback([handle](hxcplayer::PipelineState state) {
+            if (handle->pipeline_state_changed_callback) {
+                handle->pipeline_state_changed_callback(
+                    hxc_to_c_pipeline_state(state),
+                    handle->pipeline_state_user_data
+                );
+            }
+        });
+    } else {
+        handle->core->set_pipeline_state_changed_callback(nullptr);
+    }
+}
+
+void player_core_set_playing_changed_callback(PlayerCoreHandle* handle, PlayingChangedCallbackC callback, void* user_data) {
+    if (!handle || !handle->core) return;
+
+    handle->playing_changed_callback = callback;
+    handle->playing_changed_user_data = user_data;
+
+    if (callback) {
+        handle->core->set_playing_changed_callback([handle](bool is_playing) {
+            if (handle->playing_changed_callback) {
+                handle->playing_changed_callback(is_playing ? 1 : 0, handle->playing_changed_user_data);
+            }
+        });
+    } else {
+        handle->core->set_playing_changed_callback(nullptr);
     }
 }
 

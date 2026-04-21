@@ -54,6 +54,8 @@ static void position_changed_callback_c(double position, void* user_data);
 static void buffer_progress_callback_c(double position, void* user_data);
 static void playback_completed_callback_c(void* user_data);
 static void loading_callback_c(bool is_loading, void* user_data);
+static void pipeline_state_changed_callback_c(PlayerPipelineStateC state, void* user_data);
+static void playing_changed_callback_c(int is_playing, void* user_data);
 
 @interface HXCPlayerControl () {
     PlayerCoreWrapper *_wrapper;
@@ -75,6 +77,9 @@ static void loading_callback_c(bool is_loading, void* user_data);
     
     // 状态
     HXCPlayerState _state;
+    HXCPlayerPipelineState _pipelineState;
+    BOOL _playWhenReady;
+    BOOL _isPlaying;
     double _duration;
     double _position;
     NSString *_playerUrl;
@@ -118,7 +123,14 @@ static void loading_callback_c(bool is_loading, void* user_data);
 
 
 -(void)playerStateChange:(PlayerStateC)state;
+-(void)playerPipelineStateChange:(PlayerPipelineStateC)state;
+-(void)playerPlayingChange:(BOOL)isPlaying;
 -(void)playerPositionChange:(double)position;
+- (HXCPlayerState)hxc_resolveUnifiedStateFromCoreState:(PlayerStateC)coreState
+                                          pipelineState:(PlayerPipelineStateC)pipelineState
+                                          playWhenReady:(BOOL)playWhenReady
+                                              isPlaying:(BOOL)isPlaying;
+- (void)hxc_syncUnifiedStateAndNotify;
 
 /// 门禁开启且未通过 License 校验时回调 delegate 并返回 NO
 - (BOOL)hxc_licenseAllowedOrNotifyForAction:(NSString *)action;
@@ -214,6 +226,20 @@ static void loading_callback_c(bool is_loading, void* user_data) {
         if ([self.delegate respondsToSelector:@selector(player:didChangeLoadingState:)]) {
             [self.delegate player:self didChangeLoadingState:is_loading];
         }
+    });
+}
+
+static void pipeline_state_changed_callback_c(PlayerPipelineStateC state, void* user_data) {
+    HXCPlayerControl* control = (__bridge HXCPlayerControl*)user_data;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [control playerPipelineStateChange:state];
+    });
+}
+
+static void playing_changed_callback_c(int is_playing, void* user_data) {
+    HXCPlayerControl* control = (__bridge HXCPlayerControl*)user_data;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [control playerPlayingChange:(is_playing != 0)];
     });
 }
 
@@ -326,6 +352,24 @@ static HXCPlayerState hxc_to_objc_state(PlayerStateC state) {
     }
 }
 
+static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC state) {
+    switch (state) {
+        case PLAYER_PIPELINE_STATE_IDLE:
+            return HXCPlayerPipelineStateIdle;
+        case PLAYER_PIPELINE_STATE_PREPARING:
+            return HXCPlayerPipelineStatePreparing;
+        case PLAYER_PIPELINE_STATE_BUFFERING:
+            return HXCPlayerPipelineStateBuffering;
+        case PLAYER_PIPELINE_STATE_READY:
+            return HXCPlayerPipelineStateReady;
+        case PLAYER_PIPELINE_STATE_ENDED:
+            return HXCPlayerPipelineStateEnded;
+        case PLAYER_PIPELINE_STATE_ERROR:
+        default:
+            return HXCPlayerPipelineStateError;
+    }
+}
+
 - (instancetype)init {
     self = [super init];
     if (self) {
@@ -334,6 +378,9 @@ static HXCPlayerState hxc_to_objc_state(PlayerStateC state) {
         
         _wrapper = new PlayerCoreWrapper();
         _state = HXCPlayerStateIdle;
+        _pipelineState = HXCPlayerPipelineStateIdle;
+        _playWhenReady = NO;
+        _isPlaying = NO;
         _volume = 1.0;
         _playbackRate = 1.0;
         _startPosition = 0.0;
@@ -364,6 +411,8 @@ static HXCPlayerState hxc_to_objc_state(PlayerStateC state) {
         player_core_set_buffer_progress_callback(_wrapper->handle(), buffer_progress_callback_c, (__bridge void*)self);
         player_core_set_playback_completed_callback(_wrapper->handle(), playback_completed_callback_c, (__bridge void*)self);
         player_core_set_loading_callback(_wrapper->handle(), loading_callback_c, (__bridge void*)self);
+        player_core_set_pipeline_state_changed_callback(_wrapper->handle(), pipeline_state_changed_callback_c, (__bridge void*)self);
+        player_core_set_playing_changed_callback(_wrapper->handle(), playing_changed_callback_c, (__bridge void*)self);
         
         // 创建视频视图（自动管理布局）
         _videoView = [[HXCPlayerView alloc] initWithFrame:CGRectZero];
@@ -698,6 +747,9 @@ static HXCPlayerState hxc_to_objc_state(PlayerStateC state) {
 #endif
 
     _state = HXCPlayerStateIdle;
+    _pipelineState = HXCPlayerPipelineStateIdle;
+    _playWhenReady = NO;
+    _isPlaying = NO;
     _duration = 0;
     _position = 0;
     _playerUrl = nil;
@@ -820,13 +872,71 @@ didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
 }
 
 -(void)playerStateChange:(PlayerStateC)state {
-    HXCPlayerState objcState = hxc_to_objc_state(state);
+    (void)state;
+    [self hxc_syncUnifiedStateAndNotify];
+}
+
+-(void)playerPipelineStateChange:(PlayerPipelineStateC)state {
+    (void)state;
+    [self hxc_syncUnifiedStateAndNotify];
+}
+
+-(void)playerPlayingChange:(BOOL)isPlaying {
+    (void)isPlaying;
+    [self hxc_syncUnifiedStateAndNotify];
+}
+
+- (HXCPlayerState)hxc_resolveUnifiedStateFromCoreState:(PlayerStateC)coreState
+                                          pipelineState:(PlayerPipelineStateC)pipelineState
+                                          playWhenReady:(BOOL)playWhenReady
+                                              isPlaying:(BOOL)isPlaying {
+    if (coreState == PLAYER_STATE_ERROR || pipelineState == PLAYER_PIPELINE_STATE_ERROR) {
+        return HXCPlayerStateError;
+    }
+    if (coreState == PLAYER_STATE_STOPPED || pipelineState == PLAYER_PIPELINE_STATE_ENDED) {
+        return HXCPlayerStateStopped;
+    }
+    if (coreState == PLAYER_STATE_IDLE || pipelineState == PLAYER_PIPELINE_STATE_IDLE) {
+        return HXCPlayerStateIdle;
+    }
+    if (coreState == PLAYER_STATE_OPENING || pipelineState == PLAYER_PIPELINE_STATE_PREPARING) {
+        return HXCPlayerStateOpening;
+    }
+    if (pipelineState == PLAYER_PIPELINE_STATE_BUFFERING) {
+        return HXCPlayerStateLoading;
+    }
+    if (isPlaying) {
+        return HXCPlayerStatePlaying;
+    }
+    if (coreState == PLAYER_STATE_PAUSED || !playWhenReady) {
+        return HXCPlayerStatePaused;
+    }
+    return hxc_to_objc_state(coreState);
+}
+
+- (void)hxc_syncUnifiedStateAndNotify {
+    if (!(_wrapper && _wrapper->handle())) {
+        return;
+    }
+
+    PlayerStateC coreState = player_core_get_state(_wrapper->handle());
+    PlayerPipelineStateC pipelineState = player_core_get_pipeline_state(_wrapper->handle());
+    BOOL playWhenReady = player_core_get_play_when_ready(_wrapper->handle()) != 0;
+    BOOL isPlaying = player_core_is_playing(_wrapper->handle()) != 0;
+
+    _pipelineState = hxc_to_objc_pipeline_state(pipelineState);
+    _playWhenReady = playWhenReady;
+    _isPlaying = isPlaying;
+
+    HXCPlayerState resolved = [self hxc_resolveUnifiedStateFromCoreState:coreState
+                                                            pipelineState:pipelineState
+                                                            playWhenReady:playWhenReady
+                                                                isPlaying:isPlaying];
     HXCPlayerState previous = _state;
-    self->_state = objcState;
-    // 与 play/pause/openURL 的乐观更新对齐：仅在核心状态真的变化时通知，避免重复回调
-    if (previous != objcState) {
+    _state = resolved;
+    if (previous != resolved) {
         if ([self.delegate respondsToSelector:@selector(player:didChangeState:)]) {
-            [self.delegate player:self didChangeState:objcState];
+            [self.delegate player:self didChangeState:resolved];
         }
 #if TARGET_OS_IOS
         [self invalidatePictureInPicturePlaybackStateIfNeeded];
@@ -847,9 +957,40 @@ didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
 - (HXCPlayerState)state {
     if (_wrapper && _wrapper->handle()) {
         PlayerStateC coreState = player_core_get_state(_wrapper->handle());
-        _state = hxc_to_objc_state(coreState);
+        PlayerPipelineStateC pipelineState = player_core_get_pipeline_state(_wrapper->handle());
+        BOOL playWhenReady = player_core_get_play_when_ready(_wrapper->handle()) != 0;
+        BOOL isPlaying = player_core_is_playing(_wrapper->handle()) != 0;
+        _pipelineState = hxc_to_objc_pipeline_state(pipelineState);
+        _playWhenReady = playWhenReady;
+        _isPlaying = isPlaying;
+        _state = [self hxc_resolveUnifiedStateFromCoreState:coreState
+                                              pipelineState:pipelineState
+                                              playWhenReady:playWhenReady
+                                                  isPlaying:isPlaying];
     }
     return _state;
+}
+
+- (HXCPlayerPipelineState)pipelineState {
+    if (_wrapper && _wrapper->handle()) {
+        PlayerPipelineStateC pipelineState = player_core_get_pipeline_state(_wrapper->handle());
+        _pipelineState = hxc_to_objc_pipeline_state(pipelineState);
+    }
+    return _pipelineState;
+}
+
+- (BOOL)playWhenReady {
+    if (_wrapper && _wrapper->handle()) {
+        _playWhenReady = player_core_get_play_when_ready(_wrapper->handle()) != 0;
+    }
+    return _playWhenReady;
+}
+
+- (BOOL)isPlaying {
+    if (_wrapper && _wrapper->handle()) {
+        _isPlaying = player_core_is_playing(_wrapper->handle()) != 0;
+    }
+    return _isPlaying;
 }
 
 - (double)duration {

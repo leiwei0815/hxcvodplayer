@@ -638,6 +638,7 @@
                 
             case HXCPlayerStatePaused:
             case HXCPlayerStateReady:
+            case HXCPlayerStateLoading:
                 self.playPauseButton.title = @"播放";
                 self.playPauseButton.enabled = YES;
                 self.stopButton.enabled = YES;

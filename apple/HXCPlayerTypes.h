@@ -26,6 +26,7 @@ typedef NS_ENUM(NSInteger, HXCPlayerLogLevel) {
 typedef NS_ENUM(NSInteger, HXCPlayerState) {
     HXCPlayerStateIdle = 0,      // 空闲
     HXCPlayerStateOpening,       // 正在打开
+    HXCPlayerStateLoading,       // 加载中（seek/缓冲中）
     HXCPlayerStateReady,         // 准备就绪
     HXCPlayerStatePlaying,       // 播放中
     HXCPlayerStatePaused,        // 暂停
@@ -90,6 +91,16 @@ typedef NS_ENUM(NSInteger, HXCPlayerDataSourceMode) {
 typedef NS_ENUM(NSInteger, HXCPlayerDecodeMode) {
     HXCPlayerDecodeModeSoftware = 0,
     HXCPlayerDecodeModeHardware = 1,
+};
+
+/// 底层流水线状态（参考主流播放器）
+typedef NS_ENUM(NSInteger, HXCPlayerPipelineState) {
+    HXCPlayerPipelineStateIdle = 0,
+    HXCPlayerPipelineStatePreparing,
+    HXCPlayerPipelineStateBuffering,
+    HXCPlayerPipelineStateReady,
+    HXCPlayerPipelineStateEnded,
+    HXCPlayerPipelineStateError,
 };
 
 #if TARGET_OS_IOS

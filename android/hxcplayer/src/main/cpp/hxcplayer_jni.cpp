@@ -203,6 +203,45 @@ Java_com_hxcplayer_HXCPlayerControl_nativeGetState(
     return 0; // IDLE
 }
 
+JNIEXPORT jint JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeGetPipelineState(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        return player->getPipelineState();
+    }
+    return 0; // IDLE
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeGetPlayWhenReady(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        return player->getPlayWhenReady() ? JNI_TRUE : JNI_FALSE;
+    }
+    return JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeIsPlaying(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        return player->isPlaying() ? JNI_TRUE : JNI_FALSE;
+    }
+    return JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeSetPlayWhenReady(
+        JNIEnv *env, jobject thiz, jlong handle, jboolean play_when_ready) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        player->setPlayWhenReady(play_when_ready == JNI_TRUE);
+    }
+}
+
 // 获取加载状态（网络波动时用于展示 loading 动画）
 JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeIsLoading(

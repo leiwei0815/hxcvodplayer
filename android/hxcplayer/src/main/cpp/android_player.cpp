@@ -412,6 +412,26 @@ int AndroidPlayer::getState() const {
     return (int)player_core_get_state(player_core_);
 }
 
+int AndroidPlayer::getPipelineState() const {
+    if (!player_core_) return 0; // IDLE
+    return (int)player_core_get_pipeline_state(player_core_);
+}
+
+bool AndroidPlayer::getPlayWhenReady() const {
+    if (!player_core_) return false;
+    return player_core_get_play_when_ready(player_core_) != 0;
+}
+
+bool AndroidPlayer::isPlaying() const {
+    if (!player_core_) return false;
+    return player_core_is_playing(player_core_) != 0;
+}
+
+void AndroidPlayer::setPlayWhenReady(bool play_when_ready) {
+    if (!player_core_) return;
+    player_core_set_play_when_ready(player_core_, play_when_ready ? 1 : 0);
+}
+
 bool AndroidPlayer::isLoading() const {
     return is_loading_.load(std::memory_order_acquire);
 }
