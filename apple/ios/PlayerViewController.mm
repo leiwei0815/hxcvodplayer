@@ -42,7 +42,7 @@
     _player.decodeMode = HXCPlayerDecodeModeHardware;
     _player.startPosition = 67;
     if (@available(iOS 14.2, *)) {
-        _player.canStartPictureInPictureAutomaticallyFromInline = YES;
+        _player.canStartPictureInPictureAutomaticallyFromInline = NO;
     }
     
     _player.delegate = self;
