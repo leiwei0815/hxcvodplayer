@@ -1648,7 +1648,7 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
         
         // iOS 14.2+ 默认关闭自动画中画（用户可通过属性开启）
         if (@available(iOS 14.2, *)) {
-            _pictureInPictureController.canStartPictureInPictureAutomaticallyFromInline = YES;
+            _pictureInPictureController.canStartPictureInPictureAutomaticallyFromInline = NO;
             NSLog(@"🎬 自动画中画默认关闭，可通过 canStartPictureInPictureAutomaticallyFromInline 属性开启");
         }
         
