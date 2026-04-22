@@ -456,6 +456,8 @@ int PlayerCore::open(const std::string& filename) {
             };
             format_ctx_->interrupt_callback.opaque = this;
         }
+        // 每次 open 尝试前刷新 watchdog 基线，避免因上一次耗时叠加导致本次被立即中断。
+        io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
         
         auto attempt_begin = std::chrono::steady_clock::now();
         // 尝试打开
@@ -485,12 +487,19 @@ int PlayerCore::open(const std::string& filename) {
         // 判断是否应该重试
         bool should_retry = false;
         std::string error_category = "未知错误";
+        const bool network_like_input = hxc_is_network_like_url(filename.c_str());
         
         // 网络相关错误应该重试
         if (hxc_is_retryable_network_error(ret)) {
             should_retry = true;
             error_category = "网络错误";
             LOG_INFO("检测到网络错误，将进行重试");
+        }
+        // 网络流首开阶段偶发 EOF（常见于 TLS 抖动/边缘节点返回不完整）先按可恢复处理。
+        if (ret == AVERROR_EOF && network_like_input) {
+            should_retry = true;
+            error_category = "网络流EOF";
+            LOG_WARNING("检测到网络流 EOF，按可恢复错误重试");
         }
         
         // HTTP 4xx 通常为请求或鉴权问题，不建议重试
@@ -526,6 +535,11 @@ int PlayerCore::open(const std::string& filename) {
         }
         
         if (ret == AVERROR_INVALIDDATA) {       // 无效数据
+            if (network_like_input) {
+                should_retry = true;
+                error_category = "网络流无效数据（可重试）";
+                LOG_WARNING("检测到网络流 INVALIDDATA，先重试");
+            } else {
             should_retry = false;
             error_category = "无效数据";
             LOG_ERROR("检测到不可恢复错误：无效数据格式，立即停止");
@@ -535,6 +549,7 @@ int PlayerCore::open(const std::string& filename) {
             set_state(PlayerState::Error);
             av_dict_free(&options);
             return -1;
+            }
         }
         
         if (ret == AVERROR_PATCHWELCOME) {      // 功能未实现
@@ -591,6 +606,9 @@ int PlayerCore::open(const std::string& filename) {
         if (ret == AVERROR(ETIMEDOUT)) {
             error_message += "连接超时，请检查网络连接";
             code = ERROR_NET_CONNECTION_TIMEOUT;
+        } else if (ret == AVERROR_EOF && hxc_is_network_like_url(filename.c_str())) {
+            error_message += "网络连接中断（首包读取失败）";
+            code = ERROR_NET_UNREACHABLE;
         } else if (ret == AVERROR(ECONNREFUSED)) {
             error_message += "服务器拒绝连接";
             code = ERROR_NET_CONNECTION_REFUSED;
@@ -1505,7 +1523,17 @@ void PlayerCore::read_thread() {
         int ret = av_read_frame(format_ctx_, pkt);
         
         if (ret < 0) {
-            if (ret == AVERROR_EOF || avio_feof(format_ctx_->pb)) {
+            int io_error = 0;
+            if (format_ctx_->pb && format_ctx_->pb->error) {
+                io_error = format_ctx_->pb->error;
+            }
+            const bool network_like_input = hxc_is_network_like_url(format_ctx_ ? format_ctx_->url : nullptr);
+            const bool eof_signal = (ret == AVERROR_EOF) || (format_ctx_->pb && avio_feof(format_ctx_->pb));
+            const bool has_io_error = (io_error != 0);
+
+            // 网络流出现 TLS/IO 错误时，FFmpeg 可能同时给出 EOF 信号；此时不能按“正常读完文件”处理，
+            // 否则会误进入“等待 seek/终止”分支，看起来像卡住。
+            if (eof_signal && !(network_like_input && has_io_error)) {
                 // 文件结束，发送结束包给解码器
                 LOG_INFO("读取线程：文件读取结束");
                 if (video_stream_ >= 0 && video_stream_opened_ && video_packet_queue_) {
@@ -1531,19 +1559,26 @@ void PlayerCore::read_thread() {
                 LOG_INFO("读取线程：检测到 seek 请求，继续读取");
                 continue;
             }
-            
-            int io_error = 0;
-            if (format_ctx_->pb && format_ctx_->pb->error) {
-                io_error = format_ctx_->pb->error;
-            }
+
             int effective_ret = (ret != 0) ? ret : io_error;
+            if (ret == AVERROR_EOF && has_io_error) {
+                effective_ret = io_error;
+            }
+
+            // watchdog 中断会返回 AVERROR_EXIT（Immediate exit requested）。
+            // 若不是用户主动 stop/close，则按“可恢复超时”处理，并重置中断计时基线，
+            // 避免下一轮 av_read_frame 立即再次被 interrupt_callback 打断而形成循环。
+            bool interrupted_by_watchdog = (effective_ret == AVERROR_EXIT && !abort_request_.load());
+            if (interrupted_by_watchdog) {
+                effective_ret = AVERROR(ETIMEDOUT);
+                io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
+            }
 
             bool retryable_error = hxc_is_retryable_network_error(effective_ret);
             bool non_retryable_error = (effective_ret == AVERROR(ENOENT) ||
                                         effective_ret == AVERROR(EACCES) ||
                                         effective_ret == AVERROR_PATCHWELCOME ||
                                         hxc_is_http_client_error(effective_ret));
-            const bool network_like_input = hxc_is_network_like_url(format_ctx_ ? format_ctx_->url : nullptr);
             const bool is_invalid_data = (effective_ret == AVERROR_INVALIDDATA);
             const int MAX_INVALIDDATA_FAST_RETRY = 5;
             if (is_invalid_data && network_like_input) {
