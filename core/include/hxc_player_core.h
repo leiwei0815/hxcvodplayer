@@ -252,6 +252,7 @@ private:
     void emit_error(int error_code, const std::string& error_msg);
     void set_seek_loading(bool is_loading);
     void set_io_loading(bool is_loading);
+    void set_starvation_loading(bool is_loading);
     void refresh_loading_state();
 
 private:
@@ -314,10 +315,13 @@ private:
     std::atomic<bool> seeking_;  // ⚠️ 标识正在 seek，暂停进度回调
     std::atomic<bool> seek_loading_{false};  // seek 触发的 loading
     std::atomic<bool> io_loading_{false};    // 网络读取失败触发的 loading
+    std::atomic<bool> starvation_loading_{false}; // 队列低水位/进度停滞触发的 loading
     std::atomic<bool> loading_notified_{false};  // 对外已通知的 loading 状态
     std::atomic<double> seek_target_pos_;  // ⚠️ seek 的目标位置，在 seek 期间返回此值
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
     std::atomic<bool> video_hw_decode_active_{false}; // 当前视频流是否在硬解
+    std::atomic<int64_t> io_last_packet_us_{0}; // 最近一次成功读取 packet 的时间（us）
+    int64_t io_interrupt_timeout_us_{8000000};   // 阻塞读中断阈值（us）
     bool playback_completed_notified_;  // ⚠️ 是否已通知播放完成（避免重复通知）
     
 #ifndef NO_SDL

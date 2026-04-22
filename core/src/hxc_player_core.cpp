@@ -59,6 +59,24 @@ static int hxc_calc_retry_delay_ms(int retry_count, int base_delay_ms, int max_d
     int candidate = base_delay_ms << capped_power;
     return std::min(candidate, max_delay_ms);
 }
+
+static bool hxc_is_network_like_url(const char* url) {
+    if (!url || !*url) {
+        return false;
+    }
+    std::string u(url);
+    for (char& c : u) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return (u.rfind("http://", 0) == 0) ||
+           (u.rfind("https://", 0) == 0) ||
+           (u.rfind("rtmp://", 0) == 0) ||
+           (u.rfind("rtsp://", 0) == 0) ||
+           (u.rfind("udp://", 0) == 0) ||
+           (u.rfind("tcp://", 0) == 0);
+}
 static enum AVHWDeviceType hxc_platform_hw_device_type() {
 #if defined(__ANDROID__)
     return av_hwdevice_find_type_by_name("mediacodec");
@@ -182,6 +200,11 @@ PlayerCore::PlayerCore()
     , soundtouch_buffer_index_(0)
 #endif
     , playback_rate_(1.0) {  // ⚠️ 默认正常速度
+#if defined(__ANDROID__)
+    io_interrupt_timeout_us_ = 6000000;   // Android 移动网络抖动更明显，超时阈值略短
+#else
+    io_interrupt_timeout_us_ = 10000000;  // 其它平台默认 10 秒
+#endif
     
     LOG_INFO("初始化 PlayerCore...");
     
@@ -264,6 +287,7 @@ int PlayerCore::open(const std::string& filename) {
     decode_finished_ = false;  // ⚠️ 重置解码结束标志
     video_hw_decode_active_.store(false, std::memory_order_release);
     playback_completed_notified_ = false;  // ⚠️ 重置播放完成通知标志
+    io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
 
     set_state(PlayerState::Opening);
     set_play_when_ready_internal(true);
@@ -275,7 +299,17 @@ int PlayerCore::open(const std::string& filename) {
     format_ctx_->interrupt_callback.callback = [](void* ctx) -> int {
         PlayerCore* player = static_cast<PlayerCore*>(ctx);
         // 如果用户请求中止，返回 1
-        return player->abort_request_.load() ? 1 : 0;
+        if (player->abort_request_.load()) {
+            return 1;
+        }
+        int64_t last_packet_us = player->io_last_packet_us_.load(std::memory_order_acquire);
+        if (last_packet_us > 0) {
+            int64_t idle_us = av_gettime_relative() - last_packet_us;
+            if (idle_us >= player->io_interrupt_timeout_us_) {
+                return 1;
+            }
+        }
+        return 0;
     };
     format_ctx_->interrupt_callback.opaque = this;
     
@@ -408,7 +442,17 @@ int PlayerCore::open(const std::string& filename) {
             // 重新设置中断回调
             format_ctx_->interrupt_callback.callback = [](void* ctx) -> int {
                 PlayerCore* player = static_cast<PlayerCore*>(ctx);
-                return player->abort_request_.load() ? 1 : 0;
+                if (player->abort_request_.load()) {
+                    return 1;
+                }
+                int64_t last_packet_us = player->io_last_packet_us_.load(std::memory_order_acquire);
+                if (last_packet_us > 0) {
+                    int64_t idle_us = av_gettime_relative() - last_packet_us;
+                    if (idle_us >= player->io_interrupt_timeout_us_) {
+                        return 1;
+                    }
+                }
+                return 0;
             };
             format_ctx_->interrupt_callback.opaque = this;
         }
@@ -621,6 +665,7 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     abort_request_ = false;
     decode_finished_ = false;
     playback_completed_notified_ = false;
+    io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
     
     // 保存自定义 IO
     custom_io_ = std::move(custom_io);
@@ -640,7 +685,17 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     // 设置中断回调
     format_ctx_->interrupt_callback.callback = [](void* ctx) -> int {
         PlayerCore* player = static_cast<PlayerCore*>(ctx);
-        return player->abort_request_.load() ? 1 : 0;
+        if (player->abort_request_.load()) {
+            return 1;
+        }
+        int64_t last_packet_us = player->io_last_packet_us_.load(std::memory_order_acquire);
+        if (last_packet_us > 0) {
+            int64_t idle_us = av_gettime_relative() - last_packet_us;
+            if (idle_us >= player->io_interrupt_timeout_us_) {
+                return 1;
+            }
+        }
+        return 0;
     };
     format_ctx_->interrupt_callback.opaque = this;
     
@@ -1130,6 +1185,8 @@ void PlayerCore::close() {
     // 关闭时确保结束 loading 回调，避免上层 UI 长时间停留在 loading。
     set_seek_loading(false);
     set_io_loading(false);
+    set_starvation_loading(false);
+    io_last_packet_us_.store(0, std::memory_order_release);
     set_play_when_ready_internal(false);
     first_video_frame_ready_.store(false, std::memory_order_release);
     first_audio_frame_ready_.store(false, std::memory_order_release);
@@ -1286,7 +1343,11 @@ void PlayerCore::read_thread() {
     
     int packet_count = 0;
     int read_error_count = 0;
+    int invalid_data_retry_count = 0;
     auto read_error_begin = std::chrono::steady_clock::time_point{};
+    int soft_reconnect_attempt_count = 0;
+    int64_t next_soft_reconnect_try_us = 0;
+    bool pending_disconnect_error_after_drain = false;
     
     while (!abort_request_) {
         // 处理 seek
@@ -1392,6 +1453,27 @@ void PlayerCore::read_thread() {
                 
                 LOG_INFO("Seek 清理完成，等待解码新帧后恢复进度回调");
             }
+            // seek 之后重置读错误统计，避免旧的网络错误计数影响后续判定。
+            read_error_count = 0;
+            invalid_data_retry_count = 0;
+            read_error_begin = std::chrono::steady_clock::time_point{};
+        }
+
+        // 重连已耗尽后：先允许现有缓冲继续播放，等帧队列耗尽再对外报错。
+        if (pending_disconnect_error_after_drain) {
+            const bool video_drained = (!video_stream_opened_ || !video_queue_ || video_queue_->nb_remaining() <= 0);
+            const bool audio_drained = (!audio_stream_opened_ || !audio_queue_ || audio_queue_->nb_remaining() <= 0);
+            if (video_drained && audio_drained) {
+                LOG_ERROR("读取线程：重连失败且缓冲已耗尽，回调网络断开错误");
+                emit_error(ERROR_NET_UNREACHABLE, "网络连接已断开，重连失败");
+                set_io_loading(false);
+                set_starvation_loading(false);
+                set_state(PlayerState::Error);
+                break;
+            }
+            // 仍有缓冲可播：不再继续拉流重试，等待消费。
+            PLAYER_DELAY(50);
+            continue;
         }
         
         // ⚠️ 检查队列总大小（参考 ffplay）
@@ -1459,9 +1541,26 @@ void PlayerCore::read_thread() {
             bool retryable_error = hxc_is_retryable_network_error(effective_ret);
             bool non_retryable_error = (effective_ret == AVERROR(ENOENT) ||
                                         effective_ret == AVERROR(EACCES) ||
-                                        effective_ret == AVERROR_INVALIDDATA ||
                                         effective_ret == AVERROR_PATCHWELCOME ||
                                         hxc_is_http_client_error(effective_ret));
+            const bool network_like_input = hxc_is_network_like_url(format_ctx_ ? format_ctx_->url : nullptr);
+            const bool is_invalid_data = (effective_ret == AVERROR_INVALIDDATA);
+            const int MAX_INVALIDDATA_FAST_RETRY = 5;
+            if (is_invalid_data && network_like_input) {
+                invalid_data_retry_count++;
+                if (invalid_data_retry_count <= MAX_INVALIDDATA_FAST_RETRY) {
+                    // 网络流偶发 partial/corrupt chunk 时，先按可恢复处理，避免“同片偶发秒失败”。
+                    non_retryable_error = false;
+                    retryable_error = true;
+                    LOG_WARNING("读取线程：网络流出现 INVALIDDATA，先快速重试（",
+                                invalid_data_retry_count, "/", MAX_INVALIDDATA_FAST_RETRY, "）");
+                } else {
+                    // 超过快速重试阈值后继续走可恢复链路（软重连/超时兜底）。
+                    non_retryable_error = false;
+                    retryable_error = true;
+                    LOG_WARNING("读取线程：INVALIDDATA 持续出现，转入软重连/超时恢复链路");
+                }
+            }
 
             if (non_retryable_error) {
                 char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
@@ -1513,6 +1612,65 @@ void PlayerCore::read_thread() {
             const int MAX_STALL_MS = retryable_error ? MAX_STALL_MS_RETRYABLE : MAX_STALL_MS_NON_CLASSIFIED;
             auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - read_error_begin).count();
+
+            // 软重连兜底：连续失败后最多重连 3 次，重试间隔递增（指数退避）。
+            const int SOFT_RECONNECT_TRIGGER_MS = 5000;
+            const int MAX_SOFT_RECONNECT_ATTEMPTS = 3;
+            if (retryable_error && stall_ms >= SOFT_RECONNECT_TRIGGER_MS &&
+                soft_reconnect_attempt_count < MAX_SOFT_RECONNECT_ATTEMPTS) {
+                int64_t now_us = av_gettime_relative();
+                if (next_soft_reconnect_try_us > 0 && now_us < next_soft_reconnect_try_us) {
+                    int wait_ms = static_cast<int>((next_soft_reconnect_try_us - now_us) / 1000);
+                    if (wait_ms > 0) {
+                        PLAYER_DELAY(wait_ms);
+                    }
+                    continue;
+                }
+
+                double resume_pos = get_master_clock();
+                if (!isnan(resume_pos) && resume_pos < 0.0) {
+                    resume_pos = 0.0;
+                }
+                int64_t resume_ts = static_cast<int64_t>(std::max(0.0, resume_pos) * AV_TIME_BASE);
+                LOG_WARNING("读取线程：触发软重连尝试(", soft_reconnect_attempt_count + 1, "/",
+                            MAX_SOFT_RECONNECT_ATTEMPTS, "), resume_pos=", resume_pos, "s");
+
+                if (format_ctx_) {
+                    avformat_flush(format_ctx_);
+                }
+                int reconnect_ret = av_seek_frame(format_ctx_, -1, resume_ts, AVSEEK_FLAG_BACKWARD);
+                if (reconnect_ret >= 0) {
+                    if (video_packet_queue_) video_packet_queue_->flush();
+                    if (audio_packet_queue_) audio_packet_queue_->flush();
+                    if (video_queue_) { video_queue_->flush(); video_queue_->restart(); }
+                    if (audio_queue_) { audio_queue_->flush(); audio_queue_->restart(); }
+                    if (video_decoder_) video_decoder_->flush();
+                    if (audio_decoder_) audio_decoder_->flush();
+                    soft_reconnect_attempt_count = 0;
+                    next_soft_reconnect_try_us = 0;
+                    io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
+                    read_error_count = 0;
+                    read_error_begin = std::chrono::steady_clock::time_point{};
+                    LOG_INFO("读取线程：软重连成功，继续读取");
+                    PLAYER_DELAY(50);
+                    continue;
+                } else {
+                    LOG_WARNING("读取线程：软重连失败，ret=", reconnect_ret);
+                    soft_reconnect_attempt_count++;
+                    int reconnect_delay_ms = hxc_calc_retry_delay_ms(soft_reconnect_attempt_count - 1, 500, 4000);
+                    next_soft_reconnect_try_us = av_gettime_relative() + static_cast<int64_t>(reconnect_delay_ms) * 1000;
+                }
+            }
+
+            // 达到最大软重连次数后仍无法恢复：对外回调网络断开错误并结束播放。
+            if (retryable_error && soft_reconnect_attempt_count >= MAX_SOFT_RECONNECT_ATTEMPTS &&
+                stall_ms >= SOFT_RECONNECT_TRIGGER_MS) {
+                LOG_ERROR("读取线程：软重连已达上限(", MAX_SOFT_RECONNECT_ATTEMPTS,
+                          ")，标记等待缓冲耗尽后报网络断开");
+                pending_disconnect_error_after_drain = true;
+                continue;
+            }
+
             if (stall_ms >= MAX_STALL_MS) {
                 LOG_ERROR("读取线程：连续读取失败超时，退出。stall_ms=", stall_ms,
                           ", threshold=", MAX_STALL_MS);
@@ -1535,11 +1693,15 @@ void PlayerCore::read_thread() {
                 std::chrono::steady_clock::now() - read_error_begin).count();
             LOG_INFO("读取线程：读取恢复，连续失败次数=", read_error_count, ", 卡顿时长=", stall_ms, " ms");
             read_error_count = 0;
+            invalid_data_retry_count = 0;
             read_error_begin = std::chrono::steady_clock::time_point{};
         }
         
         // ⚠️ 读取成功，结束加载状态
         set_io_loading(false);
+        soft_reconnect_attempt_count = 0;
+        next_soft_reconnect_try_us = 0;
+        io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
         
         // 分发包到对应队列
         if (pkt->stream_index == video_stream_ && video_stream_opened_ && video_packet_queue_) {
@@ -2131,6 +2293,7 @@ void PlayerCore::progress_timer_thread() {
     const int CALLBACK_INTERVAL_MS = 200;  // 每 200ms 触发一次回调（每秒 5 次）
     double last_position = -1.0;
     int position_unchanged_count = 0;  // ⚠️ 位置未变化的次数
+    int starvation_ticks = 0;          // 低水位+时钟停滞持续计数
 
     while (!abort_request_) {
         // 检查播放器状态
@@ -2163,6 +2326,20 @@ void PlayerCore::progress_timer_thread() {
                     }
                 }
                 
+                // 低水位 loading：播放中若队列枯竭且进度停滞，快速进入 loading（不用等读失败超时）。
+                bool queue_starved = false;
+                if (current_state == PlayerState::Playing && !seeking_.load(std::memory_order_acquire)) {
+                    bool video_starved = video_stream_opened_ && video_queue_ && video_queue_->nb_remaining() <= 0;
+                    bool audio_starved = audio_stream_opened_ && audio_queue_ && audio_queue_->nb_remaining() <= 0;
+                    bool progress_stalled = !isnan(last_position) && fabs(current_position - last_position) < 0.01;
+                    queue_starved = (video_starved || audio_starved) && progress_stalled;
+                }
+                if (queue_starved) {
+                    starvation_ticks++;
+                } else {
+                    starvation_ticks = 0;
+                }
+                set_starvation_loading(starvation_ticks >= 3);
                 last_position = current_position;
                 
                 // ⚠️ 【关键修复】判断播放完成的多个条件：
@@ -2191,6 +2368,10 @@ void PlayerCore::progress_timer_thread() {
                     }
                 }
             }
+        }
+        if (!(current_state == PlayerState::Playing || current_state == PlayerState::Paused)) {
+            starvation_ticks = 0;
+            set_starvation_loading(false);
         }
 
         // 等待一段时间后再次检查
@@ -2624,10 +2805,16 @@ void PlayerCore::set_io_loading(bool is_loading) {
     refresh_loading_state();
 }
 
+void PlayerCore::set_starvation_loading(bool is_loading) {
+    starvation_loading_.store(is_loading, std::memory_order_release);
+    refresh_loading_state();
+}
+
 void PlayerCore::refresh_loading_state() {
     const bool merged_loading =
         seek_loading_.load(std::memory_order_acquire) ||
-        io_loading_.load(std::memory_order_acquire);
+        io_loading_.load(std::memory_order_acquire) ||
+        starvation_loading_.load(std::memory_order_acquire);
     const bool prev = loading_notified_.exchange(merged_loading, std::memory_order_acq_rel);
     update_pipeline_state_from_runtime();
     if (prev != merged_loading && loading_callback_) {
