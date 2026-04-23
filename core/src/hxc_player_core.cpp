@@ -2347,9 +2347,11 @@ void PlayerCore::progress_timer_thread() {
             
             // 只在播放进度有效时触发回调
             if (!isnan(current_position) && current_position >= 0.0) {
-                // 即使暂停也触发回调，让 UI 知道当前位置
-                if (position_changed_callback_) {
-                    position_changed_callback_(current_position);
+                // 播放完成后停止进度回调，避免 UI 收到超出时长的位置值
+                if (!playback_completed_notified_) {
+                    if (position_changed_callback_) {
+                        position_changed_callback_(current_position);
+                    }
                 }
                 
                 // ⚠️ 检测位置是否变化

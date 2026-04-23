@@ -189,18 +189,10 @@ int player_core_open(PlayerCoreHandle* handle, const char* url) {
 int player_core_open_with_start_position(PlayerCoreHandle* handle, const char* url, double start_pos) {
     if (!handle || !handle->core) return -1;
     
-    // ✅ 优化方案：通过配置设置起始时间，在 open 内部处理
-    // 这样 PlayerCore::open 会在启动解码线程前先 seek，避免解码无用数据
-    if (start_pos > 0.0) {
-        // 获取当前配置
-        auto config = handle->core->get_config();
-        
-        // 设置起始时间
-        config.start_time = start_pos;
-        
-        // 应用配置
-        handle->core->set_config(config);
-    }
+    // 无论是否 > 0，都写入 start_time，确保 start_pos=0 时能清除上次残留的值。
+    auto config = handle->core->get_config();
+    config.start_time = (start_pos > 0.0) ? start_pos : 0.0;
+    handle->core->set_config(config);
     
     // 打开文件（内部会检查 config.start_time 并在解码前 seek）
     return handle->core->open(url);
@@ -211,10 +203,10 @@ int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, Player
         return -1;
     }
 
-    // 设置起始播放时间
-    if (start_position > 0.0) {
+    // 无论是否 > 0，都写入 start_time，确保 start_position=0 时能清除上次残留的值。
+    {
         auto playerConfig = handle->core->get_config();
-        playerConfig.start_time = start_position;
+        playerConfig.start_time = (start_position > 0.0) ? start_position : 0.0;
         handle->core->set_config(playerConfig);
     }
 
