@@ -1220,6 +1220,12 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
         // 正常显示
         [self displayVideoFrameData:&frame_data];
         player_core_consume_video_frame(_wrapper->handle());
+    } else if (delay > 1.0) {
+        // 前向等待过大（常见于首帧加速后时间基错位），强制显示一帧打通渲染。
+        NSLog(@"检测到视频前向等待过大: currentPTS=%.2f, masterClock=%.2f, delay=%.2f，强制显示帧",
+              currentPTS, masterClock, delay);
+        [self displayVideoFrameData:&frame_data];
+        player_core_consume_video_frame(_wrapper->handle());
     }
     // else: delay > threshold，视频超前，不消费帧，等待下次渲染
     
@@ -1268,8 +1274,16 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     CMTime presentationTime = CMTimeMake(frameData->pts * 1000000, 1000000);
     if (_firstFrameBootstrapActive && !_hasRenderedFirstVideoFrame &&
         _videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
-        // 首帧阶段直接贴当前 timebase，避免首帧因 PTS 偏前被延后显示。
-        presentationTime = CMTimebaseGetTime(_videoView.videoLayer.controlTimebase);
+        // 首帧阶段先把 timebase 对齐到首帧 PTS，避免“首帧秒出但后续帧被长时间等待”。
+        if (!isnan(frameData->pts) && frameData->pts >= 0.0) {
+            CMTime firstPTS = CMTimeMake((int64_t)(frameData->pts * 1000000.0), 1000000);
+            CMTimebaseSetTime(_videoView.videoLayer.controlTimebase, firstPTS);
+            CMTimebaseSetRate(_videoView.videoLayer.controlTimebase, _playbackRate > 0 ? _playbackRate : 1.0);
+            presentationTime = firstPTS;
+        } else {
+            // 无有效 PTS 时退回当前 timebase，保证首帧尽快可见。
+            presentationTime = CMTimebaseGetTime(_videoView.videoLayer.controlTimebase);
+        }
     }
     CMSampleTimingInfo timing = {
         .duration = kCMTimeInvalid,
