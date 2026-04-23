@@ -106,6 +106,8 @@ static void playing_changed_callback_c(int is_playing, void* user_data);
     BOOL _deferAudioStartUntilFirstVideoFrame;
     int64_t _audioStartGeneration;
     BOOL _firstFrameBootstrapActive;
+    int _syncWarmupFramesRemaining;   // 首播/seek 后的同步宽容窗口
+    double _lastSyncVideoPTS;         // 用于估算视频帧间隔
 }
 
 #if TARGET_OS_IOS
@@ -403,6 +405,8 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
         _deferAudioStartUntilFirstVideoFrame = NO;
         _audioStartGeneration = 1;
         _firstFrameBootstrapActive = NO;
+        _syncWarmupFramesRemaining = 0;
+        _lastSyncVideoPTS = NAN;
         
         // ========== 设置播放器回调 ==========
         player_core_set_state_changed_callback(_wrapper->handle(), state_changed_callback_c, (__bridge void*)self);
@@ -531,6 +535,8 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     _hasRenderedFirstVideoFrame = NO;
     _deferAudioStartUntilFirstVideoFrame = NO;
     _firstFrameBootstrapActive = YES;
+    _syncWarmupFramesRemaining = 12;
+    _lastSyncVideoPTS = NAN;
 
     // 如果设置了起始播放位置，更新 controlTimebase
     if (_startPosition > 0) {
@@ -623,6 +629,8 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     _hasRenderedFirstVideoFrame = NO;
     _deferAudioStartUntilFirstVideoFrame = NO;
     _firstFrameBootstrapActive = YES;
+    _syncWarmupFramesRemaining = 12;
+    _lastSyncVideoPTS = NAN;
 
     if (_startPosition > 0) {
         if (_videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
@@ -657,6 +665,8 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
         if (!_hasRenderedFirstVideoFrame && _videoWidth > 0 && _videoHeight > 0) {
             _deferAudioStartUntilFirstVideoFrame = YES;
             _firstFrameBootstrapActive = YES;
+            _syncWarmupFramesRemaining = 12;
+            _lastSyncVideoPTS = NAN;
             _audioStartGeneration += 1;
             int64_t generation = _audioStartGeneration;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)),
@@ -712,6 +722,8 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     player_core_seek(_wrapper->handle(), position);
     _renderGeneration++;
     _lastEnqueuedVideoPTS = NAN;
+    _syncWarmupFramesRemaining = 18;
+    _lastSyncVideoPTS = NAN;
     
     // iOS 和 macOS 都需要更新 controlTimebase
     if (_videoView.videoLayer && _videoView.videoLayer.controlTimebase) {
@@ -762,6 +774,8 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     _deferAudioStartUntilFirstVideoFrame = NO;
     _audioStartGeneration += 1;
     _firstFrameBootstrapActive = NO;
+    _syncWarmupFramesRemaining = 0;
+    _lastSyncVideoPTS = NAN;
 #if TARGET_OS_IOS
     if (previousState != HXCPlayerStateIdle) {
         [self invalidatePictureInPicturePlaybackStateIfNeeded];
@@ -1190,6 +1204,10 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     if (_firstFrameBootstrapActive && !_hasRenderedFirstVideoFrame) {
         [self displayVideoFrameData:&frame_data];
         player_core_consume_video_frame(_wrapper->handle());
+        _lastSyncVideoPTS = currentPTS;
+        if (_syncWarmupFramesRemaining > 0) {
+            _syncWarmupFramesRemaining--;
+        }
         return;
     }
     
@@ -1201,7 +1219,18 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     
     double delay = currentPTS - masterClock;
     double playbackRate = player_core_get_playback_rate(_wrapper->handle());
-    double threshold = 0.04 / playbackRate;
+    if (playbackRate <= 0.0) {
+        playbackRate = 1.0;
+    }
+    double frameInterval = 1.0 / 30.0;
+    if (!isnan(_lastSyncVideoPTS) && currentPTS > _lastSyncVideoPTS) {
+        double delta = currentPTS - _lastSyncVideoPTS;
+        if (delta > 0.0 && delta < 0.2) {
+            frameInterval = delta;
+        }
+    }
+    double syncThreshold = fmin(0.10, fmax(0.02, frameInterval * 1.5)) / playbackRate;
+    double forceAheadCap = (_syncWarmupFramesRemaining > 0) ? 0.25 : 0.35;
     
     // ⚠️ 【关键修复】如果 delay 严重异常（< -5 秒），说明时钟还未同步（比如 seek 后）
     // 此时应该强制显示帧，不丢帧，让时钟自动同步
@@ -1210,22 +1239,43 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
               currentPTS, masterClock, delay);
         [self displayVideoFrameData:&frame_data];
         player_core_consume_video_frame(_wrapper->handle());
+        _lastSyncVideoPTS = currentPTS;
+        if (_syncWarmupFramesRemaining > 0) {
+            _syncWarmupFramesRemaining--;
+        }
+        return;
+    }
+
+    // 首播/seek 后短窗口：放宽同步策略，优先连续出图，避免“首帧后静止一段时间”。
+    if (_syncWarmupFramesRemaining > 0) {
+        if (delay < -0.5) {
+            player_core_consume_video_frame(_wrapper->handle());
+            _lastSyncVideoPTS = currentPTS;
+        } else {
+            [self displayVideoFrameData:&frame_data];
+            player_core_consume_video_frame(_wrapper->handle());
+            _lastSyncVideoPTS = currentPTS;
+        }
+        _syncWarmupFramesRemaining--;
         return;
     }
     
-    if (delay <= -threshold) {
+    if (delay <= -syncThreshold) {
         // 丢帧：视频落后太多
         player_core_consume_video_frame(_wrapper->handle());
-    } else if (delay <= threshold) {
+        _lastSyncVideoPTS = currentPTS;
+    } else if (delay <= syncThreshold) {
         // 正常显示
         [self displayVideoFrameData:&frame_data];
         player_core_consume_video_frame(_wrapper->handle());
-    } else if (delay > 1.0) {
+        _lastSyncVideoPTS = currentPTS;
+    } else if (delay > forceAheadCap) {
         // 前向等待过大（常见于首帧加速后时间基错位），强制显示一帧打通渲染。
         NSLog(@"检测到视频前向等待过大: currentPTS=%.2f, masterClock=%.2f, delay=%.2f，强制显示帧",
               currentPTS, masterClock, delay);
         [self displayVideoFrameData:&frame_data];
         player_core_consume_video_frame(_wrapper->handle());
+        _lastSyncVideoPTS = currentPTS;
     }
     // else: delay > threshold，视频超前，不消费帧，等待下次渲染
     
