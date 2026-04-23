@@ -706,12 +706,23 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
         return;
     }
 
-    NSString *url = [_playerUrl copy];
-    if (![self playURL:url]) {
-        return;
+    // replay 语义是"从头重播"，强制将起始位置清零。
+    double savedStartPosition = _startPosition;
+    _startPosition = 0.0;
+
+    BOOL ok = NO;
+    if (_lastOpenPlayModel) {
+        // 使用 playWithModel 打开的：使用同一个 model 重播，保留 mode/encryptedFile 等配置。
+        ok = [self playWithModel:_lastOpenPlayModel];
+    } else {
+        NSString *url = [_playerUrl copy];
+        ok = [self playURL:url];
     }
-    if (!self.autoPlayer) {
-        [self play];
+
+    if (!ok) {
+        // 重播失败时恢复 startPosition，避免副作用。
+        _startPosition = savedStartPosition;
+        return;
     }
 }
 

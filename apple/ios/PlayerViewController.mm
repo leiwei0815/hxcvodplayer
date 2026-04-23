@@ -24,6 +24,7 @@
 @property (nonatomic, strong) UIButton *speedButton;
 @property (nonatomic, strong) UIButton *aspectRatioButton;  // 显示模式按钮
 @property (nonatomic, strong) UIButton *pipButton;  // 画中画按钮
+@property (nonatomic, strong) UIButton *replayButton;  // 重播按钮
 @property (nonatomic, strong) UISlider *volumeSlider;
 
 @property (nonatomic, assign) BOOL isSeeking;
@@ -125,7 +126,14 @@
     _pipButton.tintColor = [UIColor whiteColor];
     [_pipButton addTarget:self action:@selector(pipButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
 
-    for (UIButton *b in @[_playPauseButton, _downloadButton, _completedDownloadsButton, _pipButton, _speedButton, _aspectRatioButton]) {
+    _replayButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_replayButton setTitle:@"重播" forState:UIControlStateNormal];
+    _replayButton.tintColor = [UIColor whiteColor];
+    _replayButton.titleLabel.adjustsFontSizeToFitWidth = YES;
+    _replayButton.titleLabel.minimumScaleFactor = 0.75;
+    [_replayButton addTarget:self action:@selector(replayButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+    for (UIButton *b in @[_playPauseButton, _downloadButton, _completedDownloadsButton, _replayButton, _pipButton, _speedButton, _aspectRatioButton]) {
         [b setContentHuggingPriority:UILayoutPriorityDefaultHigh forAxis:UILayoutConstraintAxisHorizontal];
         [b setContentCompressionResistancePriority:UILayoutPriorityDefaultHigh forAxis:UILayoutConstraintAxisHorizontal];
     }
@@ -135,7 +143,7 @@
     [topRowSpacer setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
 
     UIStackView *topButtonRow = [[UIStackView alloc] initWithArrangedSubviews:@[
-        _playPauseButton, _downloadButton, _completedDownloadsButton, topRowSpacer, _pipButton, _speedButton, _aspectRatioButton
+        _playPauseButton, _downloadButton, _completedDownloadsButton, topRowSpacer, _replayButton, _pipButton, _speedButton, _aspectRatioButton
     ]];
     topButtonRow.translatesAutoresizingMaskIntoConstraints = NO;
     topButtonRow.axis = UILayoutConstraintAxisHorizontal;
@@ -226,7 +234,7 @@
 //    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/34ab23701397757895318581301/v.f1440843.mp4";
 //    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/3b5133951397757895318833144/v.f1440843.mp4"; // 错误码: -1001, No such file or directory
 //    NSString *urlString = @"https://example.com/nonexistent-video.mp4";
-#if 1
+#if 0
     // ✨ 选择数据源模式（推荐使用新接口）
     HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeDefault;  // 或者 HXCPlayerDataSourceModeDefault
     NSLog(@"========================================");
@@ -326,6 +334,11 @@
     } else {
         [_player startPictureInPicture];
     }
+}
+
+- (void)replayButtonTapped:(UIButton *)sender {
+    [_player replay];
+    [_playPauseButton setTitle:@"暂停" forState:UIControlStateNormal];
 }
 
 - (void)downloadButtonTapped:(UIButton *)sender {
