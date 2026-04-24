@@ -65,6 +65,7 @@ static void playing_changed_callback_c(int is_playing, void* user_data);
     AudioQueueBufferRef _audioBuffers[kNumberOfBuffers];
     AudioStreamBasicDescription _audioFormat;
     BOOL _audioQueueRunning;
+    double _audioOutputLatencySec;      // 音频输出设备排队延迟估算（用于 A/V 同步）
     
     // 视频渲染定时器（平台特定）
 #if TARGET_OS_IOS
@@ -390,6 +391,7 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
         _decodeMode = HXCPlayerDecodeModeSoftware;
         _autoPlayer = YES;
         _audioQueueRunning = NO;
+        _audioOutputLatencySec = 0.0;
         _lastPositionUpdateTime = 0;
         _autoReopenOnRecoverableErrorEnabled = NO;
         _autoReopenMaxAttempts = 1;
@@ -660,6 +662,15 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
         return;
     }
     player_core_play(_wrapper->handle());
+#if TARGET_OS_IOS
+    if (_displayLink) {
+        _displayLink.paused = NO;
+    }
+#else
+    if (_displayLink && !CVDisplayLinkIsRunning(_displayLink)) {
+        CVDisplayLinkStart(_displayLink);
+    }
+#endif
     if (_audioQueue && !_audioQueueRunning) {
         // 首帧优先：有视频轨时优先等待首帧，避免出现“先听到声音还没画面”。
         if (!_hasRenderedFirstVideoFrame && _videoWidth > 0 && _videoHeight > 0) {
@@ -690,6 +701,15 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
 
 - (void)pause {
     player_core_pause(_wrapper->handle());
+#if TARGET_OS_IOS
+    if (_displayLink) {
+        _displayLink.paused = YES;
+    }
+#else
+    if (_displayLink && CVDisplayLinkIsRunning(_displayLink)) {
+        CVDisplayLinkStop(_displayLink);
+    }
+#endif
     if (_audioQueue && _audioQueueRunning) {
         AudioQueuePause(_audioQueue);
         _audioQueueRunning = NO;
@@ -749,6 +769,15 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
         }
         
         NSLog(@"[Seek] 更新 controlTimebase 到: %.2f 秒", position);
+    }
+
+    // 暂停态下 displayLink 会被冻结；主动拉一帧，支持拖动 seek 后单帧预览。
+    BOOL pausedLike = (_state == HXCPlayerStatePaused);
+    if (!pausedLike && _wrapper && _wrapper->handle()) {
+        pausedLike = (player_core_get_play_when_ready(_wrapper->handle()) == 0);
+    }
+    if (pausedLike) {
+        [self renderVideoFrame];
     }
 }
 
@@ -1098,6 +1127,18 @@ didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
         AudioQueueAllocateBuffer(_audioQueue, bufferSize, &_audioBuffers[i]);
         audioQueueCallback((__bridge void *)self, _audioQueue, _audioBuffers[i]);
     }
+
+    // AudioQueue 以多缓冲排队输出，主时钟若不扣这段排队时长会“超前耳朵”。
+    // 这里做一个保守估算，减少视频侧误判“落后音频”而频繁追帧。
+    if (sampleRate > 0 && channels > 0) {
+        double bytesPerSecond = (double)sampleRate * channels * sizeof(SInt16);
+        double queueBufferedSec = (bytesPerSecond > 0.0)
+                                  ? ((double)bufferSize * kNumberOfBuffers / bytesPerSecond)
+                                  : 0.0;
+        _audioOutputLatencySec = fmin(0.200, fmax(0.0, queueBufferedSec * 0.85));
+    } else {
+        _audioOutputLatencySec = 0.0;
+    }
     
     AudioQueueSetParameter(_audioQueue, kAudioQueueParam_Volume, _volume);
 }
@@ -1109,6 +1150,7 @@ didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
         _audioQueue = NULL;
         _audioQueueRunning = NO;
     }
+    _audioOutputLatencySec = 0.0;
 }
 
 static void audioQueueCallback(void *userData, AudioQueueRef queue, AudioQueueBufferRef buffer) {
@@ -1210,6 +1252,13 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     
     double currentPTS = frame_data.pts;
     double masterClock = player_core_get_position(_wrapper->handle());
+    if (_audioQueueRunning && _audioOutputLatencySec > 0.0) {
+        // 用“已听到的音频位置”作为同步基准，而不是“已提交到 AudioQueue”的位置。
+        masterClock -= _audioOutputLatencySec;
+        if (masterClock < 0.0) {
+            masterClock = 0.0;
+        }
+    }
 
     // 首帧快速通道：首帧阶段不等待 A/V 阈值，避免“有声无画”。
     if (_firstFrameBootstrapActive && !_hasRenderedFirstVideoFrame) {

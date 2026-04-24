@@ -40,8 +40,8 @@
     
     // 创建播放器
     _player = [[HXCPlayerControl alloc] init];
-    _player.decodeMode = HXCPlayerDecodeModeHardware;
-    _player.startPosition = 67;
+    _player.decodeMode = HXCPlayerDecodeModeSoftware;
+//    _player.startPosition = 67;
     if (@available(iOS 14.2, *)) {
         _player.canStartPictureInPictureAutomaticallyFromInline = NO;
     }

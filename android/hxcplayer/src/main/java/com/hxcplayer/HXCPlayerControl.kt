@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.graphics.SurfaceTexture
+import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -54,6 +55,8 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     companion object {
+        private const val TAG = "HXCPlayerControl"
+
         init {
             System.loadLibrary("hxcplayer")
         }
@@ -273,8 +276,17 @@ class HXCPlayerControl @JvmOverloads constructor(
         fun onNetworkQoEUpdated(currentStallMs: Long, totalStallMs: Long, reconnectCount: Int) {}
     }
 
+    /**
+     * 播放完成回调接口。
+     * 视频播放到末尾自然结束时触发，在主线程回调。
+     */
+    interface PlaybackCompletedCallback {
+        fun onPlaybackCompleted()
+    }
+
     private var nativeHandle: Long = 0
     private var callback: PlayerCallback? = null
+    private var completedCallback: PlaybackCompletedCallback? = null
     private var lastPlayerState: PlayerState? = null
     private var lastPipelineState: PipelineState? = null
     private var lastIsPlayingState: Boolean? = null
@@ -322,6 +334,14 @@ class HXCPlayerControl @JvmOverloads constructor(
     // 设置回调
     fun setCallback(callback: PlayerCallback) {
         this.callback = callback
+    }
+
+    /**
+     * 设置播放完成回调。
+     * 视频自然播放到末尾时在主线程触发 [PlaybackCompletedCallback.onPlaybackCompleted]。
+     */
+    fun setPlaybackCompletedCallback(callback: PlaybackCompletedCallback?) {
+        this.completedCallback = callback
     }
 
     /**
@@ -955,6 +975,19 @@ class HXCPlayerControl @JvmOverloads constructor(
                         dispatchError(outCode[0], errorMessage)
                     }
                 }
+
+                // 透传播放完成事件（由 core 回调写入，Java 侧轮询消费）
+                if (nativeConsumePlaybackCompleted(handle) && !isReleased) {
+                    Log.i(TAG, "[播放完成] Kotlin 层：收到播放完成事件，position=${getPosition()} duration=${getDuration()} state=${getState()}")
+                    mainHandler.post {
+                        if (completedCallback != null) {
+                            Log.i(TAG, "[播放完成] Kotlin 层：派发 onPlaybackCompleted 到应用层")
+                            completedCallback?.onPlaybackCompleted()
+                        } else {
+                            Log.w(TAG, "[播放完成] Kotlin 层：completedCallback 为 null，未派发（请调用 setPlaybackCompletedCallback 注册）")
+                        }
+                    }
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -1032,6 +1065,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeIsLoading(handle: Long): Boolean
     private external fun nativeIsHardwareDecodingActive(handle: Long): Boolean
     private external fun nativeConsumeLastError(handle: Long, outCode: IntArray): String?
+    private external fun nativeConsumePlaybackCompleted(handle: Long): Boolean
 
     // 获取当前是否处于加载中（可用于主动查询 UI 状态）
     fun isLoading(): Boolean {

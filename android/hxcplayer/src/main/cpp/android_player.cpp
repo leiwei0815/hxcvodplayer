@@ -42,6 +42,7 @@ AndroidPlayer::AndroidPlayer()
     , is_loading_(false)
     , has_pending_error_(false)
     , last_error_code_(0)
+    , has_pending_playback_completed_(false)
 {
     LOGD("AndroidPlayer created");
     
@@ -54,6 +55,9 @@ AndroidPlayer::AndroidPlayer()
         player_core_set_loading_callback(player_core_, loadingStateCallback, this);
         // 注册底层错误回调（播放中错误透传给业务层）
         player_core_set_error_callback(player_core_, errorStateCallback, this);
+        // 注册播放完成回调
+        player_core_set_playback_completed_callback(player_core_, playbackCompletedCallback, this);
+        LOGI("[播放完成] 已注册 playbackCompletedCallback");
     }
     
     // ⚠️ 不在这里初始化音频，等到打开视频后根据实际音频参数初始化
@@ -477,6 +481,28 @@ void AndroidPlayer::errorStateCallback(int error_code, const char* error_msg, vo
         player->last_error_message_ = error_msg ? error_msg : "unknown error";
     }
     player->has_pending_error_.store(true, std::memory_order_release);
+}
+
+// ========== 播放完成 ==========
+
+void AndroidPlayer::playbackCompletedCallback(void* user_data) {
+    auto* player = static_cast<AndroidPlayer*>(user_data);
+    if (!player) {
+        LOGW("[播放完成] android_player 层：收到回调但 player 为 null");
+        return;
+    }
+    LOGI("[播放完成] android_player 层：core 回调触发，position=%.3f duration=%.3f state=%d",
+         player->getPosition(), player->getDuration(), player->getState());
+    player->has_pending_playback_completed_.store(true, std::memory_order_release);
+}
+
+bool AndroidPlayer::consumePlaybackCompleted() {
+    bool completed = has_pending_playback_completed_.exchange(false, std::memory_order_acq_rel);
+    if (completed) {
+        LOGI("[播放完成] android_player 层：consumePlaybackCompleted=true，position=%.3f duration=%.3f state=%d",
+             getPosition(), getDuration(), getState());
+    }
+    return completed;
 }
 
 // ========== 视频渲染 ==========

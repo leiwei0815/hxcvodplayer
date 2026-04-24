@@ -71,7 +71,8 @@ public:
     bool isLoading() const;
     bool isHardwareDecodingActive() const;
     bool consumeLastError(int& error_code, std::string& error_message);
-    
+    bool consumePlaybackCompleted();
+
 private:
     // 核心播放器句柄
     PlayerCoreHandle* player_core_;
@@ -138,6 +139,10 @@ private:
     int last_error_code_;
     std::string last_error_message_;
     static void errorStateCallback(int error_code, const char* error_msg, void* user_data);
+
+    // 播放完成透传（由 core 回调写入，JNI 轮询消费）
+    std::atomic<bool> has_pending_playback_completed_;
+    static void playbackCompletedCallback(void* user_data);
 };
 
 #endif // ANDROID_PLAYER_H

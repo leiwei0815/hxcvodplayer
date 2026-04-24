@@ -7,6 +7,8 @@
 
 #define LOG_TAG "HXCPlayerJNI"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 extern "C" {
@@ -285,6 +287,22 @@ Java_com_hxcplayer_HXCPlayerControl_nativeConsumeLastError(
     }
 
     return env->NewStringUTF(error_message.c_str());
+}
+
+// 消费一次播放完成事件（有事件返回 JNI_TRUE；无则返回 JNI_FALSE）
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeConsumePlaybackCompleted(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) {
+        LOGW("[播放完成] JNI 层：nativeConsumePlaybackCompleted 调用时 player 为 null");
+        return JNI_FALSE;
+    }
+    bool result = player->consumePlaybackCompleted();
+    if (result) {
+        LOGI("[播放完成] JNI 层：consumePlaybackCompleted=true，即将通知 Kotlin 层");
+    }
+    return result ? JNI_TRUE : JNI_FALSE;
 }
 
 // ========== 日志配置方法 ==========

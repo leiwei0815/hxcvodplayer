@@ -29,7 +29,8 @@ struct PlayerCoreHandle {
     unsigned int audio_buf_index;
     
     // ⚠️ 音频时钟跟踪（用于 iOS/macOS/Android 平台）
-    double audio_current_pts;           // 当前音频帧的 PTS
+    double audio_current_pts;           // 当前音频时钟（用于诊断）
+    double audio_buf_pts_base;          // 当前桥接缓冲起点 PTS（媒体时间）
     int audio_current_sample_rate;      // 当前音频采样率
     int audio_current_channels;         // 当前音频通道数
     std::atomic<uint64_t> audio_seek_serial; // seek 代数，用于丢弃 seek 前旧回调
@@ -77,6 +78,7 @@ struct PlayerCoreHandle {
         , audio_buf_size(0)
         , audio_buf_index(0)
         , audio_current_pts(0.0)
+        , audio_buf_pts_base(0.0)
         , audio_current_sample_rate(0)
         , audio_current_channels(0)
         , audio_seek_serial(0)
@@ -301,6 +303,7 @@ void player_core_seek(PlayerCoreHandle* handle, double pos) {
         handle->audio_buf_index = 0;
         handle->audio_buf_size = 0;
         handle->audio_current_pts = pos;
+        handle->audio_buf_pts_base = pos;
         handle->audio_buf_serial = 0;
 #ifdef HAS_SOUNDTOUCH
         if (handle->soundtouch) {
@@ -538,29 +541,30 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             memcpy(buffer, handle->audio_buf + handle->audio_buf_index, len1);
             handle->audio_buf_index += len1;
             
-            // ⚠️ 【关键修复】在数据被复制给平台层后，更新音频时钟
+            // 在数据被复制给平台层后，基于“当前缓冲起点 + 已输出偏移”更新音频时钟。
             if (handle->audio_current_sample_rate > 0 && handle->audio_current_channels > 0) {
                 if (call_seek_serial != handle->audio_seek_serial.load(std::memory_order_acquire)) {
                     return 0;
                 }
-                // 计算实际消费的样本数
-                int consumed_samples = len1 / (handle->audio_current_channels * sizeof(int16_t));
-                
-                // 计算消费时长（媒体时间）
-                double consumed_duration = (double)consumed_samples / handle->audio_current_sample_rate;
-                
-                // ⚠️ SoundTouch 倍速播放：每个输出样本对应 playback_rate 倍的媒体内容时间
-                // 例如：2.0x 时，512 个输出样本对应 1024 个原始样本的媒体时间
+                int bytes_per_sample_all_channels = handle->audio_current_channels * (int)sizeof(int16_t);
+                if (bytes_per_sample_all_channels <= 0) {
+                    return len1;
+                }
+
+                // 注意：这里必须按“当前缓冲累计已输出字节”计算，而不是只按本次 len1 增量累加，
+                // 避免浮点累加误差与分段回调引入的时钟漂移。
+                int emitted_samples_total = (int)(handle->audio_buf_index / bytes_per_sample_all_channels);
+                double consumed_duration = (double)emitted_samples_total / handle->audio_current_sample_rate;
+
+                // SoundTouch 倍速播放：输出样本对应 media time 需要乘当前速率。
                 double current_rate = handle->core->get_playback_rate();
                 if (current_rate != 1.0) {
                     consumed_duration *= current_rate;
                 }
-                
-                // 更新 PTS（逐步累加）
-                handle->audio_current_pts += consumed_duration;
-                
-                // 更新音频时钟
-                handle->core->update_audio_pts(handle->audio_current_pts, 0);
+
+                double pts_for_clock = handle->audio_buf_pts_base + consumed_duration;
+                handle->audio_current_pts = pts_for_clock;
+                handle->core->update_audio_pts(pts_for_clock, handle->audio_buf_serial);
             }
             
             return len1;  // 返回复制的字节数
@@ -607,10 +611,10 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         }
         double pts = af->pts;  // ⚠️ 保存 PTS，用于后续时钟更新
 
-        // ⚠️ 保存当前帧的时钟信息
+        // 保存当前帧的时钟基准（注意：以输出缓冲起点作为媒体时间基准）。
         handle->audio_current_pts = pts;
+        handle->audio_buf_pts_base = pts;
         handle->audio_current_sample_rate = sample_rate;
-        handle->audio_current_channels = channels;
         handle->audio_buf_serial = af->serial;
 
         // 按当前帧的格式配置重采样器（每个新流/格式变化时重新配置）
@@ -618,6 +622,11 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         if (channels == 1) {
             dst_layout = AV_CHANNEL_LAYOUT_MONO;
         }
+        int output_channels = dst_layout.nb_channels;
+        if (output_channels <= 0) {
+            output_channels = channels;
+        }
+        handle->audio_current_channels = output_channels;
         handle->resampler->configure(&frame->ch_layout,
                                      (AVSampleFormat)frame->format,
                                      sample_rate,
@@ -639,7 +648,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             audio_data = frame->data[0];
         }
 
-        int raw_output_size = audio_samples * channels * sizeof(int16_t);
+        int raw_output_size = audio_samples * output_channels * sizeof(int16_t);
         
         // 确保临时缓冲区足够大
         if (!handle->audio_buf || handle->audio_buf_size < (unsigned int)raw_output_size * 2) {
@@ -667,14 +676,14 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             // 首次使用时设置采样率和通道数
             if (!handle->soundtouch_initialized) {
                 handle->soundtouch->setSampleRate(sample_rate);
-                handle->soundtouch->setChannels(channels);
+                handle->soundtouch->setChannels(output_channels);
                 handle->soundtouch_initialized = true;
             }
             
             // 转换 S16 为 float
             int16_t* s16_data = (int16_t*)handle->audio_buf;
-            std::vector<float> float_input(audio_samples * channels);
-            for (int i = 0; i < audio_samples * channels; i++) {
+            std::vector<float> float_input(audio_samples * output_channels);
+            for (int i = 0; i < audio_samples * output_channels; i++) {
                 float_input[i] = (float)s16_data[i] / 32768.0f;
             }
 
@@ -685,17 +694,17 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             uint32_t available = handle->soundtouch->numSamples();
             
             // 计算期望输出样本数
-            uint32_t expected_output = (uint32_t)(samples / current_rate);
+            uint32_t expected_output = (uint32_t)(audio_samples / current_rate);
             
             // 只有当积累的样本 >= 期望输出的 80% 时才取出
             if (available >= expected_output * 0.8) {
                 uint32_t samples_to_get = available > expected_output ? available : expected_output;
-                std::vector<float> output_buffer(samples_to_get * channels);
+                std::vector<float> output_buffer(samples_to_get * output_channels);
                 uint32_t received = handle->soundtouch->receiveSamples(output_buffer.data(), samples_to_get);
                 
                 if (received > 0) {
                     // 转换回 S16
-                    int out_size = received * channels * sizeof(int16_t);
+                    int out_size = received * output_channels * sizeof(int16_t);
                     
                     // 确保缓冲区足够大
                     if (handle->audio_buf_size < (unsigned int)out_size * 2) {
@@ -707,7 +716,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
                     }
                     
                     int16_t* s16_dst = (int16_t*)handle->audio_buf;
-                    for (size_t i = 0; i < received * channels; i++) {
+                    for (size_t i = 0; i < received * output_channels; i++) {
                         float sample = output_buffer[i];
                         if (sample > 1.0f) sample = 1.0f;
                         if (sample < -1.0f) sample = -1.0f;
