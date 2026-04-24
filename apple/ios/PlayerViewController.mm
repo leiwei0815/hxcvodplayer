@@ -41,7 +41,7 @@
     // 创建播放器
     _player = [[HXCPlayerControl alloc] init];
     _player.decodeMode = HXCPlayerDecodeModeSoftware;
-//    _player.startPosition = 67;
+    _player.startPosition = 120;
     if (@available(iOS 14.2, *)) {
         _player.canStartPictureInPictureAutomaticallyFromInline = NO;
     }
@@ -228,12 +228,12 @@
 - (void)openTestVideo {
     // 测试网络视频
 //        NSString *urlString = @"https://111453136245362688.tenwiseacademy.cn/6e05f006034f11e0772fd44df4beb686/4632d236ac2612c4729de505aa4fdab9.mp4";
-    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
+//    NSString *urlString = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
 //    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/4ece4b555145403697569546683/v.f1440843.mp4";//h265
 //    NSString *urlString = @"https://vod.tenwiseacademy.cn/111453136245362688/lf9cmlwy92fmszkjd6qaux2s7qhennhk/k43g4cz9f5c1sva3.m3u8";
 //    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/34ab23701397757895318581301/v.f1440843.mp4";
-//    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/3b5133951397757895318833144/v.f1440843.mp4"; // 错误码: -1001, No such file or directory
-//    NSString *urlString = @"https://example.com/nonexistent-video.mp4";
+    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/3b5133951397757895318833144/v.f1440843.mp4"; // 错误码: -1001, No such file or directory
+//    NSString *urlString = @"https://v.shkt.online/772388bdvodtranscq1317978474/1e40e986388912589374781473/v.f1440843.mp4";
 #if 0
     // ✨ 选择数据源模式（推荐使用新接口）
     HXCPlayerDataSourceMode mode = HXCPlayerDataSourceModeDefault;  // 或者 HXCPlayerDataSourceModeDefault
@@ -294,7 +294,7 @@
 }
 
 - (void)speedButtonTapped:(UIButton *)sender {
-    // 切换播放速度：1.0x -> 1.5x -> 2.0x -> 0.5x -> 1.0x
+    // 切换播放速度：1.0x -> 1.5x -> 2.0x -> 3.0x -> 0.5x -> 1.0x
     double currentRate = _player.playbackRate;
     double newRate = 1.0;
     
@@ -303,6 +303,8 @@
     } else if (currentRate == 1.5) {
         newRate = 2.0;
     } else if (currentRate == 2.0) {
+        newRate = 3.0;
+    } else if (currentRate == 3.0) {
         newRate = 0.5;
     } else {
         newRate = 1.0;

@@ -537,7 +537,7 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     _hasRenderedFirstVideoFrame = NO;
     _deferAudioStartUntilFirstVideoFrame = NO;
     _firstFrameBootstrapActive = YES;
-    _syncWarmupFramesRemaining = 12;
+    _syncWarmupFramesRemaining = 28; // 放宽首播同步窗口，吸收起播初期 A/V 前向偏差
     _lastSyncVideoPTS = NAN;
 
     // 如果设置了起始播放位置，更新 controlTimebase
@@ -631,7 +631,7 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     _hasRenderedFirstVideoFrame = NO;
     _deferAudioStartUntilFirstVideoFrame = NO;
     _firstFrameBootstrapActive = YES;
-    _syncWarmupFramesRemaining = 12;
+    _syncWarmupFramesRemaining = 28; // 放宽首播同步窗口，吸收起播初期 A/V 前向偏差
     _lastSyncVideoPTS = NAN;
 
     if (_startPosition > 0) {
@@ -676,7 +676,7 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
         if (!_hasRenderedFirstVideoFrame && _videoWidth > 0 && _videoHeight > 0) {
             _deferAudioStartUntilFirstVideoFrame = YES;
             _firstFrameBootstrapActive = YES;
-            _syncWarmupFramesRemaining = 12;
+            _syncWarmupFramesRemaining = 28; // 首帧优先路径也使用更长 warmup，减少进入稳态后的强制追帧
             _lastSyncVideoPTS = NAN;
             _audioStartGeneration += 1;
             int64_t generation = _audioStartGeneration;
@@ -753,7 +753,7 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     player_core_seek(_wrapper->handle(), position);
     _renderGeneration++;
     _lastEnqueuedVideoPTS = NAN;
-    _syncWarmupFramesRemaining = 18;
+    _syncWarmupFramesRemaining = 40; // seek 后常见前向偏差更大，延长 warmup 以平滑收敛
     _lastSyncVideoPTS = NAN;
     
     // iOS 和 macOS 都需要更新 controlTimebase
@@ -1063,7 +1063,7 @@ didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
 }
 
 - (void)setPlaybackRate:(double)playbackRate {
-    playbackRate = MAX(0.5, MIN(2.0, playbackRate));
+    playbackRate = MAX(0.5, MIN(3.0, playbackRate));
     _playbackRate = playbackRate;
 
     if (_wrapper) {
@@ -1307,8 +1307,11 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     }
 
     // 首播/seek 后短窗口：放宽同步策略，优先连续出图，避免“首帧后静止一段时间”。
+    // 但如果视频已明显前置（>0.5s），必须等待主时钟，避免“越追越前”。
     if (_syncWarmupFramesRemaining > 0) {
-        if (delay < -0.5) {
+        if (delay > 0.5) {
+            // 视频超前过大：暂停消费，等待音频主时钟追上。
+        } else if (delay < -0.5) {
             player_core_consume_video_frame(_wrapper->handle());
             _lastSyncVideoPTS = currentPTS;
         } else {
@@ -1329,8 +1332,9 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
         [self displayVideoFrameData:&frame_data];
         player_core_consume_video_frame(_wrapper->handle());
         _lastSyncVideoPTS = currentPTS;
-    } else if (delay > forceAheadCap) {
-        // 前向等待过大（常见于首帧加速后时间基错位），强制显示一帧打通渲染。
+    } else if (delay > forceAheadCap && delay <= 1.0) {
+        // 仅对“轻中度前向超前”做强制显示，防止轻度时间基错位导致长时间无画面。
+        // 对 >1s 的重度前置，应该等待主时钟追上，避免持续快进消耗视频帧。
         NSLog(@"检测到视频前向等待过大: currentPTS=%.2f, masterClock=%.2f, delay=%.2f，强制显示帧",
               currentPTS, masterClock, delay);
         [self displayVideoFrameData:&frame_data];

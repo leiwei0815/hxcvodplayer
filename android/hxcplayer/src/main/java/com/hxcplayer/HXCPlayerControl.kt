@@ -779,7 +779,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun setPlaybackRate(rate: Float) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        nativeSetPlaybackRate(handle, rate)
+        nativeSetPlaybackRate(handle, rate.coerceIn(0.5f, 3.0f))
     }
 
     // 设置音量

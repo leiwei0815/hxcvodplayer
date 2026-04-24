@@ -60,6 +60,24 @@ static int hxc_calc_retry_delay_ms(int retry_count, int base_delay_ms, int max_d
     return std::min(candidate, max_delay_ms);
 }
 
+// seek 对齐窗口：允许少量回退（关键帧对齐）和有限前跳（时间戳抖动）。
+static constexpr double kSeekAnchorBackwardToleranceMinSec = 0.2;
+static constexpr double kSeekAnchorBackwardToleranceMaxSec = 0.5;
+static constexpr double kSeekAnchorForwardToleranceSec = 5.0;
+
+static double hxc_calc_seek_backward_tolerance_sec(const MediaInfo& media_info) {
+    // 自适应容差：3 * frame interval，并限制在 [0.2s, 0.5s]。
+    // - 高帧率视频避免窗口过大导致旧帧漏过
+    // - 低帧率视频保留足够回退窗口，避免过度丢帧导致首帧慢
+    double fps = media_info.video_fps;
+    if (!(fps > 1.0 && fps < 120.0)) {
+        fps = 30.0; // 无可靠帧率时采用保守默认值
+    }
+    double adaptive = 3.0 / fps;
+    return std::max(kSeekAnchorBackwardToleranceMinSec,
+                    std::min(kSeekAnchorBackwardToleranceMaxSec, adaptive));
+}
+
 static bool hxc_is_network_like_url(const char* url) {
     if (!url || !*url) {
         return false;
@@ -1027,6 +1045,10 @@ int PlayerCore::open_common_process(const std::string &filename) {
                 audio_clock_.set_clock(config_.start_time, 0);
                 video_clock_.set_clock(config_.start_time, 0);
                 external_clock_.set_clock(config_.start_time, 0);
+                // 初始 startPosition 也走与 seek 相同的“首帧锚点”流程，避免旧帧把主时钟拉回。
+                seek_target_pos_.store(config_.start_time, std::memory_order_release);
+                seeking_.store(true, std::memory_order_release);
+                set_seek_loading(true);
             }
         } else {
             LOG_WARNING("开始播放时间 ", config_.start_time, " 无效或超过视频时长，忽略");
@@ -1379,7 +1401,6 @@ void PlayerCore::read_thread() {
             int64_t seek_target = target_pos * AV_TIME_BASE;
             
             LOG_INFO("开始 Seek 到: ", target_pos, " 秒");
-            
             if (av_seek_frame(format_ctx_, -1, seek_target, AVSEEK_FLAG_BACKWARD) < 0) {
                 LOG_ERROR("Seek 失败");
                 emit_error(PLAYER_ERROR_SEEK_FAILED, "跳转到指定位置失败");
@@ -2061,11 +2082,18 @@ void PlayerCore::video_thread() {
         // 计算帧时间戳
         pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(format_ctx_->streams[video_stream_]->time_base);
         if (seeking_.load(std::memory_order_acquire) && !isnan(pts)) {
+            double target = seek_target_pos_.load(std::memory_order_acquire);
+            const double backward_tolerance_sec = hxc_calc_seek_backward_tolerance_sec(media_info_);
+            // seeking 期间，先丢弃明显早于目标的旧帧，避免把渲染时钟拉回。
+            if (pts < (target - backward_tolerance_sec)) {
+                av_frame_unref(frame);
+                continue;
+            }
             // 无音频流时，使用视频首帧判断 seek 完成，避免 seeking 状态卡住。
             bool use_video_as_seek_anchor = (audio_stream_ < 0 || !audio_stream_opened_);
             if (use_video_as_seek_anchor) {
-                double target = seek_target_pos_.load(std::memory_order_acquire);
-                bool in_seek_window = (pts >= (target - 30.0) && pts <= (target + 5.0));
+                bool in_seek_window = (pts >= (target - backward_tolerance_sec) &&
+                                       pts <= (target + kSeekAnchorForwardToleranceSec));
                 if (in_seek_window) {
                     seeking_.store(false, std::memory_order_release);
                     set_seek_loading(false);
@@ -2262,9 +2290,16 @@ void PlayerCore::audio_thread() {
         double pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : 
                      frame->pts * av_q2d(format_ctx_->streams[audio_stream_]->time_base);
         if (seeking_.load(std::memory_order_acquire) && !isnan(pts)) {
-            // 默认 AudioMaster：以音频首个有效帧作为 seek 完成锚点。
             double target = seek_target_pos_.load(std::memory_order_acquire);
-            bool in_seek_window = (pts >= (target - 30.0) && pts <= (target + 5.0));
+            const double backward_tolerance_sec = hxc_calc_seek_backward_tolerance_sec(media_info_);
+            // seeking 期间，先丢弃明显早于目标的旧帧，避免音频主时钟回退。
+            if (pts < (target - backward_tolerance_sec)) {
+                av_frame_unref(frame);
+                continue;
+            }
+            // 默认 AudioMaster：以音频首个有效帧作为 seek 完成锚点。
+            bool in_seek_window = (pts >= (target - backward_tolerance_sec) &&
+                                   pts <= (target + kSeekAnchorForwardToleranceSec));
             if (in_seek_window) {
                 seeking_.store(false, std::memory_order_release);
                 set_seek_loading(false);
@@ -2867,9 +2902,9 @@ void PlayerCore::emit_error(int error_code, const std::string& error_msg) {
 
 // 设置播放速率（倍速播放）
 void PlayerCore::set_playback_rate(double rate) {
-    // 限制范围在 0.5 ~ 2.0
+    // 限制范围在 0.5 ~ 3.0
     if (rate < 0.5) rate = 0.5;
-    if (rate > 2.0) rate = 2.0;
+    if (rate > 3.0) rate = 3.0;
 
     playback_rate_.store(rate, std::memory_order_release);
 
