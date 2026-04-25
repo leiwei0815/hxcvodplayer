@@ -319,10 +319,13 @@ class HXCPlayerControl @JvmOverloads constructor(
     @Volatile private var decodeMode: DecodeMode = DecodeMode.SOFTWARE
     @Volatile var autoPlayer: Boolean = true
     @Volatile var startPosition: Double = 0.0
+    @get:JvmName("stateValue")
     val state: PlayerState
         get() = getState()
+    @get:JvmName("durationValue")
     val duration: Double
         get() = getDuration()
+    @get:JvmName("positionValue")
     val position: Double
         get() = getPosition()
     val hardwareDecodingActive: Boolean

@@ -618,7 +618,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             samples,
             (AVSampleFormat)frame->format,
             0);
-        if (samples <= 0 || !frame->data || !frame->data[0] || expected_src_size <= 0) {
+        if (samples <= 0 || !frame->data[0] || expected_src_size <= 0) {
             audioQueue->next();
             return 0;
         }
