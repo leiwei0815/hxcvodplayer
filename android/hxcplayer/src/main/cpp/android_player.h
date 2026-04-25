@@ -120,6 +120,7 @@ private:
     
     bool initAudioOutput(int sample_rate, int channels);
     void destroyAudioOutput();
+    void ensureAudioOutputForCurrentStream();
     static void audioCallback(SLAndroidSimpleBufferQueueItf bq, void* context);
     void onAudioData(SLAndroidSimpleBufferQueueItf bq);
     

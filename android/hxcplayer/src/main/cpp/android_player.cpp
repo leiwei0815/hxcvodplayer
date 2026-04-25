@@ -94,6 +94,7 @@ AndroidPlayer::~AndroidPlayer() {
     
     // 销毁核心播放器
     if (player_core_) {
+        player_core_set_playback_completed_callback(player_core_, nullptr, nullptr);
         player_core_destroy(player_core_);
         player_core_ = nullptr;
     }
@@ -174,25 +175,7 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     
     if (result == 0) {
         LOGI("URL opened successfully");
-        
-        // 🎵 获取音频参数并动态初始化音频输出
-        int sample_rate = player_core_get_audio_sample_rate(player_core_);
-        int channels = player_core_get_audio_channels(player_core_);
-        
-        LOGI("Audio info: sample_rate=%d, channels=%d", sample_rate, channels);
-        
-        if (sample_rate > 0 && channels > 0 && !audio_initialized_) {
-            if (initAudioOutput(sample_rate, channels)) {
-                audio_initialized_ = true;
-                LOGI("Audio output initialized with actual parameters");
-            } else {
-                LOGE("Failed to initialize audio output");
-            }
-        } else if (audio_initialized_) {
-            LOGI("Audio already initialized");
-        } else {
-            LOGW("No audio stream or invalid audio parameters");
-        }
+        ensureAudioOutputForCurrentStream();
         
         // ⏸️ 打开后自动暂停，等待用户点击播放
         player_core_pause(player_core_);
@@ -233,16 +216,7 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
 
     if (result == 0) {
         LOGI("Custom HTTP opened successfully");
-
-        int sample_rate = player_core_get_audio_sample_rate(player_core_);
-        int channels = player_core_get_audio_channels(player_core_);
-
-        if (sample_rate > 0 && channels > 0 && !audio_initialized_) {
-            if (initAudioOutput(sample_rate, channels)) {
-                audio_initialized_ = true;
-                LOGI("Audio initialized: %d Hz, %d channels", sample_rate, channels);
-            }
-        }
+        ensureAudioOutputForCurrentStream();
 
         player_core_pause(player_core_);
         return true;
@@ -275,16 +249,7 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
 
     if (result == 0) {
         LOGI("Custom file opened successfully");
-
-        int sample_rate = player_core_get_audio_sample_rate(player_core_);
-        int channels = player_core_get_audio_channels(player_core_);
-
-        if (sample_rate > 0 && channels > 0 && !audio_initialized_) {
-            if (initAudioOutput(sample_rate, channels)) {
-                audio_initialized_ = true;
-                LOGI("Audio initialized: %d Hz, %d channels", sample_rate, channels);
-            }
-        }
+        ensureAudioOutputForCurrentStream();
 
         player_core_pause(player_core_);
         return true;
@@ -873,16 +838,38 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         ANativeWindow_release(window);
         return -1;
     }
+    // resize 竞态下可能出现 width/height 暂时比预期小，若继续拷贝可能导致半屏或越界写。
+    if (buffer.width < surface_w || buffer.height < surface_h) {
+        LOGW("⚠️ Buffer size mismatch (drop frame): actual=%dx%d expected=%dx%d",
+             buffer.width, buffer.height, surface_w, surface_h);
+        {
+            std::lock_guard<std::mutex> lock(window_mutex_);
+            surface_configured_ = false;
+            surface_generation_.fetch_add(1, std::memory_order_relaxed);
+        }
+        ANativeWindow_unlockAndPost(window);
+        ANativeWindow_release(window);
+        return -1;
+    }
     
     int copy_width = dst_width;
     int copy_height = dst_height;
     int offset_x = draw_offset_x;
     int offset_y = draw_offset_y;
+    copy_width = std::min(copy_width, std::max(0, buffer.stride - offset_x));
+    copy_height = std::min(copy_height, std::max(0, buffer.height - offset_y));
+    if (copy_width <= 0 || copy_height <= 0) {
+        LOGW("⚠️ Copy area invalid (drop frame): copy=%dx%d offset=%d,%d stride=%d height=%d",
+             dst_width, dst_height, offset_x, offset_y, buffer.stride, buffer.height);
+        ANativeWindow_unlockAndPost(window);
+        ANativeWindow_release(window);
+        return -1;
+    }
     
     // FIT 模式下需要黑边背景
     if (aspect_ratio_mode_ == 0 && (offset_x > 0 || offset_y > 0 ||
                                     copy_width < surface_w || copy_height < surface_h)) {
-        memset(buffer.bits, 0, buffer.stride * surface_h * 2);
+        memset(buffer.bits, 0, buffer.stride * buffer.height * 2);
     }
     
     // 逐行复制到目标位置
@@ -1093,7 +1080,53 @@ void AndroidPlayer::destroyAudioOutput() {
     }
     
     audio_initialized_ = false;
+    audio_sample_rate_ = 0;
+    audio_channels_ = 0;
+    audio_buffer_size_ = 0;
     LOGI("Audio output destroyed");
+}
+
+void AndroidPlayer::ensureAudioOutputForCurrentStream() {
+    if (!player_core_) {
+        return;
+    }
+
+    int sample_rate = player_core_get_audio_sample_rate(player_core_);
+    int channels = player_core_get_audio_channels(player_core_);
+    LOGI("Audio info: sample_rate=%d, channels=%d", sample_rate, channels);
+
+    if (sample_rate <= 0 || channels <= 0) {
+        if (audio_initialized_) {
+            LOGI("No valid audio stream, destroying previous audio output");
+            destroyAudioOutput();
+        } else {
+            LOGW("No audio stream or invalid audio parameters");
+        }
+        return;
+    }
+
+    const bool need_recreate = !audio_initialized_
+                            || audio_sample_rate_ != sample_rate
+                            || audio_channels_ != channels;
+    if (!need_recreate) {
+        LOGI("Audio output already matched stream parameters");
+        return;
+    }
+
+    if (audio_initialized_) {
+        LOGI("Audio format changed, rebuilding output: %d/%d -> %d/%d",
+             audio_sample_rate_, audio_channels_, sample_rate, channels);
+        destroyAudioOutput();
+    }
+
+    if (!initAudioOutput(sample_rate, channels)) {
+        LOGE("Failed to initialize audio output");
+        audio_initialized_ = false;
+        return;
+    }
+
+    audio_initialized_ = true;
+    LOGI("Audio output initialized with stream parameters");
 }
 
 void AndroidPlayer::audioCallback(SLAndroidSimpleBufferQueueItf bq, void* context) {

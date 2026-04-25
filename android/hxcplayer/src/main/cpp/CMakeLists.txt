@@ -58,6 +58,9 @@ add_library(hxcplayer SHARED
     ${JNI_SOURCES}
 )
 
+# Android 侧启用 SoundTouch 分支（与 iOS/desktop 对齐）
+target_compile_definitions(hxcplayer PRIVATE HAS_SOUNDTOUCH=1)
+
 # 为纯 C++ 文件设置编译标志
 set_source_files_properties(
     ${CORE_SOURCES}

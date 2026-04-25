@@ -16,6 +16,7 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <mutex>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -187,32 +188,40 @@ public:
     using PlayingChangedCallback = std::function<void(bool)>;
     
     void set_state_changed_callback(StateChangedCallback callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         state_changed_callback_ = callback;
     }
     
     void set_error_callback(ErrorCallback callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         error_callback_ = callback;
     }
     
     void set_position_changed_callback(PositionChangedCallback callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         position_changed_callback_ = callback;
     }
     
     void set_buffer_progress_callback(BufferProgressCallback callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         buffer_progress_callback_ = callback;
     }
     
     void set_playback_completed_callback(PlaybackCompletedCallback callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         playback_completed_callback_ = callback;
     }
     
     void set_loading_callback(LoadingCallback callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         loading_callback_ = callback;
     }
     void set_pipeline_state_changed_callback(PipelineStateChangedCallback callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         pipeline_state_changed_callback_ = callback;
     }
     void set_playing_changed_callback(PlayingChangedCallback callback) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
         playing_changed_callback_ = callback;
     }
 
@@ -322,7 +331,7 @@ private:
     std::atomic<bool> video_hw_decode_active_{false}; // 当前视频流是否在硬解
     std::atomic<int64_t> io_last_packet_us_{0}; // 最近一次成功读取 packet 的时间（us）
     int64_t io_interrupt_timeout_us_{8000000};   // 阻塞读中断阈值（us）
-    bool playback_completed_notified_;  // ⚠️ 是否已通知播放完成（避免重复通知）
+    std::atomic<bool> playback_completed_notified_;  // ⚠️ 是否已通知播放完成（避免重复通知）
     
 #ifndef NO_SDL
     // SDL 音频（仅桌面平台）
@@ -377,6 +386,7 @@ private:
     LoadingCallback loading_callback_;                   // 网络加载回调
     PipelineStateChangedCallback pipeline_state_changed_callback_;
     PlayingChangedCallback playing_changed_callback_;
+    mutable std::mutex callback_mutex_;
     
     // 自定义数据源
     std::unique_ptr<CustomAVIOContext> custom_io_;       // 自定义 AVIOContext

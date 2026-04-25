@@ -472,6 +472,18 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     [self hxc_unregisterAppLifecycleNotifications];
     [self hxc_clearLastRenderedSampleBuffer];
 #endif
+
+    // 销毁前先解绑 core 回调，避免 stop/close 过程中再向上层派发异步回调。
+    if (_wrapper && _wrapper->handle()) {
+        player_core_set_state_changed_callback(_wrapper->handle(), nullptr, nullptr);
+        player_core_set_error_callback(_wrapper->handle(), nullptr, nullptr);
+        player_core_set_position_changed_callback(_wrapper->handle(), nullptr, nullptr);
+        player_core_set_buffer_progress_callback(_wrapper->handle(), nullptr, nullptr);
+        player_core_set_playback_completed_callback(_wrapper->handle(), nullptr, nullptr);
+        player_core_set_loading_callback(_wrapper->handle(), nullptr, nullptr);
+        player_core_set_pipeline_state_changed_callback(_wrapper->handle(), nullptr, nullptr);
+        player_core_set_playing_changed_callback(_wrapper->handle(), nullptr, nullptr);
+    }
     
     [self stop];
     

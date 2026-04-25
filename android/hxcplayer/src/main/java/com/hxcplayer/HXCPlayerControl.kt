@@ -16,6 +16,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * HXC Player 控制类
@@ -295,13 +296,18 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var loadingCandidateState: Boolean? = null
     private var loadingCandidateSinceMs: Long = 0L
     private val openExecutor = Executors.newSingleThreadExecutor()
+    private val nativeOpenStopLock = Any()
+    private val openGeneration = AtomicLong(0L)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val loadingShowDebounceMs = 300L
     private val loadingHideDebounceMs = 150L
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
-    private var autoReopenOnRecoverableErrorEnabled: Boolean = false
-    private var autoReopenMaxAttempts: Int = 1
+    @Volatile var autoReopenOnRecoverableErrorEnabled: Boolean = false
+    @Volatile var autoReopenMaxAttempts: Int = 1
+        set(value) {
+            field = value.coerceAtLeast(0)
+        }
     private var autoReopenAttemptCount: Int = 0
     private var autoReopenInFlight: Boolean = false
     private var networkLoadingSinceMs: Long = 0L
@@ -311,6 +317,16 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
     @Volatile private var decodeMode: DecodeMode = DecodeMode.SOFTWARE
+    @Volatile var autoPlayer: Boolean = true
+    @Volatile var startPosition: Double = 0.0
+    val state: PlayerState
+        get() = getState()
+    val duration: Double
+        get() = getDuration()
+    val position: Double
+        get() = getPosition()
+    val hardwareDecodingActive: Boolean
+        get() = isHardwareDecodingActive()
 
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
     private var textureDecoderSurface: Surface? = null
@@ -349,7 +365,7 @@ class HXCPlayerControl @JvmOverloads constructor(
      */
     fun configureWeakNetworkRecovery(enabled: Boolean, maxAttempts: Int = 1) {
         autoReopenOnRecoverableErrorEnabled = enabled
-        autoReopenMaxAttempts = maxAttempts.coerceAtLeast(0)
+        autoReopenMaxAttempts = maxAttempts
     }
 
     private fun clonePlayModel(model: PlayerDataSourcePlayModel): PlayerDataSourcePlayModel {
@@ -369,6 +385,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         synchronized(lifecycleLock) {
             return nativeHandle
         }
+    }
+
+    private fun nextOpenGeneration(): Long = openGeneration.incrementAndGet()
+
+    private fun isStaleOpenGeneration(generation: Long): Boolean {
+        return generation != openGeneration.get() || isReleased
     }
 
     fun setDecodeMode(mode: DecodeMode) {
@@ -543,24 +565,33 @@ class HXCPlayerControl @JvmOverloads constructor(
     private fun setSurface(surface: Surface?) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        nativeSetSurface(handle, surface)
+        synchronized(nativeOpenStopLock) {
+            val activeHandle = currentHandle()
+            if (activeHandle == 0L || isReleased) return
+            nativeSetSurface(activeHandle, surface)
+        }
     }
 
     // 内部方法：更新 Surface 尺寸
     private fun updateSurfaceSize(width: Int, height: Int) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        nativeUpdateSurfaceSize(handle, width, height)
+        synchronized(nativeOpenStopLock) {
+            val activeHandle = currentHandle()
+            if (activeHandle == 0L || isReleased) return
+            nativeUpdateSurfaceSize(activeHandle, width, height)
+        }
     }
 
     // 打开 URL
     fun openURL(url: String): Boolean {
-        return openURL(url, 0.0)
+        return openURL(url, startPosition)
     }
 
     // 打开 URL 并指定起始位置（秒）
     // 注意：该接口为同步调用，可能阻塞调用线程（例如网络抖动时）
     fun openURL(url: String, startPosition: Double): Boolean {
+        val generation = nextOpenGeneration()
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
@@ -577,14 +608,25 @@ class HXCPlayerControl @JvmOverloads constructor(
             networkTotalStallMs = 0L
             networkReconnectCount = 0
         }
-        applyDecodeModeForHandle(handle)
-        val result = if (startPosition > 0.0) {
-            nativeOpenURLWithStartPosition(handle, url, startPosition)
-        } else {
-            nativeOpenURL(handle, url)
+        val result = synchronized(nativeOpenStopLock) {
+            if (isStaleOpenGeneration(generation)) {
+                false
+            } else {
+                val activeHandle = currentHandle()
+                if (activeHandle == 0L) {
+                    false
+                } else {
+                    applyDecodeModeForHandle(activeHandle)
+                    if (startPosition > 0.0) {
+                        nativeOpenURLWithStartPosition(activeHandle, url, startPosition)
+                    } else {
+                        nativeOpenURL(activeHandle, url)
+                    }
+                }
+            }
         }
 
-        if (!result) {
+        if (!result && !isStaleOpenGeneration(generation)) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
         }
         return result
@@ -595,8 +637,12 @@ class HXCPlayerControl @JvmOverloads constructor(
      * 结果通过已有 callback 回调返回（失败会触发 onPlayerError）。
      */
     fun openURLAsync(url: String, startPosition: Double = 0.0) {
+        val generation = nextOpenGeneration()
         if (isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
+            return
+        }
+        if (!licenseAllowedOrNotify("openURLAsync")) {
             return
         }
         lastOpenUrl = url
@@ -609,6 +655,9 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         try {
             openExecutor.execute {
+                if (isStaleOpenGeneration(generation)) {
+                    return@execute
+                }
                 val handle = currentHandle()
                 if (handle == 0L || isReleased) {
                     mainHandler.post {
@@ -616,15 +665,25 @@ class HXCPlayerControl @JvmOverloads constructor(
                     }
                     return@execute
                 }
-                applyDecodeModeForHandle(handle)
-
-                val result = if (startPosition > 0.0) {
-                    nativeOpenURLWithStartPosition(handle, url, startPosition)
-                } else {
-                    nativeOpenURL(handle, url)
+                val result = synchronized(nativeOpenStopLock) {
+                    if (isStaleOpenGeneration(generation)) {
+                        false
+                    } else {
+                        val activeHandle = currentHandle()
+                        if (activeHandle == 0L) {
+                            false
+                        } else {
+                            applyDecodeModeForHandle(activeHandle)
+                            if (startPosition > 0.0) {
+                                nativeOpenURLWithStartPosition(activeHandle, url, startPosition)
+                            } else {
+                                nativeOpenURL(activeHandle, url)
+                            }
+                        }
+                    }
                 }
 
-                if (!result && !isReleased) {
+                if (!result && !isStaleOpenGeneration(generation)) {
                     mainHandler.post {
                         dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
                     }
@@ -639,6 +698,7 @@ class HXCPlayerControl @JvmOverloads constructor(
      * 统一入口：使用播放模型打开（对齐 iOS 的 openWithPlayModel）。
      */
     fun openWithPlayModel(model: PlayerDataSourcePlayModel): Boolean {
+        val generation = nextOpenGeneration()
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开播放模型")
@@ -659,37 +719,48 @@ class HXCPlayerControl @JvmOverloads constructor(
             networkTotalStallMs = 0L
             networkReconnectCount = 0
         }
-        applyDecodeModeForHandle(handle)
-        val result = when (model.mode) {
-            PlayerDataSourceMode.DEFAULT -> {
-                if (model.url.isBlank()) {
-                    dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+        val result = synchronized(nativeOpenStopLock) {
+            if (isStaleOpenGeneration(generation)) {
+                false
+            } else {
+                val activeHandle = currentHandle()
+                if (activeHandle == 0L) {
                     false
                 } else {
-                    nativeOpenURL(handle, model.url)
+                    applyDecodeModeForHandle(activeHandle)
+                    when (model.mode) {
+                        PlayerDataSourceMode.DEFAULT -> {
+                            if (model.url.isBlank()) {
+                                dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+                                false
+                            } else {
+                                nativeOpenURL(activeHandle, model.url)
+                            }
+                        }
+                        PlayerDataSourceMode.CUSTOM_HTTP -> {
+                            val cfg = effectiveDataSourceConfig()
+                            nativeOpenWithCustomHTTP(
+                                activeHandle,
+                                model.url,
+                                cfg.timeoutMs,
+                                cfg.maxRetries,
+                                model.encryptedFile
+                            )
+                        }
+                        PlayerDataSourceMode.CUSTOM_FILE -> {
+                            val cfg = effectiveDataSourceConfig()
+                            nativeOpenWithCustomFile(
+                                activeHandle,
+                                model.url,
+                                cfg.avioBufferSize,
+                                model.encryptedFile
+                            )
+                        }
+                    }
                 }
             }
-            PlayerDataSourceMode.CUSTOM_HTTP -> {
-                val cfg = effectiveDataSourceConfig()
-                nativeOpenWithCustomHTTP(
-                    handle,
-                    model.url,
-                    cfg.timeoutMs,
-                    cfg.maxRetries,
-                    model.encryptedFile
-                )
-            }
-            PlayerDataSourceMode.CUSTOM_FILE -> {
-                val cfg = effectiveDataSourceConfig()
-                nativeOpenWithCustomFile(
-                    handle,
-                    model.url,
-                    cfg.avioBufferSize,
-                    model.encryptedFile
-                )
-            }
         }
-        if (!result) {
+        if (!result && !isStaleOpenGeneration(generation)) {
             dispatchError(
                 PlayerErrorCode.OPEN_INPUT_FAILED,
                 "打开失败: mode=${model.mode}, url=${model.url}"
@@ -698,9 +769,32 @@ class HXCPlayerControl @JvmOverloads constructor(
         return result
     }
 
+    /**
+     * 对齐 iOS：按 [autoPlayer] 策略打开 URL。
+     */
+    fun playURL(url: String): Boolean {
+        val result = openURL(url, startPosition)
+        if (result) {
+            if (autoPlayer) play() else pause()
+        }
+        return result
+    }
+
+    /**
+     * 对齐 iOS：按 [autoPlayer] 策略用播放模型打开。
+     */
+    fun playWithModel(model: PlayerDataSourcePlayModel): Boolean {
+        val result = openWithPlayModel(model)
+        if (result) {
+            if (autoPlayer) play() else pause()
+        }
+        return result
+    }
+
     // 使用自定义 HTTP 模式打开（支持 Range 下载）
     // encryptedFile：是否与核心层约定一致，对文件头前 100 字节解密（默认 false）
     fun openWithCustomHTTP(url: String, timeoutMs: Int = 30000, maxRetries: Int = 3, encryptedFile: Boolean = false): Boolean {
+        val generation = nextOpenGeneration()
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开自定义 HTTP: $url")
@@ -709,9 +803,20 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("openWithCustomHTTP")) {
             return false
         }
-        applyDecodeModeForHandle(handle)
-        val result = nativeOpenWithCustomHTTP(handle, url, timeoutMs, maxRetries, encryptedFile)
-        if (!result) {
+        val result = synchronized(nativeOpenStopLock) {
+            if (isStaleOpenGeneration(generation)) {
+                false
+            } else {
+                val activeHandle = currentHandle()
+                if (activeHandle == 0L) {
+                    false
+                } else {
+                    applyDecodeModeForHandle(activeHandle)
+                    nativeOpenWithCustomHTTP(activeHandle, url, timeoutMs, maxRetries, encryptedFile)
+                }
+            }
+        }
+        if (!result && !isStaleOpenGeneration(generation)) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开自定义 HTTP: $url")
         }
         return result
@@ -724,6 +829,7 @@ class HXCPlayerControl @JvmOverloads constructor(
      * @param encryptedFile 是否对文件头前 100 字节按核心约定解密
      */
     fun openWithCustomFile(path: String, avioBufferSize: Int = 64 * 1024, encryptedFile: Boolean = false): Boolean {
+        val generation = nextOpenGeneration()
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开本地文件(CustomFile): $path")
@@ -732,9 +838,20 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("openWithCustomFile")) {
             return false
         }
-        applyDecodeModeForHandle(handle)
-        val result = nativeOpenWithCustomFile(handle, path, avioBufferSize, encryptedFile)
-        if (!result) {
+        val result = synchronized(nativeOpenStopLock) {
+            if (isStaleOpenGeneration(generation)) {
+                false
+            } else {
+                val activeHandle = currentHandle()
+                if (activeHandle == 0L) {
+                    false
+                } else {
+                    applyDecodeModeForHandle(activeHandle)
+                    nativeOpenWithCustomFile(activeHandle, path, avioBufferSize, encryptedFile)
+                }
+            }
+        }
+        if (!result && !isStaleOpenGeneration(generation)) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开本地文件(CustomFile): $path")
         }
         return result
@@ -759,10 +876,46 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     // 停止
     fun stop() {
+        nextOpenGeneration()
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        nativeStop(handle)
+        synchronized(nativeOpenStopLock) {
+            val activeHandle = currentHandle()
+            if (activeHandle != 0L && !isReleased) {
+                nativeStop(activeHandle)
+            }
+        }
         networkLoadingSinceMs = 0L
+    }
+
+    /**
+     * 对齐 iOS：恢复播放。
+     */
+    fun resume() {
+        play()
+    }
+
+    /**
+     * 对齐 iOS：从头重播最近一次打开的源。
+     */
+    fun replay() {
+        if (!licenseAllowedOrNotify("replay")) {
+            return
+        }
+        val url = lastOpenUrl
+        val model = lastOpenPlayModel?.let { clonePlayModel(it) }
+        val savedStartPosition = startPosition
+        startPosition = 0.0
+        val ok = if (model != null) {
+            playWithModel(model)
+        } else if (!url.isNullOrBlank()) {
+            playURL(url)
+        } else {
+            false
+        }
+        if (!ok) {
+            startPosition = savedStartPosition
+        }
     }
 
     // 跳转
@@ -773,6 +926,13 @@ class HXCPlayerControl @JvmOverloads constructor(
             return
         }
         nativeSeekTo(handle, position)
+    }
+
+    /**
+     * 对齐 iOS：跳转到指定播放位置（秒）。
+     */
+    fun seekToPosition(position: Double) {
+        seekTo(position)
     }
 
     // 设置播放速度
@@ -996,6 +1156,7 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     // 释放资源
     fun release() {
+        nextOpenGeneration()
         synchronized(lifecycleLock) {
             if (isReleased) return
             isReleased = true
@@ -1016,10 +1177,12 @@ class HXCPlayerControl @JvmOverloads constructor(
             nativeHandle = 0
         }
         if (handle != 0L) {
-            nativeSetSurface(handle, null)
-            textureDecoderSurface?.release()
-            textureDecoderSurface = null
-            nativeRelease(handle)
+            synchronized(nativeOpenStopLock) {
+                nativeSetSurface(handle, null)
+                textureDecoderSurface?.release()
+                textureDecoderSurface = null
+                nativeRelease(handle)
+            }
         }
 
         lastLoadingState = null

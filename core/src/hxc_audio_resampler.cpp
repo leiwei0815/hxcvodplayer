@@ -22,10 +22,9 @@ AudioResampler::AudioResampler()
     , dst_channels_(0)
     , src_sample_fmt_(AV_SAMPLE_FMT_NONE)
     , dst_sample_fmt_(AV_SAMPLE_FMT_NONE)
-    , has_config_(false) {
-    av_channel_layout_uninit(&src_ch_layout_);
-    av_channel_layout_uninit(&dst_ch_layout_);
-}
+    , src_ch_layout_{}
+    , dst_ch_layout_{}
+    , has_config_(false) {}
 
 AudioResampler::~AudioResampler() {
     if (swr_ctx_) {

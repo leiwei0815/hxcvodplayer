@@ -162,7 +162,7 @@ class MyActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
 
 ### License 校验说明（Android）
 
-- 调用 `openURL(...)` / `openWithPlayModel(...)` / `play()` / `seekTo(...)` 前，需先 `checkLicense(...)`
+- 调用 `openURL(...)` / `openWithPlayModel(...)` / `playURL(...)` / `playWithModel(...)` / `play()` / `seekTo(...)` / `seekToPosition(...)` 前，需先 `checkLicense(...)`
 - 校验通过条件：解密后的 License 数组里存在记录满足：
   - `package_name == context.packageName`
   - `finished_at > 当前 Unix 时间戳`

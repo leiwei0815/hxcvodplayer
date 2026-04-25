@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <mutex>
 #include "hxc_logger.h"
 
 extern "C" {
@@ -71,6 +72,7 @@ struct PlayerCoreHandle {
 
     PlayingChangedCallbackC playing_changed_callback;
     void* playing_changed_user_data;
+    std::mutex callback_mutex;
     
     PlayerCoreHandle() 
         : core(nullptr)
@@ -177,6 +179,17 @@ PlayerCoreHandle* player_core_create(void) {
 
 void player_core_destroy(PlayerCoreHandle* handle) {
     if (handle) {
+        if (handle->core) {
+            // 先解绑所有回调，避免销毁期间后台线程回调到悬空的 bridge handle。
+            handle->core->set_state_changed_callback(nullptr);
+            handle->core->set_error_callback(nullptr);
+            handle->core->set_position_changed_callback(nullptr);
+            handle->core->set_buffer_progress_callback(nullptr);
+            handle->core->set_playback_completed_callback(nullptr);
+            handle->core->set_loading_callback(nullptr);
+            handle->core->set_pipeline_state_changed_callback(nullptr);
+            handle->core->set_playing_changed_callback(nullptr);
+        }
         delete handle->core;
         delete handle->resampler;
         delete handle;
@@ -792,16 +805,25 @@ AspectRatioModeC player_core_get_aspect_ratio_mode(PlayerCoreHandle* handle) {
 // 设置状态变化回调
 void player_core_set_state_changed_callback(PlayerCoreHandle* handle, StateChangedCallbackC callback, void* user_data) {
     if (!handle || !handle->core) return;
-    
-    handle->state_changed_callback = callback;
-    handle->state_changed_user_data = user_data;
+    {
+        std::lock_guard<std::mutex> lock(handle->callback_mutex);
+        handle->state_changed_callback = callback;
+        handle->state_changed_user_data = user_data;
+    }
     
     // 设置 C++ 层回调
     if (callback) {
         handle->core->set_state_changed_callback([handle](hxcplayer::PlayerState state) {
-            if (handle->state_changed_callback) {
+            StateChangedCallbackC cb = nullptr;
+            void* ud = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(handle->callback_mutex);
+                cb = handle->state_changed_callback;
+                ud = handle->state_changed_user_data;
+            }
+            if (cb) {
                 PlayerStateC c_state = hxc_to_c_player_state(state);
-                handle->state_changed_callback(c_state, handle->state_changed_user_data);
+                cb(c_state, ud);
             }
         });
     } else {
@@ -812,15 +834,24 @@ void player_core_set_state_changed_callback(PlayerCoreHandle* handle, StateChang
 // 设置错误回调
 void player_core_set_error_callback(PlayerCoreHandle* handle, ErrorCallbackC callback, void* user_data) {
     if (!handle || !handle->core) return;
-    
-    handle->error_callback = callback;
-    handle->error_user_data = user_data;
+    {
+        std::lock_guard<std::mutex> lock(handle->callback_mutex);
+        handle->error_callback = callback;
+        handle->error_user_data = user_data;
+    }
     
     // 设置 C++ 层回调
     if (callback) {
         handle->core->set_error_callback([handle](int error_code, const std::string& error_msg) {
-            if (handle->error_callback) {
-                handle->error_callback(error_code, error_msg.c_str(), handle->error_user_data);
+            ErrorCallbackC cb = nullptr;
+            void* ud = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(handle->callback_mutex);
+                cb = handle->error_callback;
+                ud = handle->error_user_data;
+            }
+            if (cb) {
+                cb(error_code, error_msg.c_str(), ud);
             }
         });
     } else {
@@ -831,15 +862,24 @@ void player_core_set_error_callback(PlayerCoreHandle* handle, ErrorCallbackC cal
 // 设置播放进度回调
 void player_core_set_position_changed_callback(PlayerCoreHandle* handle, PositionChangedCallbackC callback, void* user_data) {
     if (!handle || !handle->core) return;
-    
-    handle->position_changed_callback = callback;
-    handle->position_user_data = user_data;
+    {
+        std::lock_guard<std::mutex> lock(handle->callback_mutex);
+        handle->position_changed_callback = callback;
+        handle->position_user_data = user_data;
+    }
     
     // 设置 C++ 层回调
     if (callback) {
         handle->core->set_position_changed_callback([handle](double position) {
-            if (handle->position_changed_callback) {
-                handle->position_changed_callback(position, handle->position_user_data);
+            PositionChangedCallbackC cb = nullptr;
+            void* ud = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(handle->callback_mutex);
+                cb = handle->position_changed_callback;
+                ud = handle->position_user_data;
+            }
+            if (cb) {
+                cb(position, ud);
             }
         });
     } else {
@@ -849,15 +889,24 @@ void player_core_set_position_changed_callback(PlayerCoreHandle* handle, Positio
 
 void player_core_set_buffer_progress_callback(PlayerCoreHandle* handle, BufferProgressCallbackC callback, void* user_data) {
     if (!handle || !handle->core) return;
-    
-    handle->buffer_progress_callback = callback;
-    handle->buffer_progress_user_data = user_data;
+    {
+        std::lock_guard<std::mutex> lock(handle->callback_mutex);
+        handle->buffer_progress_callback = callback;
+        handle->buffer_progress_user_data = user_data;
+    }
     
     // 设置 C++ 层回调
     if (callback) {
         handle->core->set_buffer_progress_callback([handle](double position) {
-            if (handle->buffer_progress_callback) {
-                handle->buffer_progress_callback(position, handle->buffer_progress_user_data);
+            BufferProgressCallbackC cb = nullptr;
+            void* ud = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(handle->callback_mutex);
+                cb = handle->buffer_progress_callback;
+                ud = handle->buffer_progress_user_data;
+            }
+            if (cb) {
+                cb(position, ud);
             }
         });
     } else {
@@ -867,15 +916,24 @@ void player_core_set_buffer_progress_callback(PlayerCoreHandle* handle, BufferPr
 
 void player_core_set_playback_completed_callback(PlayerCoreHandle* handle, PlaybackCompletedCallbackC callback, void* user_data) {
     if (!handle || !handle->core) return;
-    
-    handle->playback_completed_callback = callback;
-    handle->playback_completed_user_data = user_data;
+    {
+        std::lock_guard<std::mutex> lock(handle->callback_mutex);
+        handle->playback_completed_callback = callback;
+        handle->playback_completed_user_data = user_data;
+    }
     
     // 设置 C++ 层回调
     if (callback) {
         handle->core->set_playback_completed_callback([handle]() {
-            if (handle->playback_completed_callback) {
-                handle->playback_completed_callback(handle->playback_completed_user_data);
+            PlaybackCompletedCallbackC cb = nullptr;
+            void* ud = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(handle->callback_mutex);
+                cb = handle->playback_completed_callback;
+                ud = handle->playback_completed_user_data;
+            }
+            if (cb) {
+                cb(ud);
             }
         });
     } else {
@@ -885,15 +943,24 @@ void player_core_set_playback_completed_callback(PlayerCoreHandle* handle, Playb
 
 void player_core_set_loading_callback(PlayerCoreHandle* handle, LoadingCallbackC callback, void* user_data) {
     if (!handle || !handle->core) return;
-    
-    handle->loading_callback = callback;
-    handle->loading_user_data = user_data;
+    {
+        std::lock_guard<std::mutex> lock(handle->callback_mutex);
+        handle->loading_callback = callback;
+        handle->loading_user_data = user_data;
+    }
     
     // 设置 C++ 层回调
     if (callback) {
         handle->core->set_loading_callback([handle](bool is_loading) {
-            if (handle->loading_callback) {
-                handle->loading_callback(is_loading, handle->loading_user_data);
+            LoadingCallbackC cb = nullptr;
+            void* ud = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(handle->callback_mutex);
+                cb = handle->loading_callback;
+                ud = handle->loading_user_data;
+            }
+            if (cb) {
+                cb(is_loading, ud);
             }
         });
     } else {
@@ -904,16 +971,23 @@ void player_core_set_loading_callback(PlayerCoreHandle* handle, LoadingCallbackC
 void player_core_set_pipeline_state_changed_callback(PlayerCoreHandle* handle, PipelineStateChangedCallbackC callback, void* user_data) {
     if (!handle || !handle->core) return;
 
-    handle->pipeline_state_changed_callback = callback;
-    handle->pipeline_state_user_data = user_data;
+    {
+        std::lock_guard<std::mutex> lock(handle->callback_mutex);
+        handle->pipeline_state_changed_callback = callback;
+        handle->pipeline_state_user_data = user_data;
+    }
 
     if (callback) {
         handle->core->set_pipeline_state_changed_callback([handle](hxcplayer::PipelineState state) {
-            if (handle->pipeline_state_changed_callback) {
-                handle->pipeline_state_changed_callback(
-                    hxc_to_c_pipeline_state(state),
-                    handle->pipeline_state_user_data
-                );
+            PipelineStateChangedCallbackC cb = nullptr;
+            void* ud = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(handle->callback_mutex);
+                cb = handle->pipeline_state_changed_callback;
+                ud = handle->pipeline_state_user_data;
+            }
+            if (cb) {
+                cb(hxc_to_c_pipeline_state(state), ud);
             }
         });
     } else {
@@ -924,13 +998,23 @@ void player_core_set_pipeline_state_changed_callback(PlayerCoreHandle* handle, P
 void player_core_set_playing_changed_callback(PlayerCoreHandle* handle, PlayingChangedCallbackC callback, void* user_data) {
     if (!handle || !handle->core) return;
 
-    handle->playing_changed_callback = callback;
-    handle->playing_changed_user_data = user_data;
+    {
+        std::lock_guard<std::mutex> lock(handle->callback_mutex);
+        handle->playing_changed_callback = callback;
+        handle->playing_changed_user_data = user_data;
+    }
 
     if (callback) {
         handle->core->set_playing_changed_callback([handle](bool is_playing) {
-            if (handle->playing_changed_callback) {
-                handle->playing_changed_callback(is_playing ? 1 : 0, handle->playing_changed_user_data);
+            PlayingChangedCallbackC cb = nullptr;
+            void* ud = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(handle->callback_mutex);
+                cb = handle->playing_changed_callback;
+                ud = handle->playing_changed_user_data;
+            }
+            if (cb) {
+                cb(is_playing ? 1 : 0, ud);
             }
         });
     } else {
