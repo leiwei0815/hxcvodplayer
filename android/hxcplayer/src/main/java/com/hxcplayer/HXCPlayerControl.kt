@@ -624,11 +624,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                     false
                 } else {
                     applyDecodeModeForHandle(activeHandle)
-                    if (startPosition > 0.0) {
-                        nativeOpenURLWithStartPosition(activeHandle, url, startPosition)
-                    } else {
-                        nativeOpenURL(activeHandle, url)
-                    }
+                    val safeStart = startPosition.coerceAtLeast(0.0)
+                    nativeOpenURLWithStartPosition(activeHandle, url, safeStart)
                 }
             }
         }
@@ -681,11 +678,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                             false
                         } else {
                             applyDecodeModeForHandle(activeHandle)
-                            if (startPosition > 0.0) {
-                                nativeOpenURLWithStartPosition(activeHandle, url, startPosition)
-                            } else {
-                                nativeOpenURL(activeHandle, url)
-                            }
+                            val safeStart = startPosition.coerceAtLeast(0.0)
+                            nativeOpenURLWithStartPosition(activeHandle, url, safeStart)
                         }
                     }
                 }
@@ -743,11 +737,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
                                 false
                             } else {
-                                if (effectiveStartPosition > 0.0) {
-                                    nativeOpenURLWithStartPosition(activeHandle, model.url, effectiveStartPosition)
-                                } else {
-                                    nativeOpenURL(activeHandle, model.url)
-                                }
+                                val safeStart = effectiveStartPosition.coerceAtLeast(0.0)
+                                nativeOpenURLWithStartPosition(activeHandle, model.url, safeStart)
                             }
                         }
                         PlayerDataSourceMode.CUSTOM_HTTP -> {
@@ -918,6 +909,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         val url = lastOpenUrl
         val model = lastOpenPlayModel?.let { clonePlayModel(it) }
         val savedStartPosition = startPosition
+        // 与业务侧已验证的稳定路径对齐：replay 前先 stop 归一状态机，避免 -1002（状态错误）。
+        stop()
         startPosition = 0.0
         val ok = if (model != null) {
             playWithModel(model)
