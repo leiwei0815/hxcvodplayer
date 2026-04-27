@@ -61,8 +61,8 @@
 
 ## 6. 文档导航
 
-- 服务端接口与返回规范：`docs/HLS_AES128_BACKEND_API.md`
-- SDK 接入与代码示例：`docs/HLS_AES128_SDK_INTEGRATION.md`
+- 服务端接口与返回规范：[HLS_AES128_BACKEND_API.md](./HLS_AES128_BACKEND_API.md)
+- SDK 接入与代码示例：[HLS_AES128_SDK_INTEGRATION.md](./HLS_AES128_SDK_INTEGRATION.md)
 
 ---
 
