@@ -207,6 +207,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         var url: String = ""
         var mode: PlayerDataSourceMode = PlayerDataSourceMode.DEFAULT
         var encryptedFile: Boolean = false
+        var startPosition: Double = 0.0
         var video: PlayerVideo? = null
 
         companion object {
@@ -376,6 +377,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             url = model.url
             mode = model.mode
             encryptedFile = model.encryptedFile
+            startPosition = model.startPosition
             video = model.video
         }
     }
@@ -466,6 +468,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                 autoReopenInFlight = false
                 return@postDelayed
             }
+            // 与 iOS 对齐：自动重开前先把播放器起播点更新为重开位置。
+            startPosition = retryStart
             val ok = if (retryModel != null) {
                 openWithPlayModel(retryModel)
             } else {
@@ -714,8 +718,15 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("openWithPlayModel")) {
             return false
         }
+        // 与 iOS 语义对齐：playWithModel 默认读取 player.startPosition 作为起播进度。
+        // 兼容兜底：若调用方只设置了 model.startPosition，则仍可生效，避免老代码回归。
+        val effectiveStartPosition = when {
+            startPosition > 0.0 -> startPosition
+            model.startPosition > 0.0 -> model.startPosition
+            else -> 0.0
+        }
         lastOpenUrl = model.url
-        lastOpenStartPosition = 0.0
+        lastOpenStartPosition = effectiveStartPosition
         lastOpenPlayModel = clonePlayModel(model)
         if (!autoReopenInFlight) {
             autoReopenAttemptCount = 0
@@ -737,7 +748,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
                                 false
                             } else {
-                                nativeOpenURL(activeHandle, model.url)
+                                if (effectiveStartPosition > 0.0) {
+                                    nativeOpenURLWithStartPosition(activeHandle, model.url, effectiveStartPosition)
+                                } else {
+                                    nativeOpenURL(activeHandle, model.url)
+                                }
                             }
                         }
                         PlayerDataSourceMode.CUSTOM_HTTP -> {
@@ -909,6 +924,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         val model = lastOpenPlayModel?.let { clonePlayModel(it) }
         val savedStartPosition = startPosition
         startPosition = 0.0
+        // replay 语义固定为从 0 开始；兜底分支下也不允许 model 自带起播点覆盖。
+        model?.startPosition = 0.0
         val ok = if (model != null) {
             playWithModel(model)
         } else if (!url.isNullOrBlank()) {
