@@ -311,6 +311,9 @@ static BOOL g_hasConfigured = NO;
 
 @end
 
+@implementation HXCSecureHLSOptions
+@end
+
 @implementation HXCPlayerControl
 
 static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
@@ -586,12 +589,24 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     }
     player_core_set_decode_mode(_wrapper->handle(), hxc_to_c_decode_mode(_decodeMode));
 
-    PlayerDataSourceConfigC cConfig;
+    PlayerDataSourceConfigC cConfig{};
     cConfig.timeout_ms = (int)config.timeoutMs;
     cConfig.max_retries = (int)config.maxRetries;
     cConfig.cache_size = config.cacheSize;
     cConfig.avio_buffer_size = config.avioBufferSize;
     cConfig.encrypted_file = model.encryptedFile ? 1 : 0;
+    cConfig.auth_token = model.authToken.UTF8String;
+    cConfig.video_id = model.videoID.UTF8String;
+    cConfig.device_id = model.deviceID.UTF8String;
+    cConfig.app_id = model.appID.UTF8String;
+    cConfig.nonce = model.nonce.UTF8String;
+    cConfig.timestamp_ms = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
+    cConfig.play_session_id = model.playSessionID.UTF8String;
+    cConfig.secure_headers = model.secureHeaders.UTF8String;
+    cConfig.session_expire_at_ms = model.sessionExpireAtMs;
+    cConfig.key_mode = model.inlineKeyMode ? 1 : 0;
+    cConfig.key_material_b64 = model.keyMaterialBase64.UTF8String;
+    cConfig.key_iv_hex = model.keyIVHex.UTF8String;
 
     PlayerDataSourceModeC cMode;
     switch (model.mode) {
@@ -603,6 +618,9 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
             break;
         case HXCPlayerDataSourceModeCustomFile:
             cMode = PLAYER_DATA_SOURCE_MODE_CUSTOM_FILE;
+            break;
+        case HXCPlayerDataSourceModeSecureHLS:
+            cMode = PLAYER_DATA_SOURCE_MODE_SECURE_HLS;
             break;
         default:
             cMode = PLAYER_DATA_SOURCE_MODE_DEFAULT;
@@ -651,6 +669,41 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
         [self pause];
     }
     return YES;
+}
+
+- (BOOL)openSecureHLSWithURL:(NSString *)url
+                    authToken:(NSString *)authToken
+                      videoID:(NSString *)videoID
+                     deviceID:(NSString *)deviceID
+                        appID:(NSString *)appID
+                        nonce:(NSString *)nonce {
+    HXCSecureHLSOptions *options = [[HXCSecureHLSOptions alloc] init];
+    options.deviceID = deviceID;
+    options.appID = appID;
+    options.nonce = nonce;
+    return [self openSecureHLSWithURL:url authToken:authToken videoID:videoID options:options];
+}
+
+- (BOOL)openSecureHLSWithURL:(NSString *)url
+                   authToken:(NSString *)authToken
+                     videoID:(NSString *)videoID
+                     options:(HXCSecureHLSOptions *)options {
+    HXCPlayerDataSourcePlayModel *model =
+    [HXCPlayerDataSourcePlayModel modelWithURL:url
+                                          mode:HXCPlayerDataSourceModeSecureHLS
+                                 encryptedFile:NO];
+    model.authToken = authToken;
+    model.videoID = videoID;
+    model.deviceID = options.deviceID;
+    model.appID = options.appID;
+    model.nonce = options.nonce;
+    model.playSessionID = options.playSessionID;
+    model.secureHeaders = options.secureHeaders;
+    model.sessionExpireAtMs = options.sessionExpireAtMs;
+    model.inlineKeyMode = options.inlineKeyMode;
+    model.keyMaterialBase64 = options.keyMaterialBase64;
+    model.keyIVHex = options.keyIVHex;
+    return [self playWithModel:model];
 }
 
 - (void)play {
@@ -903,6 +956,17 @@ didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
         retryModel = [HXCPlayerDataSourcePlayModel modelWithURL:_lastOpenPlayModel.url
                                                            mode:_lastOpenPlayModel.mode
                                                   encryptedFile:_lastOpenPlayModel.encryptedFile];
+        retryModel.authToken = _lastOpenPlayModel.authToken;
+        retryModel.videoID = _lastOpenPlayModel.videoID;
+        retryModel.deviceID = _lastOpenPlayModel.deviceID;
+        retryModel.appID = _lastOpenPlayModel.appID;
+        retryModel.nonce = _lastOpenPlayModel.nonce;
+        retryModel.playSessionID = _lastOpenPlayModel.playSessionID;
+        retryModel.secureHeaders = _lastOpenPlayModel.secureHeaders;
+        retryModel.sessionExpireAtMs = _lastOpenPlayModel.sessionExpireAtMs;
+        retryModel.inlineKeyMode = _lastOpenPlayModel.inlineKeyMode;
+        retryModel.keyMaterialBase64 = _lastOpenPlayModel.keyMaterialBase64;
+        retryModel.keyIVHex = _lastOpenPlayModel.keyIVHex;
     }
     NSString *retryURL = [_playerUrl copy];
     double retryStartPosition = _position > 0 ? _position : _startPosition;

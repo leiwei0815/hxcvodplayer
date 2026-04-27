@@ -120,6 +120,27 @@ int hxc_player_open(HXCPlayerSDK* player, const char* url, double start_time) {
     }
 }
 
+int hxc_player_open_secure_hls(HXCPlayerSDK* player, const HXCSecureHLSOpenParams* params) {
+    if (!player || !player->core_handle || !params || !params->url) {
+        return -1;
+    }
+    PlayerSecureHLSConfigC cfg{};
+    cfg.url = params->url;
+    cfg.auth_token = params->auth_token;
+    cfg.video_id = params->video_id;
+    cfg.device_id = params->device_id;
+    cfg.app_id = params->app_id;
+    cfg.nonce = params->nonce;
+    cfg.play_session_id = params->play_session_id;
+    cfg.secure_headers = params->secure_headers;
+    cfg.session_expire_at_ms = params->session_expire_at_ms;
+    cfg.key_mode = params->key_mode;
+    cfg.key_material_b64 = params->key_material_b64;
+    cfg.key_iv_hex = params->key_iv_hex;
+    cfg.start_position = params->start_time;
+    return player_core_open_secure_hls(player->core_handle, &cfg);
+}
+
 void hxc_player_play(HXCPlayerSDK* player) {
     if (player && player->core_handle) {
         player_core_play(player->core_handle);

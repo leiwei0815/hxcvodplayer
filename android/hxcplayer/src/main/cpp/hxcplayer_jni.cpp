@@ -384,6 +384,42 @@ Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomHTTP(
     return result ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithSecureHLS(
+        JNIEnv *env, jobject thiz, jlong handle, jstring url, jstring auth_token, jstring video_id,
+        jstring device_id, jstring app_id, jstring nonce, jstring play_session_id,
+        jstring secure_headers, jlong session_expire_at_ms, jint key_mode, jstring key_material_b64, jstring key_iv_hex) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return JNI_FALSE;
+
+    const char* c_url = env->GetStringUTFChars(url, nullptr);
+    const char* c_auth = auth_token ? env->GetStringUTFChars(auth_token, nullptr) : nullptr;
+    const char* c_vid = video_id ? env->GetStringUTFChars(video_id, nullptr) : nullptr;
+    const char* c_dev = device_id ? env->GetStringUTFChars(device_id, nullptr) : nullptr;
+    const char* c_app = app_id ? env->GetStringUTFChars(app_id, nullptr) : nullptr;
+    const char* c_nonce = nonce ? env->GetStringUTFChars(nonce, nullptr) : nullptr;
+    const char* c_sid = play_session_id ? env->GetStringUTFChars(play_session_id, nullptr) : nullptr;
+    const char* c_hdr = secure_headers ? env->GetStringUTFChars(secure_headers, nullptr) : nullptr;
+    const char* c_key = key_material_b64 ? env->GetStringUTFChars(key_material_b64, nullptr) : nullptr;
+    const char* c_iv = key_iv_hex ? env->GetStringUTFChars(key_iv_hex, nullptr) : nullptr;
+
+    bool result = player->openWithSecureHLS(c_url, c_auth, c_vid, c_dev, c_app, c_nonce, c_sid, c_hdr,
+                                            static_cast<int64_t>(session_expire_at_ms), key_mode, c_key, c_iv);
+
+    env->ReleaseStringUTFChars(url, c_url);
+    if (auth_token && c_auth) env->ReleaseStringUTFChars(auth_token, c_auth);
+    if (video_id && c_vid) env->ReleaseStringUTFChars(video_id, c_vid);
+    if (device_id && c_dev) env->ReleaseStringUTFChars(device_id, c_dev);
+    if (app_id && c_app) env->ReleaseStringUTFChars(app_id, c_app);
+    if (nonce && c_nonce) env->ReleaseStringUTFChars(nonce, c_nonce);
+    if (play_session_id && c_sid) env->ReleaseStringUTFChars(play_session_id, c_sid);
+    if (secure_headers && c_hdr) env->ReleaseStringUTFChars(secure_headers, c_hdr);
+    if (key_material_b64 && c_key) env->ReleaseStringUTFChars(key_material_b64, c_key);
+    if (key_iv_hex && c_iv) env->ReleaseStringUTFChars(key_iv_hex, c_iv);
+
+    return result ? JNI_TRUE : JNI_FALSE;
+}
+
 // 使用自定义本地文件模式打开（与 DataSourceMode::CustomFile 一致）
 JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomFile(

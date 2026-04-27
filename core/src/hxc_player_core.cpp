@@ -8,14 +8,17 @@
 #include "hxc_logger.h"
 #include "hxc_debug_helper.h"
 #include <iostream>
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <thread>
 #include <sstream>
+#include <cstring>
 extern "C" {
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/base64.h>
 #include <libavformat/avformat.h>
 }
 
@@ -94,6 +97,69 @@ static bool hxc_is_network_like_url(const char* url) {
            (u.rfind("rtsp://", 0) == 0) ||
            (u.rfind("udp://", 0) == 0) ||
            (u.rfind("tcp://", 0) == 0);
+}
+
+static int64_t hxc_now_ms() {
+    return static_cast<int64_t>(av_gettime_relative() / 1000);
+}
+
+static std::string hxc_trim(const std::string& input) {
+    size_t b = 0;
+    while (b < input.size() && (input[b] == ' ' || input[b] == '\t' || input[b] == '\r' || input[b] == '\n')) {
+        ++b;
+    }
+    size_t e = input.size();
+    while (e > b && (input[e - 1] == ' ' || input[e - 1] == '\t' || input[e - 1] == '\r' || input[e - 1] == '\n')) {
+        --e;
+    }
+    return input.substr(b, e - b);
+}
+
+static std::string hxc_append_header_line(const std::string& base, const std::string& line) {
+    std::string trimmed = hxc_trim(line);
+    if (trimmed.empty()) {
+        return base;
+    }
+    std::string out = base;
+    if (!out.empty()) {
+        if (out.size() < 2 || out.substr(out.size() - 2) != "\r\n") {
+            out += "\r\n";
+        }
+    }
+    out += trimmed;
+    out += "\r\n";
+    return out;
+}
+
+static bool hxc_contains_header_key(const std::string& headers, const std::string& key_lower) {
+    if (headers.empty()) {
+        return false;
+    }
+    std::string s = headers;
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return s.find(key_lower + ":") != std::string::npos;
+}
+
+static bool hxc_decode_base64_to_bytes(const std::string& b64, std::vector<uint8_t>& out) {
+    if (b64.empty()) {
+        return false;
+    }
+    int max_len = AV_BASE64_DECODE_SIZE(static_cast<int>(b64.size()));
+    if (max_len <= 0) {
+        return false;
+    }
+    out.assign(static_cast<size_t>(max_len), 0);
+    int n = av_base64_decode(out.data(), b64.c_str(), max_len);
+    if (n <= 0) {
+        out.clear();
+        return false;
+    }
+    out.resize(static_cast<size_t>(n));
+    return true;
 }
 static enum AVHWDeviceType hxc_platform_hw_device_type() {
 #if defined(__ANDROID__)
@@ -279,6 +345,11 @@ int PlayerCore::open(const std::string& filename) {
         set_state(PlayerState::Error);
         return -1;
     }
+    if (secure_session_.expire_at_ms > 0 && hxc_now_ms() >= secure_session_.expire_at_ms) {
+        emit_error(ERROR_SECURE_AUTH_EXPIRED, "播放会话过期，请重新鉴权");
+        set_state(PlayerState::Error);
+        return -1;
+    }
     
     LOG_INFO("========================================");
     LOG_INFO("开始打开文件");
@@ -366,6 +437,10 @@ int PlayerCore::open(const std::string& filename) {
     // 其他平台使用通用 User-Agent
     av_dict_set(&options, "user_agent", "HXCPlayer/1.0", 0);
 #endif
+    if (!secure_session_.request_headers.empty()) {
+        av_dict_set(&options, "headers", secure_session_.request_headers.c_str(), 0);
+        LOG_INFO("SecureHLS 注入 headers 成功");
+    }
     
     // 🔧 增强重定向支持（处理 302 等重定向）
     av_dict_set(&options, "follow_redirects", "1", 0);
@@ -797,6 +872,80 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     return open_common_process("custom_io_stream");
 }
 
+int PlayerCore::open_secure_hls(const std::string& url, const SecurePlaybackConfig& config) {
+    SecureHLSSession session = config.preset_session;
+    if (session.m3u8_url.empty()) {
+        session.m3u8_url = url;
+    }
+
+    if (session.play_session_id.empty()) {
+        SecureHLSAuthRequest req;
+        req.token = config.token;
+        req.video_id = config.video_id;
+        req.device_id = config.device_id;
+        req.app_id = config.app_id;
+        req.nonce = config.nonce;
+        req.timestamp_ms = (config.timestamp_ms > 0) ? config.timestamp_ms : hxc_now_ms();
+
+        if (req.token.empty() || req.video_id.empty()) {
+            emit_error(ERROR_SECURE_AUTH_FAILED, "SecureHLS 缺少 token 或 video_id");
+            set_state(PlayerState::Error);
+            return -1;
+        }
+        if (auth_callback_) {
+            int auth_ret = auth_callback_(req, session);
+            if (auth_ret < 0) {
+                emit_error(ERROR_SECURE_AUTH_FAILED, "SecureHLS 鉴权失败");
+                set_state(PlayerState::Error);
+                return -1;
+            }
+        } else {
+            // 未注册鉴权回调时，退化为 Header 透传模式（由服务端在 m3u8/ts/key 请求处完成鉴权）
+            LOG_WARNING("SecureHLS 未设置鉴权回调，已退化为 Header 透传模式");
+        }
+    }
+
+    if (session.expire_at_ms > 0 && hxc_now_ms() >= session.expire_at_ms) {
+        emit_error(ERROR_SECURE_AUTH_EXPIRED, "SecureHLS 会话已过期");
+        set_state(PlayerState::Error);
+        return -1;
+    }
+
+    std::string headers = session.request_headers;
+    if (!config.token.empty() && !hxc_contains_header_key(headers, "authorization")) {
+        headers = hxc_append_header_line(headers, "Authorization: Bearer " + config.token);
+    }
+    if (!session.play_session_id.empty() && !hxc_contains_header_key(headers, "x-playback-session")) {
+        headers = hxc_append_header_line(headers, "X-Playback-Session: " + session.play_session_id);
+    }
+    if (!config.video_id.empty() && !hxc_contains_header_key(headers, "x-video-id")) {
+        headers = hxc_append_header_line(headers, "X-Video-ID: " + config.video_id);
+    }
+    session.request_headers = headers;
+
+    secure_key_material_.clear();
+    if (session.inline_key_mode && !session.key_material_b64.empty()) {
+        if (!hxc_decode_base64_to_bytes(session.key_material_b64, secure_key_material_) ||
+            secure_key_material_.size() != 16) {
+            emit_error(ERROR_SECURE_KEY_INVALID, "SecureHLS 内联密钥无效（需为 16 字节 AES-128）");
+            set_state(PlayerState::Error);
+            return -1;
+        }
+        if (resource_delegate_.on_request_key) {
+            resource_delegate_.on_request_key("inline-key-material");
+        }
+    }
+
+    secure_session_ = session;
+    if (resource_delegate_.on_request_manifest) {
+        resource_delegate_.on_request_manifest(session.m3u8_url);
+    }
+    LOG_INFO("SecureHLS 会话已建立: session=", secure_session_.play_session_id,
+             " expire_at_ms=", secure_session_.expire_at_ms,
+             " inline_key=", secure_session_.inline_key_mode ? "yes" : "no");
+    return open(session.m3u8_url);
+}
+
 // 使用指定数据源模式打开
 int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, const CustomDataSourceConfig& config) {
     PlayerState current_state = get_state();
@@ -949,6 +1098,23 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
                 set_state(PlayerState::Error);
                 return -1;
             }
+        }
+        case DataSourceMode::SecureHLS: {
+            SecurePlaybackConfig secure_cfg;
+            if (config.auth_token) secure_cfg.token = config.auth_token;
+            if (config.video_id) secure_cfg.video_id = config.video_id;
+            if (config.device_id) secure_cfg.device_id = config.device_id;
+            if (config.app_id) secure_cfg.app_id = config.app_id;
+            if (config.nonce) secure_cfg.nonce = config.nonce;
+            secure_cfg.timestamp_ms = config.timestamp_ms;
+            if (config.play_session_id) secure_cfg.preset_session.play_session_id = config.play_session_id;
+            if (config.secure_headers) secure_cfg.preset_session.request_headers = config.secure_headers;
+            secure_cfg.preset_session.expire_at_ms = config.session_expire_at_ms;
+            secure_cfg.preset_session.inline_key_mode = (config.key_mode == 1);
+            if (config.key_material_b64) secure_cfg.preset_session.key_material_b64 = config.key_material_b64;
+            if (config.key_iv_hex) secure_cfg.preset_session.key_iv_hex = config.key_iv_hex;
+            secure_cfg.preset_session.m3u8_url = url;
+            return open_secure_hls(url, secure_cfg);
         }
             
         default:
@@ -1201,6 +1367,11 @@ void PlayerCore::close() {
         custom_io_.reset();
         LOG_INFO("自定义数据源已关闭");
     }
+    if (!secure_key_material_.empty()) {
+        std::fill(secure_key_material_.begin(), secure_key_material_.end(), 0);
+        secure_key_material_.clear();
+    }
+    secure_session_ = SecureHLSSession{};
     
     // 清理队列
     video_packet_queue_.reset();
@@ -1758,6 +1929,14 @@ void PlayerCore::read_thread() {
         soft_reconnect_attempt_count = 0;
         next_soft_reconnect_try_us = 0;
         io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
+        if (!secure_session_.play_session_id.empty()) {
+            if (resource_delegate_.on_request_segment) {
+                resource_delegate_.on_request_segment(format_ctx_ && format_ctx_->url ? format_ctx_->url : "");
+            }
+            if (resource_delegate_.on_store_segment && pkt->size > 0) {
+                resource_delegate_.on_store_segment(format_ctx_ && format_ctx_->url ? format_ctx_->url : "", pkt->size);
+            }
+        }
         
         // 分发包到对应队列
         if (pkt->stream_index == video_stream_ && video_stream_opened_ && video_packet_queue_) {

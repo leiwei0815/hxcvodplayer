@@ -122,6 +122,24 @@ HXCPLAYER_SDK_API void hxc_player_on_resize(HXCPlayerSDK* player, int width, int
  */
 HXCPLAYER_SDK_API int hxc_player_open(HXCPlayerSDK* player, const char* url, double start_time);
 
+typedef struct {
+    const char* url;
+    const char* auth_token;
+    const char* video_id;
+    const char* device_id;
+    const char* app_id;
+    const char* nonce;
+    const char* play_session_id;
+    const char* secure_headers;
+    int64_t session_expire_at_ms;
+    int key_mode; // 0=远端 key URI, 1=内联 key
+    const char* key_material_b64;
+    const char* key_iv_hex;
+    double start_time;
+} HXCSecureHLSOpenParams;
+
+HXCPLAYER_SDK_API int hxc_player_open_secure_hls(HXCPlayerSDK* player, const HXCSecureHLSOpenParams* params);
+
 /**
  * @brief 播放
  */

@@ -75,6 +75,12 @@ typedef NS_ENUM(NSInteger, HXCPlayerErrorCode) {
     HXCPlayerErrorHTTPServerError = -3003,              // HTTP 服务器错误（5xx）
     HXCPlayerErrorHTTPUnauthorized = -3004,             // 需要身份验证（401）
     HXCPlayerErrorHTTPForbidden = -3005,                // 访问被禁止（403）
+    HXCPlayerErrorSecureAuthFailed = -4101,             // SecureHLS 鉴权失败
+    HXCPlayerErrorSecureAuthExpired = -4102,            // SecureHLS 会话过期
+    HXCPlayerErrorSecureKeyExpired = -4103,             // SecureHLS 密钥过期
+    HXCPlayerErrorSecureKeyInvalid = -4104,             // SecureHLS 密钥非法
+    HXCPlayerErrorSecureReplayBlocked = -4105,          // SecureHLS 重放被拒绝
+    HXCPlayerErrorSecureClockSkew = -4106,              // SecureHLS 设备时钟偏移过大
 
     // License（-4001 ~ -4099）
     HXCPlayerErrorLicenseValidationFailed = -4001,      // License 校验未通过或门禁开启但未通过校验
@@ -85,6 +91,7 @@ typedef NS_ENUM(NSInteger, HXCPlayerDataSourceMode) {
     HXCPlayerDataSourceModeDefault = 0,      // 默认模式（FFmpeg 直接打开）
     HXCPlayerDataSourceModeCustomHTTP = 1,   // 自定义 HTTP Range 下载器
     HXCPlayerDataSourceModeCustomFile = 2,   // 本地文件自定义读取（支持加密文件头解密）
+    HXCPlayerDataSourceModeSecureHLS = 3,    // HLS AES-128 鉴权播放
 };
 
 /// 解码模式（播放前设置，默认软解）

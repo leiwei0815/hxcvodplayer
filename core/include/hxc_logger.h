@@ -194,9 +194,29 @@ public:
     void debug_with_location(const char* file, int line, const char* func, Args&&... args) {
         if (level_ <= LogLevel::DEBUG) {
             std::ostringstream oss;
-            oss << "[" << get_filename(file) << ":" << line << " " << func << "()] ";
+            oss << "[" << get_filename(file) << ":" << line << "] [" << func << "] ";
             ((oss << args), ...);
             log("DEBUG", oss.str());
+        }
+    }
+
+    template<typename... Args>
+    void info_with_location(const char* file, int line, const char* func, Args&&... args) {
+        if (level_ <= LogLevel::INFO) {
+            std::ostringstream oss;
+            oss << "[" << get_filename(file) << ":" << line << "] [" << func << "] ";
+            ((oss << args), ...);
+            log("INFO", oss.str());
+        }
+    }
+
+    template<typename... Args>
+    void warning_with_location(const char* file, int line, const char* func, Args&&... args) {
+        if (level_ <= LogLevel::WARNING) {
+            std::ostringstream oss;
+            oss << "[" << get_filename(file) << ":" << line << "] [" << func << "] ";
+            ((oss << args), ...);
+            log("WARNING", oss.str());
         }
     }
     
@@ -204,7 +224,7 @@ public:
     void error_with_location(const char* file, int line, const char* func, Args&&... args) {
         if (level_ <= LogLevel::ERROR_LEVEL) {
             std::ostringstream oss;
-            oss << "[" << get_filename(file) << ":" << line << " " << func << "()] ";
+            oss << "[" << get_filename(file) << ":" << line << "] [" << func << "] ";
             ((oss << args), ...);
             log("ERROR", oss.str());
         }
@@ -488,15 +508,24 @@ private:
     std::condition_variable async_cv_;
 };
 
-// 便捷宏
-#define LOG_DEBUG(...) hxcplayer::Logger::instance().debug(__VA_ARGS__)
-#define LOG_INFO(...) hxcplayer::Logger::instance().info(__VA_ARGS__)
-#define LOG_WARNING(...) hxcplayer::Logger::instance().warning(__VA_ARGS__)
-#define LOG_ERROR(...) hxcplayer::Logger::instance().error(__VA_ARGS__)
+// 调用位置信息：优先使用包含类名/函数签名的信息
+#if defined(__clang__) || defined(__GNUC__)
+#define HXC_LOG_CALLSITE_FUNC __PRETTY_FUNCTION__
+#elif defined(_MSC_VER)
+#define HXC_LOG_CALLSITE_FUNC __FUNCSIG__
+#else
+#define HXC_LOG_CALLSITE_FUNC __FUNCTION__
+#endif
+
+// 便捷宏（默认包含文件/行号/函数签名）
+#define LOG_DEBUG(...) hxcplayer::Logger::instance().debug_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
+#define LOG_INFO(...) hxcplayer::Logger::instance().info_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
+#define LOG_WARNING(...) hxcplayer::Logger::instance().warning_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
+#define LOG_ERROR(...) hxcplayer::Logger::instance().error_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
 
 // 带位置信息的日志宏
-#define LOG_DEBUG_LOC(...) hxcplayer::Logger::instance().debug_with_location(__FILE__, __LINE__, __FUNCTION__, __VA_ARGS__)
-#define LOG_ERROR_LOC(...) hxcplayer::Logger::instance().error_with_location(__FILE__, __LINE__, __FUNCTION__, __VA_ARGS__)
+#define LOG_DEBUG_LOC(...) hxcplayer::Logger::instance().debug_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
+#define LOG_ERROR_LOC(...) hxcplayer::Logger::instance().error_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
 
 } // namespace hxcplayer
 

@@ -7,6 +7,7 @@
 #define YXVODPLAYER_PLAYER_CORE_C_BRIDGE_H
 
 #include <stddef.h>  // for size_t
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -74,6 +75,12 @@ typedef enum {
     PLAYER_ERROR_HTTP_SERVER_ERROR = -3003,             // HTTP 服务器错误（5xx）
     PLAYER_ERROR_HTTP_UNAUTHORIZED = -3004,             // 需要身份验证（401）
     PLAYER_ERROR_HTTP_FORBIDDEN = -3005,                // 访问被禁止（403）
+    PLAYER_ERROR_SECURE_AUTH_FAILED = -4101,            // SecureHLS 鉴权失败
+    PLAYER_ERROR_SECURE_AUTH_EXPIRED = -4102,           // SecureHLS 会话过期
+    PLAYER_ERROR_SECURE_KEY_EXPIRED = -4103,            // SecureHLS 密钥过期
+    PLAYER_ERROR_SECURE_KEY_INVALID = -4104,            // SecureHLS 密钥非法
+    PLAYER_ERROR_SECURE_REPLAY_BLOCKED = -4105,         // SecureHLS 重放被拒绝
+    PLAYER_ERROR_SECURE_CLOCK_SKEW = -4106,             // SecureHLS 设备时钟偏移过大
     
     // FFmpeg 错误码范围 (负数)
     // 使用 FFmpeg 原始错误码，例如：
@@ -89,6 +96,7 @@ typedef enum {
     PLAYER_DATA_SOURCE_MODE_DEFAULT = 0,      // 默认模式（FFmpeg 直接打开）
     PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP = 1,  // 自定义 HTTP Range 下载器
     PLAYER_DATA_SOURCE_MODE_CUSTOM_FILE = 2,  // 本地文件自定义读取（支持加密文件头解密）
+    PLAYER_DATA_SOURCE_MODE_SECURE_HLS = 3,   // HLS AES-128 鉴权模式
 } PlayerDataSourceModeC;
 
 // 解码模式（播放前设置；默认软解）
@@ -104,7 +112,36 @@ typedef struct {
     size_t cache_size;        // 缓存大小（字节），默认 2MB
     size_t avio_buffer_size;  // AVIO 缓冲区大小（字节），默认 64KB
     int encrypted_file;       // 是否为加密文件（0/1），仅解密文件头前 100 字节
+    const char* auth_token;   // SecureHLS: 业务 token
+    const char* video_id;     // SecureHLS: 视频 ID
+    const char* device_id;    // SecureHLS: 设备 ID
+    const char* app_id;       // SecureHLS: 应用 ID
+    const char* nonce;        // SecureHLS: nonce
+    int64_t timestamp_ms;     // SecureHLS: 时间戳（毫秒）
+    const char* play_session_id;      // SecureHLS: 已鉴权会话 ID（可选）
+    const char* secure_headers;       // SecureHLS: 透传 header 文本
+    int64_t session_expire_at_ms;     // SecureHLS: 会话过期时间（毫秒）
+    int key_mode;                     // SecureHLS: 0=远端 key URI, 1=内联 key
+    const char* key_material_b64;     // SecureHLS: Base64 密钥（16字节）
+    const char* key_iv_hex;           // SecureHLS: 可选 IV
 } PlayerDataSourceConfigC;
+
+typedef struct {
+    const char* url;
+    const char* auth_token;
+    const char* video_id;
+    const char* device_id;
+    const char* app_id;
+    const char* nonce;
+    int64_t timestamp_ms;
+    const char* play_session_id;
+    const char* secure_headers;
+    int64_t session_expire_at_ms;
+    int key_mode;
+    const char* key_material_b64;
+    const char* key_iv_hex;
+    double start_position;
+} PlayerSecureHLSConfigC;
 
 // 创建/销毁播放器
 PlayerCoreHandle* player_core_create(void);
@@ -114,6 +151,7 @@ void player_core_destroy(PlayerCoreHandle* handle);
 int player_core_open(PlayerCoreHandle* handle, const char* url);
 int player_core_open_with_start_position(PlayerCoreHandle* handle, const char* url, double start_pos);
 int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, PlayerDataSourceModeC mode, const PlayerDataSourceConfigC* config, double start_position);
+int player_core_open_secure_hls(PlayerCoreHandle* handle, const PlayerSecureHLSConfigC* config);
 void player_core_play(PlayerCoreHandle* handle);
 void player_core_pause(PlayerCoreHandle* handle);
 void player_core_stop(PlayerCoreHandle* handle);

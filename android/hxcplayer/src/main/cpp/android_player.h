@@ -7,6 +7,7 @@
 #include <atomic>
 #include <mutex>
 #include <memory>
+#include <cstdint>
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
 
@@ -46,6 +47,20 @@ public:
 
     // 使用自定义本地文件模式打开（经 CustomAVIOContext + LocalFileDataSource，支持可选文件头解密）
     bool openWithCustomFile(const char* path, size_t avio_buffer_size = 64 * 1024, bool encrypted_file = false);
+
+    // SecureHLS 打开（token + videoID 鉴权参数透传到 core）
+    bool openWithSecureHLS(const char* url,
+                           const char* auth_token,
+                           const char* video_id,
+                           const char* device_id = nullptr,
+                           const char* app_id = nullptr,
+                           const char* nonce = nullptr,
+                           const char* play_session_id = nullptr,
+                           const char* secure_headers = nullptr,
+                           int64_t session_expire_at_ms = 0,
+                           int key_mode = 0,
+                           const char* key_material_b64 = nullptr,
+                           const char* key_iv_hex = nullptr);
     
     // 播放控制
     void play();

@@ -224,6 +224,9 @@ int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, Player
         case PLAYER_DATA_SOURCE_MODE_CUSTOM_FILE:
             cppMode = hxcplayer::DataSourceMode::CustomFile;
             break;
+        case PLAYER_DATA_SOURCE_MODE_SECURE_HLS:
+            cppMode = hxcplayer::DataSourceMode::SecureHLS;
+            break;
         default:
             return -1;  // 不支持的模式
     }
@@ -236,10 +239,47 @@ int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, Player
         cppConfig.cache_size = config->cache_size;
         cppConfig.avio_buffer_size = config->avio_buffer_size;
         cppConfig.encrypted_file = (config->encrypted_file != 0);
+        cppConfig.auth_token = config->auth_token;
+        cppConfig.video_id = config->video_id;
+        cppConfig.device_id = config->device_id;
+        cppConfig.app_id = config->app_id;
+        cppConfig.nonce = config->nonce;
+        cppConfig.timestamp_ms = config->timestamp_ms;
+        cppConfig.play_session_id = config->play_session_id;
+        cppConfig.secure_headers = config->secure_headers;
+        cppConfig.session_expire_at_ms = config->session_expire_at_ms;
+        cppConfig.key_mode = config->key_mode;
+        cppConfig.key_material_b64 = config->key_material_b64;
+        cppConfig.key_iv_hex = config->key_iv_hex;
     }
     // 否则使用默认配置
     
     return handle->core->open_with_mode(url, cppMode, cppConfig);
+}
+
+int player_core_open_secure_hls(PlayerCoreHandle* handle, const PlayerSecureHLSConfigC* config) {
+    if (!handle || !handle->core || !config || !config->url) {
+        return -1;
+    }
+    hxcplayer::SecurePlaybackConfig secure_cfg;
+    if (config->auth_token) secure_cfg.token = config->auth_token;
+    if (config->video_id) secure_cfg.video_id = config->video_id;
+    if (config->device_id) secure_cfg.device_id = config->device_id;
+    if (config->app_id) secure_cfg.app_id = config->app_id;
+    if (config->nonce) secure_cfg.nonce = config->nonce;
+    secure_cfg.timestamp_ms = config->timestamp_ms;
+    if (config->play_session_id) secure_cfg.preset_session.play_session_id = config->play_session_id;
+    if (config->secure_headers) secure_cfg.preset_session.request_headers = config->secure_headers;
+    secure_cfg.preset_session.expire_at_ms = config->session_expire_at_ms;
+    secure_cfg.preset_session.inline_key_mode = (config->key_mode == 1);
+    if (config->key_material_b64) secure_cfg.preset_session.key_material_b64 = config->key_material_b64;
+    if (config->key_iv_hex) secure_cfg.preset_session.key_iv_hex = config->key_iv_hex;
+    secure_cfg.preset_session.m3u8_url = config->url;
+
+    auto playerConfig = handle->core->get_config();
+    playerConfig.start_time = (config->start_position > 0.0) ? config->start_position : 0.0;
+    handle->core->set_config(playerConfig);
+    return handle->core->open_secure_hls(config->url, secure_cfg);
 }
 
 void player_core_play(PlayerCoreHandle* handle) {

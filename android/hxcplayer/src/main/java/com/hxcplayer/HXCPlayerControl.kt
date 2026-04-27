@@ -164,7 +164,8 @@ class HXCPlayerControl @JvmOverloads constructor(
     enum class PlayerDataSourceMode {
         DEFAULT,
         CUSTOM_HTTP,
-        CUSTOM_FILE
+        CUSTOM_FILE,
+        SECURE_HLS
     }
 
     /** 解码模式（默认软解，播放前设置） */
@@ -207,6 +208,17 @@ class HXCPlayerControl @JvmOverloads constructor(
         var mode: PlayerDataSourceMode = PlayerDataSourceMode.DEFAULT
         var encryptedFile: Boolean = false
         var video: PlayerVideo? = null
+        var authToken: String? = null
+        var videoID: String? = null
+        var deviceID: String? = null
+        var appID: String? = null
+        var nonce: String? = null
+        var playSessionID: String? = null
+        var secureHeaders: String? = null
+        var sessionExpireAtMs: Long = 0L
+        var inlineKeyMode: Boolean = false
+        var keyMaterialBase64: String? = null
+        var keyIVHex: String? = null
 
         companion object {
             @JvmStatic
@@ -222,6 +234,21 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
             }
         }
+    }
+
+    /**
+     * SecureHLS 可选参数（可预置会话/headers/内联key）。
+     */
+    class SecureHLSOptions {
+        var deviceID: String? = null
+        var appID: String? = null
+        var nonce: String? = null
+        var playSessionID: String? = null
+        var secureHeaders: String? = null
+        var sessionExpireAtMs: Long = 0L
+        var inlineKeyMode: Boolean = false
+        var keyMaterialBase64: String? = null
+        var keyIVHex: String? = null
     }
 
     /**
@@ -358,6 +385,17 @@ class HXCPlayerControl @JvmOverloads constructor(
             mode = model.mode
             encryptedFile = model.encryptedFile
             video = model.video
+            authToken = model.authToken
+            videoID = model.videoID
+            deviceID = model.deviceID
+            appID = model.appID
+            nonce = model.nonce
+            playSessionID = model.playSessionID
+            secureHeaders = model.secureHeaders
+            sessionExpireAtMs = model.sessionExpireAtMs
+            inlineKeyMode = model.inlineKeyMode
+            keyMaterialBase64 = model.keyMaterialBase64
+            keyIVHex = model.keyIVHex
         }
     }
 
@@ -688,6 +726,23 @@ class HXCPlayerControl @JvmOverloads constructor(
                     model.encryptedFile
                 )
             }
+            PlayerDataSourceMode.SECURE_HLS -> {
+                nativeOpenWithSecureHLS(
+                    handle,
+                    model.url,
+                    model.authToken,
+                    model.videoID,
+                    model.deviceID,
+                    model.appID,
+                    model.nonce,
+                    model.playSessionID,
+                    model.secureHeaders,
+                    model.sessionExpireAtMs,
+                    if (model.inlineKeyMode) 1 else 0,
+                    model.keyMaterialBase64,
+                    model.keyIVHex
+                )
+            }
         }
         if (!result) {
             dispatchError(
@@ -738,6 +793,30 @@ class HXCPlayerControl @JvmOverloads constructor(
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开本地文件(CustomFile): $path")
         }
         return result
+    }
+
+    fun openSecureHLS(
+        url: String,
+        authToken: String,
+        videoID: String,
+        deviceID: String? = null,
+        appID: String? = null,
+        nonce: String? = null,
+        options: SecureHLSOptions? = null
+    ): Boolean {
+        val model = PlayerDataSourcePlayModel.modelWithURL(url, PlayerDataSourceMode.SECURE_HLS, false)
+        model.authToken = authToken
+        model.videoID = videoID
+        model.deviceID = options?.deviceID ?: deviceID
+        model.appID = options?.appID ?: appID
+        model.nonce = options?.nonce ?: nonce
+        model.playSessionID = options?.playSessionID
+        model.secureHeaders = options?.secureHeaders
+        model.sessionExpireAtMs = options?.sessionExpireAtMs ?: 0L
+        model.inlineKeyMode = options?.inlineKeyMode ?: false
+        model.keyMaterialBase64 = options?.keyMaterialBase64
+        model.keyIVHex = options?.keyIVHex
+        return openWithPlayModel(model)
     }
 
     // 播放
@@ -1047,6 +1126,21 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeOpenURLWithStartPosition(handle: Long, url: String, startPosition: Double): Boolean
     private external fun nativeOpenWithCustomHTTP(handle: Long, url: String, timeoutMs: Int, maxRetries: Int, encryptedFile: Boolean): Boolean
     private external fun nativeOpenWithCustomFile(handle: Long, path: String, avioBufferSize: Int, encryptedFile: Boolean): Boolean
+    private external fun nativeOpenWithSecureHLS(
+        handle: Long,
+        url: String,
+        authToken: String?,
+        videoID: String?,
+        deviceID: String?,
+        appID: String?,
+        nonce: String?,
+        playSessionID: String?,
+        secureHeaders: String?,
+        sessionExpireAtMs: Long,
+        keyMode: Int,
+        keyMaterialBase64: String?,
+        keyIVHex: String?
+    ): Boolean
     private external fun nativePlay(handle: Long)
     private external fun nativePause(handle: Long)
     private external fun nativeStop(handle: Long)

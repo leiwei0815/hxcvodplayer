@@ -16,6 +16,7 @@
 #include <thread>
 #include <atomic>
 #include <functional>
+#include <cstdint>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -72,6 +73,13 @@ enum PlayerErrorCode {
     ERROR_INPUT_INVALID_DATA = -1018,        //无效数据
     ERROR_NOT_SUPPORT = -1019,
     ERROR_UNKNOWN = -1099,                 // 未知错误
+    // Secure HLS 鉴权/密钥错误
+    ERROR_SECURE_AUTH_FAILED = -4101,      // 鉴权失败
+    ERROR_SECURE_AUTH_EXPIRED = -4102,     // 鉴权过期
+    ERROR_SECURE_KEY_EXPIRED = -4103,      // 密钥过期
+    ERROR_SECURE_KEY_INVALID = -4104,      // 密钥非法
+    ERROR_SECURE_REPLAY_BLOCKED = -4105,   // 重放被拒绝
+    ERROR_SECURE_CLOCK_SKEW = -4106,       // 设备时钟偏移过大
     
     // FFmpeg 错误码范围 (负数)
     // 使用 FFmpeg 原始错误码，例如：
@@ -84,6 +92,7 @@ enum class DataSourceMode {
     Default = 0,     // 默认模式（FFmpeg 直接打开）
     CustomHTTP = 1,  // 自定义 HTTP Range 下载器
     CustomFile = 2,  // 本地文件自定义读取（支持加密文件头解密）
+    SecureHLS = 3,   // HLS AES-128 鉴权播放
     // 未来可扩展：
     // Encrypted = 2,   // 加密视频
     // P2P = 3,         // P2P 数据源
@@ -97,6 +106,55 @@ struct CustomDataSourceConfig {
     size_t cache_size = 2 * 1024 * 1024;  // 缓存大小（字节）
     size_t avio_buffer_size = 64 * 1024;  // AVIO 缓冲区大小（字节）
     bool encrypted_file = false;      // 是否为加密文件（仅解密文件头前 100 字节）
+    // Secure HLS 参数（mode=SecureHLS 时使用）
+    const char* auth_token = nullptr;
+    const char* video_id = nullptr;
+    const char* device_id = nullptr;
+    const char* app_id = nullptr;
+    const char* nonce = nullptr;
+    int64_t timestamp_ms = 0;
+    const char* play_session_id = nullptr;
+    const char* secure_headers = nullptr;  // "Authorization: xxx\r\nX-Playback-Session: yyy\r\n"
+    int64_t session_expire_at_ms = 0;
+    int key_mode = 0;                      // 0=远端 key URI，1=内联 key
+    const char* key_material_b64 = nullptr;
+    const char* key_iv_hex = nullptr;
+};
+
+struct SecureHLSAuthRequest {
+    std::string token;
+    std::string video_id;
+    std::string device_id;
+    std::string app_id;
+    std::string nonce;
+    int64_t timestamp_ms = 0;
+};
+
+struct SecureHLSSession {
+    std::string play_session_id;
+    std::string m3u8_url;
+    std::string request_headers;
+    int64_t expire_at_ms = 0;
+    bool inline_key_mode = false;
+    std::string key_material_b64;
+    std::string key_iv_hex;
+};
+
+struct SecurePlaybackConfig {
+    std::string token;
+    std::string video_id;
+    std::string device_id;
+    std::string app_id;
+    std::string nonce;
+    int64_t timestamp_ms = 0;
+    SecureHLSSession preset_session;
+};
+
+struct PlaybackResourceDelegate {
+    std::function<void(const std::string& url)> on_request_manifest;
+    std::function<void(const std::string& url)> on_request_segment;
+    std::function<void(const std::string& url, int64_t bytes)> on_store_segment;
+    std::function<void(const std::string& key_uri)> on_request_key;
 };
 
 /**
@@ -105,6 +163,7 @@ struct CustomDataSourceConfig {
  */
 class PlayerCore {
 public:
+    using SecureHLSAuthCallback = std::function<int(const SecureHLSAuthRequest&, SecureHLSSession&)>;
     PlayerCore();
     ~PlayerCore();
     
@@ -124,6 +183,9 @@ public:
     
     // 使用指定数据源模式打开（新接口）
     int open_with_mode(const std::string& url, DataSourceMode mode, const CustomDataSourceConfig& config = CustomDataSourceConfig());
+    int open_secure_hls(const std::string& url, const SecurePlaybackConfig& config);
+    void set_secure_hls_auth_callback(SecureHLSAuthCallback callback) { auth_callback_ = std::move(callback); }
+    void set_playback_resource_delegate(PlaybackResourceDelegate delegate) { resource_delegate_ = std::move(delegate); }
     
     // 关闭
     void close();
@@ -380,6 +442,10 @@ private:
     
     // 自定义数据源
     std::unique_ptr<CustomAVIOContext> custom_io_;       // 自定义 AVIOContext
+    SecureHLSAuthCallback auth_callback_;
+    PlaybackResourceDelegate resource_delegate_;
+    SecureHLSSession secure_session_;
+    std::vector<uint8_t> secure_key_material_;
 };
 
 } // namespace hxcplayer
