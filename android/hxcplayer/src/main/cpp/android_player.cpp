@@ -101,34 +101,41 @@ AndroidPlayer::~AndroidPlayer() {
 }
 
 void AndroidPlayer::setSurface(ANativeWindow* window) {
-    std::lock_guard<std::mutex> lock(window_mutex_);
-    
-    if (native_window_) {
-        ANativeWindow_release(native_window_);
-        surface_configured_ = false;
+    // 先在锁外决定是否需要停止渲染线程，再释放锁后 join，
+    // 避免持锁 join 时与 renderFrame 内的锁形成死锁。
+    std::thread thread_to_join;
+    {
+        std::lock_guard<std::mutex> lock(window_mutex_);
+
+        if (native_window_) {
+            ANativeWindow_release(native_window_);
+            surface_configured_ = false;
+        }
+
+        native_window_ = window;
+        surface_generation_.fetch_add(1, std::memory_order_relaxed);
+
+        if (native_window_) {
+            ANativeWindow_acquire(native_window_);
+            LOGD("Surface set: %p", native_window_);
+            surface_configured_ = false;
+
+            if (!render_running_) {
+                render_running_ = true;
+                render_thread_ = std::thread(&AndroidPlayer::renderLoop, this);
+            }
+        } else {
+            LOGD("Surface cleared");
+            render_running_ = false;
+            // 把 thread 移出来，锁外再 join
+            if (render_thread_.joinable()) {
+                thread_to_join = std::move(render_thread_);
+            }
+        }
     }
-    
-    native_window_ = window;
-    surface_generation_.fetch_add(1, std::memory_order_relaxed);
-    
-    if (native_window_) {
-        ANativeWindow_acquire(native_window_);
-        LOGD("Surface set: %p", native_window_);
-        surface_configured_ = false;  // 新 Surface，需要重新配置
-        
-        // 启动渲染线程
-        if (!render_running_) {
-            render_running_ = true;
-            render_thread_ = std::thread(&AndroidPlayer::renderLoop, this);
-        }
-    } else {
-        LOGD("Surface cleared");
-        
-        // 停止渲染线程
-        render_running_ = false;
-        if (render_thread_.joinable()) {
-            render_thread_.join();
-        }
+    // 锁已释放，renderFrame 可以正常退出，join 不会死锁
+    if (thread_to_join.joinable()) {
+        thread_to_join.join();
     }
 }
 
@@ -294,10 +301,13 @@ void AndroidPlayer::pause() {
 
 void AndroidPlayer::stop() {
     if (!player_core_) return;
-    
+
     LOGD("Stop");
+    // 主动丢弃上一次播放结束的 pending 事件，避免 stop 后立刻 open 新资源时
+    // 第一次 consume 仍返回 true，误触发应用层 onPlaybackCompleted 回调。
+    has_pending_playback_completed_.store(false, std::memory_order_release);
     player_core_stop(player_core_);
-    
+
     // 停止音频
     if (playItf_) {
         SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
@@ -332,21 +342,25 @@ void AndroidPlayer::setVolume(float volume) {
 void AndroidPlayer::setAspectRatioMode(int mode) {
     aspect_ratio_mode_ = mode;
     LOGI("✅ Set aspect ratio mode: %d (%s)", mode, mode == 0 ? "FIT" : "FILL");
-    
+
     if (player_core_) {
-        player_core_set_aspect_ratio_mode(player_core_, 
+        player_core_set_aspect_ratio_mode(player_core_,
             mode == 1 ? ASPECT_RATIO_FILL : ASPECT_RATIO_FIT);
     }
-    
-    // 重置 swscale context 以应用新的宽高比模式
-    if (sws_ctx_) {
-        sws_freeContext(sws_ctx_);
-        sws_ctx_ = nullptr;
-        last_video_width_ = 0;
-        last_video_height_ = 0;
-        last_target_width_ = 0;
-        last_target_height_ = 0;
-        LOGI("🔄 Reset swscale context to apply new aspect ratio mode");
+
+    // 重置 swscale context 以应用新的宽高比模式。
+    // sws_ctx_ 同时被渲染线程访问，必须持 sws_mutex_ 操作，避免 UAF/崩溃。
+    {
+        std::lock_guard<std::mutex> lock(sws_mutex_);
+        if (sws_ctx_) {
+            sws_freeContext(sws_ctx_);
+            sws_ctx_ = nullptr;
+            last_video_width_ = 0;
+            last_video_height_ = 0;
+            last_target_width_ = 0;
+            last_target_height_ = 0;
+            LOGI("🔄 Reset swscale context to apply new aspect ratio mode");
+        }
     }
 }
 
@@ -724,54 +738,55 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     }
     
     // 🖼️ 使用 FFmpeg swscale 进行硬件加速的 YUV->RGB 转换和缩放
-    // 类似 iOS 的 AVSampleBufferDisplayLayer，但在软件层面实现
-    
-    // 检查是否需要重新创建 swscale context（只在视频尺寸或目标尺寸变化时）
+    // sws_ctx_ / rgb_buffer_ 会被 setAspectRatioMode（UI 线程）并发修改，必须持 sws_mutex_。
+
+    // 检查是否需要重新创建 swscale context，并完成 YUV→RGB 转换，整段持锁保护
+    std::lock_guard<std::mutex> sws_lock(sws_mutex_);
+
     if (!sws_ctx_ ||
         src_crop_w != last_video_width_ || src_crop_h != last_video_height_ ||
         dst_width != last_target_width_ || dst_height != last_target_height_) {
-        
+
         if (sws_ctx_) {
             sws_freeContext(sws_ctx_);
         }
-        
+
         // 创建 swscale context (YUV420P -> RGB565)
         sws_ctx_ = sws_getContext(
             src_crop_w, src_crop_h, AV_PIX_FMT_YUV420P,
             dst_width, dst_height, AV_PIX_FMT_RGB565LE,
-            SWS_FAST_BILINEAR,  // 快速双线性插值
+            SWS_FAST_BILINEAR,
             nullptr, nullptr, nullptr
         );
-        
+
         if (!sws_ctx_) {
             LOGE("Failed to create swscale context");
             ANativeWindow_unlockAndPost(window);
             ANativeWindow_release(window);
             return -1;
         }
-        
-        // 记录当前尺寸
+
         last_video_width_ = src_crop_w;
         last_video_height_ = src_crop_h;
         last_target_width_ = dst_width;
         last_target_height_ = dst_height;
-        
+
         LOGI("✅ Created swscale context: src_crop=%dx%d -> dst=%dx%d", src_crop_w, src_crop_h, dst_width, dst_height);
     }
-    
+
     // 准备源数据（YUV420P，带源裁剪）
-    const uint8_t* src_data[4] = { 
+    const uint8_t* src_data[4] = {
         ((uint8_t*)y_data) + src_crop_y * y_linesize + src_crop_x,
         ((uint8_t*)u_data) + (src_crop_y / 2) * u_linesize + (src_crop_x / 2),
         ((uint8_t*)v_data) + (src_crop_y / 2) * v_linesize + (src_crop_x / 2),
         nullptr
     };
     int src_linesize[4] = { y_linesize, u_linesize, v_linesize, 0 };
-    
+
     // 分配临时缓冲区（避免直接写入 ANativeWindow buffer）
     int temp_stride = dst_width * 2;  // RGB565 = 2 bytes per pixel
     int temp_size = temp_stride * dst_height;
-    
+
     // ⚠️ 限制最大分配大小，防止异常参数导致 OOM
     const int MAX_RGB_BUFFER_SIZE = 3840 * 2160 * 2;  // 4K RGB565 约 16MB
     if (temp_size > MAX_RGB_BUFFER_SIZE) {
@@ -780,7 +795,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         ANativeWindow_release(window);
         return -1;
     }
-    
+
     if (!rgb_buffer_ || rgb_buffer_size_ < temp_size) {
         if (rgb_buffer_) {
             av_free(rgb_buffer_);
@@ -795,7 +810,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         rgb_buffer_size_ = temp_size;
         LOGI("📦 Allocated RGB buffer: %d bytes (%dx%d)", temp_size, dst_width, dst_height);
     }
-    
+
     // 准备目标数据（渲染到临时缓冲区）
     uint8_t* dst_data[4] = { rgb_buffer_, nullptr, nullptr, nullptr };
     int dst_linesize[4] = { temp_stride, 0, 0, 0 };
@@ -910,19 +925,22 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     result = (*engineObject_)->GetInterface(engineObject_, SL_IID_ENGINE, &engineEngine_);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to get engine interface: %d", result);
+        destroyAudioOutput();
         return false;
     }
-    
+
     // 创建输出混音器
     result = (*engineEngine_)->CreateOutputMix(engineEngine_, &outputMixObject_, 0, nullptr, nullptr);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to create output mix: %d", result);
+        destroyAudioOutput();
         return false;
     }
-    
+
     result = (*outputMixObject_)->Realize(outputMixObject_, SL_BOOLEAN_FALSE);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to realize output mix: %d", result);
+        destroyAudioOutput();
         return false;
     }
     
@@ -988,33 +1006,38 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
                                                  &audioSrc, &audioSnk, 1, ids, req);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to create audio player: %d", result);
+        destroyAudioOutput();
         return false;
     }
-    
+
     result = (*playerObject_)->Realize(playerObject_, SL_BOOLEAN_FALSE);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to realize audio player: %d", result);
+        destroyAudioOutput();
         return false;
     }
-    
+
     // 获取播放接口
     result = (*playerObject_)->GetInterface(playerObject_, SL_IID_PLAY, &playItf_);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to get play interface: %d", result);
+        destroyAudioOutput();
         return false;
     }
-    
+
     // 获取缓冲队列接口
     result = (*playerObject_)->GetInterface(playerObject_, SL_IID_BUFFERQUEUE, &bufferQueueItf_);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to get buffer queue interface: %d", result);
+        destroyAudioOutput();
         return false;
     }
-    
+
     // 注册回调
     result = (*bufferQueueItf_)->RegisterCallback(bufferQueueItf_, audioCallback, this);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to register callback: %d", result);
+        destroyAudioOutput();
         return false;
     }
     

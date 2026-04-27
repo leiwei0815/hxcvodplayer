@@ -314,6 +314,12 @@ int PlayerCore::open(const std::string& filename) {
     seek_request_ = false;
     seek_pos_ = 0.0;
 
+    // ⚠️ 重置时钟：close() 不会清时钟，若不重置则 getPosition() 在新会话建流初期
+    // 仍返回上一会话的旧值，可能误触发 near_end_stalled（尤其新片时长短于旧片时）。
+    audio_clock_.set_clock(0.0, 0);
+    video_clock_.set_clock(0.0, 0);
+    external_clock_.set_clock(0.0, 0);
+
     set_state(PlayerState::Opening);
     set_play_when_ready_internal(true);
     first_video_frame_ready_.store(false, std::memory_order_release);
