@@ -718,13 +718,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("openWithPlayModel")) {
             return false
         }
-        // 与 iOS 语义对齐：playWithModel 默认读取 player.startPosition 作为起播进度。
-        // 兼容兜底：若调用方只设置了 model.startPosition，则仍可生效，避免老代码回归。
-        val effectiveStartPosition = when {
-            startPosition > 0.0 -> startPosition
-            model.startPosition > 0.0 -> model.startPosition
-            else -> 0.0
-        }
+        // 与 iOS 语义对齐：playWithModel 仅使用 player.startPosition 作为起播进度。
+        val effectiveStartPosition = if (startPosition > 0.0) startPosition else 0.0
         lastOpenUrl = model.url
         lastOpenStartPosition = effectiveStartPosition
         lastOpenPlayModel = clonePlayModel(model)
@@ -924,8 +919,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         val model = lastOpenPlayModel?.let { clonePlayModel(it) }
         val savedStartPosition = startPosition
         startPosition = 0.0
-        // replay 语义固定为从 0 开始；兜底分支下也不允许 model 自带起播点覆盖。
-        model?.startPosition = 0.0
         val ok = if (model != null) {
             playWithModel(model)
         } else if (!url.isNullOrBlank()) {
