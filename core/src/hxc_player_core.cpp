@@ -307,6 +307,13 @@ int PlayerCore::open(const std::string& filename) {
     playback_completed_notified_.store(false, std::memory_order_release);  // ⚠️ 重置播放完成通知标志
     io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
 
+    // ⚠️ 重置 seek 状态（close() 强杀线程时 seeking_ 可能残留 true，
+    // 导致新会话的所有帧被误判为"seek 前的旧帧"而丢弃，播放从原 seek 目标位置开始而非 0）。
+    seeking_.store(false, std::memory_order_release);
+    seek_target_pos_.store(0.0, std::memory_order_release);
+    seek_request_ = false;
+    seek_pos_ = 0.0;
+
     set_state(PlayerState::Opening);
     set_play_when_ready_internal(true);
     first_video_frame_ready_.store(false, std::memory_order_release);
