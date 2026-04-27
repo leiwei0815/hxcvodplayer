@@ -12,6 +12,11 @@ import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import kotlin.jvm.JvmOverloads
+import org.json.JSONObject
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
@@ -56,6 +61,7 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     companion object {
         private const val TAG = "HXCPlayerControl"
+        private const val SECURE_HLS_AUTH_URL = "https://api.example.com/api/v1/play/auth"
 
         init {
             System.loadLibrary("hxcplayer")
@@ -137,6 +143,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         fun defaultConfig(): PlayerDataSourceConfig {
             return PlayerDataSourceConfig.defaultConfig()
         }
+
+        private fun secureHLSAuthURL(): String = SECURE_HLS_AUTH_URL
+
+        private fun secureHLSAuthHeaders(): Map<String, String> = emptyMap()
     }
 
     // 播放器状态
@@ -312,20 +322,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
     @Volatile private var decodeMode: DecodeMode = DecodeMode.SOFTWARE
-    /**
-     * 仅在 openWithPlayModel + SecureHLS 下触发：
-     * 外层根据 model.video.videoId + model.video.appId + model.video.sign 请求业务鉴权接口并返回 Map。
-     * 返回字段（key）：
-     * - m3u8_url: String (必填)
-     * - play_session_id: String (可选)
-     * - secure_headers: String (可选，CRLF 分隔请求头)
-     * - expire_at_ms: Number/String (可选)
-     * - inline_key_mode: Boolean/Number/String (可选)
-     * - key_material_b64: String (可选)
-     * - key_iv_hex: String (可选)
-     */
-    var secureHLSAuthHandler: ((PlayerDataSourcePlayModel) -> Map<String, Any?>?)? = null
-
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
     private var textureDecoderSurface: Surface? = null
 
@@ -484,6 +480,144 @@ class HXCPlayerControl @JvmOverloads constructor(
             }
         }
         return cfg
+    }
+
+    private fun parseLongValue(v: Any?): Long {
+        return when (v) {
+            is Number -> v.toLong()
+            is String -> v.toLongOrNull() ?: 0L
+            else -> 0L
+        }
+    }
+
+    private fun parseBooleanValue(v: Any?): Boolean {
+        return when (v) {
+            is Boolean -> v
+            is Number -> v.toInt() != 0
+            is String -> {
+                val lower = v.lowercase()
+                lower == "1" || lower == "true" || lower == "yes"
+            }
+            else -> false
+        }
+    }
+
+    private fun buildDefaultSecureHeaders(video: PlayerVideo, expireAtMs: Long, playSessionID: String?): String {
+        return "X-App-Id: ${video.appId}\r\n" +
+            "X-File-Id: ${video.videoId}\r\n" +
+            "X-Sign: ${video.sign}\r\n" +
+            "X-Expire-At: $expireAtMs\r\n" +
+            "X-Playback-Session: ${playSessionID ?: ""}\r\n"
+    }
+
+    private fun performSecureHLSAuthRequestOnCurrentThread(
+        config: PlayerDataSourceConfig,
+        video: PlayerVideo
+    ): Pair<Map<String, Any?>?, String?> {
+        if (video.videoId <= 0 || video.appId <= 0 || video.sign.isBlank()) {
+            return Pair(null, "鉴权参数无效")
+        }
+        val authURL = secureHLSAuthURL()
+        if (authURL.isBlank()) {
+            return Pair(null, "SDK 内部未配置 SecureHLS 鉴权地址")
+        }
+
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = (URL(authURL).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = config.timeoutMs.coerceAtLeast(1000)
+                readTimeout = config.timeoutMs.coerceAtLeast(1000)
+                doInput = true
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                secureHLSAuthHeaders().forEach { (key, value) ->
+                    if (key.isNotBlank() && value.isNotBlank()) {
+                        setRequestProperty(key, value)
+                    }
+                }
+            }
+
+            val body = JSONObject().apply {
+                put("app_id", video.appId)
+                put("file_id", video.videoId)
+                put("sign", video.sign)
+            }.toString()
+
+            OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
+                writer.write(body)
+                writer.flush()
+            }
+
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val responseText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+            if (code !in 200..299) {
+                val msg = if (responseText.isNotBlank()) {
+                    "鉴权请求失败: HTTP $code, $responseText"
+                } else {
+                    "鉴权请求失败: HTTP $code"
+                }
+                return Pair(null, msg)
+            }
+            if (responseText.isBlank()) {
+                return Pair(null, "鉴权接口返回空响应")
+            }
+
+            val root = JSONObject(responseText)
+            val data = if (root.opt("data") is JSONObject) root.optJSONObject("data") else root
+            if (data == null) {
+                return Pair(null, "鉴权响应不是 JSON 对象")
+            }
+
+            val m3u8URL = data.optString("m3u8_url", "").takeIf { it.isNotBlank() }
+                ?: return Pair(null, "鉴权响应缺少 m3u8_url")
+            val playSessionID = data.optString("play_session_id", "").takeIf { it.isNotBlank() }
+            val expireAtMs = parseLongValue(data.opt("expire_at"))
+            val secureHeaders = data.optString("secure_headers", "").takeIf { it.isNotBlank() }
+                ?: buildDefaultSecureHeaders(video, expireAtMs, playSessionID)
+            val inlineKeyMode = parseBooleanValue(data.opt("inline_key_mode"))
+            val keyMaterial = data.optString("key_material_b64", "").takeIf { it.isNotBlank() }
+            val keyIVHex = data.optString("key_iv_hex", "").takeIf { it.isNotBlank() }
+
+            Pair(
+                mapOf(
+                    "m3u8_url" to m3u8URL,
+                    "play_session_id" to playSessionID,
+                    "secure_headers" to secureHeaders,
+                    "expire_at_ms" to expireAtMs,
+                    "inline_key_mode" to inlineKeyMode,
+                    "key_material_b64" to keyMaterial,
+                    "key_iv_hex" to keyIVHex
+                ),
+                null
+            )
+        } catch (e: Exception) {
+            Pair(null, e.message ?: "鉴权请求异常")
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+    private fun performSecureHLSAuthRequest(
+        config: PlayerDataSourceConfig,
+        video: PlayerVideo
+    ): Pair<Map<String, Any?>?, String?> {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            return performSecureHLSAuthRequestOnCurrentThread(config, video)
+        }
+        val latch = CountDownLatch(1)
+        var result: Pair<Map<String, Any?>?, String?> = Pair(null, "鉴权请求未完成")
+        Thread {
+            result = performSecureHLSAuthRequestOnCurrentThread(config, video)
+            latch.countDown()
+        }.start()
+        val timeoutMs = config.timeoutMs.coerceAtLeast(1000).toLong() + 2000L
+        val ok = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+        if (!ok) {
+            return Pair(null, "鉴权请求超时")
+        }
+        return result
     }
 
     /**
@@ -673,7 +807,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         var resolvedInlineKeyMode = false
         var resolvedKeyMaterialBase64: String? = null
         var resolvedKeyIVHex: String? = null
-        if (workingModel.mode == PlayerDataSourceMode.SECURE_HLS) {
+        val config = effectiveDataSourceConfig()
+        if (workingModel.video != null) {
             val video = workingModel.video
             if (video == null || video.videoId <= 0 || video.appId <= 0 || video.sign.isBlank()) {
                 dispatchError(PlayerErrorCode.INVALID_URL, "SecureHLS 缺少必要参数: video.videoId/video.appId/video.sign")
@@ -683,21 +818,28 @@ class HXCPlayerControl @JvmOverloads constructor(
             resolvedAppID = video.appId.toString()
             resolvedAuthToken = video.sign
 
-            val authResult = secureHLSAuthHandler?.invoke(workingModel)
+            val (authResult, authError) = performSecureHLSAuthRequest(config, video)
             val m3u8URL = authResult?.get("m3u8_url")?.toString()?.takeIf { it.isNotBlank() }
             if (m3u8URL.isNullOrBlank()) {
-                dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "SecureHLS 鉴权失败: 未返回有效 m3u8_url")
+                dispatchError(
+                    PlayerErrorCode.OPEN_INPUT_FAILED,
+                    authError ?: "SecureHLS 鉴权失败: 未返回有效 m3u8_url"
+                )
+                return false
+            }
+            val authData = authResult ?: run {
+                dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, authError ?: "SecureHLS 鉴权失败")
                 return false
             }
             workingModel.url = m3u8URL
-            resolvedPlaySessionID = authResult["play_session_id"]?.toString()?.takeIf { it.isNotBlank() }
-            resolvedSecureHeaders = authResult["secure_headers"]?.toString()?.takeIf { it.isNotBlank() }
-            resolvedSessionExpireAtMs = when (val v = authResult["expire_at_ms"]) {
+            resolvedPlaySessionID = authData["play_session_id"]?.toString()?.takeIf { it.isNotBlank() }
+            resolvedSecureHeaders = authData["secure_headers"]?.toString()?.takeIf { it.isNotBlank() }
+            resolvedSessionExpireAtMs = when (val v = authData["expire_at_ms"]) {
                 is Number -> v.toLong()
                 is String -> v.toLongOrNull() ?: 0L
                 else -> 0L
             }
-            resolvedInlineKeyMode = when (val v = authResult["inline_key_mode"]) {
+            resolvedInlineKeyMode = when (val v = authData["inline_key_mode"]) {
                 is Boolean -> v
                 is Number -> v.toInt() != 0
                 is String -> {
@@ -706,11 +848,10 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
                 else -> false
             }
-            resolvedKeyMaterialBase64 = authResult["key_material_b64"]?.toString()?.takeIf { it.isNotBlank() }
-            resolvedKeyIVHex = authResult["key_iv_hex"]?.toString()?.takeIf { it.isNotBlank() }
-        }
-        if (workingModel.url.isBlank()) {
-            dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+            resolvedKeyMaterialBase64 = authData["key_material_b64"]?.toString()?.takeIf { it.isNotBlank() }
+            resolvedKeyIVHex = authData["key_iv_hex"]?.toString()?.takeIf { it.isNotBlank() }
+        } else if (workingModel.url.isBlank()) {
+            dispatchError(PlayerErrorCode.INVALID_URL, "播放参数无效：video 和 url 不能同时为空")
             return false
         }
         lastOpenUrl = workingModel.url
@@ -732,21 +873,19 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
             }
             PlayerDataSourceMode.CUSTOM_HTTP -> {
-                val cfg = effectiveDataSourceConfig()
                 nativeOpenWithCustomHTTP(
                     handle,
                     workingModel.url,
-                    cfg.timeoutMs,
-                    cfg.maxRetries,
+                    config.timeoutMs,
+                    config.maxRetries,
                     workingModel.encryptedFile
                 )
             }
             PlayerDataSourceMode.CUSTOM_FILE -> {
-                val cfg = effectiveDataSourceConfig()
                 nativeOpenWithCustomFile(
                     handle,
                     workingModel.url,
-                    cfg.avioBufferSize,
+                    config.avioBufferSize,
                     workingModel.encryptedFile
                 )
             }

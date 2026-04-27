@@ -22,6 +22,8 @@
 #import "HXCPlayerView.h"
 @class HXCPlayerControl;
 
+NS_ASSUME_NONNULL_BEGIN
+
 // ⚠️ 自定义数据源配置
 @interface HXCPlayerDataSourceConfig : NSObject
 @property (nonatomic, assign) NSInteger timeoutMs;          // 超时时间（毫秒），默认 30000
@@ -34,7 +36,7 @@
 
 /// 在播放前调用一次，用你自己的全局默认值覆盖 `defaultConfig` 的字段。
 /// 之后每次播放只需要通过 `HXCPlayerDataSourcePlayModel` 传入 `url/mode/encryptedFile`。
-+ (void)configureDefaultConfig:(HXCPlayerDataSourceConfig *)config;
++ (void)configureDefaultConfig:(nullable HXCPlayerDataSourceConfig *)config;
 @end
 
 /// 视频模型
@@ -54,7 +56,7 @@
 @property (nonatomic, assign) HXCPlayerDataSourceMode mode;
 @property (nonatomic, assign) BOOL encryptedFile;
 /// 通过fileid+appid+sign播放
-@property (nonatomic, strong) HXCPlayerVideo *video;
+@property (nonatomic, strong, nullable) HXCPlayerVideo *video;
 
 + (instancetype)modelWithURL:(NSString *)url
                          mode:(HXCPlayerDataSourceMode)mode
@@ -123,7 +125,7 @@ reconnectCount:(NSInteger)reconnectCount;
 @interface HXCPlayerControl : NSObject
 
 // 属性
-@property (nonatomic, weak) id<HXCPlayerControlDelegate> delegate;
+@property (nonatomic, weak, nullable) id<HXCPlayerControlDelegate> delegate;
 @property (nonatomic, assign) double volume;           // 音量 (0.0-1.0)
 @property (nonatomic, assign) double playbackRate;     // 播放速度 (0.5-2.0)
 @property (nonatomic, assign) double startPosition;    // 起始播放位置（秒）
@@ -141,19 +143,6 @@ reconnectCount:(NSInteger)reconnectCount;
 
 /// 自动重开最大次数（默认 1，最小 0）
 @property (nonatomic, assign) NSInteger autoReopenMaxAttempts;
-
-/// 仅在 `playWithModel` + `mode=SecureHLS` 时触发：
-/// 外层根据 `model.video.videoId + model.video.appId + model.video.sign` 请求业务鉴权接口并返回字典，返回 nil 视为鉴权失败。
-/// 返回字典字段：
-/// - m3u8_url(NSString, 必填)
-/// - play_session_id(NSString, 可选)
-/// - secure_headers(NSString, 可选，CRLF 分隔请求头)
-/// - expire_at_ms(NSNumber, 可选)
-/// - inline_key_mode(NSNumber(BOOL), 可选)
-/// - key_material_b64(NSString, 可选)
-/// - key_iv_hex(NSString, 可选)
-@property (nonatomic, copy, nullable) NSDictionary<NSString *, id> * _Nullable (^secureHLSAuthHandler)(HXCPlayerDataSourcePlayModel *model,
-                                                                                                         NSError **error);
 
 #if TARGET_OS_IOS
 // 画中画相关属性（仅 iOS）
@@ -201,5 +190,7 @@ reconnectCount:(NSInteger)reconnectCount;
 +(void)disableFileLogging;
 
 @end
+
+NS_ASSUME_NONNULL_END
 
 #endif // HXCPLAYER_CONTROL_H
