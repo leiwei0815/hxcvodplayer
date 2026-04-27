@@ -900,28 +900,37 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     /**
-     * 对齐 iOS：从头重播最近一次打开的源。
+     * 从头重播最近一次打开的源（始终从位置 0 开始）。
      */
     fun replay() {
-        if (!licenseAllowedOrNotify("replay")) {
+        replayFrom(0.0)
+    }
+
+    /**
+     * 从指定位置重新打开并播放最近一次打开的源。
+     *
+     * 适用场景：
+     * - [replay]：从 0 开始重播（内部调用 replayFrom(0.0)）
+     * - 播放完成后拖动进度条：以目标进度为起点重开，避免在 STOPPED 状态下直接 seekTo 触发 -1011 错误
+     *
+     * @param position 起始位置（秒），负值视为 0
+     */
+    fun replayFrom(position: Double) {
+        if (!licenseAllowedOrNotify("replayFrom")) {
             return
         }
         val url = lastOpenUrl
         val model = lastOpenPlayModel?.let { clonePlayModel(it) }
-        val savedStartPosition = startPosition
-        // 与业务侧已验证的稳定路径对齐：replay 前先 stop 归一状态机，避免 -1002（状态错误）。
+        // replay 前先 stop 归一状态机，避免 -1002（状态错误）。
         stop()
-        startPosition = 0.0
-        val ok = if (model != null) {
+        startPosition = position.coerceAtLeast(0.0)
+        if (model != null) {
             playWithModel(model)
         } else if (!url.isNullOrBlank()) {
             playURL(url)
-        } else {
-            false
         }
-        if (!ok) {
-            startPosition = savedStartPosition
-        }
+        // startPosition 保留为 position，不在失败时恢复旧值，
+        // 避免旧值（如 viewTime）在下次 open 时被错误复用。
     }
 
     // 跳转

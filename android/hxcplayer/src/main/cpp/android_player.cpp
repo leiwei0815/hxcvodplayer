@@ -165,13 +165,10 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
 
-    int result;
-    if (start_position > 0.0) {
-        // 使用带起始位置的打开方法
-        result = player_core_open_with_start_position(player_core_, url, start_position);
-    } else {
-        result = player_core_open(player_core_, url);
-    }
+    // 始终使用带起始位置的 API，确保 start_position=0 也能显式重置到起点。
+    // 原来 start_position==0 时走 player_core_open(url)，core 可能沿用上次缓存进度，
+    // 导致重播时从"首次带入进度"而非 0 开始播放。
+    int result = player_core_open_with_start_position(player_core_, url, start_position);
     
     if (result == 0) {
         LOGI("URL opened successfully");
