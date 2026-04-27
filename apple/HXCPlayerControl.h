@@ -53,36 +53,12 @@
 @property (nonatomic, copy) NSString *url;
 @property (nonatomic, assign) HXCPlayerDataSourceMode mode;
 @property (nonatomic, assign) BOOL encryptedFile;
-@property (nonatomic, copy) NSString *authToken;            // SecureHLS: 业务 token
-@property (nonatomic, copy) NSString *videoID;              // SecureHLS: 视频 ID
-@property (nonatomic, copy) NSString *deviceID;             // SecureHLS: 设备 ID（可选）
-@property (nonatomic, copy) NSString *appID;                // SecureHLS: 应用 ID（可选）
-@property (nonatomic, copy) NSString *nonce;                // SecureHLS: 随机串（可选）
-@property (nonatomic, copy) NSString *playSessionID;        // SecureHLS: 外部已鉴权会话（可选）
-@property (nonatomic, copy) NSString *secureHeaders;        // SecureHLS: 透传请求头
-@property (nonatomic, assign) int64_t sessionExpireAtMs;    // SecureHLS: 过期时间戳（毫秒）
-@property (nonatomic, assign) BOOL inlineKeyMode;           // SecureHLS: 是否使用内联 key
-@property (nonatomic, copy) NSString *keyMaterialBase64;    // SecureHLS: Base64 AES-128 key
-@property (nonatomic, copy) NSString *keyIVHex;             // SecureHLS: IV hex（可选）
 /// 通过fileid+appid+sign播放
 @property (nonatomic, strong) HXCPlayerVideo *video;
 
 + (instancetype)modelWithURL:(NSString *)url
                          mode:(HXCPlayerDataSourceMode)mode
                   encryptedFile:(BOOL)encryptedFile;
-@end
-
-/// SecureHLS 打开参数（可选）。当你已在业务层拿到会话、headers、内联密钥时传入。
-@interface HXCSecureHLSOptions : NSObject
-@property (nonatomic, copy, nullable) NSString *deviceID;
-@property (nonatomic, copy, nullable) NSString *appID;
-@property (nonatomic, copy, nullable) NSString *nonce;
-@property (nonatomic, copy, nullable) NSString *playSessionID;
-@property (nonatomic, copy, nullable) NSString *secureHeaders;
-@property (nonatomic, assign) int64_t sessionExpireAtMs;
-@property (nonatomic, assign) BOOL inlineKeyMode;
-@property (nonatomic, copy, nullable) NSString *keyMaterialBase64;
-@property (nonatomic, copy, nullable) NSString *keyIVHex;
 @end
 
 // 播放器回调协议
@@ -166,6 +142,19 @@ reconnectCount:(NSInteger)reconnectCount;
 /// 自动重开最大次数（默认 1，最小 0）
 @property (nonatomic, assign) NSInteger autoReopenMaxAttempts;
 
+/// 仅在 `playWithModel` + `mode=SecureHLS` 时触发：
+/// 外层根据 `model.video.videoId + model.video.appId + model.video.sign` 请求业务鉴权接口并返回字典，返回 nil 视为鉴权失败。
+/// 返回字典字段：
+/// - m3u8_url(NSString, 必填)
+/// - play_session_id(NSString, 可选)
+/// - secure_headers(NSString, 可选，CRLF 分隔请求头)
+/// - expire_at_ms(NSNumber, 可选)
+/// - inline_key_mode(NSNumber(BOOL), 可选)
+/// - key_material_b64(NSString, 可选)
+/// - key_iv_hex(NSString, 可选)
+@property (nonatomic, copy, nullable) NSDictionary<NSString *, id> * _Nullable (^secureHLSAuthHandler)(HXCPlayerDataSourcePlayModel *model,
+                                                                                                         NSError **error);
+
 #if TARGET_OS_IOS
 // 画中画相关属性（仅 iOS）
 @property (nonatomic, readonly) BOOL isPictureInPictureSupported;   // 设备是否支持画中画
@@ -179,19 +168,6 @@ reconnectCount:(NSInteger)reconnectCount;
 
 /// 使用播放模型打开：内部自动构建 `HXCPlayerDataSourceConfig`（仅通过 `encryptedFile` 差异化），并按 autoPlayer 决定是否自动播放。
 - (BOOL)playWithModel:(HXCPlayerDataSourcePlayModel *)model;
-// 便捷接口：SecureHLS 播放（内部会走 mode=SecureHLS）
-- (BOOL)openSecureHLSWithURL:(NSString *)url
-                    authToken:(NSString *)authToken
-                      videoID:(NSString *)videoID
-                   deviceID:(nullable NSString *)deviceID
-                        appID:(nullable NSString *)appID
-                        nonce:(nullable NSString *)nonce;
-
-/// 推荐入口：可附带 options，支持预置会话、headers、内联 key 等高级能力。
-- (BOOL)openSecureHLSWithURL:(NSString *)url
-                   authToken:(NSString *)authToken
-                     videoID:(NSString *)videoID
-                     options:(nullable HXCSecureHLSOptions *)options;
 
 - (void)play;                                          // 开始播放
 - (void)pause;                                         // 暂停

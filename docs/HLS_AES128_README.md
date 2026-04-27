@@ -53,7 +53,7 @@
 
 - Core 新增 `SecureHLS` 模式与安全会话结构。
 - C Bridge / iOS / Android / Windows SDK 均已打通 SecureHLS 接口。
-- 支持 `openSecureHLS(..., options)` 方式透传 `playSessionID/headers/过期时间`。
+- 外层仅需 `playWithModel/openWithPlayModel`；SecureHLS 鉴权与会话组装通过模型参数 + SDK 鉴权回调完成。
 - 支持无鉴权回调时的 Header 透传退化路径。
 - 预留缓存回调能力，支持后续上层终端扩展。
 

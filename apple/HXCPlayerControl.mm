@@ -311,9 +311,6 @@ static BOOL g_hasConfigured = NO;
 
 @end
 
-@implementation HXCSecureHLSOptions
-@end
-
 @implementation HXCPlayerControl
 
 static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
@@ -327,6 +324,51 @@ static HXCPlayerDataSourceConfig *hxc_build_effective_data_source_config(void) {
         }
     }
     return config;
+}
+
+static HXCPlayerDataSourcePlayModel *hxc_clone_play_model(HXCPlayerDataSourcePlayModel *model) {
+    if (!model) {
+        return nil;
+    }
+    HXCPlayerDataSourcePlayModel *copy = [HXCPlayerDataSourcePlayModel modelWithURL:model.url
+                                                                                mode:model.mode
+                                                                       encryptedFile:model.encryptedFile];
+    copy.video = model.video;
+    return copy;
+}
+
+static NSString *hxc_dict_string(NSDictionary<NSString *, id> *dict, NSString *key) {
+    id value = dict[key];
+    if ([value isKindOfClass:[NSString class]]) {
+        return (NSString *)value;
+    }
+    if ([value isKindOfClass:[NSNumber class]]) {
+        return [(NSNumber *)value stringValue];
+    }
+    return nil;
+}
+
+static int64_t hxc_dict_int64(NSDictionary<NSString *, id> *dict, NSString *key) {
+    id value = dict[key];
+    if ([value isKindOfClass:[NSNumber class]]) {
+        return [(NSNumber *)value longLongValue];
+    }
+    if ([value isKindOfClass:[NSString class]]) {
+        return [(NSString *)value longLongValue];
+    }
+    return 0;
+}
+
+static BOOL hxc_dict_bool(NSDictionary<NSString *, id> *dict, NSString *key) {
+    id value = dict[key];
+    if ([value isKindOfClass:[NSNumber class]]) {
+        return [(NSNumber *)value boolValue];
+    }
+    if ([value isKindOfClass:[NSString class]]) {
+        NSString *lower = [(NSString *)value lowercaseString];
+        return [lower isEqualToString:@"1"] || [lower isEqualToString:@"true"] || [lower isEqualToString:@"yes"];
+    }
+    return NO;
 }
 
 static PlayerDecodeModeC hxc_to_c_decode_mode(HXCPlayerDecodeMode mode) {
@@ -567,21 +609,68 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
 }
 
 - (BOOL)playWithModel:(HXCPlayerDataSourcePlayModel *)model {
-    if (!model || model.url.length == 0) {
+    if (!model) {
         return NO;
     }
     if (![self hxc_licenseAllowedOrNotifyForAction:@"playWithModel"]) {
         return NO;
     }
-    HXCPlayerDataSourceConfig *config = hxc_build_effective_data_source_config();
-    // 复用旧实现来完成 stop/url/state 等逻辑，但把 encrypted_file 走 model 传入
-    // 这里直接复制 openURL:withMode:config: 的关键配置段到 C 结构，避免改动旧签名行为过多。
-    if (!model.url || model.url.length == 0) {
+    HXCPlayerDataSourcePlayModel *workingModel = hxc_clone_play_model(model);
+    if (!workingModel) {
         return NO;
     }
+    NSString *resolvedAuthToken = nil;
+    NSString *resolvedVideoID = nil;
+    NSString *resolvedAppID = nil;
+    NSString *resolvedDeviceID = nil;
+    NSString *resolvedNonce = nil;
+    NSString *resolvedPlaySessionID = nil;
+    NSString *resolvedSecureHeaders = nil;
+    int64_t resolvedExpireAtMs = 0;
+    BOOL resolvedInlineKeyMode = NO;
+    NSString *resolvedKeyMaterialB64 = nil;
+    NSString *resolvedKeyIVHex = nil;
+
+    if (workingModel.mode == HXCPlayerDataSourceModeSecureHLS) {
+        HXCPlayerVideo *video = workingModel.video;
+        if (!video || video.videoId <= 0 || video.appId <= 0 || video.sign.length == 0) {
+            NSLog(@"❌ SecureHLS 缺少必要参数：video.videoId/video.appId/video.sign");
+            return NO;
+        }
+        if (!self.secureHLSAuthHandler) {
+            NSLog(@"❌ SecureHLS 未设置 secureHLSAuthHandler");
+            return NO;
+        }
+        resolvedVideoID = [NSString stringWithFormat:@"%d", video.videoId];
+        resolvedAppID = [NSString stringWithFormat:@"%d", video.appId];
+        resolvedAuthToken = video.sign;
+
+        NSError *authError = nil;
+        NSDictionary<NSString *, id> *authResult = self.secureHLSAuthHandler(workingModel, &authError);
+        NSString *m3u8URL = hxc_dict_string(authResult, @"m3u8_url");
+        if (!authResult || m3u8URL.length == 0) {
+            NSLog(@"❌ SecureHLS 鉴权失败: %@", authError.localizedDescription ?: @"unknown");
+            if (authError && [self.delegate respondsToSelector:@selector(player:didFailWithError:)]) {
+                [self.delegate player:self didFailWithError:authError];
+            }
+            return NO;
+        }
+        workingModel.url = m3u8URL;
+        resolvedPlaySessionID = hxc_dict_string(authResult, @"play_session_id");
+        resolvedSecureHeaders = hxc_dict_string(authResult, @"secure_headers");
+        resolvedExpireAtMs = hxc_dict_int64(authResult, @"expire_at_ms");
+        resolvedInlineKeyMode = hxc_dict_bool(authResult, @"inline_key_mode");
+        resolvedKeyMaterialB64 = hxc_dict_string(authResult, @"key_material_b64");
+        resolvedKeyIVHex = hxc_dict_string(authResult, @"key_iv_hex");
+    }
+    if (workingModel.url.length == 0) {
+        return NO;
+    }
+
+    HXCPlayerDataSourceConfig *config = hxc_build_effective_data_source_config();
     [self stop];
-    _playerUrl = [model.url copy];
-    _lastOpenPlayModel = [HXCPlayerDataSourcePlayModel modelWithURL:model.url mode:model.mode encryptedFile:model.encryptedFile];
+    _playerUrl = [workingModel.url copy];
+    _lastOpenPlayModel = hxc_clone_play_model(workingModel);
     if (!_autoReopenInFlight) {
         _autoReopenAttemptCount = 0;
         _networkTotalStallMs = 0;
@@ -594,22 +683,22 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     cConfig.max_retries = (int)config.maxRetries;
     cConfig.cache_size = config.cacheSize;
     cConfig.avio_buffer_size = config.avioBufferSize;
-    cConfig.encrypted_file = model.encryptedFile ? 1 : 0;
-    cConfig.auth_token = model.authToken.UTF8String;
-    cConfig.video_id = model.videoID.UTF8String;
-    cConfig.device_id = model.deviceID.UTF8String;
-    cConfig.app_id = model.appID.UTF8String;
-    cConfig.nonce = model.nonce.UTF8String;
+    cConfig.encrypted_file = workingModel.encryptedFile ? 1 : 0;
+    cConfig.auth_token = resolvedAuthToken.UTF8String;
+    cConfig.video_id = resolvedVideoID.UTF8String;
+    cConfig.device_id = resolvedDeviceID.UTF8String;
+    cConfig.app_id = resolvedAppID.UTF8String;
+    cConfig.nonce = resolvedNonce.UTF8String;
     cConfig.timestamp_ms = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
-    cConfig.play_session_id = model.playSessionID.UTF8String;
-    cConfig.secure_headers = model.secureHeaders.UTF8String;
-    cConfig.session_expire_at_ms = model.sessionExpireAtMs;
-    cConfig.key_mode = model.inlineKeyMode ? 1 : 0;
-    cConfig.key_material_b64 = model.keyMaterialBase64.UTF8String;
-    cConfig.key_iv_hex = model.keyIVHex.UTF8String;
+    cConfig.play_session_id = resolvedPlaySessionID.UTF8String;
+    cConfig.secure_headers = resolvedSecureHeaders.UTF8String;
+    cConfig.session_expire_at_ms = resolvedExpireAtMs;
+    cConfig.key_mode = resolvedInlineKeyMode ? 1 : 0;
+    cConfig.key_material_b64 = resolvedKeyMaterialB64.UTF8String;
+    cConfig.key_iv_hex = resolvedKeyIVHex.UTF8String;
 
     PlayerDataSourceModeC cMode;
-    switch (model.mode) {
+    switch (workingModel.mode) {
         case HXCPlayerDataSourceModeDefault:
             cMode = PLAYER_DATA_SOURCE_MODE_DEFAULT;
             break;
@@ -627,9 +716,9 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
             break;
     }
 
-    int ret = player_core_open_with_mode(_wrapper->handle(), model.url.UTF8String, cMode, &cConfig, _startPosition);
+    int ret = player_core_open_with_mode(_wrapper->handle(), workingModel.url.UTF8String, cMode, &cConfig, _startPosition);
     if (ret != 0) {
-        NSLog(@"❌ 打开失败: mode=%ld, ret=%d", (long)model.mode, ret);
+        NSLog(@"❌ 打开失败: mode=%ld, ret=%d", (long)workingModel.mode, ret);
         return NO;
     }
 
@@ -639,8 +728,8 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     _videoWidth = player_core_get_video_width(_wrapper->handle());
     _videoHeight = player_core_get_video_height(_wrapper->handle());
 
-    NSLog(@"✅ 使用模式 %ld 打开成功", (long)model.mode);
-    NSLog(@"   URL: %@", model.url);
+    NSLog(@"✅ 使用模式 %ld 打开成功", (long)workingModel.mode);
+    NSLog(@"   URL: %@", workingModel.url);
     NSLog(@"   时长: %.2f 秒", _duration);
     NSLog(@"   分辨率: %d x %d", _videoWidth, _videoHeight);
     NSLog(@"   音频: %d Hz, %d 通道", sampleRate, channels);
@@ -669,41 +758,6 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
         [self pause];
     }
     return YES;
-}
-
-- (BOOL)openSecureHLSWithURL:(NSString *)url
-                    authToken:(NSString *)authToken
-                      videoID:(NSString *)videoID
-                     deviceID:(NSString *)deviceID
-                        appID:(NSString *)appID
-                        nonce:(NSString *)nonce {
-    HXCSecureHLSOptions *options = [[HXCSecureHLSOptions alloc] init];
-    options.deviceID = deviceID;
-    options.appID = appID;
-    options.nonce = nonce;
-    return [self openSecureHLSWithURL:url authToken:authToken videoID:videoID options:options];
-}
-
-- (BOOL)openSecureHLSWithURL:(NSString *)url
-                   authToken:(NSString *)authToken
-                     videoID:(NSString *)videoID
-                     options:(HXCSecureHLSOptions *)options {
-    HXCPlayerDataSourcePlayModel *model =
-    [HXCPlayerDataSourcePlayModel modelWithURL:url
-                                          mode:HXCPlayerDataSourceModeSecureHLS
-                                 encryptedFile:NO];
-    model.authToken = authToken;
-    model.videoID = videoID;
-    model.deviceID = options.deviceID;
-    model.appID = options.appID;
-    model.nonce = options.nonce;
-    model.playSessionID = options.playSessionID;
-    model.secureHeaders = options.secureHeaders;
-    model.sessionExpireAtMs = options.sessionExpireAtMs;
-    model.inlineKeyMode = options.inlineKeyMode;
-    model.keyMaterialBase64 = options.keyMaterialBase64;
-    model.keyIVHex = options.keyIVHex;
-    return [self playWithModel:model];
 }
 
 - (void)play {
@@ -953,20 +1007,7 @@ didUpdateNetworkQoEWithCurrentStallMs:currentStallMs
 
     HXCPlayerDataSourcePlayModel *retryModel = nil;
     if (_lastOpenPlayModel) {
-        retryModel = [HXCPlayerDataSourcePlayModel modelWithURL:_lastOpenPlayModel.url
-                                                           mode:_lastOpenPlayModel.mode
-                                                  encryptedFile:_lastOpenPlayModel.encryptedFile];
-        retryModel.authToken = _lastOpenPlayModel.authToken;
-        retryModel.videoID = _lastOpenPlayModel.videoID;
-        retryModel.deviceID = _lastOpenPlayModel.deviceID;
-        retryModel.appID = _lastOpenPlayModel.appID;
-        retryModel.nonce = _lastOpenPlayModel.nonce;
-        retryModel.playSessionID = _lastOpenPlayModel.playSessionID;
-        retryModel.secureHeaders = _lastOpenPlayModel.secureHeaders;
-        retryModel.sessionExpireAtMs = _lastOpenPlayModel.sessionExpireAtMs;
-        retryModel.inlineKeyMode = _lastOpenPlayModel.inlineKeyMode;
-        retryModel.keyMaterialBase64 = _lastOpenPlayModel.keyMaterialBase64;
-        retryModel.keyIVHex = _lastOpenPlayModel.keyIVHex;
+        retryModel = hxc_clone_play_model(_lastOpenPlayModel);
     }
     NSString *retryURL = [_playerUrl copy];
     double retryStartPosition = _position > 0 ? _position : _startPosition;

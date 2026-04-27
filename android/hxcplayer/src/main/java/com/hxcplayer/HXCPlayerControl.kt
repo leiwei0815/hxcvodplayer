@@ -198,27 +198,16 @@ class HXCPlayerControl @JvmOverloads constructor(
     /**
      * 对外统一播放模型：只传一个 model 即可。
      *
-     * - [url] 必填
-     * - [mode] 对应默认/自定义 HTTP/自定义本地文件
+     * - [mode] 对应默认/自定义 HTTP/自定义本地文件/SecureHLS
+     * - [url] 在非 SecureHLS 下必填；SecureHLS 可由鉴权回调返回 m3u8URL
      * - [encryptedFile] 是否按核心约定解密文件头
-     * - [video] 对齐 iOS：通过 fileid+appid+sign 播放（Android 当前未实现该分支，预留）
+     * - [video] 对齐 iOS：通过 fileid+appid+sign 播放
      */
     class PlayerDataSourcePlayModel {
         var url: String = ""
         var mode: PlayerDataSourceMode = PlayerDataSourceMode.DEFAULT
         var encryptedFile: Boolean = false
         var video: PlayerVideo? = null
-        var authToken: String? = null
-        var videoID: String? = null
-        var deviceID: String? = null
-        var appID: String? = null
-        var nonce: String? = null
-        var playSessionID: String? = null
-        var secureHeaders: String? = null
-        var sessionExpireAtMs: Long = 0L
-        var inlineKeyMode: Boolean = false
-        var keyMaterialBase64: String? = null
-        var keyIVHex: String? = null
 
         companion object {
             @JvmStatic
@@ -234,21 +223,6 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
             }
         }
-    }
-
-    /**
-     * SecureHLS 可选参数（可预置会话/headers/内联key）。
-     */
-    class SecureHLSOptions {
-        var deviceID: String? = null
-        var appID: String? = null
-        var nonce: String? = null
-        var playSessionID: String? = null
-        var secureHeaders: String? = null
-        var sessionExpireAtMs: Long = 0L
-        var inlineKeyMode: Boolean = false
-        var keyMaterialBase64: String? = null
-        var keyIVHex: String? = null
     }
 
     /**
@@ -338,6 +312,19 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
     @Volatile private var decodeMode: DecodeMode = DecodeMode.SOFTWARE
+    /**
+     * 仅在 openWithPlayModel + SecureHLS 下触发：
+     * 外层根据 model.video.videoId + model.video.appId + model.video.sign 请求业务鉴权接口并返回 Map。
+     * 返回字段（key）：
+     * - m3u8_url: String (必填)
+     * - play_session_id: String (可选)
+     * - secure_headers: String (可选，CRLF 分隔请求头)
+     * - expire_at_ms: Number/String (可选)
+     * - inline_key_mode: Boolean/Number/String (可选)
+     * - key_material_b64: String (可选)
+     * - key_iv_hex: String (可选)
+     */
+    var secureHLSAuthHandler: ((PlayerDataSourcePlayModel) -> Map<String, Any?>?)? = null
 
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
     private var textureDecoderSurface: Surface? = null
@@ -385,17 +372,6 @@ class HXCPlayerControl @JvmOverloads constructor(
             mode = model.mode
             encryptedFile = model.encryptedFile
             video = model.video
-            authToken = model.authToken
-            videoID = model.videoID
-            deviceID = model.deviceID
-            appID = model.appID
-            nonce = model.nonce
-            playSessionID = model.playSessionID
-            secureHeaders = model.secureHeaders
-            sessionExpireAtMs = model.sessionExpireAtMs
-            inlineKeyMode = model.inlineKeyMode
-            keyMaterialBase64 = model.keyMaterialBase64
-            keyIVHex = model.keyIVHex
         }
     }
 
@@ -682,72 +658,120 @@ class HXCPlayerControl @JvmOverloads constructor(
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开播放模型")
             return false
         }
-        if (model.url.isBlank()) {
-            dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
-            return false
-        }
         if (!licenseAllowedOrNotify("openWithPlayModel")) {
             return false
         }
-        lastOpenUrl = model.url
+        val workingModel = clonePlayModel(model)
+        var resolvedAuthToken: String? = null
+        var resolvedVideoID: String? = null
+        var resolvedDeviceID: String? = null
+        var resolvedAppID: String? = null
+        var resolvedNonce: String? = null
+        var resolvedPlaySessionID: String? = null
+        var resolvedSecureHeaders: String? = null
+        var resolvedSessionExpireAtMs: Long = 0L
+        var resolvedInlineKeyMode = false
+        var resolvedKeyMaterialBase64: String? = null
+        var resolvedKeyIVHex: String? = null
+        if (workingModel.mode == PlayerDataSourceMode.SECURE_HLS) {
+            val video = workingModel.video
+            if (video == null || video.videoId <= 0 || video.appId <= 0 || video.sign.isBlank()) {
+                dispatchError(PlayerErrorCode.INVALID_URL, "SecureHLS 缺少必要参数: video.videoId/video.appId/video.sign")
+                return false
+            }
+            resolvedVideoID = video.videoId.toString()
+            resolvedAppID = video.appId.toString()
+            resolvedAuthToken = video.sign
+
+            val authResult = secureHLSAuthHandler?.invoke(workingModel)
+            val m3u8URL = authResult?.get("m3u8_url")?.toString()?.takeIf { it.isNotBlank() }
+            if (m3u8URL.isNullOrBlank()) {
+                dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "SecureHLS 鉴权失败: 未返回有效 m3u8_url")
+                return false
+            }
+            workingModel.url = m3u8URL
+            resolvedPlaySessionID = authResult["play_session_id"]?.toString()?.takeIf { it.isNotBlank() }
+            resolvedSecureHeaders = authResult["secure_headers"]?.toString()?.takeIf { it.isNotBlank() }
+            resolvedSessionExpireAtMs = when (val v = authResult["expire_at_ms"]) {
+                is Number -> v.toLong()
+                is String -> v.toLongOrNull() ?: 0L
+                else -> 0L
+            }
+            resolvedInlineKeyMode = when (val v = authResult["inline_key_mode"]) {
+                is Boolean -> v
+                is Number -> v.toInt() != 0
+                is String -> {
+                    val lower = v.lowercase()
+                    lower == "1" || lower == "true" || lower == "yes"
+                }
+                else -> false
+            }
+            resolvedKeyMaterialBase64 = authResult["key_material_b64"]?.toString()?.takeIf { it.isNotBlank() }
+            resolvedKeyIVHex = authResult["key_iv_hex"]?.toString()?.takeIf { it.isNotBlank() }
+        }
+        if (workingModel.url.isBlank()) {
+            dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+            return false
+        }
+        lastOpenUrl = workingModel.url
         lastOpenStartPosition = 0.0
-        lastOpenPlayModel = clonePlayModel(model)
+        lastOpenPlayModel = clonePlayModel(workingModel)
         if (!autoReopenInFlight) {
             autoReopenAttemptCount = 0
             networkTotalStallMs = 0L
             networkReconnectCount = 0
         }
         applyDecodeModeForHandle(handle)
-        val result = when (model.mode) {
+        val result = when (workingModel.mode) {
             PlayerDataSourceMode.DEFAULT -> {
-                if (model.url.isBlank()) {
+                if (workingModel.url.isBlank()) {
                     dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
                     false
                 } else {
-                    nativeOpenURL(handle, model.url)
+                    nativeOpenURL(handle, workingModel.url)
                 }
             }
             PlayerDataSourceMode.CUSTOM_HTTP -> {
                 val cfg = effectiveDataSourceConfig()
                 nativeOpenWithCustomHTTP(
                     handle,
-                    model.url,
+                    workingModel.url,
                     cfg.timeoutMs,
                     cfg.maxRetries,
-                    model.encryptedFile
+                    workingModel.encryptedFile
                 )
             }
             PlayerDataSourceMode.CUSTOM_FILE -> {
                 val cfg = effectiveDataSourceConfig()
                 nativeOpenWithCustomFile(
                     handle,
-                    model.url,
+                    workingModel.url,
                     cfg.avioBufferSize,
-                    model.encryptedFile
+                    workingModel.encryptedFile
                 )
             }
             PlayerDataSourceMode.SECURE_HLS -> {
                 nativeOpenWithSecureHLS(
                     handle,
-                    model.url,
-                    model.authToken,
-                    model.videoID,
-                    model.deviceID,
-                    model.appID,
-                    model.nonce,
-                    model.playSessionID,
-                    model.secureHeaders,
-                    model.sessionExpireAtMs,
-                    if (model.inlineKeyMode) 1 else 0,
-                    model.keyMaterialBase64,
-                    model.keyIVHex
+                    workingModel.url,
+                    resolvedAuthToken,
+                    resolvedVideoID,
+                    resolvedDeviceID,
+                    resolvedAppID,
+                    resolvedNonce,
+                    resolvedPlaySessionID,
+                    resolvedSecureHeaders,
+                    resolvedSessionExpireAtMs,
+                    if (resolvedInlineKeyMode) 1 else 0,
+                    resolvedKeyMaterialBase64,
+                    resolvedKeyIVHex
                 )
             }
         }
         if (!result) {
             dispatchError(
                 PlayerErrorCode.OPEN_INPUT_FAILED,
-                "打开失败: mode=${model.mode}, url=${model.url}"
+                "打开失败: mode=${workingModel.mode}, url=${workingModel.url}"
             )
         }
         return result
@@ -793,30 +817,6 @@ class HXCPlayerControl @JvmOverloads constructor(
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开本地文件(CustomFile): $path")
         }
         return result
-    }
-
-    fun openSecureHLS(
-        url: String,
-        authToken: String,
-        videoID: String,
-        deviceID: String? = null,
-        appID: String? = null,
-        nonce: String? = null,
-        options: SecureHLSOptions? = null
-    ): Boolean {
-        val model = PlayerDataSourcePlayModel.modelWithURL(url, PlayerDataSourceMode.SECURE_HLS, false)
-        model.authToken = authToken
-        model.videoID = videoID
-        model.deviceID = options?.deviceID ?: deviceID
-        model.appID = options?.appID ?: appID
-        model.nonce = options?.nonce ?: nonce
-        model.playSessionID = options?.playSessionID
-        model.secureHeaders = options?.secureHeaders
-        model.sessionExpireAtMs = options?.sessionExpireAtMs ?: 0L
-        model.inlineKeyMode = options?.inlineKeyMode ?: false
-        model.keyMaterialBase64 = options?.keyMaterialBase64
-        model.keyIVHex = options?.keyIVHex
-        return openWithPlayModel(model)
     }
 
     // 播放

@@ -38,30 +38,50 @@ X-Playback-Session: ps_9f3c2d5a7b4e\r\n
 
 ---
 
-## 3. iOS 接入示例（Objective-C）
+## 3. iOS 接入示例（Objective-C，仅 playWithModel）
 
 ```objc
-NSDictionary *resp = ...; // 业务网络层请求播放鉴权接口
-NSString *m3u8URL = resp[@"data"][@"m3u8_url"];
-NSString *sessionId = resp[@"data"][@"play_session_id"];
-NSNumber *expireAt = resp[@"data"][@"expire_at"];
+player.secureHLSAuthHandler = ^NSDictionary<NSString *, id> * _Nullable(HXCPlayerDataSourcePlayModel *model,
+                                                                         NSError **error) {
+    // 用 model.video.videoId + model.video.appId + model.video.sign 请求你们自己的播放鉴权接口
+    if (!model.video || model.video.videoId <= 0 || model.video.appId <= 0 || model.video.sign.length == 0) {
+        return nil;
+    }
+    NSDictionary *resp = ...;
+    NSString *m3u8URL = resp[@"data"][@"m3u8_url"];
+    NSString *sessionId = resp[@"data"][@"play_session_id"];
+    NSNumber *expireAt = resp[@"data"][@"expire_at"];
+    if (m3u8URL.length == 0 || sessionId.length == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"biz.auth"
+                                         code:-1
+                                     userInfo:@{NSLocalizedDescriptionKey: @"鉴权返回不完整"}];
+        }
+        return nil;
+    }
+    NSString *headers = [NSString stringWithFormat:
+                         @"X-App-Id: %@\r\n"
+                         @"X-File-Id: %@\r\n"
+                         @"X-Sign: %@\r\n"
+                         @"X-Expire-At: %@\r\n"
+                         @"X-Playback-Session: %@\r\n",
+                         @(model.video.appId), @(model.video.videoId), model.video.sign ?: @"", expireAt, sessionId];
+    return @{
+        @"m3u8_url": m3u8URL,
+        @"play_session_id": sessionId,
+        @"expire_at_ms": expireAt ?: @(0),
+        @"secure_headers": headers
+    };
+};
 
-HXCSecureHLSOptions *opt = [[HXCSecureHLSOptions alloc] init];
-opt.playSessionID = sessionId;
-opt.sessionExpireAtMs = expireAt.longLongValue;
-opt.secureHeaders =
-    [NSString stringWithFormat:
-     @"X-App-Id: %@\r\n"
-     @"X-File-Id: %@\r\n"
-     @"X-Sign: %@\r\n"
-     @"X-Expire-At: %@\r\n"
-     @"X-Playback-Session: %@\r\n",
-     appID, fileID, sign, expireAt, sessionId];
-
-BOOL ok = [player openSecureHLSWithURL:m3u8URL
-                              authToken:sign
-                                videoID:fileID
-                                options:opt];
+HXCPlayerDataSourcePlayModel *m = [HXCPlayerDataSourcePlayModel modelWithURL:@""
+                                                                         mode:HXCPlayerDataSourceModeSecureHLS
+                                                                encryptedFile:NO];
+m.video = [HXCPlayerVideo new];
+m.video.appId = appID.intValue;
+m.video.videoId = fileID.intValue;
+m.video.sign = sign;
+BOOL ok = [player playWithModel:m];
 if (ok) {
     [player play];
 }
@@ -69,30 +89,48 @@ if (ok) {
 
 ---
 
-## 4. Android 接入示例（Kotlin）
+## 4. Android 接入示例（Kotlin，仅 openWithPlayModel）
 
 ```kotlin
-val m3u8Url = authResp.data.m3u8Url
-val sessionId = authResp.data.playSessionId
-val expireAt = authResp.data.expireAt
-
-val options = HXCPlayerControl.SecureHLSOptions().apply {
-    playSessionID = sessionId
-    sessionExpireAtMs = expireAt
-    secureHeaders =
-        "X-App-Id: $appId\r\n" +
-        "X-File-Id: $fileId\r\n" +
-        "X-Sign: $sign\r\n" +
-        "X-Expire-At: $expireAt\r\n" +
-        "X-Playback-Session: $sessionId\r\n"
+player.secureHLSAuthHandler = { model ->
+    // 用 model.video.videoId + model.video.appId + model.video.sign 请求你们自己的播放鉴权接口
+    val v = model.video ?: return@secureHLSAuthHandler null
+    if (v.videoId <= 0 || v.appId <= 0 || v.sign.isBlank()) return@secureHLSAuthHandler null
+    val authResp = ...
+    val m3u8Url = authResp.data.m3u8Url
+    val sessionId = authResp.data.playSessionId
+    val expireAt = authResp.data.expireAt
+    if (m3u8Url.isNullOrBlank() || sessionId.isNullOrBlank()) {
+        null
+    } else {
+        mapOf(
+            "m3u8_url" to m3u8Url,
+            "play_session_id" to sessionId,
+            "expire_at_ms" to expireAt,
+            "secure_headers" to (
+                "X-App-Id: ${v.appId}\r\n" +
+                "X-File-Id: ${v.videoId}\r\n" +
+                "X-Sign: ${v.sign}\r\n" +
+                "X-Expire-At: $expireAt\r\n" +
+                "X-Playback-Session: $sessionId\r\n"
+            )
+        )
+    }
 }
 
-val ok = player.openSecureHLS(
-    url = m3u8Url,
-    authToken = sign,
-    videoID = fileId,
-    options = options
-)
+val m = HXCPlayerControl.PlayerDataSourcePlayModel.modelWithURL(
+    url = "",
+    mode = HXCPlayerControl.PlayerDataSourceMode.SECURE_HLS,
+    encryptedFile = false
+).apply {
+    video = HXCPlayerControl.PlayerVideo().apply {
+        this.appId = appId.toInt()
+        this.videoId = fileId.toInt()
+        this.sign = sign
+    }
+}
+
+val ok = player.openWithPlayModel(m)
 if (ok) {
     player.play()
 }
