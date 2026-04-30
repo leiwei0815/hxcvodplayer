@@ -121,6 +121,7 @@ build_ffmpeg() {
         --enable-protocol=file \
         --enable-protocol=http \
         --enable-protocol=https \
+        --enable-protocol=crypto \
         --enable-protocol=tcp \
         --enable-protocol=tls \
         --enable-securetransport \

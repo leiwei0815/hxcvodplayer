@@ -174,6 +174,7 @@ echo ""
     --enable-protocol=file \
     --enable-protocol=http \
     --enable-protocol=https \
+    --enable-protocol=crypto \
     --enable-protocol=tcp \
     --enable-protocol=udp \
     --enable-decoder=h264 \

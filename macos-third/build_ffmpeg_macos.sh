@@ -71,6 +71,7 @@ echo "🔨 配置 FFmpeg..."
     --enable-protocol=file \
     --enable-protocol=http \
     --enable-protocol=https \
+    --enable-protocol=crypto \
     --enable-protocol=tcp \
     --enable-protocol=tls \
     --enable-protocol=rtmp \

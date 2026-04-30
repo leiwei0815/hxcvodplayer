@@ -518,10 +518,14 @@ private:
 #endif
 
 // 便捷宏（默认包含文件/行号/函数签名）
-#define LOG_DEBUG(...) hxcplayer::Logger::instance().debug_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
-#define LOG_INFO(...) hxcplayer::Logger::instance().info_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
-#define LOG_WARNING(...) hxcplayer::Logger::instance().warning_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
-#define LOG_ERROR(...) hxcplayer::Logger::instance().error_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
+//#define LOG_DEBUG(...) hxcplayer::Logger::instance().debug_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
+//#define LOG_INFO(...) hxcplayer::Logger::instance().info_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
+//#define LOG_WARNING(...) hxcplayer::Logger::instance().warning_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
+//#define LOG_ERROR(...) hxcplayer::Logger::instance().error_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)
+#define LOG_DEBUG(...) hxcplayer::Logger::instance().debug(__VA_ARGS__)
+#define LOG_INFO(...) hxcplayer::Logger::instance().info(__VA_ARGS__)
+#define LOG_WARNING(...) hxcplayer::Logger::instance().warning(__VA_ARGS__)
+#define LOG_ERROR(...) hxcplayer::Logger::instance().error(__VA_ARGS__)
 
 // 带位置信息的日志宏
 #define LOG_DEBUG_LOC(...) hxcplayer::Logger::instance().debug_with_location(__FILE__, __LINE__, HXC_LOG_CALLSITE_FUNC, __VA_ARGS__)

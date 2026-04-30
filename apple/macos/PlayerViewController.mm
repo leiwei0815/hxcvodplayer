@@ -362,7 +362,8 @@
     // 创建输入框
     NSTextField *input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 400, 24)];
     input.placeholderString = @"https://example.com/video.mp4";
-    input.stringValue = @"https://vod-volcengine.cskziwl.cn/942e964bce38a8cb0661c217d2db11ee/cacc46704568102b52a40dc8b27bd5cb.m3u8";
+//    input.stringValue = @"https://vod-volcengine.cskziwl.cn/942e964bce38a8cb0661c217d2db11ee/cacc46704568102b52a40dc8b27bd5cb.m3u8";
+    input.stringValue = @"http://127.0.0.1:8000/hls_enc/output/index.m3u8";
 //    input.stringValue = @"https://vod-volcengine.cskziwl.cn/P6N8MWsjc58A5Rb3/K7XpsqzzPY1dGv5f.mp4";
 //    input.stringValue = @"rtmp://liveplay.shanhuketang.com/live/2619_tenghuiwangxiao_live_560021_1";
 //    input.stringValue = @"https://v.shkt.online/772388bdvodtranscq1317978474/4ece4b555145403697569546683/v.f1440843.mp4";
@@ -608,12 +609,12 @@
     HXCPlayerDataSourcePlayModel *model = [HXCPlayerDataSourcePlayModel modelWithURL:urlString
                                                                                  mode:mode
                                                                           encryptedFile:encryptedFile];
-//    HXCPlayerVideo *video = [[HXCPlayerVideo alloc] init];
-//    video.videoId = @"114290945964511233";
-//    video.timestamp = @"1777466855";
-//    video.sign = @"072d04f3c56ff94655bb441e180faffec722e1df68a5adb9a9a2a1df31ea32de";
-//    video.secretId = @"30d4e4cc44029ec36a9c1e3e35139723";
-//    model.video = video;
+    HXCPlayerVideo *video = [[HXCPlayerVideo alloc] init];
+    video.videoId = @"114290945964511233";
+    video.timestamp = @"1777466855";
+    video.sign = @"072d04f3c56ff94655bb441e180faffec722e1df68a5adb9a9a2a1df31ea32de";
+    video.secretId = @"30d4e4cc44029ec36a9c1e3e35139723";
+    model.video = video;
     success = [_player playWithModel:model];
 #else
     success = [_player prepareToPlay:urlString];

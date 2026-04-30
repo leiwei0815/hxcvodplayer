@@ -345,6 +345,7 @@ private:
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
     std::atomic<bool> video_hw_decode_active_{false}; // 当前视频流是否在硬解
     std::atomic<int64_t> io_last_packet_us_{0}; // 最近一次成功读取 packet 的时间（us）
+    std::atomic<bool> io_watchdog_disabled_{false}; // 是否禁用阻塞读 watchdog（用于 loopback HTTP）
     int64_t io_interrupt_timeout_us_{8000000};   // 阻塞读中断阈值（us）
     bool playback_completed_notified_;  // ⚠️ 是否已通知播放完成（避免重复通知）
     
