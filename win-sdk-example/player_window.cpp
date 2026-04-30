@@ -15,6 +15,10 @@
 #include <QTimer>
 #include <QPainter>
 #include <QEvent>
+#include <QTextEdit>
+#include <QCheckBox>
+#include <QFormLayout>
+#include <QDialogButtonBox>
 #include <vector>
 
 // ==================== OpenMediaDialog 实现 ====================
@@ -431,4 +435,233 @@ QString PlayerWindow::formatTime(double seconds) {
             .arg(minutes)
             .arg(secs, 2, 10, QChar('0'));
     }
+}
+
+// ==================== SecureHLS 测试入口 ====================
+
+void PlayerWindow::on_secureHlsButton_clicked() {
+    SecureHLSDialog dlg(this);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    QString m3u8Url = dlg.getM3u8Url().trimmed();
+    if (m3u8Url.isEmpty()) {
+        QMessageBox::warning(this, "提示", "请填写 m3u8 地址");
+        return;
+    }
+
+    // 将多行 headers 文本转换为 FFmpeg 所需格式（每行末加 \r\n）
+    QString rawHeaders = dlg.getSecureHeaders().trimmed();
+    QString ffmpegHeaders;
+    if (!rawHeaders.isEmpty()) {
+        QStringList lines = rawHeaders.split('\n', Qt::SkipEmptyParts);
+        for (const QString& line : lines) {
+            QString trimmed = line.trimmed();
+            if (!trimmed.isEmpty()) {
+                ffmpegHeaders += trimmed + "\r\n";
+            }
+        }
+    }
+
+    qDebug() << "[SecureHLS] m3u8 URL :" << m3u8Url;
+    qDebug() << "[SecureHLS] headers  :" << ffmpegHeaders;
+
+    // 停止当前播放
+    player_core_stop(player_);
+
+    // 调用 SecureHLS 模式打开
+    PlayerDataSourceC source{};
+    source.url            = m3u8Url.toUtf8().constData();
+    source.start_position = 0.0;
+    source.mode           = PLAYER_DATA_SOURCE_MODE_SECURE_HLS;
+    source.encrypted_file = 0;
+
+    QByteArray headerBytes = ffmpegHeaders.toUtf8();
+    source.secure_headers = headerBytes.isEmpty() ? nullptr : headerBytes.constData();
+
+    PlayerDataSourceConfigC cfg{};
+    cfg.timeout_ms       = 30000;
+    cfg.max_retries      = 3;
+    cfg.cache_size       = 2 * 1024 * 1024;
+    cfg.avio_buffer_size = 64 * 1024;
+
+    int ret = player_core_open_with_mode(player_, &source, &cfg);
+    if (ret < 0) {
+        QMessageBox::critical(this, "SecureHLS 错误",
+            QString("player_core_open_with_mode 失败，错误码: %1\n\n"
+                    "常见原因：\n"
+                    "1. m3u8 URL 不可访问\n"
+                    "2. key 接口未返回 16 字节二进制原始密钥\n"
+                    "3. 鉴权 header 缺失或格式错误\n"
+                    "4. 本地测试服务器未启动（运行 start_test_server.bat）").arg(ret));
+        return;
+    }
+
+    duration_ = player_core_get_duration(player_);
+    ui->playButton->setEnabled(true);
+    ui->pauseButton->setEnabled(true);
+    ui->stopButton->setEnabled(true);
+    ui->seekSlider->setEnabled(true);
+    ui->statusLabel->setText("SecureHLS: " + m3u8Url);
+
+    player_core_play(player_);
+    qDebug() << "[SecureHLS] 播放已启动";
+}
+
+// ==================== SecureHLSDialog 实现 ====================
+
+SecureHLSDialog::SecureHLSDialog(QWidget *parent)
+    : QDialog(parent) {
+
+    setWindowTitle("SecureHLS / HLS AES-128 测试");
+    setMinimumWidth(560);
+
+    QVBoxLayout* root = new QVBoxLayout(this);
+
+    // ---- 快捷填充按钮行 ----
+    QHBoxLayout* quickFillLayout = new QHBoxLayout();
+    localTestCheck_ = new QCheckBox("使用本地测试服务器（127.0.0.1:8765）");
+    QPushButton* fillRealBtn = new QPushButton("填充真实后台参数");
+    fillRealBtn->setStyleSheet("QPushButton { background:#52c41a; color:white; border-radius:4px; padding:4px 10px; }");
+    quickFillLayout->addWidget(localTestCheck_);
+    quickFillLayout->addStretch();
+    quickFillLayout->addWidget(fillRealBtn);
+    root->addLayout(quickFillLayout);
+
+    hintLabel_ = new QLabel(
+        "<b>本地测试服务器说明：</b><br>"
+        "运行项目根目录下 <code>win-sdk-example/start_test_server.bat</code><br>"
+        "服务器会在本机生成 AES-128 加密 HLS 流，无需真实 CDN。<br>"
+        "key 接口返回 <b>16 字节 raw binary</b>，用于验证解密链路。"
+    );
+    hintLabel_->setWordWrap(true);
+    hintLabel_->setStyleSheet("QLabel { background:#fffbe6; border:1px solid #ffe58f; "
+                              "padding:6px; border-radius:4px; }");
+    root->addWidget(hintLabel_);
+
+    connect(fillRealBtn, &QPushButton::clicked, this, &SecureHLSDialog::fillRealServerDefaults);
+
+    // ---- 表单 ----
+    QFormLayout* form = new QFormLayout();
+
+    m3u8UrlEdit_ = new QLineEdit();
+    m3u8UrlEdit_->setPlaceholderText("http://127.0.0.1:8765/stream.m3u8");
+    form->addRow("m3u8 地址：", m3u8UrlEdit_);
+
+    headersEdit_ = new QTextEdit();
+    headersEdit_->setFixedHeight(100);
+    headersEdit_->setPlaceholderText(
+        "每行一个 header，格式：Key: Value\n"
+        "例如：\n"
+        "X-Playback-Session: ps_test_123\n"
+        "X-File-Id: f_demo_001"
+    );
+    form->addRow("鉴权 Headers：", headersEdit_);
+
+    root->addLayout(form);
+
+    // ---- 验证按钮（打开 key 接口检测） ----
+    verifyBtn_ = new QPushButton("检测 key 接口（curl 验证）");
+    verifyBtn_->setToolTip("在命令行执行 curl 请求 key 接口，检查返回是否为 16 字节");
+    root->addWidget(verifyBtn_);
+
+    // ---- 关键说明 ----
+    QLabel* warnLabel = new QLabel(
+        "<b>⚠️ 解密失败最常见原因：</b><br>"
+        "1. key 接口返回的不是 <b>16 字节原始二进制</b>（例如返回了 JSON / Base64 / Hex 字符串）<br>"
+        "2. m3u8 中 <code>EXT-X-KEY URI</code> 与实际 key 地址不符<br>"
+        "3. FFmpeg 请求 key 时 header 未透传（查看日志中 'SecureHLS 注入 headers 成功'）<br>"
+        "4. IV 与加密时不一致（若未指定 IV，FFmpeg 默认用分片序号）"
+    );
+    warnLabel->setWordWrap(true);
+    warnLabel->setStyleSheet("QLabel { background:#fff1f0; border:1px solid #ffa39e; "
+                             "padding:6px; border-radius:4px; font-size:9pt; }");
+    root->addWidget(warnLabel);
+
+    // ---- 按钮 ----
+    QDialogButtonBox* bbox = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    bbox->button(QDialogButtonBox::Ok)->setText("开始播放");
+    bbox->button(QDialogButtonBox::Cancel)->setText("取消");
+    root->addWidget(bbox);
+
+    connect(bbox, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(bbox, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    connect(localTestCheck_, &QCheckBox::toggled, this, &SecureHLSDialog::onUseLocalToggled);
+    connect(verifyBtn_, &QPushButton::clicked, this, &SecureHLSDialog::onVerifyClicked);
+}
+
+void SecureHLSDialog::onUseLocalToggled(bool checked) {
+    if (checked) {
+        fillLocalDefaults();
+    }
+}
+
+void SecureHLSDialog::fillLocalDefaults() {
+    m3u8UrlEdit_->setText("http://127.0.0.1:8765/stream.m3u8");
+    headersEdit_->setPlainText(
+        "X-Playback-Session: ps_test_local_123\r\n"
+        "X-File-Id: f_demo_001\r\n"
+    );
+}
+
+void SecureHLSDialog::fillRealServerDefaults() {
+    localTestCheck_->setChecked(false);
+    m3u8UrlEdit_->setText(
+        "https://111453136245362688.tenwiseacademy.cn"
+        "/111453136245362688/8jwu5vj74orbp7itf9138eiy1t23kl80a1"
+        "/a6c917r96qvxm23w.m3u8"
+    );
+    headersEdit_->setPlainText(
+        "P-HX-SecretID: 30d4e4cc44029ec36a9c1e3e35139723\r\n"
+        "P-HX-FileId: 114290945964511233\r\n"
+        "P-HX-Timestamp: 1777466855\r\n"
+        "P-HX-Sign: 072d04f3c56ff94655bb441e180faffec722e1df68a5adb9a9a2a1df31ea32de\r\n"
+        "P-HX-Terminal-Type: iOS\r\n"
+    );
+    hintLabel_->setText(
+        "<b>已填充真实后台参数</b><br>"
+        "URL: <code>111453136245362688.tenwiseacademy.cn/...a6c917r96qvxm23w.m3u8</code><br>"
+        "注意：<b>P-HX-Timestamp</b> 可能已过期，若播放失败请更新签名参数后重试。"
+    );
+    hintLabel_->setStyleSheet("QLabel { background:#f6ffed; border:1px solid #b7eb8f; "
+                              "padding:6px; border-radius:4px; }");
+}
+
+void SecureHLSDialog::onVerifyClicked() {
+    QString url = m3u8UrlEdit_->text().trimmed();
+    // 从 m3u8 URL 推断 key 地址
+    // 本地服务器规范：key 在 /key 路由
+    QString keyUrl;
+    if (url.contains("127.0.0.1:8765")) {
+        keyUrl = "http://127.0.0.1:8765/key";
+    } else {
+        keyUrl = url; // 用户自行替换
+    }
+
+    QString cmd = QString(
+        "start cmd /k \"curl -v -o key_check.bin \"%1\" && "
+        "echo. && echo === key 文件字节数（必须=16）=== && "
+        "for %%A in (key_check.bin) do echo %%~zA bytes && pause\""
+    ).arg(keyUrl);
+
+    qDebug() << "[SecureHLS] 执行 key 检测:" << cmd;
+    QMessageBox::information(this, "key 接口检测",
+        QString("将打开命令行执行 curl 请求：\n%1\n\n"
+                "请确认输出 <16 bytes> 才是正确的 raw 二进制 key。\n"
+                "若显示 JSON/Base64/大于16字节 → 服务端返回格式有误！").arg(keyUrl));
+    system(cmd.toLocal8Bit().constData());
+}
+
+QString SecureHLSDialog::getM3u8Url() const {
+    return m3u8UrlEdit_->text();
+}
+
+QString SecureHLSDialog::getSecureHeaders() const {
+    return headersEdit_->toPlainText();
+}
+
+bool SecureHLSDialog::useLocalTestServer() const {
+    return localTestCheck_->isChecked();
 }

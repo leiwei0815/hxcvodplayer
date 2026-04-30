@@ -5,6 +5,10 @@
 #include <QDialog>
 #include <QLineEdit>
 #include <QRadioButton>
+#include <QTextEdit>
+#include <QLabel>
+#include <QPushButton>
+#include <QCheckBox>
 #include "hxcplayer_sdk.h"
 
 QT_BEGIN_NAMESPACE
@@ -30,6 +34,34 @@ private:
     QPushButton* browseButton_;
 };
 
+// ========== SecureHLS 测试对话框 ==========
+// 用于配置并测试 HLS AES-128 自定义解密链路
+class SecureHLSDialog : public QDialog {
+    Q_OBJECT
+
+public:
+    explicit SecureHLSDialog(QWidget *parent = nullptr);
+
+    // 获取用户填写的参数
+    QString getM3u8Url() const;
+    QString getSecureHeaders() const;  // 多行，每行 "Key: Value"
+    bool    useLocalTestServer() const;
+
+private slots:
+    void onUseLocalToggled(bool checked);
+    void onVerifyClicked();
+
+private:
+    QLineEdit*  m3u8UrlEdit_;
+    QTextEdit*  headersEdit_;
+    QCheckBox*  localTestCheck_;
+    QLabel*     hintLabel_;
+    QPushButton* verifyBtn_;
+
+    void fillLocalDefaults();
+    void fillRealServerDefaults();
+};
+
 class PlayerWindow : public QMainWindow {
     Q_OBJECT
 
@@ -49,7 +81,8 @@ private slots:
     void on_seekSlider_sliderPressed();
     void on_seekSlider_sliderReleased();
     void on_seekSlider_sliderMoved(int position);
-    
+    void on_secureHlsButton_clicked();   // SecureHLS 测试入口
+
     // 回调触发的 UI 更新槽
     void onProgressChanged();
     void onStateChanged();

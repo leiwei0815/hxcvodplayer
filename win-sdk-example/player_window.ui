@@ -79,6 +79,19 @@
        </widget>
       </item>
       <item>
+       <widget class="QPushButton" name="secureHlsButton">
+        <property name="text">
+         <string>SecureHLS 测试</string>
+        </property>
+        <property name="toolTip">
+         <string>测试 HLS AES-128 自定义解密播放链路</string>
+        </property>
+        <property name="styleSheet">
+         <string notr="true">QPushButton { background-color: #1677ff; color: white; border-radius: 4px; padding: 4px 8px; }</string>
+        </property>
+       </widget>
+      </item>
+      <item>
        <widget class="QPushButton" name="playButton">
         <property name="text">
          <string>播放</string>
