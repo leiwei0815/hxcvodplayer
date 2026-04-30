@@ -184,11 +184,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         HARDWARE
     }
 
-    /** 对齐 iOS 的视频模型（fileid + appid + sign） */
+    /** 对齐 iOS 的视频模型（videoId + sign + secretId + timestamp） */
     class PlayerVideo {
-        var videoId: Int = 0
+        var videoId: String = ""
         var sign: String = ""
-        var appId: Int = 0
+        var secretId: String = ""
+        var timestamp: String = ""
     }
 
     /** 对齐 iOS：全局数据源默认配置 */
@@ -211,7 +212,7 @@ class HXCPlayerControl @JvmOverloads constructor(
      * - [mode] 对应默认/自定义 HTTP/自定义本地文件/SecureHLS
      * - [url] 在非 SecureHLS 下必填；SecureHLS 可由鉴权回调返回 m3u8URL
      * - [encryptedFile] 是否按核心约定解密文件头
-     * - [video] 对齐 iOS：通过 fileid+appid+sign 播放
+     * - [video] 对齐 iOS：通过 videoId+sign+secretId 播放
      */
     class PlayerDataSourcePlayModel {
         var url: String = ""
@@ -502,19 +503,30 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
     }
 
-    private fun buildDefaultSecureHeaders(video: PlayerVideo, expireAtMs: Long, playSessionID: String?): String {
-        return "X-App-Id: ${video.appId}\r\n" +
-            "X-File-Id: ${video.videoId}\r\n" +
-            "X-Sign: ${video.sign}\r\n" +
-            "X-Expire-At: $expireAtMs\r\n" +
-            "X-Playback-Session: ${playSessionID ?: ""}\r\n"
+    private fun urlLooksLikeM3u8(url: String?): Boolean {
+        if (url.isNullOrBlank()) {
+            return false
+        }
+        return url.contains(".m3u8", ignoreCase = true)
+    }
+
+    private fun buildDefaultSecureHeaders(video: PlayerVideo, timestamp: String): String {
+        return "P-HX-SecretID: ${video.secretId}\r\n" +
+            "P-HX-FileId: ${video.videoId}\r\n" +
+            "P-HX-Timestamp: $timestamp\r\n" +
+            "P-HX-Sign: ${video.sign}\r\n" +
+            "P-HX-Terminal-Type: android\r\n",
+    }
+
+    private fun resolveRequestTimestamp(video: PlayerVideo): String {
+        return video.timestamp.takeIf { it.isNotBlank() } ?: System.currentTimeMillis().toString()
     }
 
     private fun performSecureHLSAuthRequestOnCurrentThread(
         config: PlayerDataSourceConfig,
         video: PlayerVideo
     ): Pair<Map<String, Any?>?, String?> {
-        if (video.videoId <= 0 || video.appId <= 0 || video.sign.isBlank()) {
+        if (video.videoId.isBlank() || video.sign.isBlank() || video.secretId.isBlank()) {
             return Pair(null, "鉴权参数无效")
         }
         val authURL = secureHLSAuthURL()
@@ -538,10 +550,12 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
             }
 
+            val requestTimestamp = resolveRequestTimestamp(video)
             val body = JSONObject().apply {
-                put("app_id", video.appId)
+                put("secret_id", video.secretId)
                 put("file_id", video.videoId)
                 put("sign", video.sign)
+                put("timestamp", requestTimestamp)
             }.toString()
 
             OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
@@ -570,25 +584,21 @@ class HXCPlayerControl @JvmOverloads constructor(
                 return Pair(null, "鉴权响应不是 JSON 对象")
             }
 
-            val m3u8URL = data.optString("m3u8_url", "").takeIf { it.isNotBlank() }
-                ?: return Pair(null, "鉴权响应缺少 m3u8_url")
+            val playURL = data.optString("play_url", "").takeIf { it.isNotBlank() }
+                ?: return Pair(null, "鉴权响应缺少 play_url")
             val playSessionID = data.optString("play_session_id", "").takeIf { it.isNotBlank() }
-            val expireAtMs = parseLongValue(data.opt("expire_at"))
+            val isEncrypted = parseLongValue(data.opt("encrypt_type")) == 1L ||
+                parseBooleanValue(data.opt("is_encrypted")) ||
+                parseBooleanValue(data.opt("encrypted")) ||
+                parseBooleanValue(data.opt("is_encrypt"))
             val secureHeaders = data.optString("secure_headers", "").takeIf { it.isNotBlank() }
-                ?: buildDefaultSecureHeaders(video, expireAtMs, playSessionID)
-            val inlineKeyMode = parseBooleanValue(data.opt("inline_key_mode"))
-            val keyMaterial = data.optString("key_material_b64", "").takeIf { it.isNotBlank() }
-            val keyIVHex = data.optString("key_iv_hex", "").takeIf { it.isNotBlank() }
+                ?: if (isEncrypted) buildDefaultSecureHeaders(video, requestTimestamp) else null
 
             Pair(
                 mapOf(
-                    "m3u8_url" to m3u8URL,
-                    "play_session_id" to playSessionID,
-                    "secure_headers" to secureHeaders,
-                    "expire_at_ms" to expireAtMs,
-                    "inline_key_mode" to inlineKeyMode,
-                    "key_material_b64" to keyMaterial,
-                    "key_iv_hex" to keyIVHex
+                    "play_url" to playURL,
+                    "is_encrypted" to isEncrypted,
+                    "secure_headers" to secureHeaders
                 ),
                 null
             )
@@ -799,31 +809,32 @@ class HXCPlayerControl @JvmOverloads constructor(
         var resolvedAuthToken: String? = null
         var resolvedVideoID: String? = null
         var resolvedDeviceID: String? = null
-        var resolvedAppID: String? = null
+        var resolvedSecretID: String? = null
         var resolvedNonce: String? = null
         var resolvedPlaySessionID: String? = null
         var resolvedSecureHeaders: String? = null
         var resolvedSessionExpireAtMs: Long = 0L
+        var resolvedEncrypted = false
         var resolvedInlineKeyMode = false
         var resolvedKeyMaterialBase64: String? = null
         var resolvedKeyIVHex: String? = null
         val config = effectiveDataSourceConfig()
         if (workingModel.video != null) {
             val video = workingModel.video
-            if (video == null || video.videoId <= 0 || video.appId <= 0 || video.sign.isBlank()) {
-                dispatchError(PlayerErrorCode.INVALID_URL, "SecureHLS 缺少必要参数: video.videoId/video.appId/video.sign")
+            if (video == null || video.videoId.isBlank() || video.sign.isBlank() || video.secretId.isBlank()) {
+                dispatchError(PlayerErrorCode.INVALID_URL, "SecureHLS 缺少必要参数: video.videoId/video.sign/video.secretId")
                 return false
             }
-            resolvedVideoID = video.videoId.toString()
-            resolvedAppID = video.appId.toString()
+            resolvedVideoID = video.videoId
+            resolvedSecretID = video.secretId
             resolvedAuthToken = video.sign
 
             val (authResult, authError) = performSecureHLSAuthRequest(config, video)
-            val m3u8URL = authResult?.get("m3u8_url")?.toString()?.takeIf { it.isNotBlank() }
-            if (m3u8URL.isNullOrBlank()) {
+            val playURL = authResult?.get("play_url")?.toString()?.takeIf { it.isNotBlank() }
+            if (playURL.isNullOrBlank()) {
                 dispatchError(
                     PlayerErrorCode.OPEN_INPUT_FAILED,
-                    authError ?: "SecureHLS 鉴权失败: 未返回有效 m3u8_url"
+                    authError ?: "SecureHLS 鉴权失败: 未返回有效播放地址"
                 )
                 return false
             }
@@ -831,15 +842,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                 dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, authError ?: "SecureHLS 鉴权失败")
                 return false
             }
-            workingModel.url = m3u8URL
-            resolvedPlaySessionID = authData["play_session_id"]?.toString()?.takeIf { it.isNotBlank() }
-            resolvedSecureHeaders = authData["secure_headers"]?.toString()?.takeIf { it.isNotBlank() }
-            resolvedSessionExpireAtMs = when (val v = authData["expire_at_ms"]) {
-                is Number -> v.toLong()
-                is String -> v.toLongOrNull() ?: 0L
-                else -> 0L
-            }
-            resolvedInlineKeyMode = when (val v = authData["inline_key_mode"]) {
+            workingModel.url = playURL
+            resolvedEncrypted = when (val v = authData["is_encrypted"]) {
                 is Boolean -> v
                 is Number -> v.toInt() != 0
                 is String -> {
@@ -848,8 +852,16 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
                 else -> false
             }
-            resolvedKeyMaterialBase64 = authData["key_material_b64"]?.toString()?.takeIf { it.isNotBlank() }
-            resolvedKeyIVHex = authData["key_iv_hex"]?.toString()?.takeIf { it.isNotBlank() }
+            resolvedSecureHeaders = authData["secure_headers"]?.toString()?.takeIf { it.isNotBlank() }
+
+            val needsSecureSession = resolvedEncrypted ||
+                !resolvedSecureHeaders.isNullOrBlank()
+            if (needsSecureSession) {
+                workingModel.mode = PlayerDataSourceMode.SECURE_HLS
+            } else if (workingModel.mode == PlayerDataSourceMode.SECURE_HLS && !urlLooksLikeM3u8(workingModel.url)) {
+                // 非加密直链（如 mp4）不再强依赖 SecureHLS 模式。
+                workingModel.mode = PlayerDataSourceMode.DEFAULT
+            }
         } else if (workingModel.url.isBlank()) {
             dispatchError(PlayerErrorCode.INVALID_URL, "播放参数无效：video 和 url 不能同时为空")
             return false
@@ -890,13 +902,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                 )
             }
             PlayerDataSourceMode.SECURE_HLS -> {
-                nativeOpenWithSecureHLS(
+                nativeOpenWithSecureSession(
                     handle,
                     workingModel.url,
                     resolvedAuthToken,
                     resolvedVideoID,
                     resolvedDeviceID,
-                    resolvedAppID,
+                    resolvedSecretID,
                     resolvedNonce,
                     resolvedPlaySessionID,
                     resolvedSecureHeaders,
@@ -1265,13 +1277,29 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeOpenURLWithStartPosition(handle: Long, url: String, startPosition: Double): Boolean
     private external fun nativeOpenWithCustomHTTP(handle: Long, url: String, timeoutMs: Int, maxRetries: Int, encryptedFile: Boolean): Boolean
     private external fun nativeOpenWithCustomFile(handle: Long, path: String, avioBufferSize: Int, encryptedFile: Boolean): Boolean
+    private external fun nativeOpenWithSecureSession(
+        handle: Long,
+        url: String,
+        authToken: String?,
+        videoID: String?,
+        deviceID: String?,
+        secretID: String?,
+        nonce: String?,
+        playSessionID: String?,
+        secureHeaders: String?,
+        sessionExpireAtMs: Long,
+        keyMode: Int,
+        keyMaterialBase64: String?,
+        keyIVHex: String?
+    ): Boolean
+    // 兼容旧 JNI 名称，保留声明便于回滚和灰度排障。
     private external fun nativeOpenWithSecureHLS(
         handle: Long,
         url: String,
         authToken: String?,
         videoID: String?,
         deviceID: String?,
-        appID: String?,
+        secretID: String?,
         nonce: String?,
         playSessionID: String?,
         secureHeaders: String?,

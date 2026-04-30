@@ -111,37 +111,16 @@ typedef struct {
     int max_retries;          // 最大重试次数，默认 3
     size_t cache_size;        // 缓存大小（字节），默认 2MB
     size_t avio_buffer_size;  // AVIO 缓冲区大小（字节），默认 64KB
-    int encrypted_file;       // 是否为加密文件（0/1），仅解密文件头前 100 字节
-    const char* auth_token;   // SecureHLS: 业务 token
-    const char* video_id;     // SecureHLS: 视频 ID
-    const char* device_id;    // SecureHLS: 设备 ID
-    const char* app_id;       // SecureHLS: 应用 ID
-    const char* nonce;        // SecureHLS: nonce
-    int64_t timestamp_ms;     // SecureHLS: 时间戳（毫秒）
-    const char* play_session_id;      // SecureHLS: 已鉴权会话 ID（可选）
-    const char* secure_headers;       // SecureHLS: 透传 header 文本
-    int64_t session_expire_at_ms;     // SecureHLS: 会话过期时间（毫秒）
-    int key_mode;                     // SecureHLS: 0=远端 key URI, 1=内联 key
-    const char* key_material_b64;     // SecureHLS: Base64 密钥（16字节）
-    const char* key_iv_hex;           // SecureHLS: 可选 IV
 } PlayerDataSourceConfigC;
 
+/// 播放的视频
 typedef struct {
     const char* url;
-    const char* auth_token;
-    const char* video_id;
-    const char* device_id;
-    const char* app_id;
-    const char* nonce;
-    int64_t timestamp_ms;
-    const char* play_session_id;
-    const char* secure_headers;
-    int64_t session_expire_at_ms;
-    int key_mode;
-    const char* key_material_b64;
-    const char* key_iv_hex;
     double start_position;
-} PlayerSecureHLSConfigC;
+    PlayerDataSourceModeC mode;
+    int encrypted_file;
+    const char* secure_headers;
+} PlayerDataSourceC;
 
 // 创建/销毁播放器
 PlayerCoreHandle* player_core_create(void);
@@ -150,8 +129,7 @@ void player_core_destroy(PlayerCoreHandle* handle);
 // 播放控制
 int player_core_open(PlayerCoreHandle* handle, const char* url);
 int player_core_open_with_start_position(PlayerCoreHandle* handle, const char* url, double start_pos);
-int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, PlayerDataSourceModeC mode, const PlayerDataSourceConfigC* config, double start_position);
-int player_core_open_secure_hls(PlayerCoreHandle* handle, const PlayerSecureHLSConfigC* config);
+int player_core_open_with_mode(PlayerCoreHandle* handle, const PlayerDataSourceC* data_source, const PlayerDataSourceConfigC* config);
 void player_core_play(PlayerCoreHandle* handle);
 void player_core_pause(PlayerCoreHandle* handle);
 void player_core_stop(PlayerCoreHandle* handle);

@@ -371,9 +371,27 @@ static BOOL hxc_dict_bool(NSDictionary<NSString *, id> *dict, NSString *key) {
     return NO;
 }
 
+static NSString *hxc_first_non_empty_string(NSDictionary<NSString *, id> *dict, NSArray<NSString *> *keys) {
+    for (NSString *key in keys) {
+        NSString *value = hxc_dict_string(dict, key);
+        if (value.length > 0) {
+            return value;
+        }
+    }
+    return nil;
+}
+
+static BOOL hxc_url_looks_like_m3u8(NSString *url) {
+    if (url.length == 0) {
+        return NO;
+    }
+    NSRange range = [url rangeOfString:@".m3u8" options:NSCaseInsensitiveSearch];
+    return range.location != NSNotFound;
+}
+
 /// SecureHLS 鉴权接口地址由 SDK 内部维护，外部不暴露配置入口。
 static NSString *hxc_secure_hls_auth_url(void) {
-    return @"https://api.example.com/api/v1/play/auth";
+    return @"https://console-api.huaxiacloud.net/third_party/verify/sign";
 }
 
 /// SecureHLS 鉴权接口附加请求头（内部保留位，当前默认空）。
@@ -384,7 +402,7 @@ static NSDictionary<NSString *, NSString *> *hxc_secure_hls_auth_headers(void) {
 static NSDictionary<NSString *, id> *hxc_perform_secure_hls_auth_request(HXCPlayerDataSourceConfig *config,
                                                                           HXCPlayerVideo *video,
                                                                           NSError **outError) {
-    if (!config || !video || video.videoId <= 0 || video.appId <= 0 || video.sign.length == 0) {
+    if (!config || !video || video.videoId.length == 0 || video.sign.length == 0 || video.secretId.length == 0) {
         if (outError) {
             *outError = [NSError errorWithDomain:@"HXCPlayerSecureHLS"
                                             code:HXCPlayerErrorInvalidURL
@@ -423,9 +441,11 @@ static NSDictionary<NSString *, id> *hxc_perform_secure_hls_auth_request(HXCPlay
     }];
 
     NSDictionary *payload = @{
-        @"app_id": @(video.appId),
-        @"file_id": @(video.videoId),
-        @"sign": video.sign ?: @""
+        @"secret_id": video.secretId ?: @"",
+        @"file_id": video.videoId ?: @"",
+        @"sign": video.sign ?: @"",
+        @"timestamp": video.timestamp ?: @"",
+        @"client_type": @"iOS"
     };
     NSError *jsonError = nil;
     NSData *body = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&jsonError];
@@ -479,6 +499,20 @@ static NSDictionary<NSString *, id> *hxc_perform_secure_hls_auth_request(HXCPlay
         return nil;
     }
     NSDictionary *root = (NSDictionary *)jsonObj;
+    id codeValue = root[@"code"];
+    BOOL hasBizCode = (codeValue != nil && codeValue != (id)[NSNull null]);
+    int64_t bizCode = hasBizCode ? hxc_dict_int64(root, @"code") : 200;
+    NSString *bizMsg = hxc_dict_string(root, @"msg");
+    if (hasBizCode && bizCode != 200) {
+        if (outError) {
+            NSString *desc = bizMsg.length > 0 ? bizMsg : @"播放鉴权失败";
+            *outError = [NSError errorWithDomain:@"HXCPlayerSecureHLS"
+                                            code:HXCPlayerErrorSecureAuthFailed
+                                        userInfo:@{NSLocalizedDescriptionKey: desc}];
+        }
+        return nil;
+    }
+
     NSDictionary *data = nil;
     id dataField = root[@"data"];
     if ([dataField isKindOfClass:[NSDictionary class]]) {
@@ -487,36 +521,34 @@ static NSDictionary<NSString *, id> *hxc_perform_secure_hls_auth_request(HXCPlay
         data = root;
     }
 
-    NSString *m3u8URL = hxc_dict_string(data, @"m3u8_url");
-    if (m3u8URL.length == 0) {
+    NSString *playURL = hxc_dict_string(data, @"play_url");
+    if (playURL.length == 0) {
         if (outError) {
             *outError = [NSError errorWithDomain:@"HXCPlayerSecureHLS"
                                             code:HXCPlayerErrorSecureAuthFailed
-                                        userInfo:@{NSLocalizedDescriptionKey: @"鉴权响应缺少 m3u8_url"}];
+                                        userInfo:@{NSLocalizedDescriptionKey: @"鉴权响应缺少 play_url"}];
         }
         return nil;
     }
-    NSString *playSessionID = hxc_dict_string(data, @"play_session_id");
-    int64_t expireAtMs = hxc_dict_int64(data, @"expire_at");
+
+    BOOL isEncrypted = (hxc_dict_int64(data, @"encrypt_type") == 1);
     NSString *secureHeaders = hxc_dict_string(data, @"secure_headers");
-    if (secureHeaders.length == 0) {
+    if (isEncrypted && secureHeaders.length == 0) {
         secureHeaders = [NSString stringWithFormat:
-                         @"X-App-Id: %d\r\n"
-                         @"X-File-Id: %d\r\n"
-                         @"X-Sign: %@\r\n"
-                         @"X-Expire-At: %lld\r\n"
-                         @"X-Playback-Session: %@\r\n",
-                         video.appId,
+                         @"P-HX-SecretID: %@\r\n"
+                         @"P-HX-FileId: %@\r\n"
+                         @"P-HX-Timestamp: %@\r\n"
+                         @"P-HX-Sign: %@\r\n"
+                         @"P-HX-Terminal-Type: iOS\r\n",
+                         video.secretId ?: @"",
                          video.videoId,
-                         video.sign ?: @"",
-                         (long long)expireAtMs,
-                         playSessionID ?: @""];
+                         video.timestamp ?: @"",
+                         video.sign ?: @""];
     }
     return @{
-        @"m3u8_url": m3u8URL,
-        @"play_session_id": playSessionID ?: @"",
-        @"secure_headers": secureHeaders ?: @"",
-        @"expire_at_ms": @(expireAtMs)
+        @"play_url": playURL,
+        @"is_encrypted": @(isEncrypted),
+        @"secure_headers": secureHeaders ?: @""
     };
 }
 
@@ -768,49 +800,42 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     if (!workingModel) {
         return NO;
     }
-    NSString *resolvedAuthToken = nil;
-    NSString *resolvedVideoID = nil;
-    NSString *resolvedAppID = nil;
-    NSString *resolvedDeviceID = nil;
-    NSString *resolvedNonce = nil;
-    NSString *resolvedPlaySessionID = nil;
     NSString *resolvedSecureHeaders = nil;
-    int64_t resolvedExpireAtMs = 0;
-    BOOL resolvedInlineKeyMode = NO;
-    NSString *resolvedKeyMaterialB64 = nil;
-    NSString *resolvedKeyIVHex = nil;
+    BOOL resolvedEncrypted = NO;
     HXCPlayerDataSourceConfig *config = hxc_build_effective_data_source_config();
 
     if (workingModel.video) {
         HXCPlayerVideo *video = workingModel.video;
-        if (!video || video.videoId <= 0 || video.appId <= 0 || video.sign.length == 0) {
-            NSLog(@"❌ SecureHLS 缺少必要参数：video.videoId/video.appId/video.sign");
+        if (!video || video.videoId.length == 0 || video.sign.length == 0 || video.secretId.length == 0) {
+            NSLog(@"❌ SecureHLS 缺少必要参数：video.videoId/video.sign/video.secretId");
             [self playerErrorHandler:HXCPlayerErrorInvalidURL
-                              errMsg:@"播放参数无效：video.videoId/video.appId/video.sign 不能为空"];
+                              errMsg:@"播放参数无效：video.videoId/video.sign/video.secretId 不能为空"];
             return NO;
         }
-        resolvedVideoID = [NSString stringWithFormat:@"%d", video.videoId];
-        resolvedAppID = [NSString stringWithFormat:@"%d", video.appId];
-        resolvedAuthToken = video.sign;
-
         NSError *authError = nil;
         NSDictionary<NSString *, id> *authResult = hxc_perform_secure_hls_auth_request(config,
                                                                                         video,
                                                                                         &authError);
-        NSString *m3u8URL = hxc_dict_string(authResult, @"m3u8_url");
-        if (!authResult || m3u8URL.length == 0) {
+        NSString *playURL = hxc_dict_string(authResult, @"play_url");
+        if (!authResult || playURL.length == 0) {
             NSLog(@"❌ SecureHLS 鉴权失败: %@", authError.localizedDescription ?: @"unknown");
             [self playerErrorHandler:HXCPlayerErrorSecureAuthFailed
-                              errMsg:authError.localizedDescription ?: @"播放鉴权失败：未返回有效 m3u8_url"];
+                              errMsg:authError.localizedDescription ?: @"播放鉴权失败：未返回有效播放地址"];
             return NO;
         }
-        workingModel.url = m3u8URL;
-        resolvedPlaySessionID = hxc_dict_string(authResult, @"play_session_id");
+        workingModel.url = playURL;
+        resolvedEncrypted = hxc_dict_bool(authResult, @"is_encrypted");
         resolvedSecureHeaders = hxc_dict_string(authResult, @"secure_headers");
-        resolvedExpireAtMs = hxc_dict_int64(authResult, @"expire_at_ms");
-        resolvedInlineKeyMode = hxc_dict_bool(authResult, @"inline_key_mode");
-        resolvedKeyMaterialB64 = hxc_dict_string(authResult, @"key_material_b64");
-        resolvedKeyIVHex = hxc_dict_string(authResult, @"key_iv_hex");
+        workingModel.encryptedFile = resolvedEncrypted;
+        BOOL needsSecureSession =
+            resolvedEncrypted ||
+            resolvedSecureHeaders.length > 0;
+        if (needsSecureSession) {
+            workingModel.mode = HXCPlayerDataSourceModeSecureHLS;
+        } else if (workingModel.mode == HXCPlayerDataSourceModeSecureHLS && !hxc_url_looks_like_m3u8(workingModel.url)) {
+            // 非加密直链（如 mp4）不再强依赖 SecureHLS 模式，避免不必要的会话流程。
+            workingModel.mode = HXCPlayerDataSourceModeDefault;
+        }
     } else if (workingModel.url.length == 0) {
         [self playerErrorHandler:HXCPlayerErrorInvalidURL
                           errMsg:@"播放参数无效：video 和 url 不能同时为空"];
@@ -827,24 +852,11 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
     }
     player_core_set_decode_mode(_wrapper->handle(), hxc_to_c_decode_mode(_decodeMode));
 
-    PlayerDataSourceConfigC cConfig{};
-    cConfig.timeout_ms = (int)config.timeoutMs;
-    cConfig.max_retries = (int)config.maxRetries;
-    cConfig.cache_size = config.cacheSize;
-    cConfig.avio_buffer_size = config.avioBufferSize;
-    cConfig.encrypted_file = workingModel.encryptedFile ? 1 : 0;
-    cConfig.auth_token = resolvedAuthToken.UTF8String;
-    cConfig.video_id = resolvedVideoID.UTF8String;
-    cConfig.device_id = resolvedDeviceID.UTF8String;
-    cConfig.app_id = resolvedAppID.UTF8String;
-    cConfig.nonce = resolvedNonce.UTF8String;
-    cConfig.timestamp_ms = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
-    cConfig.play_session_id = resolvedPlaySessionID.UTF8String;
-    cConfig.secure_headers = resolvedSecureHeaders.UTF8String;
-    cConfig.session_expire_at_ms = resolvedExpireAtMs;
-    cConfig.key_mode = resolvedInlineKeyMode ? 1 : 0;
-    cConfig.key_material_b64 = resolvedKeyMaterialB64.UTF8String;
-    cConfig.key_iv_hex = resolvedKeyIVHex.UTF8String;
+    PlayerDataSourceC cSource{};
+    cSource.url = workingModel.url.UTF8String;
+    cSource.start_position = _startPosition;
+    cSource.encrypted_file = workingModel.encryptedFile ? 1 : 0;
+    cSource.secure_headers = resolvedSecureHeaders.UTF8String;
 
     PlayerDataSourceModeC cMode;
     switch (workingModel.mode) {
@@ -864,8 +876,14 @@ static HXCPlayerPipelineState hxc_to_objc_pipeline_state(PlayerPipelineStateC st
             cMode = PLAYER_DATA_SOURCE_MODE_DEFAULT;
             break;
     }
+    cSource.mode = cMode;
 
-    int ret = player_core_open_with_mode(_wrapper->handle(), workingModel.url.UTF8String, cMode, &cConfig, _startPosition);
+    PlayerDataSourceConfigC cConfig{};
+    cConfig.timeout_ms = (int)config.timeoutMs;
+    cConfig.max_retries = (int)config.maxRetries;
+    cConfig.cache_size = config.cacheSize;
+    cConfig.avio_buffer_size = config.avioBufferSize;
+    int ret = player_core_open_with_mode(_wrapper->handle(), &cSource, &cConfig);
     if (ret != 0) {
         NSLog(@"❌ 打开失败: mode=%ld, ret=%d", (long)workingModel.mode, ret);
         return NO;
@@ -1841,13 +1859,21 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
         if (gHXCUserSetLogDirExplicitly || gHXCDefaultFileLoggingInstalled) {
             return;
         }
-        NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *documentsDirectory = paths.firstObject;
-        if (documentsDirectory.length == 0) {
-            NSLog(@"⚠️ 无法解析 Documents 目录，跳过默认文件日志");
+        NSSearchPathDirectory searchDirectory;
+#if TARGET_OS_IOS
+        // iOS: 日志默认放 Caches，避免占用用户可见文档空间。
+        searchDirectory = NSCachesDirectory;
+#else
+        // macOS: 日志默认放 Application Support，避免触发 Documents 权限弹窗。
+        searchDirectory = NSApplicationSupportDirectory;
+#endif
+        NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(searchDirectory, NSUserDomainMask, YES);
+        NSString *baseDirectory = paths.firstObject;
+        if (baseDirectory.length == 0) {
+            NSLog(@"⚠️ 无法解析默认日志目录，跳过默认文件日志");
             return;
         }
-        NSString *logDir = [documentsDirectory stringByAppendingPathComponent:@"HXCPlayerLogs"];
+        NSString *logDir = [baseDirectory stringByAppendingPathComponent:@"HXCPlayerLogs"];
         NSError *error = nil;
         if (![self hxc_installFileLoggingAtPath:logDir error:&error]) {
             NSLog(@"❌ 默认日志目录启用失败: %@", error.localizedDescription);

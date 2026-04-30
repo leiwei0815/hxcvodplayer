@@ -2,7 +2,7 @@
 
 ## 1. 总体流程
 
-1. 业务层传入：`appID + fileId + sign`
+1. 业务层传入：`secretId + fileId + sign`
 2. SDK 调后端播放鉴权接口，获取：
    - `m3u8_url`
    - `play_session_id`
@@ -20,7 +20,7 @@
 
 建议使用以下头字段：
 
-- `X-App-Id`
+- `X-Secret-Id`
 - `X-File-Id`
 - `X-Sign`
 - `X-Expire-At`
@@ -29,7 +29,7 @@
 示例（字符串形式，CRLF 分隔）：
 
 ```text
-X-App-Id: 10001\r\n
+X-Secret-Id: sk_10001\r\n
 X-File-Id: f_20260427_abc123\r\n
 X-Sign: xxxxxxxxxxxxxxxx\r\n
 X-Expire-At: 1714188300123\r\n
@@ -45,9 +45,9 @@ HXCPlayerDataSourcePlayModel *m = [HXCPlayerDataSourcePlayModel modelWithURL:@""
                                                                          mode:HXCPlayerDataSourceModeSecureHLS
                                                                 encryptedFile:NO];
 m.video = [HXCPlayerVideo new];
-m.video.appId = appID.intValue;
-m.video.videoId = fileID.intValue;
+m.video.videoId = fileID;
 m.video.sign = sign;
+m.video.secretId = secretID;
 BOOL ok = [player playWithModel:m];
 if (ok) {
     [player play];
@@ -67,9 +67,9 @@ val m = HXCPlayerControl.PlayerDataSourcePlayModel.modelWithURL(
     encryptedFile = false
 ).apply {
     video = HXCPlayerControl.PlayerVideo().apply {
-        this.appId = appId.toInt()
-        this.videoId = fileId.toInt()
+        this.videoId = fileId
         this.sign = sign
+        this.secretId = secretId
     }
 }
 

@@ -200,21 +200,21 @@ int player_core_open_with_start_position(PlayerCoreHandle* handle, const char* u
     return handle->core->open(url);
 }
 
-int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, PlayerDataSourceModeC mode, const PlayerDataSourceConfigC* config, double start_position) {
-    if (!handle || !handle->core || !url) {
+int player_core_open_with_mode(PlayerCoreHandle* handle, const PlayerDataSourceC* data_source, const PlayerDataSourceConfigC* config) {
+    if (!handle || !handle->core || !data_source || !data_source->url) {
         return -1;
     }
 
     // 无论是否 > 0，都写入 start_time，确保 start_position=0 时能清除上次残留的值。
     {
         auto playerConfig = handle->core->get_config();
-        playerConfig.start_time = (start_position > 0.0) ? start_position : 0.0;
+        playerConfig.start_time = (data_source->start_position > 0.0) ? data_source->start_position : 0.0;
         handle->core->set_config(playerConfig);
     }
 
     // 转换 C 枚举到 C++ 枚举
     hxcplayer::DataSourceMode cppMode;
-    switch (mode) {
+    switch (data_source->mode) {
         case PLAYER_DATA_SOURCE_MODE_DEFAULT:
             cppMode = hxcplayer::DataSourceMode::Default;
             break;
@@ -238,48 +238,13 @@ int player_core_open_with_mode(PlayerCoreHandle* handle, const char* url, Player
         cppConfig.max_retries = config->max_retries;
         cppConfig.cache_size = config->cache_size;
         cppConfig.avio_buffer_size = config->avio_buffer_size;
-        cppConfig.encrypted_file = (config->encrypted_file != 0);
-        cppConfig.auth_token = config->auth_token;
-        cppConfig.video_id = config->video_id;
-        cppConfig.device_id = config->device_id;
-        cppConfig.app_id = config->app_id;
-        cppConfig.nonce = config->nonce;
-        cppConfig.timestamp_ms = config->timestamp_ms;
-        cppConfig.play_session_id = config->play_session_id;
-        cppConfig.secure_headers = config->secure_headers;
-        cppConfig.session_expire_at_ms = config->session_expire_at_ms;
-        cppConfig.key_mode = config->key_mode;
-        cppConfig.key_material_b64 = config->key_material_b64;
-        cppConfig.key_iv_hex = config->key_iv_hex;
     }
+    // 播放源上的属性
+    cppConfig.encrypted_file = (data_source->encrypted_file != 0);
+    cppConfig.secure_headers = data_source->secure_headers;
     // 否则使用默认配置
     
-    return handle->core->open_with_mode(url, cppMode, cppConfig);
-}
-
-int player_core_open_secure_hls(PlayerCoreHandle* handle, const PlayerSecureHLSConfigC* config) {
-    if (!handle || !handle->core || !config || !config->url) {
-        return -1;
-    }
-    hxcplayer::SecurePlaybackConfig secure_cfg;
-    if (config->auth_token) secure_cfg.token = config->auth_token;
-    if (config->video_id) secure_cfg.video_id = config->video_id;
-    if (config->device_id) secure_cfg.device_id = config->device_id;
-    if (config->app_id) secure_cfg.app_id = config->app_id;
-    if (config->nonce) secure_cfg.nonce = config->nonce;
-    secure_cfg.timestamp_ms = config->timestamp_ms;
-    if (config->play_session_id) secure_cfg.preset_session.play_session_id = config->play_session_id;
-    if (config->secure_headers) secure_cfg.preset_session.request_headers = config->secure_headers;
-    secure_cfg.preset_session.expire_at_ms = config->session_expire_at_ms;
-    secure_cfg.preset_session.inline_key_mode = (config->key_mode == 1);
-    if (config->key_material_b64) secure_cfg.preset_session.key_material_b64 = config->key_material_b64;
-    if (config->key_iv_hex) secure_cfg.preset_session.key_iv_hex = config->key_iv_hex;
-    secure_cfg.preset_session.m3u8_url = config->url;
-
-    auto playerConfig = handle->core->get_config();
-    playerConfig.start_time = (config->start_position > 0.0) ? config->start_position : 0.0;
-    handle->core->set_config(playerConfig);
-    return handle->core->open_secure_hls(config->url, secure_cfg);
+    return handle->core->open_with_mode(data_source->url, cppMode, cppConfig);
 }
 
 void player_core_play(PlayerCoreHandle* handle) {

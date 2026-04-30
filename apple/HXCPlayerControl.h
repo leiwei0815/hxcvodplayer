@@ -42,11 +42,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// 视频模型
 @interface HXCPlayerVideo: NSObject
 /// 视频id
-@property (nonatomic, assign) int videoId;
+@property (nonatomic, copy) NSString *videoId;
 /// 签名
 @property (nonatomic, copy) NSString *sign;
-/// appid
-@property (nonatomic, assign) int appId;
+/// 业务密钥 ID（字符串）
+@property (nonatomic, copy) NSString *secretId;
+/// 时间戳
+@property (nonatomic, copy) NSString *timestamp;
 
 @end
 
@@ -55,7 +57,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy) NSString *url;
 @property (nonatomic, assign) HXCPlayerDataSourceMode mode;
 @property (nonatomic, assign) BOOL encryptedFile;
-/// 通过fileid+appid+sign播放
+/// 通过 videoId + sign + secretId 播放
 @property (nonatomic, strong, nullable) HXCPlayerVideo *video;
 
 + (instancetype)modelWithURL:(NSString *)url

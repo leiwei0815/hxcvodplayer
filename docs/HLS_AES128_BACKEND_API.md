@@ -4,7 +4,7 @@
 
 用于支撑以下播放链路：
 
-- 业务入参：`appID + fileId + sign`
+- 业务入参：`secretId + fileId + sign`
 - SDK 先调用播放鉴权接口拿到 `m3u8_url`、`play_session_id`、`expire_at`
 - FFmpeg 拉取 m3u8 后，读取 `EXT-X-KEY` 的 `URI` 请求密钥
 - 密钥接口通过请求头鉴权，返回 16 字节二进制 key
@@ -18,13 +18,13 @@
 
 - 方法：`POST`
 - 路径示例：`/api/v1/play/auth`
-- 说明：校验 `appID/fileId/sign` 后返回播放会话
+- 说明：校验 `secretId/fileId/sign` 后返回播放会话
 
 ### 2.2 请求体
 
 ```json
 {
-  "app_id": "10001",
+  "secret_id": "sk_10001",
   "file_id": "f_20260427_abc123",
   "sign": "xxxxxxxxxxxxxxxx",
   "device_id": "ios_4f3b2c1d",
@@ -104,7 +104,7 @@ m3u8 必须包含如下 key 声明：
 
 兼容方式：
 
-- `X-App-Id`
+- `X-Secret-Id`
 - `X-File-Id`
 - `X-Sign`
 - `X-Expire-At`
@@ -140,7 +140,7 @@ m3u8 必须包含如下 key 声明：
 
 - 全链路 HTTPS
 - 会话 TTL 建议 2~5 分钟
-- 会话绑定 `file_id + device_id + app_id`
+- 会话绑定 `file_id + device_id + secret_id`
 - 增加 nonce/timestamp 防重放
 - key 接口限频
 - 日志脱敏，不落 key/sign 明文

@@ -127,7 +127,7 @@ typedef struct {
     const char* auth_token;
     const char* video_id;
     const char* device_id;
-    const char* app_id;
+    const char* secret_id;
     const char* nonce;
     const char* play_session_id;
     const char* secure_headers;

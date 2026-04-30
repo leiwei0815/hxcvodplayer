@@ -227,9 +227,14 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
     config.max_retries = max_retries;
     config.cache_size = 2 * 1024 * 1024;  // 2MB
     config.avio_buffer_size = 64 * 1024;  // 64KB
-    config.encrypted_file = encrypted_file ? 1 : 0;
+    PlayerDataSourceC source{};
+    source.url = url;
+    source.start_position = 0.0;
+    source.mode = PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP;
+    source.encrypted_file = encrypted_file ? 1 : 0;
+    source.secure_headers = nullptr;
 
-    int result = player_core_open_with_mode(player_core_, url, PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP, &config, 0.0);
+    int result = player_core_open_with_mode(player_core_, &source, &config);
 
     if (result == 0) {
         LOGI("Custom HTTP opened successfully");
@@ -269,9 +274,14 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
     config.max_retries = 3;
     config.cache_size = 2 * 1024 * 1024;
     config.avio_buffer_size = avio_buffer_size;
-    config.encrypted_file = encrypted_file ? 1 : 0;
+    PlayerDataSourceC source{};
+    source.url = path;
+    source.start_position = 0.0;
+    source.mode = PLAYER_DATA_SOURCE_MODE_CUSTOM_FILE;
+    source.encrypted_file = encrypted_file ? 1 : 0;
+    source.secure_headers = nullptr;
 
-    int result = player_core_open_with_mode(player_core_, path, PLAYER_DATA_SOURCE_MODE_CUSTOM_FILE, &config, 0.0);
+    int result = player_core_open_with_mode(player_core_, &source, &config);
 
     if (result == 0) {
         LOGI("Custom file opened successfully");
@@ -294,18 +304,28 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
     }
 }
 
-bool AndroidPlayer::openWithSecureHLS(const char* url,
-                                      const char* auth_token,
-                                      const char* video_id,
-                                      const char* device_id,
-                                      const char* app_id,
-                                      const char* nonce,
-                                      const char* play_session_id,
-                                      const char* secure_headers,
-                                      int64_t session_expire_at_ms,
-                                      int key_mode,
-                                      const char* key_material_b64,
-                                      const char* key_iv_hex) {
+bool AndroidPlayer::openWithSecureSession(const char* url,
+                                          const char* auth_token,
+                                          const char* video_id,
+                                          const char* device_id,
+                                          const char* secret_id,
+                                          const char* nonce,
+                                          const char* play_session_id,
+                                          const char* secure_headers,
+                                          int64_t session_expire_at_ms,
+                                          int key_mode,
+                                          const char* key_material_b64,
+                                          const char* key_iv_hex) {
+    (void)auth_token;
+    (void)video_id;
+    (void)device_id;
+    (void)secret_id;
+    (void)nonce;
+    (void)play_session_id;
+    (void)session_expire_at_ms;
+    (void)key_mode;
+    (void)key_material_b64;
+    (void)key_iv_hex;
     if (!player_core_) {
         LOGE("Player core not initialized");
         return false;
@@ -314,23 +334,15 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
 
-    PlayerSecureHLSConfigC config{};
-    config.url = url;
-    config.auth_token = auth_token;
-    config.video_id = video_id;
-    config.device_id = device_id;
-    config.app_id = app_id;
-    config.nonce = nonce;
-    config.timestamp_ms = 0;
-    config.play_session_id = play_session_id;
-    config.secure_headers = secure_headers;
-    config.session_expire_at_ms = session_expire_at_ms;
-    config.key_mode = key_mode;
-    config.key_material_b64 = key_material_b64;
-    config.key_iv_hex = key_iv_hex;
-    config.start_position = 0.0;
+    PlayerDataSourceConfigC config{};
+    PlayerDataSourceC source{};
+    source.url = url;
+    source.start_position = 0.0;
+    source.mode = PLAYER_DATA_SOURCE_MODE_SECURE_HLS;
+    source.encrypted_file = 0;
+    source.secure_headers = secure_headers;
 
-    int result = player_core_open_secure_hls(player_core_, &config);
+    int result = player_core_open_with_mode(player_core_, &source, &config);
     if (result == 0) {
         int sample_rate = player_core_get_audio_sample_rate(player_core_);
         int channels = player_core_get_audio_channels(player_core_);
@@ -344,6 +356,33 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
     }
     LOGE("Failed to open secure hls: %d", result);
     return false;
+}
+
+bool AndroidPlayer::openWithSecureHLS(const char* url,
+                                      const char* auth_token,
+                                      const char* video_id,
+                                      const char* device_id,
+                                      const char* secret_id,
+                                      const char* nonce,
+                                      const char* play_session_id,
+                                      const char* secure_headers,
+                                      int64_t session_expire_at_ms,
+                                      int key_mode,
+                                      const char* key_material_b64,
+                                      const char* key_iv_hex) {
+    // 兼容旧命名入口，统一收敛到 SecureSession。
+    return openWithSecureSession(url,
+                                 auth_token,
+                                 video_id,
+                                 device_id,
+                                 secret_id,
+                                 nonce,
+                                 play_session_id,
+                                 secure_headers,
+                                 session_expire_at_ms,
+                                 key_mode,
+                                 key_material_b64,
+                                 key_iv_hex);
 }
 
 void AndroidPlayer::play() {
