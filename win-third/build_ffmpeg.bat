@@ -175,7 +175,7 @@ echo 安装目录: %INSTALL_MSYS%
 echo.
 
 REM 执行配置（直接在 MSYS2 bash 中运行）
-"%MSYS2_BASH%" -lc "cd '%BUILD_MSYS%' && '%SOURCE_MSYS%/configure' --prefix='%INSTALL_MSYS%' --enable-shared --disable-static --disable-doc --disable-ffplay --disable-ffprobe --disable-ffmpeg --enable-avcodec --enable-avformat --enable-avutil --enable-swscale --enable-swresample --enable-network --enable-protocol=file --enable-protocol=http --enable-protocol=https --enable-protocol=tcp --enable-protocol=udp --enable-decoder=h264,hevc,aac,mp3 --enable-parser=h264,hevc --enable-demuxer=mov,mpegts,flv,hls --enable-small --disable-debug --arch=x86_64"
+"%MSYS2_BASH%" -lc "cd '%BUILD_MSYS%' && '%SOURCE_MSYS%/configure' --prefix='%INSTALL_MSYS%' --enable-shared --disable-static --disable-doc --disable-ffplay --disable-ffprobe --disable-ffmpeg --enable-avcodec --enable-avformat --enable-avutil --enable-swscale --enable-swresample --enable-network --enable-protocol=file --enable-protocol=http --enable-protocol=https --enable-protocol=crypto --enable-protocol=tcp --enable-protocol=udp --enable-decoder=h264,hevc,aac,mp3 --enable-parser=h264,hevc --enable-demuxer=mov,mpegts,flv,hls --enable-small --disable-debug --arch=x86_64"
 
 if %ERRORLEVEL% neq 0 (
     echo.

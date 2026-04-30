@@ -98,6 +98,34 @@ static bool hxc_is_network_like_url(const char* url) {
            (u.rfind("tcp://", 0) == 0);
 }
 
+static bool hxc_is_loopback_http_url(const char* url) {
+    if (!url || !*url) {
+        return false;
+    }
+    std::string u(url);
+    for (char& c : u) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return (u.rfind("http://127.0.0.1", 0) == 0) ||
+           (u.rfind("http://localhost", 0) == 0);
+}
+
+static bool hxc_ffmpeg_has_input_protocol(const char* protocol_name) {
+    if (!protocol_name || !*protocol_name) {
+        return false;
+    }
+    void* opaque = nullptr;
+    const char* name = nullptr;
+    while ((name = avio_enum_protocols(&opaque, 0)) != nullptr) {
+        if (std::strcmp(name, protocol_name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static std::string hxc_av_err_to_string(int err) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(err, errbuf, sizeof(errbuf));
@@ -303,6 +331,13 @@ int PlayerCore::open(const std::string& filename) {
     LOG_INFO("开始打开文件");
     LOG_INFO("========================================");
     LOG_INFO("URL: ", filename);
+    if (filename.find(".m3u8") != std::string::npos) {
+        const bool has_crypto = hxc_ffmpeg_has_input_protocol("crypto");
+        LOG_INFO("FFmpeg 协议检查: crypto=", has_crypto ? "enabled" : "disabled");
+        if (!has_crypto) {
+            LOG_WARNING("当前 FFmpeg 未启用 crypto 协议；AES-128 HLS 可能无法打开分片（Failed to open segment）");
+        }
+    }
     LOG_INFO("当前状态: ", (int)current_state);
     LOG_INFO("配置信息:");
     LOG_INFO("  - 启用音频: ", config_.enable_audio ? "是" : "否");
@@ -330,6 +365,7 @@ int PlayerCore::open(const std::string& filename) {
     set_play_when_ready_internal(true);
     first_video_frame_ready_.store(false, std::memory_order_release);
     first_audio_frame_ready_.store(false, std::memory_order_release);
+    io_watchdog_disabled_.store(hxc_is_loopback_http_url(filename.c_str()), std::memory_order_release);
     // 打开输入文件
     format_ctx_ = avformat_alloc_context();
     // 🔧 设置中断回调（防止网络卡住导致无限等待）
@@ -338,6 +374,10 @@ int PlayerCore::open(const std::string& filename) {
         // 如果用户请求中止，返回 1
         if (player->abort_request_.load()) {
             return 1;
+        }
+        // 对 loopback HTTP 禁用 watchdog，避免分片切换时被误中断。
+        if (player->io_watchdog_disabled_.load(std::memory_order_acquire)) {
+            return 0;
         }
         int64_t last_packet_us = player->io_last_packet_us_.load(std::memory_order_acquire);
         if (last_packet_us > 0) {
@@ -353,20 +393,31 @@ int PlayerCore::open(const std::string& filename) {
     // 🔧 设置网络超时和重试参数（对于网络流很重要）
     AVDictionary* options = nullptr;
     
+    const bool loopback_http = io_watchdog_disabled_.load(std::memory_order_acquire);
+    if (loopback_http) {
+        LOG_INFO("检测到 loopback HTTP 源，使用兼容参数（贴近 ffplay 默认行为）");
+    }
+
     // 设置超时时间（微秒）
 #if defined(__ANDROID__)
     // Android 移动网络抖动明显，适当降低默认等待时间，避免单次卡住过久。
-    av_dict_set(&options, "timeout", "8000000", 0);      // 8 秒
-    av_dict_set(&options, "stimeout", "3000000", 0);     // 3 秒
+    if (!loopback_http) {
+        av_dict_set(&options, "timeout", "8000000", 0);      // 8 秒
+        av_dict_set(&options, "stimeout", "3000000", 0);     // 3 秒
+    }
 #else
-    av_dict_set(&options, "timeout", "15000000", 0);     // 15 秒
-    av_dict_set(&options, "stimeout", "5000000", 0);     // 5 秒
+    if (!loopback_http) {
+        av_dict_set(&options, "timeout", "15000000", 0);     // 15 秒
+        av_dict_set(&options, "stimeout", "5000000", 0);     // 5 秒
+    }
 #endif
     
     // 设置重连次数
-    av_dict_set(&options, "reconnect", "1", 0);
-    av_dict_set(&options, "reconnect_streamed", "1", 0);
-    av_dict_set(&options, "reconnect_delay_max", "5", 0);
+    if (!loopback_http) {
+        av_dict_set(&options, "reconnect", "1", 0);
+        av_dict_set(&options, "reconnect_streamed", "1", 0);
+        av_dict_set(&options, "reconnect_delay_max", "5", 0);
+    }
     
     // 设置 User-Agent（根据平台自适应）
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -487,6 +538,9 @@ int PlayerCore::open(const std::string& filename) {
                 PlayerCore* player = static_cast<PlayerCore*>(ctx);
                 if (player->abort_request_.load()) {
                     return 1;
+                }
+                if (player->io_watchdog_disabled_.load(std::memory_order_acquire)) {
+                    return 0;
                 }
                 int64_t last_packet_us = player->io_last_packet_us_.load(std::memory_order_acquire);
                 if (last_packet_us > 0) {
@@ -739,6 +793,7 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     set_play_when_ready_internal(true);
     first_video_frame_ready_.store(false, std::memory_order_release);
     first_audio_frame_ready_.store(false, std::memory_order_release);
+    io_watchdog_disabled_.store(false, std::memory_order_release);
     
     // 分配 AVFormatContext
     format_ctx_ = avformat_alloc_context();
@@ -1266,6 +1321,7 @@ void PlayerCore::close() {
     set_io_loading(false);
     set_starvation_loading(false);
     io_last_packet_us_.store(0, std::memory_order_release);
+    io_watchdog_disabled_.store(false, std::memory_order_release);
     set_play_when_ready_internal(false);
     first_video_frame_ready_.store(false, std::memory_order_release);
     first_audio_frame_ready_.store(false, std::memory_order_release);
@@ -1909,6 +1965,13 @@ int PlayerCore::stream_component_open(int stream_index) {
         
     } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
         audio_codec_ctx_ = codec_ctx;
+        // HLS 场景下 codecpar 早期可能为 0，打开解码器后以 codec_ctx 为准回填音频信息。
+        if (audio_codec_ctx_->sample_rate > 0) {
+            media_info_.audio_sample_rate = audio_codec_ctx_->sample_rate;
+        }
+        if (audio_codec_ctx_->ch_layout.nb_channels > 0) {
+            media_info_.audio_channels = audio_codec_ctx_->ch_layout.nb_channels;
+        }
         
         // ⚠️ 先创建解码器，再启动音频设备！
         audio_decoder_ = std::make_unique<AudioDecoder>();
@@ -2811,13 +2874,12 @@ void PlayerCore::update_audio_pts(double pts, int serial) {
 }
 
 bool PlayerCore::has_first_renderable_frame_ready() const {
-    if (video_stream_opened_) {
-        return first_video_frame_ready_.load(std::memory_order_acquire);
-    }
-    if (audio_stream_opened_) {
-        return first_audio_frame_ready_.load(std::memory_order_acquire);
-    }
-    return false;
+    const bool video_ready = video_stream_opened_ &&
+                             first_video_frame_ready_.load(std::memory_order_acquire);
+    const bool audio_ready = audio_stream_opened_ &&
+                             first_audio_frame_ready_.load(std::memory_order_acquire);
+    // 只要有任一可渲染流首帧就绪即可进入 Ready，避免 HLS 视频首帧晚到导致状态长期停在 Opening/Buffering。
+    return video_ready || audio_ready;
 }
 
 bool PlayerCore::is_playing() const {
