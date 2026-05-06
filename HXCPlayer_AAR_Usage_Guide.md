@@ -20,10 +20,10 @@ HXCPlayer 是一个基于 FFmpeg 和 SoundTouch 的高性能 Android 视频播�
 
 | 类别 | 说明 |
 |------|------|
-| 打开 | `openURL(url)` / `openURL(url, startPosition)`、`openWithPlayModel(model)` |
+| 打开 | `openURL(url)` / `openURL(url, startPosition)`、`openWithPlayModel(model)`、`playURL(url)`、`playWithModel(model)` |
 | 渲染 | 构造可选 `VideoRenderViewType`：`SURFACE_VIEW`（默认）或 `TEXTURE_VIEW`；布局使用 `renderView`（与 `videoView` 同一实例） |
-| 控制 | `play()`、`pause()`、`stop()`、`seekTo(position)` |
-| 属性 | `setPlaybackRate`、`setVolume`、`setAspectRatioMode`、`getDuration`、`getPosition`、`getState` |
+| 控制 | `play()`、`pause()`、`resume()`、`stop()`、`replay()`、`seekTo(position)`、`seekToPosition(position)` |
+| 属性 | `autoPlayer`、`startPosition`、`setPlaybackRate`、`setVolume`、`setAspectRatioMode`、`getDuration`、`getPosition`、`getState` |
 | 回调 | `PlayerCallback`：`onPlayerStateChanged`、`onPlayerPositionUpdated`、`onPlayerError(errorCode, errorMessage)` |
 | License | `checkLicense(licenseKey, licenseUrl)`、`resetLicenseState()`（播放前必须通过校验） |
 | 日志 | 伴生对象：`enableFileLogging`、`disableFileLogging`、`setLogLevel`、`getLogLevel`、`setLogRetentionDays`、`getLogDirectory`、`getCurrentLogFile` |
@@ -200,6 +200,11 @@ player.openURL(url)
 
 // 从指定位置开始播放（秒）
 player.openURL(url, startPosition = 30.0)  // 从第 30 秒开始
+
+// 与 iOS 对齐：通过属性控制起播行为（不传 startPosition 参数）
+player.startPosition = 30.0
+player.autoPlayer = true
+player.playURL(url)
 ```
 
 ### 使用播放模型打开（推荐）
@@ -228,6 +233,10 @@ val fileModel = HXCPlayerControl.PlayerDataSourcePlayModel.modelWithURL(
     encryptedFile = false
 )
 player.openWithPlayModel(fileModel)
+
+// 与 iOS 对齐：按 autoPlayer 策略打开并自动 play/pause
+player.autoPlayer = false
+player.playWithModel(fileModel) // 仅打开并暂停
 ```
 
 说明：**HLS（`.m3u8`）** 需要拉取清单与多个分片，与「单路自定义 IO」模型不完全一致；若核心层对 `CUSTOM_HTTP + m3u8` 做了自动降级，行为与默认模式一致。

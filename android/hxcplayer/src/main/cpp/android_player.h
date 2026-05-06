@@ -109,6 +109,7 @@ private:
     // Surface 相关
     ANativeWindow* native_window_;
     std::mutex window_mutex_;
+    std::mutex sws_mutex_;   // 保护 sws_ctx_ / rgb_buffer_ / last_video/target_width/height
     int surface_width_;
     int surface_height_;
     int aspect_ratio_mode_; // 0=FIT, 1=FILL
@@ -149,6 +150,7 @@ private:
     
     bool initAudioOutput(int sample_rate, int channels);
     void destroyAudioOutput();
+    void ensureAudioOutputForCurrentStream();
     static void audioCallback(SLAndroidSimpleBufferQueueItf bq, void* context);
     void onAudioData(SLAndroidSimpleBufferQueueItf bq);
     

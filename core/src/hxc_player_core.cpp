@@ -358,8 +358,21 @@ int PlayerCore::open(const std::string& filename) {
     abort_request_ = false;
     decode_finished_ = false;  // ⚠️ 重置解码结束标志
     video_hw_decode_active_.store(false, std::memory_order_release);
-    playback_completed_notified_ = false;  // ⚠️ 重置播放完成通知标志
+    playback_completed_notified_.store(false, std::memory_order_release);  // ⚠️ 重置播放完成通知标志
     io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
+
+    // ⚠️ 重置 seek 状态（close() 强杀线程时 seeking_ 可能残留 true，
+    // 导致新会话的所有帧被误判为"seek 前的旧帧"而丢弃，播放从原 seek 目标位置开始而非 0）。
+    seeking_.store(false, std::memory_order_release);
+    seek_target_pos_.store(0.0, std::memory_order_release);
+    seek_request_ = false;
+    seek_pos_ = 0.0;
+
+    // ⚠️ 重置时钟：close() 不会清时钟，若不重置则 getPosition() 在新会话建流初期
+    // 仍返回上一会话的旧值，可能误触发 near_end_stalled（尤其新片时长短于旧片时）。
+    audio_clock_.set_clock(0.0, 0);
+    video_clock_.set_clock(0.0, 0);
+    external_clock_.set_clock(0.0, 0);
 
     set_state(PlayerState::Opening);
     set_play_when_ready_internal(true);
@@ -783,7 +796,7 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     // 重置标志
     abort_request_ = false;
     decode_finished_ = false;
-    playback_completed_notified_ = false;
+    playback_completed_notified_.store(false, std::memory_order_release);
     io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
     
     // 保存自定义 IO
@@ -1208,9 +1221,16 @@ int PlayerCore::open_common_process(const std::string &filename) {
     refresh_effective_playing_state();
     
     // ⚠️ 启动播放进度回调定时器线程
-    if (position_changed_callback_) {
-        progress_timer_thread_ = std::thread(&PlayerCore::progress_timer_thread, this);
-        LOG_INFO("播放进度回调定时器线程已启动");
+    {
+        PositionChangedCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            cb = position_changed_callback_;
+        }
+        if (cb) {
+            progress_timer_thread_ = std::thread(&PlayerCore::progress_timer_thread, this);
+            LOG_INFO("播放进度回调定时器线程已启动");
+        }
     }
 
     auto common_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1506,7 +1526,7 @@ void PlayerCore::read_thread() {
                 
                 // ⚠️ 清除播放完成标志，允许重新播放
                 decode_finished_.store(false, std::memory_order_release);
-                playback_completed_notified_ = false;
+                playback_completed_notified_.store(false, std::memory_order_release);
                 LOG_INFO("清除解码结束标志和播放完成通知标志");
                 
                 // ⚠️ 1. 清空数据包队列
@@ -1577,8 +1597,13 @@ void PlayerCore::read_thread() {
 #endif
                 
                 // ⚠️ 6. 【关键修复】立即触发一次进度回调，通知 UI 新位置
-                if (position_changed_callback_) {
-                    position_changed_callback_(target_pos);
+                PositionChangedCallback cb;
+                {
+                    std::lock_guard<std::mutex> lock(callback_mutex_);
+                    cb = position_changed_callback_;
+                }
+                if (cb) {
+                    cb(target_pos);
                     LOG_INFO("立即触发进度回调: ", target_pos);
                 }
                 
@@ -2425,8 +2450,15 @@ void PlayerCore::audio_thread() {
         // 这里的 pts 是解码位置，不是播放位置
         
         // ⚠️ 触发缓冲进度回调（报告音频解码位置）
-        if (!isnan(pts) && buffer_progress_callback_ && frame_count % 10 == 0) {
-            buffer_progress_callback_(pts);
+        if (!isnan(pts) && frame_count % 10 == 0) {
+            BufferProgressCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(callback_mutex_);
+                cb = buffer_progress_callback_;
+            }
+            if (cb) {
+                cb(pts);
+            }
         }
         
         // 获取可写帧
@@ -2495,9 +2527,14 @@ void PlayerCore::progress_timer_thread() {
             // 只在播放进度有效时触发回调
             if (!isnan(current_position) && current_position >= 0.0) {
                 // 播放完成后停止进度回调，避免 UI 收到超出时长的位置值
-                if (!playback_completed_notified_) {
-                    if (position_changed_callback_) {
-                        position_changed_callback_(current_position);
+                if (!playback_completed_notified_.load(std::memory_order_acquire)) {
+                    PositionChangedCallback cb;
+                    {
+                        std::lock_guard<std::mutex> lock(callback_mutex_);
+                        cb = position_changed_callback_;
+                    }
+                    if (cb) {
+                        cb(current_position);
                     }
                 }
                 
@@ -2529,7 +2566,7 @@ void PlayerCore::progress_timer_thread() {
                 // ⚠️ 【关键修复】判断播放完成的多个条件：
                 // 条件1：解码已结束 + 播放位置接近时长
                 // 条件2：播放中 + 位置连续 3 次（600ms）不变 + 位置接近时长
-                if (!playback_completed_notified_) {
+                if (!playback_completed_notified_.load(std::memory_order_acquire)) {
                     double duration = get_duration();
                     bool near_end = duration > 0 && (duration - current_position) < 1.0;  // 最后 1 秒内
                     
@@ -2539,15 +2576,20 @@ void PlayerCore::progress_timer_thread() {
                                      near_end;
                     
                     if (condition1 || condition2) {
-                        playback_completed_notified_ = true;  // 避免重复通知
+                        playback_completed_notified_.store(true, std::memory_order_release);  // 避免重复通知
                         set_pipeline_state(PipelineState::Ended);
                         refresh_effective_playing_state();
                         LOG_INFO("检测到播放完成: 当前位置=", current_position, 
                                 ", 时长=", duration, 
                                 ", decode_finished=", decode_finished_.load(),
                                 ", position_unchanged_count=", position_unchanged_count);
-                        if (playback_completed_callback_) {
-                            playback_completed_callback_();
+                        PlaybackCompletedCallback cb;
+                        {
+                            std::lock_guard<std::mutex> lock(callback_mutex_);
+                            cb = playback_completed_callback_;
+                        }
+                        if (cb) {
+                            cb();
                         }
                     }
                 }
@@ -2891,8 +2933,13 @@ void PlayerCore::set_state(PlayerState state) {
     PlayerState old_state = state_.load(std::memory_order_acquire);
     if (old_state != state) {
         state_.store(state, std::memory_order_release);
-        if (state_changed_callback_) {
-            state_changed_callback_(state);
+        StateChangedCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            cb = state_changed_callback_;
+        }
+        if (cb) {
+            cb(state);
         }
     }
     if (state == PlayerState::Opening) {
@@ -2910,8 +2957,13 @@ void PlayerCore::set_pipeline_state(PipelineState state) {
     PipelineState old_state = pipeline_state_.load(std::memory_order_acquire);
     if (old_state != state) {
         pipeline_state_.store(state, std::memory_order_release);
-        if (pipeline_state_changed_callback_) {
-            pipeline_state_changed_callback_(state);
+        PipelineStateChangedCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            cb = pipeline_state_changed_callback_;
+        }
+        if (cb) {
+            cb(state);
         }
     }
     refresh_effective_playing_state();
@@ -2927,8 +2979,15 @@ void PlayerCore::set_play_when_ready_internal(bool play_when_ready) {
 void PlayerCore::refresh_effective_playing_state() {
     const bool playing_now = is_playing();
     const bool old_playing = effective_is_playing_.exchange(playing_now, std::memory_order_acq_rel);
-    if (old_playing != playing_now && playing_changed_callback_) {
-        playing_changed_callback_(playing_now);
+    if (old_playing != playing_now) {
+        PlayingChangedCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            cb = playing_changed_callback_;
+        }
+        if (cb) {
+            cb(playing_now);
+        }
     }
 
     PlayerState st = get_state();
@@ -3000,14 +3059,26 @@ void PlayerCore::refresh_loading_state() {
         starvation_loading_.load(std::memory_order_acquire);
     const bool prev = loading_notified_.exchange(merged_loading, std::memory_order_acq_rel);
     update_pipeline_state_from_runtime();
-    if (prev != merged_loading && loading_callback_) {
-        loading_callback_(merged_loading);
+    if (prev != merged_loading) {
+        LoadingCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            cb = loading_callback_;
+        }
+        if (cb) {
+            cb(merged_loading);
+        }
     }
 }
 
 void PlayerCore::emit_error(int error_code, const std::string& error_msg) {
-    if (error_callback_) {
-        error_callback_(error_code, error_msg);
+    ErrorCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        cb = error_callback_;
+    }
+    if (cb) {
+        cb(error_code, error_msg);
     }
 }
 
