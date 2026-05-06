@@ -1,0 +1,277 @@
+name: Build Android SDK
+
+on:
+  push:
+    branches: [ main, master, develop ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '编译类型'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+          - all
+      skip_third_party_cache:
+        description: '跳过第三方库缓存（强制重新编译）'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  NDK_VERSION: '26.3.11579264'
+  ANDROID_API_LEVEL: '24'
+
+jobs:
+  # ============================================================
+  # Job 1: 编译第三方库（mbedTLS、curl、FFmpeg、SoundTouch）
+  # ============================================================
+  build-third-party:
+    name: Build Third-Party Libraries
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      # 缓存第三方库（核心优化：避免每次重新编译耗时几十分钟）
+      - name: 缓存 android-third 编译产物
+        id: cache-third-party
+        uses: actions/cache@v4
+        with:
+          path: android-third
+          key: android-third-${{ env.NDK_VERSION }}-${{ hashFiles('android-third/build_*.sh') }}
+          restore-keys: |
+            android-third-${{ env.NDK_VERSION }}-
+
+      - name: 安装 Android NDK
+        if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '11076708'
+          packages: 'ndk;${{ env.NDK_VERSION }}'
+
+      - name: 设置 NDK 环境变量
+        if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
+        run: |
+          NDK_PATH="$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}"
+          echo "ANDROID_NDK=$NDK_PATH" >> $GITHUB_ENV
+          echo "NDK_PATH=$NDK_PATH" >> $GITHUB_ENV
+          echo "NDK 路径: $NDK_PATH"
+          ls "$NDK_PATH"
+
+      - name: 安装编译依赖
+        if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            yasm \
+            nasm \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool \
+            git \
+            curl \
+            wget \
+            unzip \
+            perl
+
+      - name: 修复编译脚本（darwin→linux 工具链路径）
+        if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
+        working-directory: android-third
+        run: |
+          # 将脚本中 darwin-x86_64 替换为 linux-x86_64（macOS NDK 路径 → Linux）
+          for f in build_ffmpeg_android.sh build_mbedtls_android.sh build_curl_android.sh build_soundtouch_android.sh; do
+            if [ -f "$f" ]; then
+              sed -i 's/darwin-x86_64/linux-x86_64/g' "$f"
+              echo "✅ 已修复: $f"
+            fi
+          done
+
+      - name: 编译 mbedTLS
+        if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
+        working-directory: android-third
+        run: bash build_mbedtls_android.sh
+
+      - name: 编译 curl
+        if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
+        working-directory: android-third
+        run: bash build_curl_android.sh
+
+      - name: 编译 FFmpeg
+        if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
+        working-directory: android-third
+        run: bash build_ffmpeg_android.sh
+
+      - name: 编译 SoundTouch
+        if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
+        working-directory: android-third
+        run: bash build_soundtouch_android.sh
+
+      - name: 验证第三方库输出
+        working-directory: android-third
+        run: |
+          echo "=== 第三方库编译结果 ==="
+          for lib in ffmpeg-build-android/FFmpeg-Android mbedtls-build-android/mbedTLS-Android curl-build-android/curl-Android soundtouch-build-android/SoundTouch-Android; do
+            if [ -d "$lib" ]; then
+              echo "✅ $lib"
+              find "$lib" -name "*.so" -o -name "*.a" | head -20
+            else
+              echo "❌ 缺失: $lib"
+              exit 1
+            fi
+          done
+
+      # 上传第三方库产物，供下一个 Job 使用
+      - name: 上传第三方库产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-third-libs
+          path: android-third
+          retention-days: 7
+
+  # ============================================================
+  # Job 2: 编译 AAR
+  # ============================================================
+  build-aar:
+    name: Build Android AAR
+    runs-on: ubuntu-22.04
+    needs: build-third-party
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: 安装 Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '11076708'
+          packages: |
+            ndk;${{ env.NDK_VERSION }}
+            cmake;3.22.1
+
+      - name: 设置 NDK 环境变量
+        run: |
+          NDK_PATH="$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}"
+          echo "ANDROID_NDK=$NDK_PATH" >> $GITHUB_ENV
+          echo "NDK_PATH=$NDK_PATH" >> $GITHUB_ENV
+
+      # 下载第三方库产物
+      - name: 下载第三方库产物
+        uses: actions/download-artifact@v4
+        with:
+          name: android-third-libs
+          path: android-third
+
+      - name: 验证第三方库
+        run: |
+          echo "=== 检查第三方库 ==="
+          find android-third -name "*.so" | head -30
+          find android-third -name "*.a" | head -10
+
+      - name: 设置 Gradle 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('android/library/build.gradle', 'android/hxcplayer/build.gradle') }}
+          restore-keys: |
+            gradle-
+
+      - name: 赋予 gradlew 执行权限
+        working-directory: android/library
+        run: chmod +x gradlew
+
+      - name: 复制第三方库到 jniLibs
+        working-directory: android/library
+        run: bash build_aar.sh --copy-libs || true
+
+      - name: 编译 AAR（Release）
+        if: ${{ inputs.build_type != 'debug' }}
+        working-directory: android/library
+        run: |
+          ./gradlew :hxcplayer:assembleRelease \
+            -PANDROID_NDK_HOME=${{ env.NDK_PATH }} \
+            --no-daemon \
+            --stacktrace
+
+      - name: 编译 AAR（Debug）
+        if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'all' }}
+        working-directory: android/library
+        run: |
+          ./gradlew :hxcplayer:assembleDebug \
+            -PANDROID_NDK_HOME=${{ env.NDK_PATH }} \
+            --no-daemon \
+            --stacktrace
+
+      - name: 查看 AAR 输出
+        run: |
+          echo "=== AAR 输出文件 ==="
+          find android -name "*.aar" -exec ls -lh {} \;
+          echo ""
+          echo "=== AAR 内容（.so 文件）==="
+          find android -name "*.aar" | while read aar; do
+            echo "--- $aar ---"
+            unzip -l "$aar" | grep "\.so$" || true
+          done
+
+      - name: 上传 AAR（Release）
+        uses: actions/upload-artifact@v4
+        with:
+          name: hxcplayer-release-aar
+          path: android/hxcplayer/build/outputs/aar/hxcplayer-release.aar
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 上传 AAR（Debug）
+        if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'all' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hxcplayer-debug-aar
+          path: android/hxcplayer/build/outputs/aar/hxcplayer-debug.aar
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ============================================================
+  # Job 3: 发布到 GitHub Release（仅在打 tag 时）
+  # ============================================================
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-22.04
+    needs: build-aar
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: 下载 Release AAR
+        uses: actions/download-artifact@v4
+        with:
+          name: hxcplayer-release-aar
+          path: release-artifacts
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*.aar
+          generate_release_notes: true
+          name: HXCPlayer Android SDK ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
