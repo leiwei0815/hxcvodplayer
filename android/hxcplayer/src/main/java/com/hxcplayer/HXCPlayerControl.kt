@@ -515,7 +515,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             "P-HX-FileId: ${video.videoId}\r\n" +
             "P-HX-Timestamp: $timestamp\r\n" +
             "P-HX-Sign: ${video.sign}\r\n" +
-            "P-HX-Terminal-Type: android\r\n",
+            "P-HX-Terminal-Type: android\r\n"
     }
 
     private fun resolveRequestTimestamp(video: PlayerVideo): String {
