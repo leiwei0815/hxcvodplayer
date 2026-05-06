@@ -166,13 +166,16 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: 安装 Android SDK & NDK
+      - name: 安装 Android NDK
         uses: android-actions/setup-android@v3
         with:
           cmdline-tools-version: '11076708'
-          packages: |
-            ndk;${{ env.NDK_VERSION }}
-            cmake;3.22.1
+          packages: 'ndk;${{ env.NDK_VERSION }}'
+
+      - name: 安装 CMake
+        run: |
+          sudo apt-get install -y cmake
+          cmake --version
 
       - name: 设置 NDK 环境变量
         run: |
