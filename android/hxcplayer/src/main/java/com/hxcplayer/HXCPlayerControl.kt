@@ -371,6 +371,130 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
     }
 
+    // ========== iOS 对齐属性（property 风格 setter/getter）==========
+
+    /**
+     * 起始播放位置（秒），对齐 iOS `startPosition` property。
+     * 在 [playURL]/[playWithModel] 之前设置，打开时生效。
+     */
+    private var pendingStartPosition: Double = 0.0
+
+    fun setStartPosition(position: Double) {
+        pendingStartPosition = maxOf(0.0, position)
+    }
+
+    fun getStartPosition(): Double = pendingStartPosition
+
+    /**
+     * 是否在打开成功后自动播放，对齐 iOS `autoPlayer` property，默认 true。
+     * 设置为 false 时 [playURL]/[playWithModel] 打开后保持暂停，需手动调 [play]。
+     */
+    private var autoPlayer: Boolean = true
+
+    fun setAutoPlayer(auto: Boolean) {
+        autoPlayer = auto
+    }
+
+    fun isAutoPlayer(): Boolean = autoPlayer
+
+    // ========== iOS 对齐方法 ==========
+
+    /**
+     * 打开 URL（对齐 iOS `playURL:`）。
+     * 按 [autoPlayer] 决定是否自动播放，使用 [pendingStartPosition] 作为起始位置。
+     */
+    fun playURL(url: String): Boolean {
+        val pos = pendingStartPosition
+        pendingStartPosition = 0.0  // 消费后重置，防止下次意外复用
+        val ok = openURL(url, pos)
+        if (ok && autoPlayer) play()
+        return ok
+    }
+
+    /**
+     * 使用播放模型打开（对齐 iOS `playWithModel:`）。
+     * 按 [autoPlayer] 决定是否自动播放，使用 [pendingStartPosition] 作为起始位置。
+     */
+    fun playWithModel(model: PlayerDataSourcePlayModel): Boolean {
+        val pos = pendingStartPosition
+        pendingStartPosition = 0.0  // 消费后重置
+        val ok = openWithPlayModel(model, pos)
+        if (ok && autoPlayer) play()
+        return ok
+    }
+
+    /**
+     * 跳转到指定位置（秒），对齐 iOS `seekToPosition:`。
+     */
+    fun seekToPosition(position: Double) = seekTo(position)
+
+    /**
+     * 重新播放（对齐 iOS `replay`）。
+     * 从头（position=0）重新打开最后一次的 URL/Model。
+     */
+    fun replay() = replayFrom(0.0)
+
+    /**
+     * 从指定位置重新播放（对齐业务层 `replayFrom(startPositionSec)`）。
+     * 重新打开最后一次的 URL/Model，从 [startPositionSec] 秒开始。
+     */
+    fun replayFrom(startPositionSec: Double) {
+        val safeStart = maxOf(0.0, startPositionSec)
+        val replayModel = lastOpenPlayModel
+        val replayUrl = lastOpenUrl
+        when {
+            replayModel != null -> {
+                openWithPlayModel(replayModel, safeStart)
+                if (autoPlayer) play()
+            }
+            !replayUrl.isNullOrBlank() -> {
+                openURL(replayUrl, safeStart)
+                if (autoPlayer) play()
+            }
+        }
+    }
+
+    /**
+     * [openWithPlayModel] 带起始位置重载（支持 [playWithModel] 传入 startPosition）。
+     */
+    fun openWithPlayModel(model: PlayerDataSourcePlayModel, startPosition: Double): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) {
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开播放模型")
+            return false
+        }
+        if (model.url.isBlank()) {
+            dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+            return false
+        }
+        if (!licenseAllowedOrNotify("openWithPlayModel")) return false
+        lastOpenUrl = model.url
+        lastOpenStartPosition = maxOf(0.0, startPosition)
+        lastOpenPlayModel = clonePlayModel(model)
+        if (!autoReopenInFlight) {
+            autoReopenAttemptCount = 0
+            networkTotalStallMs = 0L
+            networkReconnectCount = 0
+        }
+        applyDecodeModeForHandle(handle)
+        val result = when (model.mode) {
+            PlayerDataSourceMode.DEFAULT ->
+                nativeOpenURLWithStartPosition(handle, model.url, lastOpenStartPosition)
+            PlayerDataSourceMode.CUSTOM_HTTP -> {
+                val cfg = effectiveDataSourceConfig()
+                nativeOpenWithCustomHTTP(handle, model.url, cfg.timeoutMs, cfg.maxRetries, model.encryptedFile)
+            }
+            PlayerDataSourceMode.CUSTOM_FILE -> {
+                val cfg = effectiveDataSourceConfig()
+                nativeOpenWithCustomFile(handle, model.url, cfg.avioBufferSize, model.encryptedFile)
+            }
+        }
+        if (!result) {
+            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "打开失败: mode=${model.mode}, url=${model.url}")
+        }
+        return result
+    }
+
     fun setDecodeMode(mode: DecodeMode) {
         decodeMode = mode
         val handle = currentHandle()
@@ -652,43 +776,8 @@ class HXCPlayerControl @JvmOverloads constructor(
             networkTotalStallMs = 0L
             networkReconnectCount = 0
         }
-        applyDecodeModeForHandle(handle)
-        val result = when (model.mode) {
-            PlayerDataSourceMode.DEFAULT -> {
-                if (model.url.isBlank()) {
-                    dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
-                    false
-                } else {
-                    nativeOpenURL(handle, model.url)
-                }
-            }
-            PlayerDataSourceMode.CUSTOM_HTTP -> {
-                val cfg = effectiveDataSourceConfig()
-                nativeOpenWithCustomHTTP(
-                    handle,
-                    model.url,
-                    cfg.timeoutMs,
-                    cfg.maxRetries,
-                    model.encryptedFile
-                )
-            }
-            PlayerDataSourceMode.CUSTOM_FILE -> {
-                val cfg = effectiveDataSourceConfig()
-                nativeOpenWithCustomFile(
-                    handle,
-                    model.url,
-                    cfg.avioBufferSize,
-                    model.encryptedFile
-                )
-            }
-        }
-        if (!result) {
-            dispatchError(
-                PlayerErrorCode.OPEN_INPUT_FAILED,
-                "打开失败: mode=${model.mode}, url=${model.url}"
-            )
-        }
-        return result
+        // 无 startPosition 的重载委托给带 startPosition 版本（传 0.0 从头开始）
+        return openWithPlayModel(model, 0.0)
     }
 
     // 使用自定义 HTTP 模式打开（支持 Range 下载）
