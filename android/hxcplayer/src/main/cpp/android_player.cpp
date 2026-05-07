@@ -1321,19 +1321,6 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     
     std::lock_guard<std::mutex> lock(audio_mutex_);
 
-    // seek 后跳过早于目标位置的音频帧（输出静音），避免播放到错误位置的音频。
-    // 此判断在 Android 层做，不污染 core 的 player_core_get_audio_data 接口。
-    double seek_target = player_core_get_seek_target(player_core_);
-    if (seek_target > 0.0) {
-        double pos = player_core_get_position(player_core_);
-        if (!std::isnan(pos) && pos < seek_target - 0.3) {
-            // 当前播放位置仍明显早于目标：输出静音，等待时钟追上
-            memset(audio_buffer_, 0, audio_buffer_size_);
-            (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
-            return;
-        }
-    }
-    
     // 循环填充缓冲区，直到填满或没有数据
     int total_bytes_read = 0;
     while (total_bytes_read < audio_buffer_size_) {
@@ -1349,6 +1336,7 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
             break;
         }
     }
+
     
     static int callback_count = 0;
     callback_count++;
