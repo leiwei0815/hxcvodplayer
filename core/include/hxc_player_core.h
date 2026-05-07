@@ -202,6 +202,7 @@ public:
     void update_audio_pts(double pts, int serial);
     double get_seek_target_pos() const { return seek_target_pos_.load(std::memory_order_acquire); }
     const MediaInfo& get_media_info() const { return media_info_; }
+    int get_post_seek_warmup_frames() const { return post_seek_warmup_frames_.load(std::memory_order_acquire); }
     
     // 事件回调
     using StateChangedCallback = std::function<void(PlayerState)>;

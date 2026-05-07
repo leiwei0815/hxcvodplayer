@@ -3,6 +3,7 @@
 #include <android/log.h>
 #include <android/native_window.h>
 #include <cstring>
+#include <cmath>
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -761,7 +762,7 @@ void AndroidPlayer::renderLoop() {
         auto t_get1 = now_ms();
 
         if (result == 0) {
-            // 空帧阶段结束：打印等待耗时（可用于判断解码速度）
+            // 空帧等待阶段结束
             if (in_empty_streak) {
                 int64_t wait_ms = now_ms() - empty_start_ms;
                 LOGI("🎬 [DIAG] 帧等待结束: 空帧轮询耗时 %" PRId64 " ms (empty_count=%d) | 视频尺寸=%dx%d",
@@ -770,51 +771,111 @@ void AndroidPlayer::renderLoop() {
             }
             empty_count = 0;
 
-            frame_count++;
-            auto t_render0 = now_ms();
-            int cost = renderFrame(frame_data.y_data, frame_data.u_data, frame_data.v_data,
-                                   frame_data.y_linesize, frame_data.u_linesize, frame_data.v_linesize,
-                                   frame_data.width, frame_data.height,
-                                   &total_upload_ms, &max_upload_ms);
-            auto t_render1 = now_ms();
-            int64_t render_ms = t_render1 - t_render0;
-            total_render_ms += render_ms;
-            if (render_ms > max_render_ms) max_render_ms = render_ms;
+            // ── A/V sync（对齐 iOS renderVideoFrame 逻辑）────────────────────
+            double currentPTS   = frame_data.pts;
+            double masterClock  = player_core_get_position(player_core_);
+            double delay        = currentPTS - masterClock;
+            int    warmup       = player_core_get_post_seek_warmup(player_core_);
+            bool   should_display = false;
+            bool   should_consume = false;
 
-            if (cost < 0) {
-                LOGW("⚠️ renderFrame failed, reinitializing EGL...");
-                destroyEGL();
-                gl_ready = false;
+            if (std::isnan(currentPTS)) {
+                // PTS 无效：直接显示
+                should_display = true;
+                should_consume = true;
+            } else if (delay < -5.0) {
+                // 时钟严重未同步（seek 后初期）：强制显示，不丢帧
+                LOGI("🔄 [SYNC] 时钟未同步: pts=%.3f clock=%.3f delay=%.3f, 强制显示",
+                     currentPTS, masterClock, delay);
+                should_display = true;
+                should_consume = true;
+            } else if (warmup > 0) {
+                // seek 结束后 warmup 阶段：放宽同步策略，优先连续出图
+                if (delay > 0.5) {
+                    // 视频超前过大：等待音频追上，不消费帧
+                    should_display = false;
+                    should_consume = false;
+                } else if (delay < -0.5) {
+                    // 视频落后过多：跳帧（只消费不显示）
+                    should_display = false;
+                    should_consume = true;
+                } else {
+                    should_display = true;
+                    should_consume = true;
+                }
+            } else {
+                // 正常播放：精确 A/V sync
+                // syncThreshold ≈ max(20ms, min(100ms, frameInterval * 1.5))
+                double frame_interval = 1.0 / 30.0;
+                double sync_threshold = std::min(0.10, std::max(0.02, frame_interval * 1.5));
+                if (delay <= -sync_threshold) {
+                    // 视频落后：跳帧
+                    should_display = false;
+                    should_consume = true;
+                } else if (delay <= sync_threshold) {
+                    // 在同步窗口内：正常显示
+                    should_display = true;
+                    should_consume = true;
+                } else if (delay > 0.35 && delay <= 1.0) {
+                    // 视频轻度超前：强制显示防止长时间无画面
+                    should_display = true;
+                    should_consume = true;
+                }
+                // else: 视频超前 > 1s：等待音频追上，不消费
             }
-            player_core_consume_video_frame(player_core_);
+            // ────────────────────────────────────────────────────────────────
 
-            // 每 diag_interval 帧打一次诊断统计
-            if (frame_count % diag_interval == 0) {
-                LOGI("📊 [DIAG] 最近 %d 帧统计 | "
-                     "avg_render=%" PRId64 "ms max_render=%" PRId64 "ms "
-                     "avg_upload=%" PRId64 "ms max_upload=%" PRId64 "ms "
-                     "get_frame=%" PRId64 "ms",
-                     diag_interval,
-                     total_render_ms / diag_interval, max_render_ms,
-                     total_upload_ms / diag_interval, max_upload_ms,
-                     t_get1 - t_get0);
-                total_render_ms = 0; total_upload_ms = 0;
-                max_render_ms = 0;  max_upload_ms = 0;
+            if (should_display) {
+                frame_count++;
+                auto t_render0 = now_ms();
+                int cost = renderFrame(frame_data.y_data, frame_data.u_data, frame_data.v_data,
+                                       frame_data.y_linesize, frame_data.u_linesize, frame_data.v_linesize,
+                                       frame_data.width, frame_data.height,
+                                       &total_upload_ms, &max_upload_ms);
+                auto t_render1 = now_ms();
+                int64_t render_ms = t_render1 - t_render0;
+                total_render_ms += render_ms;
+                if (render_ms > max_render_ms) max_render_ms = render_ms;
+
+                if (cost < 0) {
+                    LOGW("⚠️ renderFrame failed, reinitializing EGL...");
+                    destroyEGL();
+                    gl_ready = false;
+                }
+
+                // 每 diag_interval 帧打一次诊断统计
+                if (frame_count % diag_interval == 0) {
+                    LOGI("📊 [DIAG] 最近 %d 帧 | "
+                         "avg_render=%" PRId64 "ms max_render=%" PRId64 "ms "
+                         "avg_upload=%" PRId64 "ms max_upload=%" PRId64 "ms "
+                         "get_frame=%" PRId64 "ms",
+                         diag_interval,
+                         total_render_ms / diag_interval, max_render_ms,
+                         total_upload_ms / diag_interval, max_upload_ms,
+                         t_get1 - t_get0);
+                    total_render_ms = 0; total_upload_ms = 0;
+                    max_render_ms = 0;  max_upload_ms = 0;
+                }
+                if (render_ms > 33) {
+                    LOGW("⚠️ [DIAG] 慢帧: render_ms=%" PRId64 "ms | %dx%d surface=%dx%d",
+                         render_ms, frame_data.width, frame_data.height,
+                         surface_width_, surface_height_);
+                }
             }
 
-            // 慢帧单独警告（>33ms = 低于 30fps）
-            if (render_ms > 33) {
-                LOGW("⚠️ [DIAG] 慢帧警告: render_ms=%" PRId64 "ms upload_ms=%" PRId64 "ms | 视频=%dx%d surface=%dx%d",
-                     render_ms, render_ms,  // upload_ms 在 renderFrame 内部独立计时
-                     frame_data.width, frame_data.height,
-                     surface_width_, surface_height_);
+            if (should_consume) {
+                player_core_consume_video_frame(player_core_);
+            }
+
+            // 如果本轮不消费（视频超前等待），短暂 sleep 避免空转
+            if (!should_consume) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         } else {
             empty_count++;
             if (!in_empty_streak) {
                 empty_start_ms = now_ms();
                 in_empty_streak = true;
-                // 队列首次空：打印核心状态帮助排查是 seek 后等待还是卡解码
                 if (player_core_) {
                     LOGI("⏳ [DIAG] 帧队列为空开始等待: state=%d pos=%.3f",
                          player_core_get_state(player_core_),
@@ -822,7 +883,6 @@ void AndroidPlayer::renderLoop() {
                 }
             }
             // seek 后帧队列暂时为空，用短间隔积极轮询
-            // 前 50 次（约 150ms）用 3ms 快速轮询，之后降到 16ms 节省 CPU
             int wait_ms = (empty_count <= 50) ? 3 : 16;
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
         }
@@ -1242,13 +1302,25 @@ void AndroidPlayer::audioCallback(SLAndroidSimpleBufferQueueItf bq, void* contex
 
 void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     if (!player_core_ || audio_buffer_size_ == 0) {
-        // 填充静音
         memset(audio_buffer_, 0, audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096);
         (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096);
         return;
     }
     
     std::lock_guard<std::mutex> lock(audio_mutex_);
+
+    // seek 后跳过早于目标位置的音频帧（输出静音），避免播放到错误位置的音频。
+    // 此判断在 Android 层做，不污染 core 的 player_core_get_audio_data 接口。
+    double seek_target = player_core_get_seek_target(player_core_);
+    if (seek_target > 0.0) {
+        double pos = player_core_get_position(player_core_);
+        if (!std::isnan(pos) && pos < seek_target - 0.3) {
+            // 当前播放位置仍明显早于目标：输出静音，等待时钟追上
+            memset(audio_buffer_, 0, audio_buffer_size_);
+            (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
+            return;
+        }
+    }
     
     // 循环填充缓冲区，直到填满或没有数据
     int total_bytes_read = 0;
@@ -1262,7 +1334,6 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         if (bytes_read > 0) {
             total_bytes_read += bytes_read;
         } else {
-            // 没有更多数据了
             break;
         }
     }

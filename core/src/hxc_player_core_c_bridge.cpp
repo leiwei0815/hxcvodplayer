@@ -558,6 +558,17 @@ int player_core_get_video_frame_rgb(
 }
 
 
+double player_core_get_seek_target(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return -1.0;
+    double t = handle->core->get_seek_target_pos();
+    return (t > 0.0) ? t : -1.0;
+}
+
+int player_core_get_post_seek_warmup(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return 0;
+    return handle->core->get_post_seek_warmup_frames();
+}
+
 int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, int buffer_size) {
     if (!handle || !handle->core || !buffer || buffer_size <= 0) {
         return 0;
@@ -658,22 +669,6 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             return 0;
         }
         double pts = af->pts;  // ⚠️ 保存 PTS，用于后续时钟更新
-
-        // seek 后跳过早于目标位置的音频帧（输出静音），与 audio_callback_impl 行为对齐。
-        // seeking_ 已由 audio_thread 清除，通过 get_seek_target_pos() 单独判断。
-        if (!std::isnan(pts) && pts >= 0.0) {
-            double target = handle->core->get_seek_target_pos();
-            if (target > 0.0) {
-                // 自适应容差（与 hxc_player_core.cpp 中 hxc_calc_seek_backward_tolerance_sec 一致）
-                double fps = handle->core->get_media_info().video_fps;
-                if (!(fps > 1.0 && fps < 120.0)) fps = 30.0;
-                double backward_tol = std::max(0.2, std::min(0.5, 3.0 / fps));
-                if (pts < (target - backward_tol)) {
-                    audioQueue->next();
-                    return 0;  // 输出静音（调用方负责 memset 为 0）
-                }
-            }
-        }
 
         // 保存当前帧的时钟基准（注意：以输出缓冲起点作为媒体时间基准）。
         handle->audio_current_pts = pts;

@@ -2278,30 +2278,14 @@ void PlayerCore::video_thread() {
         // 计算帧持续时间
         duration = av_q2d(format_ctx_->streams[video_stream_]->time_base);
         
-        // 音画同步丢帧（对齐 iOS syncWarmupFramesRemaining 机制）：
-        // - seeking 中：不丢帧（threshold = -10s），等 audio_thread 清除 seeking_ 标志。
-        // - seek 刚结束的 warmup 阶段（40 帧内）：放宽到 -0.5s，避免 seeking_ 刚清除时
-        //   因音频时钟已跳到目标而视频帧还稍早，被立刻全部丢掉。
-        // - 正常播放：收紧回 -0.1s（与修改前行为一致，iOS 渲染层也有自己的 syncThreshold）。
-        if (!isnan(pts)) {
-            double diff = pts - get_master_clock();
-            if (!isnan(diff)) {
-                double drop_threshold;
-                if (is_seeking) {
-                    drop_threshold = -10.0;  // seeking 中不丢帧
-                } else {
-                    int warmup = post_seek_warmup_frames_.load(std::memory_order_acquire);
-                    if (warmup > 0) {
-                        post_seek_warmup_frames_.fetch_sub(1, std::memory_order_acq_rel);
-                        drop_threshold = -0.5;   // warmup 阶段放宽
-                    } else {
-                        drop_threshold = -0.1;   // 正常播放：落后 100ms 才丢帧
-                    }
-                }
-                if (diff <= drop_threshold) {
-                    av_frame_unref(frame);
-                    continue;
-                }
+        // A/V sync 丢帧由平台渲染层（Android/iOS）自己决策，core 不主动丢帧。
+        // post_seek_warmup_frames_ 由 audio_thread 在 seek 结束时设置，
+        // 供平台层通过 player_core_get_post_seek_warmup() 查询 warmup 状态。
+        // 此处仅在 warmup 计数 > 0 时递减（消耗计数，但不丢帧）。
+        if (!is_seeking) {
+            int warmup = post_seek_warmup_frames_.load(std::memory_order_acquire);
+            if (warmup > 0) {
+                post_seek_warmup_frames_.fetch_sub(1, std::memory_order_acq_rel);
             }
         }
 

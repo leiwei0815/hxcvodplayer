@@ -284,8 +284,14 @@ int player_core_get_video_frame_rgb(
     int* linesize
 );
 
-// 音频数据获取（用于 iOS AudioQueue）
+// 音频数据获取（用于 iOS AudioQueue 和 Android OpenSL ES）
 int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, int buffer_size);
+
+// seek 相关查询（供平台渲染层做 A/V sync 决策）
+// 返回 seek 目标位置（秒），未 seek 或 seek 已结束返回 -1
+double player_core_get_seek_target(PlayerCoreHandle* handle);
+// 返回 seek 结束后 warmup 剩余帧数（>0 表示 seek 刚结束，平台层应放宽 A/V sync 阈值）
+int    player_core_get_post_seek_warmup(PlayerCoreHandle* handle);
 
 // 媒体信息
 int player_core_get_audio_sample_rate(PlayerCoreHandle* handle);
