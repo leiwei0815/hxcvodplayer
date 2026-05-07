@@ -76,25 +76,31 @@ AndroidPlayer::AndroidPlayer()
 
 AndroidPlayer::~AndroidPlayer() {
     LOGD("AndroidPlayer destroyed");
-    
-    // 停止渲染线程（EGL/GL 资源在线程内销毁）
+
+    // ① 先禁止 audio callback 访问 player_core_（必须在 destroy player_core 之前）
+    audio_active_.store(false, std::memory_order_seq_cst);
+
+    // ② 停止渲染线程（EGL/GL 资源在线程内销毁）
     render_running_ = false;
     if (render_thread_.joinable()) {
         render_thread_.join();
     }
-    
-    // 销毁音频输出
+
+    // ③ 销毁音频输出（Destroy 内部会等待当前 callback 执行完，
+    //    此时 audio_active_=false，callback 只填静音不访问 player_core_，安全）
     destroyAudioOutput();
-    
-    // 释放窗口
+
+    // ④ 释放窗口
     if (native_window_) {
         ANativeWindow_release(native_window_);
         native_window_ = nullptr;
     }
-    
-    // 销毁核心播放器
+
+    // ⑤ 销毁核心播放器（此时 audio callback 已不可能再访问它）
     if (player_core_) {
         player_core_set_playback_completed_callback(player_core_, nullptr, nullptr);
+        player_core_set_loading_callback(player_core_, nullptr, nullptr);
+        player_core_set_error_callback(player_core_, nullptr, nullptr);
         player_core_destroy(player_core_);
         player_core_ = nullptr;
     }
@@ -610,7 +616,10 @@ static GLuint compileShader(GLenum type, const char* src) {
     return shader;
 }
 
-bool AndroidPlayer::initEGL() {
+// EGL config 缓存（initEGLContext 时选定，initEGLSurface 复用）
+static EGLConfig s_egl_config = nullptr;
+
+bool AndroidPlayer::initEGLContext() {
     egl_display_ = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (egl_display_ == EGL_NO_DISPLAY) { LOGE("❌ eglGetDisplay failed"); return false; }
     if (!eglInitialize(egl_display_, nullptr, nullptr)) { LOGE("❌ eglInitialize failed"); return false; }
@@ -621,29 +630,57 @@ bool AndroidPlayer::initEGL() {
         EGL_RED_SIZE,   8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
         EGL_NONE
     };
-    EGLConfig config;
     EGLint num_configs = 0;
-    if (!eglChooseConfig(egl_display_, attribs, &config, 1, &num_configs) || num_configs == 0) {
+    if (!eglChooseConfig(egl_display_, attribs, &s_egl_config, 1, &num_configs) || num_configs == 0) {
         LOGE("❌ eglChooseConfig failed"); return false;
     }
 
     EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-    egl_context_ = eglCreateContext(egl_display_, config, EGL_NO_CONTEXT, ctx_attribs);
+    egl_context_ = eglCreateContext(egl_display_, s_egl_config, EGL_NO_CONTEXT, ctx_attribs);
     if (egl_context_ == EGL_NO_CONTEXT) { LOGE("❌ eglCreateContext failed"); return false; }
 
+    LOGI("✅ EGL Context created");
+    return true;
+}
+
+bool AndroidPlayer::initEGLSurface() {
     ANativeWindow* win = nullptr;
     { std::lock_guard<std::mutex> lock(window_mutex_); win = native_window_; }
-    if (!win) { LOGE("❌ initEGL: native_window_ is null"); return false; }
+    if (!win) { LOGE("❌ initEGLSurface: native_window_ is null"); return false; }
+    if (s_egl_config == nullptr) { LOGE("❌ initEGLSurface: no EGL config, call initEGLContext first"); return false; }
 
-    egl_surface_ = eglCreateWindowSurface(egl_display_, config, win, nullptr);
+    // 销毁旧 Surface（如有），再基于新 Window 重建
+    if (egl_surface_ != EGL_NO_SURFACE) {
+        eglMakeCurrent(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(egl_display_, egl_surface_);
+        egl_surface_ = EGL_NO_SURFACE;
+    }
+
+    egl_surface_ = eglCreateWindowSurface(egl_display_, s_egl_config, win, nullptr);
     if (egl_surface_ == EGL_NO_SURFACE) {
         LOGE("❌ eglCreateWindowSurface failed: %d", eglGetError()); return false;
     }
     if (!eglMakeCurrent(egl_display_, egl_surface_, egl_surface_, egl_context_)) {
         LOGE("❌ eglMakeCurrent failed"); return false;
     }
+    LOGI("✅ EGL Surface (re)created");
+    return true;
+}
+
+bool AndroidPlayer::initEGL() {
+    if (!initEGLContext()) return false;
+    if (!initEGLSurface()) return false;
     LOGI("✅ EGL initialized");
     return true;
+}
+
+void AndroidPlayer::destroyEGLSurface() {
+    if (egl_display_ != EGL_NO_DISPLAY && egl_surface_ != EGL_NO_SURFACE) {
+        eglMakeCurrent(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        eglDestroySurface(egl_display_, egl_surface_);
+        egl_surface_ = EGL_NO_SURFACE;
+        LOGI("EGL Surface destroyed");
+    }
 }
 
 void AndroidPlayer::destroyEGL() {
@@ -654,8 +691,17 @@ void AndroidPlayer::destroyEGL() {
         if (egl_context_ != EGL_NO_CONTEXT) { eglDestroyContext(egl_display_, egl_context_); egl_context_ = EGL_NO_CONTEXT; }
         eglTerminate(egl_display_);
         egl_display_ = EGL_NO_DISPLAY;
+        s_egl_config = nullptr;
     }
     LOGI("EGL destroyed");
+}
+
+void AndroidPlayer::redrawLastFrame() {
+    if (last_frame_width_ <= 0 || last_frame_height_ <= 0) return;
+    if (last_frame_y_.empty()) return;
+    renderFrame(last_frame_y_.data(), last_frame_u_.data(), last_frame_v_.data(),
+                last_frame_y_stride_, last_frame_u_stride_, last_frame_v_stride_,
+                last_frame_width_, last_frame_height_, nullptr, nullptr);
 }
 
 bool AndroidPlayer::initGLProgram() {
@@ -717,6 +763,7 @@ void AndroidPlayer::renderLoop() {
     int frame_count = 0;
     int empty_count = 0;
     bool gl_ready = false;
+    uint64_t last_surface_gen = UINT64_MAX;  // 上次处理的 surface generation
 
     // 诊断统计
     int64_t total_render_ms = 0;
@@ -736,16 +783,21 @@ void AndroidPlayer::renderLoop() {
 
     while (render_running_) {
         // 等待 Surface 就绪
+        bool has_window = false;
+        uint64_t cur_gen = 0;
         {
             std::lock_guard<std::mutex> lock(window_mutex_);
-            if (!native_window_) {
-                if (gl_ready) { destroyEGL(); gl_ready = false; }
-                std::this_thread::sleep_for(std::chrono::milliseconds(16));
-                continue;
-            }
+            has_window = (native_window_ != nullptr);
+            cur_gen = surface_generation_.load(std::memory_order_relaxed);
         }
 
-        // 初始化 EGL（每次 Surface 重建后执行一次）
+        if (!has_window) {
+            if (gl_ready) { destroyEGL(); gl_ready = false; last_surface_gen = UINT64_MAX; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            continue;
+        }
+
+        // 初始化 EGL（首次）
         if (!gl_ready) {
             if (!initEGL() || !initGLProgram()) {
                 LOGE("❌ GL init failed, retrying...");
@@ -754,7 +806,24 @@ void AndroidPlayer::renderLoop() {
                 continue;
             }
             gl_ready = true;
+            last_surface_gen = cur_gen;
             LOGI("✅ Render loop: GL ready");
+            redrawLastFrame();  // 首次就绪后若有缓存帧（重新进入 Activity 等场景）立即重绘
+        } else if (cur_gen != last_surface_gen) {
+            // Surface 变化（swap / updateSurfaceSize）：只重建 EGL Surface，保留 Context + GL 资源
+            LOGI("🔄 Surface generation changed (%llu -> %llu), rebuilding EGL Surface...",
+                 (unsigned long long)last_surface_gen, (unsigned long long)cur_gen);
+            if (!initEGLSurface()) {
+                LOGE("❌ initEGLSurface failed, doing full reinit...");
+                destroyEGL();
+                gl_ready = false;
+                last_surface_gen = UINT64_MAX;
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                continue;
+            }
+            last_surface_gen = cur_gen;
+            LOGI("✅ EGL Surface rebuilt, redrawing last frame");
+            redrawLastFrame();  // 立即重绘最后一帧，消除黑屏
         }
 
         if (!player_core_) {
@@ -849,6 +918,23 @@ void AndroidPlayer::renderLoop() {
                     LOGW("⚠️ renderFrame failed, reinitializing EGL...");
                     destroyEGL();
                     gl_ready = false;
+                    last_surface_gen = UINT64_MAX;
+                } else {
+                    // 缓存最后成功渲染的帧数据，供 Surface 切换后立即重绘
+                    int y_stride = frame_data.y_linesize > 0 ? frame_data.y_linesize : frame_data.width;
+                    int uv_stride = frame_data.u_linesize > 0 ? frame_data.u_linesize : frame_data.width / 2;
+                    int y_size  = y_stride  * frame_data.height;
+                    int uv_size = uv_stride * (frame_data.height / 2);
+                    if (y_size > 0 && uv_size > 0) {
+                        last_frame_y_.assign((uint8_t*)frame_data.y_data, (uint8_t*)frame_data.y_data + y_size);
+                        last_frame_u_.assign((uint8_t*)frame_data.u_data, (uint8_t*)frame_data.u_data + uv_size);
+                        last_frame_v_.assign((uint8_t*)frame_data.v_data, (uint8_t*)frame_data.v_data + uv_size);
+                        last_frame_width_    = frame_data.width;
+                        last_frame_height_   = frame_data.height;
+                        last_frame_y_stride_ = frame_data.y_linesize;
+                        last_frame_u_stride_ = frame_data.u_linesize;
+                        last_frame_v_stride_ = frame_data.v_linesize;
+                    }
                 }
 
                 // 每 diag_interval 帧打一次诊断统计
@@ -1232,13 +1318,24 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     // 初始填充缓冲区
     memset(audio_buffer_, 0, audio_buffer_size_);
     (*bufferQueueItf_)->Enqueue(bufferQueueItf_, audio_buffer_, audio_buffer_size_);
-    
+
+    // 允许 onAudioData 访问 player_core_
+    audio_active_.store(true, std::memory_order_seq_cst);
+
     LOGI("Audio output initialized successfully with %d Hz, %d channels", sample_rate, channels);
     return true;
 }
 
 void AndroidPlayer::destroyAudioOutput() {
+    // 先禁止 callback 访问 player_core_，再 Destroy player
+    // Destroy 会阻塞直到当前 callback 完成，此时 callback 已不会访问 player_core_
+    audio_active_.store(false, std::memory_order_seq_cst);
+
     if (playerObject_) {
+        // 先停止播放，让 AudioTrack 不再触发新的 callback
+        if (playItf_) {
+            (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
+        }
         (*playerObject_)->Destroy(playerObject_);
         playerObject_ = nullptr;
         playItf_ = nullptr;
@@ -1313,13 +1410,21 @@ void AndroidPlayer::audioCallback(SLAndroidSimpleBufferQueueItf bq, void* contex
 }
 
 void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
-    if (!player_core_ || audio_buffer_size_ == 0) {
-        memset(audio_buffer_, 0, audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096);
-        (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096);
+    int buf_size = audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096;
+    // audio_active_ 为 false 说明正在析构或 player_core_ 即将失效，只填静音
+    if (!audio_active_.load(std::memory_order_acquire) || !player_core_ || audio_buffer_size_ == 0) {
+        memset(audio_buffer_, 0, buf_size);
+        (*bq)->Enqueue(bq, audio_buffer_, buf_size);
         return;
     }
-    
+
     std::lock_guard<std::mutex> lock(audio_mutex_);
+    // 持锁后再次检查（destroyAudioOutput 在锁外 set false，但 player_core_ 此时仍有效）
+    if (!audio_active_.load(std::memory_order_acquire) || !player_core_) {
+        memset(audio_buffer_, 0, buf_size);
+        (*bq)->Enqueue(bq, audio_buffer_, buf_size);
+        return;
+    }
 
     // 循环填充缓冲区，直到填满或没有数据
     int total_bytes_read = 0;
