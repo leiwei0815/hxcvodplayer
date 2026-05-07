@@ -201,7 +201,6 @@ public:
     // ⚠️ 音频时钟更新（供 iOS/macOS/Android 平台使用）
     void update_audio_pts(double pts, int serial);
     double get_seek_target_pos() const { return seek_target_pos_.load(std::memory_order_acquire); }
-    const MediaInfo& get_media_info() const { return media_info_; }
     int get_post_seek_warmup_frames() const { return post_seek_warmup_frames_.load(std::memory_order_acquire); }
     
     // 事件回调
