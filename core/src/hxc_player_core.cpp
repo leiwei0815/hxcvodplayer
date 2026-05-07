@@ -1958,13 +1958,13 @@ int PlayerCore::stream_component_open(int stream_index) {
         LOG_INFO("视频解码模式：软解");
     }
 
-    // 软解时开启多线程（参考 ijkplayer：thread_count = CPU 核数，最多 4）
-    // 硬解由 GPU 处理，无需设置 thread_count。
+    // 软解多线程：使用 SLICE 级并行（帧内切片并行），不改变帧的输出顺序，
+    // iOS AVSampleBufferDisplayLayer 和 Android OpenGL ES 渲染都安全。
+    // FF_THREAD_FRAME（帧级并行）会打乱帧顺序，对 iOS 渲染层有兼容风险，故不使用。
     if (!request_video_hw_decode && codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-        // frame-level 并行（H.264/H.265 都支持，兼容性好）
-        codec_ctx->thread_count = 0;   // 0 = FFmpeg 自动选择（通常 = CPU 核数，上限 16）
-        codec_ctx->thread_type  = FF_THREAD_FRAME;
-        LOG_INFO("视频软解多线程：thread_count=auto(0), thread_type=FRAME");
+        codec_ctx->thread_count = 0;                 // 0 = FFmpeg 自动选核数
+        codec_ctx->thread_type  = FF_THREAD_SLICE;   // slice-level: 帧内并行，顺序不变
+        LOG_INFO("视频软解多线程：thread_count=auto(0), thread_type=SLICE");
     }
 
     // 打开解码器（若硬解打开失败，自动回退软解）
@@ -1980,7 +1980,7 @@ int PlayerCore::stream_component_open(int stream_index) {
         }
         // 回退到软解时同样启用多线程
         codec_ctx->thread_count = 0;
-        codec_ctx->thread_type  = FF_THREAD_FRAME;
+        codec_ctx->thread_type  = FF_THREAD_SLICE;
         open_ret = avcodec_open2(codec_ctx, codec, nullptr);
         hw_decode_enabled = false;
     }
@@ -2264,6 +2264,7 @@ void PlayerCore::video_thread() {
                 if (in_seek_window) {
                     seeking_.store(false, std::memory_order_release);
                     set_seek_loading(false);
+                    post_seek_warmup_frames_.store(40, std::memory_order_release);
                     LOG_INFO("视频线程：检测到 seek 后有效首帧，结束 seeking。target=",
                              target, ", pts=", pts);
                 }
@@ -2277,16 +2278,26 @@ void PlayerCore::video_thread() {
         // 计算帧持续时间
         duration = av_q2d(format_ctx_->streams[video_stream_]->time_base);
         
-        // 音画同步丢帧：
-        // - seek 刚结束后有一段"warmup"窗口（对齐 iOS syncWarmupFramesRemaining 机制），
-        //   放宽到 -0.5s，避免 seeking_ 清除后视频帧因轻微滞后被立刻全部丢掉。
-        // - 正常播放时，视频落后超过 100ms 才丢帧。
+        // 音画同步丢帧（对齐 iOS syncWarmupFramesRemaining 机制）：
+        // - seeking 中：不丢帧（threshold = -10s），等 audio_thread 清除 seeking_ 标志。
+        // - seek 刚结束的 warmup 阶段（40 帧内）：放宽到 -0.5s，避免 seeking_ 刚清除时
+        //   因音频时钟已跳到目标而视频帧还稍早，被立刻全部丢掉。
+        // - 正常播放：收紧回 -0.1s（与修改前行为一致，iOS 渲染层也有自己的 syncThreshold）。
         if (!isnan(pts)) {
             double diff = pts - get_master_clock();
             if (!isnan(diff)) {
-                // seek 刚结束（seeking_ 从 true 变 false）后，放宽丢帧窗口
-                double drop_threshold = is_seeking ? -10.0   // seeking 中不丢
-                                                   : -0.5;   // 正常播放窗口放宽到 0.5s
+                double drop_threshold;
+                if (is_seeking) {
+                    drop_threshold = -10.0;  // seeking 中不丢帧
+                } else {
+                    int warmup = post_seek_warmup_frames_.load(std::memory_order_acquire);
+                    if (warmup > 0) {
+                        post_seek_warmup_frames_.fetch_sub(1, std::memory_order_acq_rel);
+                        drop_threshold = -0.5;   // warmup 阶段放宽
+                    } else {
+                        drop_threshold = -0.1;   // 正常播放：落后 100ms 才丢帧
+                    }
+                }
                 if (diff <= drop_threshold) {
                     av_frame_unref(frame);
                     continue;
@@ -2475,6 +2486,8 @@ void PlayerCore::audio_thread() {
             if (pts >= 0.0) {
                 seeking_.store(false, std::memory_order_release);
                 set_seek_loading(false);
+                // seek 结束后给 video_thread 40 帧的 warmup 窗口（对齐 iOS syncWarmupFramesRemaining）
+                post_seek_warmup_frames_.store(40, std::memory_order_release);
                 LOG_INFO("audio_thread: seek done, target=", target, " audio_pts=", pts);
             }
         }

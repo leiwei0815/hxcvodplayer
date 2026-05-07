@@ -200,6 +200,8 @@ public:
     
     // ⚠️ 音频时钟更新（供 iOS/macOS/Android 平台使用）
     void update_audio_pts(double pts, int serial);
+    double get_seek_target_pos() const { return seek_target_pos_.load(std::memory_order_acquire); }
+    const MediaInfo& get_media_info() const { return media_info_; }
     
     // 事件回调
     using StateChangedCallback = std::function<void(PlayerState)>;
@@ -351,6 +353,7 @@ private:
     std::atomic<bool> starvation_loading_{false}; // 队列低水位/进度停滞触发的 loading
     std::atomic<bool> loading_notified_{false};  // 对外已通知的 loading 状态
     std::atomic<double> seek_target_pos_;  // ⚠️ seek 的目标位置，在 seek 期间返回此值
+    std::atomic<int>   post_seek_warmup_frames_{0}; // seek 结束后放宽 A/V 同步丢帧阈值的剩余帧数
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
     std::atomic<bool> video_hw_decode_active_{false}; // 当前视频流是否在硬解
     std::atomic<int64_t> io_last_packet_us_{0}; // 最近一次成功读取 packet 的时间（us）
