@@ -1127,37 +1127,36 @@ int PlayerCore::open_common_process(const std::string &filename) {
     
     LOG_INFO("队列创建完成");
     
-    // ⚠️ 参考 ffplay：如果配置了开始播放时间，在打开流之前先 seek
-    // 这样可以避免解码不需要的数据，显著提高启动速度
+    // seek to start_time before launching threads (like ffplay/ijkplayer)
     if (config_.start_time > 0.0) {
         double duration = get_duration();
         if (duration > 0 && config_.start_time < duration) {
-            int64_t seek_target = config_.start_time * AV_TIME_BASE;
-            LOG_INFO("配置了开始播放时间: ", config_.start_time, " 秒，在启动线程前先 seek...");
-            
-            // ⚠️ 使用 avformat_seek_file（比 av_seek_frame 更精确）
-            int ret = avformat_seek_file(format_ctx_, -1,
-                                         INT64_MIN,      // min_ts
-                                         seek_target,     // ts (目标时间)
-                                         seek_target,     // max_ts
-                                         0);              // flags
-            if (ret < 0) {
-                LOG_WARNING("初始 seek 失败，将从头开始播放");
+            int64_t seek_target = (int64_t)(config_.start_time * AV_TIME_BASE);
+            LOG_INFO("initial seek: start_time=", config_.start_time, "s");
+            // AVSEEK_FLAG_BACKWARD: find nearest I-frame BEFORE target
+            // Faster than avformat_seek_file(max_ts=target) because FFmpeg
+            // can pick the closest keyframe without an upper-bound constraint.
+            // video_thread will discard frames via AVDISCARD_NONREF until pts >= target.
+            int seek_ret = av_seek_frame(format_ctx_, -1, seek_target, AVSEEK_FLAG_BACKWARD);
+            if (seek_ret < 0) {
+                seek_ret = av_seek_frame(format_ctx_, -1, seek_target, AVSEEK_FLAG_ANY);
+                LOG_WARNING("BACKWARD seek failed, try ANY, ret=", seek_ret);
+            }
+            if (seek_ret < 0) {
+                LOG_WARNING("initial seek failed, play from beginning, ret=", seek_ret);
             } else {
-                LOG_INFO("初始 seek 成功，将从 ", config_.start_time, " 秒开始播放");
-                // ⚠️ 清空解复用器的内部缓冲区
+                LOG_INFO("initial seek ok");
                 avformat_flush(format_ctx_);
-                // 更新时钟到 seek 目标位置，避免音视频同步判断异常
+                // Pre-set clocks to target to prevent A/V sync from discarding frames
                 audio_clock_.set_clock(config_.start_time, 0);
                 video_clock_.set_clock(config_.start_time, 0);
                 external_clock_.set_clock(config_.start_time, 0);
-                // 初始 startPosition 也走与 seek 相同的“首帧锚点”流程，避免旧帧把主时钟拉回。
                 seek_target_pos_.store(config_.start_time, std::memory_order_release);
                 seeking_.store(true, std::memory_order_release);
                 set_seek_loading(true);
             }
         } else {
-            LOG_WARNING("开始播放时间 ", config_.start_time, " 无效或超过视频时长，忽略");
+            LOG_WARNING("start_time=", config_.start_time, " invalid or exceeds duration, ignored");
         }
     }
     
