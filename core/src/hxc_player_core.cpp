@@ -2243,6 +2243,16 @@ void PlayerCore::video_thread() {
         // 计算帧持续时间
         duration = av_q2d(format_ctx_->streams[video_stream_]->time_base);
         
+        // ⚠️ 音画同步：在写入队列之前判断是否丢帧，避免 push 后再 next 导致消费端看不到帧
+        if (!isnan(pts)) {
+            double diff = pts - get_master_clock();
+            if (!isnan(diff) && diff <= -0.1) {
+                // 视频落后音频超过 100ms，丢弃此帧，不写入队列
+                av_frame_unref(frame);
+                continue;
+            }
+        }
+
         // 获取可写帧
         VideoFrame* vf = video_queue_->peek_writable();
         if (!vf) {
@@ -2275,28 +2285,15 @@ void PlayerCore::video_thread() {
         
         // 更新视频时钟
         update_video_pts(pts, video_packet_queue_->get_serial());
-        
-        // ⚠️ 音画同步控制（参考 ffplay）
+
+        // 视频帧领先音频时，等待（避免视频跑太快）
         if (!isnan(pts)) {
             double diff = pts - get_master_clock();
-            
-            if (!isnan(diff)) {
-                if (diff <= -0.1) {
-                    // 视频太慢（落后音频超过 100ms），丢帧
-//                    LOG_INFO("视频落后，丢帧 diff=", diff);
-                    av_frame_unref(frame);
-                    video_queue_->next();  // 从队列中移除
-                    continue;
-                } else if (diff > 0.01) {
-                    // 视频太快（领先音频），等待
-                    // diff 是媒体时间差，需要转换为物理等待时间（除以 playback_rate）
-                    double rate = playback_rate_.load();
-                    double physical_delay = diff / rate;
-                    if (physical_delay > 0.1) {
-                        physical_delay = 0.1;  // 最多等待 100ms
-                    }
-                    PLAYER_DELAY((int)(physical_delay * 1000));
-                }
+            if (!isnan(diff) && diff > 0.01) {
+                double rate = playback_rate_.load();
+                double physical_delay = diff / rate;
+                if (physical_delay > 0.1) physical_delay = 0.1;
+                PLAYER_DELAY((int)(physical_delay * 1000));
             }
         }
         

@@ -231,19 +231,35 @@ bool PlayerWindow::eventFilter(QObject* obj, QEvent* event) {
         if (player_) {
             // 尝试获取新帧（RGB 格式）
             int width, height, linesize;
-            
-            // 预分配足够大的缓冲区（1080p）
-            if (rgb_buffer_.size() < 1920 * 1080 * 3) {
-                rgb_buffer_.resize(1920 * 1080 * 3);
+
+            // 先用最小缓冲区探测实际分辨率（buffer_size=0 会返回 -2 表示缓冲区太小，但不取帧）
+            // 策略：先尝试当前缓冲区大小，若返回 -2 则按实际尺寸扩容后重试
+            if (rgb_buffer_.empty()) {
+                rgb_buffer_.resize(1920 * 1080 * 3);  // 初始 1080p 大小
             }
-            
-            // 调用新的 RGB 转换 API
-            if (player_core_get_video_frame_rgb(player_, rgb_buffer_.data(), rgb_buffer_.size(),
-                                                 &width, &height, &linesize) == 0) {
-                // 成功获取并转换了帧
-                // 创建 QImage（注意：使用 copy 避免数据被覆盖）
+
+            int ret = player_core_get_video_frame_rgb(player_, rgb_buffer_.data(), (int)rgb_buffer_.size(),
+                                                      &width, &height, &linesize);
+            if (ret == -2) {
+                // 缓冲区不足，按实际分辨率扩容后重取
+                int needed = width * height * 3;
+                if (needed > 0) {
+                    rgb_buffer_.resize(needed);
+                    qDebug() << "[Render] 缓冲区扩容至" << needed << "bytes (" << width << "x" << height << ")";
+                    ret = player_core_get_video_frame_rgb(player_, rgb_buffer_.data(), (int)rgb_buffer_.size(),
+                                                          &width, &height, &linesize);
+                }
+            }
+
+            if (ret == 0) {
+                // 成功获取并转换了帧，创建 QImage（copy 避免数据被覆盖）
                 current_frame_ = QImage(rgb_buffer_.data(), width, height, linesize,
                                        QImage::Format_RGB888).copy();
+                static int frame_log_count = 0;
+                if (++frame_log_count <= 5 || frame_log_count % 300 == 0) {
+                    qDebug() << "[Render] 成功获取帧 #" << frame_log_count
+                             << " size=" << width << "x" << height;
+                }
             }
             
             // 绘制当前帧

@@ -459,9 +459,11 @@ int player_core_get_video_frame_rgb(
     if (!videoQueue || videoQueue->size() <= 0) {
         return -1;  // 没有可用帧
     }
-    
-    auto* vf = videoQueue->peek_readable();
+
+    // 使用非阻塞取帧，避免在 Qt 主线程中阻塞
+    auto* vf = videoQueue->peek_last_nonblocking();
     if (!vf || !vf->frame) {
+        LOG_DEBUG("[RGB] peek_last_nonblocking 返回空帧，queue.size=", videoQueue->size());
         return -1;
     }
     
@@ -469,15 +471,29 @@ int player_core_get_video_frame_rgb(
     int frame_width = frame->width;
     int frame_height = frame->height;
     int required_size = frame_width * frame_height * 3;  // RGB24
+
+    static int rgb_call_count = 0;
+    if (++rgb_call_count <= 3) {
+        LOG_INFO("[RGB] 首次取帧 #", rgb_call_count,
+                 " 分辨率=", frame_width, "x", frame_height,
+                 " format=", frame->format,
+                 " buffer_size=", buffer_size, " required=", required_size);
+    }
     
-    // 检查缓冲区大小
+    // 检查缓冲区大小，不足时输出实际尺寸供调用方扩容后重试
     if (buffer_size < required_size) {
-        return -1;  // 缓冲区太小
+        *width = frame_width;
+        *height = frame_height;
+        *linesize = frame_width * 3;
+        LOG_WARNING("[RGB] 缓冲区不足: buffer_size=", buffer_size, " required=", required_size,
+                    " (", frame_width, "x", frame_height, ")，返回 -2 请调用方扩容");
+        return -2;  // 缓冲区太小，调用方需要扩容
     }
     
     // 创建 RGB 帧
     AVFrame* rgb_frame = av_frame_alloc();
     if (!rgb_frame) {
+        LOG_ERROR("[RGB] av_frame_alloc 失败");
         return -1;
     }
     
@@ -500,6 +516,7 @@ int player_core_get_video_frame_rgb(
     );
     
     if (!sws_ctx) {
+        LOG_ERROR("[RGB] sws_getContext 失败，format=", frame->format);
         av_frame_free(&rgb_frame);
         return -1;
     }
@@ -520,6 +537,12 @@ int player_core_get_video_frame_rgb(
     *width = frame_width;
     *height = frame_height;
     *linesize = frame_width * 3;
+
+    static int rgb_success_count = 0;
+    if (++rgb_success_count <= 5 || rgb_success_count % 300 == 0) {
+        LOG_INFO("[RGB] 帧转换成功 #", rgb_success_count, " pts=", vf->pts,
+                 " size=", frame_width, "x", frame_height);
+    }
     
     // 自动消费帧
     videoQueue->next();

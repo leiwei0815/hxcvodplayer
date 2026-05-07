@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file frame_queue.h
  * @brief 帧队列管理（参照 ffplay 实现）
  */
@@ -85,6 +85,16 @@ public:
     // 获取上一帧（不移动指针）
     T* peek_last() {
         std::lock_guard<std::mutex> lock(mutex_);
+        return &frames_[rindex_];
+    }
+
+    // 非阻塞取当前可读帧（size > 0 时才返回，否则返回 nullptr）
+    // 用于 Qt/UI 线程等不能阻塞的场景
+    T* peek_last_nonblocking() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (size_ - rindex_shown_ <= 0) {
+            return nullptr;
+        }
         return &frames_[rindex_];
     }
     
