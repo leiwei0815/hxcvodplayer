@@ -12,16 +12,10 @@ import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import kotlin.jvm.JvmOverloads
-import org.json.JSONObject
-import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * HXC Player 控制类
@@ -62,7 +56,6 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     companion object {
         private const val TAG = "HXCPlayerControl"
-        private const val SECURE_HLS_AUTH_URL = "https://api.example.com/api/v1/play/auth"
 
         init {
             System.loadLibrary("hxcplayer")
@@ -144,10 +137,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         fun defaultConfig(): PlayerDataSourceConfig {
             return PlayerDataSourceConfig.defaultConfig()
         }
-
-        private fun secureHLSAuthURL(): String = SECURE_HLS_AUTH_URL
-
-        private fun secureHLSAuthHeaders(): Map<String, String> = emptyMap()
     }
 
     // 播放器状态
@@ -175,8 +164,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     enum class PlayerDataSourceMode {
         DEFAULT,
         CUSTOM_HTTP,
-        CUSTOM_FILE,
-        SECURE_HLS
+        CUSTOM_FILE
     }
 
     /** 解码模式（默认软解，播放前设置） */
@@ -185,12 +173,11 @@ class HXCPlayerControl @JvmOverloads constructor(
         HARDWARE
     }
 
-    /** 对齐 iOS 的视频模型（videoId + sign + secretId + timestamp） */
+    /** 对齐 iOS 的视频模型（fileid + appid + sign） */
     class PlayerVideo {
-        var videoId: String = ""
+        var videoId: Int = 0
         var sign: String = ""
-        var secretId: String = ""
-        var timestamp: String = ""
+        var appId: Int = 0
     }
 
     /** 对齐 iOS：全局数据源默认配置 */
@@ -210,16 +197,15 @@ class HXCPlayerControl @JvmOverloads constructor(
     /**
      * 对外统一播放模型：只传一个 model 即可。
      *
-     * - [mode] 对应默认/自定义 HTTP/自定义本地文件/SecureHLS
-     * - [url] 在非 SecureHLS 下必填；SecureHLS 可由鉴权回调返回 m3u8URL
+     * - [url] 必填
+     * - [mode] 对应默认/自定义 HTTP/自定义本地文件
      * - [encryptedFile] 是否按核心约定解密文件头
-     * - [video] 对齐 iOS：通过 videoId+sign+secretId 播放
+     * - [video] 对齐 iOS：通过 fileid+appid+sign 播放（Android 当前未实现该分支，预留）
      */
     class PlayerDataSourcePlayModel {
         var url: String = ""
         var mode: PlayerDataSourceMode = PlayerDataSourceMode.DEFAULT
         var encryptedFile: Boolean = false
-        var startPosition: Double = 0.0
         var video: PlayerVideo? = null
 
         companion object {
@@ -309,18 +295,13 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var loadingCandidateState: Boolean? = null
     private var loadingCandidateSinceMs: Long = 0L
     private val openExecutor = Executors.newSingleThreadExecutor()
-    private val nativeOpenStopLock = Any()
-    private val openGeneration = AtomicLong(0L)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val loadingShowDebounceMs = 300L
     private val loadingHideDebounceMs = 150L
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
-    @Volatile var autoReopenOnRecoverableErrorEnabled: Boolean = false
-    @Volatile var autoReopenMaxAttempts: Int = 1
-        set(value) {
-            field = value.coerceAtLeast(0)
-        }
+    private var autoReopenOnRecoverableErrorEnabled: Boolean = false
+    private var autoReopenMaxAttempts: Int = 1
     private var autoReopenAttemptCount: Int = 0
     private var autoReopenInFlight: Boolean = false
     private var networkLoadingSinceMs: Long = 0L
@@ -330,19 +311,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
     @Volatile private var decodeMode: DecodeMode = DecodeMode.SOFTWARE
-    @Volatile var autoPlayer: Boolean = true
-    @Volatile var startPosition: Double = 0.0
-    @get:JvmName("stateValue")
-    val state: PlayerState
-        get() = getState()
-    @get:JvmName("durationValue")
-    val duration: Double
-        get() = getDuration()
-    @get:JvmName("positionValue")
-    val position: Double
-        get() = getPosition()
-    val hardwareDecodingActive: Boolean
-        get() = isHardwareDecodingActive()
 
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
     private var textureDecoderSurface: Surface? = null
@@ -381,7 +349,7 @@ class HXCPlayerControl @JvmOverloads constructor(
      */
     fun configureWeakNetworkRecovery(enabled: Boolean, maxAttempts: Int = 1) {
         autoReopenOnRecoverableErrorEnabled = enabled
-        autoReopenMaxAttempts = maxAttempts
+        autoReopenMaxAttempts = maxAttempts.coerceAtLeast(0)
     }
 
     private fun clonePlayModel(model: PlayerDataSourcePlayModel): PlayerDataSourcePlayModel {
@@ -389,7 +357,6 @@ class HXCPlayerControl @JvmOverloads constructor(
             url = model.url
             mode = model.mode
             encryptedFile = model.encryptedFile
-            startPosition = model.startPosition
             video = model.video
         }
     }
@@ -402,12 +369,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         synchronized(lifecycleLock) {
             return nativeHandle
         }
-    }
-
-    private fun nextOpenGeneration(): Long = openGeneration.incrementAndGet()
-
-    private fun isStaleOpenGeneration(generation: Long): Boolean {
-        return generation != openGeneration.get() || isReleased
     }
 
     fun setDecodeMode(mode: DecodeMode) {
@@ -480,8 +441,6 @@ class HXCPlayerControl @JvmOverloads constructor(
                 autoReopenInFlight = false
                 return@postDelayed
             }
-            // 与 iOS 对齐：自动重开前先把播放器起播点更新为重开位置。
-            startPosition = retryStart
             val ok = if (retryModel != null) {
                 openWithPlayModel(retryModel)
             } else {
@@ -511,153 +470,6 @@ class HXCPlayerControl @JvmOverloads constructor(
             }
         }
         return cfg
-    }
-
-    private fun parseLongValue(v: Any?): Long {
-        return when (v) {
-            is Number -> v.toLong()
-            is String -> v.toLongOrNull() ?: 0L
-            else -> 0L
-        }
-    }
-
-    private fun parseBooleanValue(v: Any?): Boolean {
-        return when (v) {
-            is Boolean -> v
-            is Number -> v.toInt() != 0
-            is String -> {
-                val lower = v.lowercase()
-                lower == "1" || lower == "true" || lower == "yes"
-            }
-            else -> false
-        }
-    }
-
-    private fun urlLooksLikeM3u8(url: String?): Boolean {
-        if (url.isNullOrBlank()) {
-            return false
-        }
-        return url.contains(".m3u8", ignoreCase = true)
-    }
-
-    private fun buildDefaultSecureHeaders(video: PlayerVideo, timestamp: String): String {
-        return "P-HX-SecretID: ${video.secretId}\r\n" +
-            "P-HX-FileId: ${video.videoId}\r\n" +
-            "P-HX-Timestamp: $timestamp\r\n" +
-            "P-HX-Sign: ${video.sign}\r\n" +
-            "P-HX-Terminal-Type: android\r\n"
-    }
-
-    private fun resolveRequestTimestamp(video: PlayerVideo): String {
-        return video.timestamp.takeIf { it.isNotBlank() } ?: System.currentTimeMillis().toString()
-    }
-
-    private fun performSecureHLSAuthRequestOnCurrentThread(
-        config: PlayerDataSourceConfig,
-        video: PlayerVideo
-    ): Pair<Map<String, Any?>?, String?> {
-        if (video.videoId.isBlank() || video.sign.isBlank() || video.secretId.isBlank()) {
-            return Pair(null, "鉴权参数无效")
-        }
-        val authURL = secureHLSAuthURL()
-        if (authURL.isBlank()) {
-            return Pair(null, "SDK 内部未配置 SecureHLS 鉴权地址")
-        }
-
-        var connection: HttpURLConnection? = null
-        return try {
-            connection = (URL(authURL).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = config.timeoutMs.coerceAtLeast(1000)
-                readTimeout = config.timeoutMs.coerceAtLeast(1000)
-                doInput = true
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-                secureHLSAuthHeaders().forEach { (key, value) ->
-                    if (key.isNotBlank() && value.isNotBlank()) {
-                        setRequestProperty(key, value)
-                    }
-                }
-            }
-
-            val requestTimestamp = resolveRequestTimestamp(video)
-            val body = JSONObject().apply {
-                put("secret_id", video.secretId)
-                put("file_id", video.videoId)
-                put("sign", video.sign)
-                put("timestamp", requestTimestamp)
-            }.toString()
-
-            OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
-                writer.write(body)
-                writer.flush()
-            }
-
-            val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val responseText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-            if (code !in 200..299) {
-                val msg = if (responseText.isNotBlank()) {
-                    "鉴权请求失败: HTTP $code, $responseText"
-                } else {
-                    "鉴权请求失败: HTTP $code"
-                }
-                return Pair(null, msg)
-            }
-            if (responseText.isBlank()) {
-                return Pair(null, "鉴权接口返回空响应")
-            }
-
-            val root = JSONObject(responseText)
-            val data = if (root.opt("data") is JSONObject) root.optJSONObject("data") else root
-            if (data == null) {
-                return Pair(null, "鉴权响应不是 JSON 对象")
-            }
-
-            val playURL = data.optString("play_url", "").takeIf { it.isNotBlank() }
-                ?: return Pair(null, "鉴权响应缺少 play_url")
-            val playSessionID = data.optString("play_session_id", "").takeIf { it.isNotBlank() }
-            val isEncrypted = parseLongValue(data.opt("encrypt_type")) == 1L ||
-                parseBooleanValue(data.opt("is_encrypted")) ||
-                parseBooleanValue(data.opt("encrypted")) ||
-                parseBooleanValue(data.opt("is_encrypt"))
-            val secureHeaders = data.optString("secure_headers", "").takeIf { it.isNotBlank() }
-                ?: if (isEncrypted) buildDefaultSecureHeaders(video, requestTimestamp) else null
-
-            Pair(
-                mapOf(
-                    "play_url" to playURL,
-                    "is_encrypted" to isEncrypted,
-                    "secure_headers" to secureHeaders
-                ),
-                null
-            )
-        } catch (e: Exception) {
-            Pair(null, e.message ?: "鉴权请求异常")
-        } finally {
-            connection?.disconnect()
-        }
-    }
-
-    private fun performSecureHLSAuthRequest(
-        config: PlayerDataSourceConfig,
-        video: PlayerVideo
-    ): Pair<Map<String, Any?>?, String?> {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            return performSecureHLSAuthRequestOnCurrentThread(config, video)
-        }
-        val latch = CountDownLatch(1)
-        var result: Pair<Map<String, Any?>?, String?> = Pair(null, "鉴权请求未完成")
-        Thread {
-            result = performSecureHLSAuthRequestOnCurrentThread(config, video)
-            latch.countDown()
-        }.start()
-        val timeoutMs = config.timeoutMs.coerceAtLeast(1000).toLong() + 2000L
-        val ok = latch.await(timeoutMs, TimeUnit.MILLISECONDS)
-        if (!ok) {
-            return Pair(null, "鉴权请求超时")
-        }
-        return result
     }
 
     /**
@@ -731,33 +543,24 @@ class HXCPlayerControl @JvmOverloads constructor(
     private fun setSurface(surface: Surface?) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        synchronized(nativeOpenStopLock) {
-            val activeHandle = currentHandle()
-            if (activeHandle == 0L || isReleased) return
-            nativeSetSurface(activeHandle, surface)
-        }
+        nativeSetSurface(handle, surface)
     }
 
     // 内部方法：更新 Surface 尺寸
     private fun updateSurfaceSize(width: Int, height: Int) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        synchronized(nativeOpenStopLock) {
-            val activeHandle = currentHandle()
-            if (activeHandle == 0L || isReleased) return
-            nativeUpdateSurfaceSize(activeHandle, width, height)
-        }
+        nativeUpdateSurfaceSize(handle, width, height)
     }
 
     // 打开 URL
     fun openURL(url: String): Boolean {
-        return openURL(url, startPosition)
+        return openURL(url, 0.0)
     }
 
     // 打开 URL 并指定起始位置（秒）
     // 注意：该接口为同步调用，可能阻塞调用线程（例如网络抖动时）
     fun openURL(url: String, startPosition: Double): Boolean {
-        val generation = nextOpenGeneration()
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
@@ -774,22 +577,11 @@ class HXCPlayerControl @JvmOverloads constructor(
             networkTotalStallMs = 0L
             networkReconnectCount = 0
         }
-        val result = synchronized(nativeOpenStopLock) {
-            if (isStaleOpenGeneration(generation)) {
-                false
-            } else {
-                val activeHandle = currentHandle()
-                if (activeHandle == 0L) {
-                    false
-                } else {
-                    applyDecodeModeForHandle(activeHandle)
-                    val safeStart = startPosition.coerceAtLeast(0.0)
-                    nativeOpenURLWithStartPosition(activeHandle, url, safeStart)
-                }
-            }
-        }
+        applyDecodeModeForHandle(handle)
+        // 始终用带起始位置的接口，确保 startPosition=0 时也能清除上次残留进度
+        val result = nativeOpenURLWithStartPosition(handle, url, startPosition)
 
-        if (!result && !isStaleOpenGeneration(generation)) {
+        if (!result) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
         }
         return result
@@ -800,12 +592,8 @@ class HXCPlayerControl @JvmOverloads constructor(
      * 结果通过已有 callback 回调返回（失败会触发 onPlayerError）。
      */
     fun openURLAsync(url: String, startPosition: Double = 0.0) {
-        val generation = nextOpenGeneration()
         if (isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
-            return
-        }
-        if (!licenseAllowedOrNotify("openURLAsync")) {
             return
         }
         lastOpenUrl = url
@@ -818,9 +606,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         try {
             openExecutor.execute {
-                if (isStaleOpenGeneration(generation)) {
-                    return@execute
-                }
                 val handle = currentHandle()
                 if (handle == 0L || isReleased) {
                     mainHandler.post {
@@ -828,22 +613,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                     }
                     return@execute
                 }
-                val result = synchronized(nativeOpenStopLock) {
-                    if (isStaleOpenGeneration(generation)) {
-                        false
-                    } else {
-                        val activeHandle = currentHandle()
-                        if (activeHandle == 0L) {
-                            false
-                        } else {
-                            applyDecodeModeForHandle(activeHandle)
-                            val safeStart = startPosition.coerceAtLeast(0.0)
-                            nativeOpenURLWithStartPosition(activeHandle, url, safeStart)
-                        }
-                    }
-                }
+                applyDecodeModeForHandle(handle)
+                // 始终用带起始位置的接口
+                val result = nativeOpenURLWithStartPosition(handle, url, startPosition)
 
-                if (!result && !isStaleOpenGeneration(generation)) {
+                if (!result && !isReleased) {
                     mainHandler.post {
                         dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
                     }
@@ -858,156 +632,61 @@ class HXCPlayerControl @JvmOverloads constructor(
      * 统一入口：使用播放模型打开（对齐 iOS 的 openWithPlayModel）。
      */
     fun openWithPlayModel(model: PlayerDataSourcePlayModel): Boolean {
-        val generation = nextOpenGeneration()
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开播放模型")
             return false
         }
+        if (model.url.isBlank()) {
+            dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+            return false
+        }
         if (!licenseAllowedOrNotify("openWithPlayModel")) {
             return false
         }
-        val workingModel = clonePlayModel(model)
-        var resolvedAuthToken: String? = null
-        var resolvedVideoID: String? = null
-        var resolvedDeviceID: String? = null
-        var resolvedSecretID: String? = null
-        var resolvedNonce: String? = null
-        var resolvedPlaySessionID: String? = null
-        var resolvedSecureHeaders: String? = null
-        var resolvedSessionExpireAtMs: Long = 0L
-        var resolvedEncrypted = false
-        var resolvedInlineKeyMode = false
-        var resolvedKeyMaterialBase64: String? = null
-        var resolvedKeyIVHex: String? = null
-        val config = effectiveDataSourceConfig()
-        if (workingModel.video != null) {
-            val video = workingModel.video
-            if (video == null || video.videoId.isBlank() || video.sign.isBlank() || video.secretId.isBlank()) {
-                dispatchError(PlayerErrorCode.INVALID_URL, "SecureHLS 缺少必要参数: video.videoId/video.sign/video.secretId")
-                return false
-            }
-            resolvedVideoID = video.videoId
-            resolvedSecretID = video.secretId
-            resolvedAuthToken = video.sign
-
-            val (authResult, authError) = performSecureHLSAuthRequest(config, video)
-            val playURL = authResult?.get("play_url")?.toString()?.takeIf { it.isNotBlank() }
-            if (playURL.isNullOrBlank()) {
-                dispatchError(
-                    PlayerErrorCode.OPEN_INPUT_FAILED,
-                    authError ?: "SecureHLS 鉴权失败: 未返回有效播放地址"
-                )
-                return false
-            }
-            val authData = authResult ?: run {
-                dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, authError ?: "SecureHLS 鉴权失败")
-                return false
-            }
-            workingModel.url = playURL
-            resolvedEncrypted = when (val v = authData["is_encrypted"]) {
-                is Boolean -> v
-                is Number -> v.toInt() != 0
-                is String -> {
-                    val lower = v.lowercase()
-                    lower == "1" || lower == "true" || lower == "yes"
-                }
-                else -> false
-            }
-            resolvedSecureHeaders = authData["secure_headers"]?.toString()?.takeIf { it.isNotBlank() }
-
-            val needsSecureSession = resolvedEncrypted ||
-                !resolvedSecureHeaders.isNullOrBlank()
-            if (needsSecureSession) {
-                workingModel.mode = PlayerDataSourceMode.SECURE_HLS
-            } else if (workingModel.mode == PlayerDataSourceMode.SECURE_HLS && !urlLooksLikeM3u8(workingModel.url)) {
-                // 非加密直链（如 mp4）不再强依赖 SecureHLS 模式。
-                workingModel.mode = PlayerDataSourceMode.DEFAULT
-            }
-        } else if (workingModel.url.isBlank()) {
-            dispatchError(PlayerErrorCode.INVALID_URL, "播放参数无效：video 和 url 不能同时为空")
-            return false
-        }
-        lastOpenUrl = workingModel.url
+        lastOpenUrl = model.url
         lastOpenStartPosition = 0.0
-        lastOpenPlayModel = clonePlayModel(workingModel)
+        lastOpenPlayModel = clonePlayModel(model)
         if (!autoReopenInFlight) {
             autoReopenAttemptCount = 0
             networkTotalStallMs = 0L
             networkReconnectCount = 0
         }
         applyDecodeModeForHandle(handle)
-        val result = when (workingModel.mode) {
+        val result = when (model.mode) {
             PlayerDataSourceMode.DEFAULT -> {
-                if (workingModel.url.isBlank()) {
+                if (model.url.isBlank()) {
                     dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
                     false
                 } else {
-                    nativeOpenURL(handle, workingModel.url)
+                    nativeOpenURL(handle, model.url)
                 }
             }
             PlayerDataSourceMode.CUSTOM_HTTP -> {
+                val cfg = effectiveDataSourceConfig()
                 nativeOpenWithCustomHTTP(
                     handle,
-                    workingModel.url,
-                    config.timeoutMs,
-                    config.maxRetries,
-                    workingModel.encryptedFile
+                    model.url,
+                    cfg.timeoutMs,
+                    cfg.maxRetries,
+                    model.encryptedFile
                 )
             }
             PlayerDataSourceMode.CUSTOM_FILE -> {
+                val cfg = effectiveDataSourceConfig()
                 nativeOpenWithCustomFile(
                     handle,
-                    workingModel.url,
-                    config.avioBufferSize,
-                    workingModel.encryptedFile
-                )
-            }
-            PlayerDataSourceMode.SECURE_HLS -> {
-                nativeOpenWithSecureSession(
-                    handle,
-                    workingModel.url,
-                    resolvedAuthToken,
-                    resolvedVideoID,
-                    resolvedDeviceID,
-                    resolvedSecretID,
-                    resolvedNonce,
-                    resolvedPlaySessionID,
-                    resolvedSecureHeaders,
-                    resolvedSessionExpireAtMs,
-                    if (resolvedInlineKeyMode) 1 else 0,
-                    resolvedKeyMaterialBase64,
-                    resolvedKeyIVHex
+                    model.url,
+                    cfg.avioBufferSize,
+                    model.encryptedFile
                 )
             }
         }
         if (!result) {
             dispatchError(
                 PlayerErrorCode.OPEN_INPUT_FAILED,
-                "打开失败: mode=${workingModel.mode}, url=${workingModel.url}"
+                "打开失败: mode=${model.mode}, url=${model.url}"
             )
-        }
-        return result
-    }
-
-    /**
-     * 对齐 iOS：按 [autoPlayer] 策略打开 URL。
-     */
-    fun playURL(url: String): Boolean {
-        val result = openURL(url, startPosition)
-        if (result) {
-            if (autoPlayer) play() else pause()
-        }
-        return result
-    }
-
-    /**
-     * 对齐 iOS：按 [autoPlayer] 策略用播放模型打开。
-     */
-    fun playWithModel(model: PlayerDataSourcePlayModel): Boolean {
-        val result = openWithPlayModel(model)
-        if (result) {
-            if (autoPlayer) play() else pause()
         }
         return result
     }
@@ -1015,7 +694,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     // 使用自定义 HTTP 模式打开（支持 Range 下载）
     // encryptedFile：是否与核心层约定一致，对文件头前 100 字节解密（默认 false）
     fun openWithCustomHTTP(url: String, timeoutMs: Int = 30000, maxRetries: Int = 3, encryptedFile: Boolean = false): Boolean {
-        val generation = nextOpenGeneration()
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开自定义 HTTP: $url")
@@ -1024,20 +702,9 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("openWithCustomHTTP")) {
             return false
         }
-        val result = synchronized(nativeOpenStopLock) {
-            if (isStaleOpenGeneration(generation)) {
-                false
-            } else {
-                val activeHandle = currentHandle()
-                if (activeHandle == 0L) {
-                    false
-                } else {
-                    applyDecodeModeForHandle(activeHandle)
-                    nativeOpenWithCustomHTTP(activeHandle, url, timeoutMs, maxRetries, encryptedFile)
-                }
-            }
-        }
-        if (!result && !isStaleOpenGeneration(generation)) {
+        applyDecodeModeForHandle(handle)
+        val result = nativeOpenWithCustomHTTP(handle, url, timeoutMs, maxRetries, encryptedFile)
+        if (!result) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开自定义 HTTP: $url")
         }
         return result
@@ -1050,7 +717,6 @@ class HXCPlayerControl @JvmOverloads constructor(
      * @param encryptedFile 是否对文件头前 100 字节按核心约定解密
      */
     fun openWithCustomFile(path: String, avioBufferSize: Int = 64 * 1024, encryptedFile: Boolean = false): Boolean {
-        val generation = nextOpenGeneration()
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开本地文件(CustomFile): $path")
@@ -1059,20 +725,9 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("openWithCustomFile")) {
             return false
         }
-        val result = synchronized(nativeOpenStopLock) {
-            if (isStaleOpenGeneration(generation)) {
-                false
-            } else {
-                val activeHandle = currentHandle()
-                if (activeHandle == 0L) {
-                    false
-                } else {
-                    applyDecodeModeForHandle(activeHandle)
-                    nativeOpenWithCustomFile(activeHandle, path, avioBufferSize, encryptedFile)
-                }
-            }
-        }
-        if (!result && !isStaleOpenGeneration(generation)) {
+        applyDecodeModeForHandle(handle)
+        val result = nativeOpenWithCustomFile(handle, path, avioBufferSize, encryptedFile)
+        if (!result) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开本地文件(CustomFile): $path")
         }
         return result
@@ -1097,57 +752,10 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     // 停止
     fun stop() {
-        nextOpenGeneration()
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        synchronized(nativeOpenStopLock) {
-            val activeHandle = currentHandle()
-            if (activeHandle != 0L && !isReleased) {
-                nativeStop(activeHandle)
-            }
-        }
+        nativeStop(handle)
         networkLoadingSinceMs = 0L
-    }
-
-    /**
-     * 对齐 iOS：恢复播放。
-     */
-    fun resume() {
-        play()
-    }
-
-    /**
-     * 从头重播最近一次打开的源（始终从位置 0 开始）。
-     */
-    fun replay() {
-        replayFrom(0.0)
-    }
-
-    /**
-     * 从指定位置重新打开并播放最近一次打开的源。
-     *
-     * 适用场景：
-     * - [replay]：从 0 开始重播（内部调用 replayFrom(0.0)）
-     * - 播放完成后拖动进度条：以目标进度为起点重开，避免在 STOPPED 状态下直接 seekTo 触发 -1011 错误
-     *
-     * @param position 起始位置（秒），负值视为 0
-     */
-    fun replayFrom(position: Double) {
-        if (!licenseAllowedOrNotify("replayFrom")) {
-            return
-        }
-        val url = lastOpenUrl
-        val model = lastOpenPlayModel?.let { clonePlayModel(it) }
-        // replay 前先 stop 归一状态机，避免 -1002（状态错误）。
-        stop()
-        startPosition = position.coerceAtLeast(0.0)
-        if (model != null) {
-            playWithModel(model)
-        } else if (!url.isNullOrBlank()) {
-            playURL(url)
-        }
-        // startPosition 保留为 position，不在失败时恢复旧值，
-        // 避免旧值（如 viewTime）在下次 open 时被错误复用。
     }
 
     // 跳转
@@ -1158,13 +766,6 @@ class HXCPlayerControl @JvmOverloads constructor(
             return
         }
         nativeSeekTo(handle, position)
-    }
-
-    /**
-     * 对齐 iOS：跳转到指定播放位置（秒）。
-     */
-    fun seekToPosition(position: Double) {
-        seekTo(position)
     }
 
     // 设置播放速度
@@ -1388,7 +989,6 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     // 释放资源
     fun release() {
-        nextOpenGeneration()
         synchronized(lifecycleLock) {
             if (isReleased) return
             isReleased = true
@@ -1409,12 +1009,10 @@ class HXCPlayerControl @JvmOverloads constructor(
             nativeHandle = 0
         }
         if (handle != 0L) {
-            synchronized(nativeOpenStopLock) {
-                nativeSetSurface(handle, null)
-                textureDecoderSurface?.release()
-                textureDecoderSurface = null
-                nativeRelease(handle)
-            }
+            nativeSetSurface(handle, null)
+            textureDecoderSurface?.release()
+            textureDecoderSurface = null
+            nativeRelease(handle)
         }
 
         lastLoadingState = null
@@ -1442,37 +1040,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeOpenURLWithStartPosition(handle: Long, url: String, startPosition: Double): Boolean
     private external fun nativeOpenWithCustomHTTP(handle: Long, url: String, timeoutMs: Int, maxRetries: Int, encryptedFile: Boolean): Boolean
     private external fun nativeOpenWithCustomFile(handle: Long, path: String, avioBufferSize: Int, encryptedFile: Boolean): Boolean
-    private external fun nativeOpenWithSecureSession(
-        handle: Long,
-        url: String,
-        authToken: String?,
-        videoID: String?,
-        deviceID: String?,
-        secretID: String?,
-        nonce: String?,
-        playSessionID: String?,
-        secureHeaders: String?,
-        sessionExpireAtMs: Long,
-        keyMode: Int,
-        keyMaterialBase64: String?,
-        keyIVHex: String?
-    ): Boolean
-    // 兼容旧 JNI 名称，保留声明便于回滚和灰度排障。
-    private external fun nativeOpenWithSecureHLS(
-        handle: Long,
-        url: String,
-        authToken: String?,
-        videoID: String?,
-        deviceID: String?,
-        secretID: String?,
-        nonce: String?,
-        playSessionID: String?,
-        secureHeaders: String?,
-        sessionExpireAtMs: Long,
-        keyMode: Int,
-        keyMaterialBase64: String?,
-        keyIVHex: String?
-    ): Boolean
     private external fun nativePlay(handle: Long)
     private external fun nativePause(handle: Long)
     private external fun nativeStop(handle: Long)
