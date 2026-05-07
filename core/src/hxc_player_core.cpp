@@ -2277,13 +2277,20 @@ void PlayerCore::video_thread() {
         // 计算帧持续时间
         duration = av_q2d(format_ctx_->streams[video_stream_]->time_base);
         
-        // ⚠️ 音画同步丢帧：seeking 期间跳过（已用 skip_frame 加速追帧，不应再丢）
-        // 正常播放时，视频落后音频超过 100ms 才丢帧
-        if (!is_seeking && !isnan(pts)) {
+        // 音画同步丢帧：
+        // - seek 刚结束后有一段"warmup"窗口（对齐 iOS syncWarmupFramesRemaining 机制），
+        //   放宽到 -0.5s，避免 seeking_ 清除后视频帧因轻微滞后被立刻全部丢掉。
+        // - 正常播放时，视频落后超过 100ms 才丢帧。
+        if (!isnan(pts)) {
             double diff = pts - get_master_clock();
-            if (!isnan(diff) && diff <= -0.1) {
-                av_frame_unref(frame);
-                continue;
+            if (!isnan(diff)) {
+                // seek 刚结束（seeking_ 从 true 变 false）后，放宽丢帧窗口
+                double drop_threshold = is_seeking ? -10.0   // seeking 中不丢
+                                                   : -0.5;   // 正常播放窗口放宽到 0.5s
+                if (diff <= drop_threshold) {
+                    av_frame_unref(frame);
+                    continue;
+                }
             }
         }
 
@@ -2457,22 +2464,18 @@ void PlayerCore::audio_thread() {
         // 计算时间戳
         double pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : 
                      frame->pts * av_q2d(format_ctx_->streams[audio_stream_]->time_base);
+
+        // seek 追帧策略（关键修复，对齐 iOS 行为）：
+        // - 不在这里丢帧！audio_callback_impl 消费时对 pts < target 的帧输出静音。
+        // - 只要拿到第一个有效音频帧，立即清除 seeking_ 标志，让 video_thread 停止追帧，
+        //   渲染线程能尽快拿到视频帧出图。
         if (seeking_.load(std::memory_order_acquire) && !isnan(pts)) {
             double target = seek_target_pos_.load(std::memory_order_acquire);
-            const double backward_tolerance_sec = hxc_calc_seek_backward_tolerance_sec(media_info_);
-            // seeking 期间，先丢弃明显早于目标的旧帧，避免音频主时钟回退。
-            if (pts < (target - backward_tolerance_sec)) {
-                av_frame_unref(frame);
-                continue;
-            }
-            // 默认 AudioMaster：以音频首个有效帧作为 seek 完成锚点。
-            bool in_seek_window = (pts >= (target - backward_tolerance_sec) &&
-                                   pts <= (target + kSeekAnchorForwardToleranceSec));
-            if (in_seek_window) {
+            // 任何 pts > 0 的音频帧都可以作为 seek 完成锚点（callback 会跳过早于 target 的帧）
+            if (pts >= 0.0) {
                 seeking_.store(false, std::memory_order_release);
                 set_seek_loading(false);
-                LOG_INFO("音频线程：检测到 seek 后有效首帧，结束 seeking。target=",
-                         target, ", pts=", pts);
+                LOG_INFO("audio_thread: seek done, target=", target, " audio_pts=", pts);
             }
         }
         
@@ -2683,7 +2686,18 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
             if (!af || !af->frame) {
                 return;
             }
-            
+
+            // seek 后跳过早于目标位置的音频帧（输出静音），避免播放到错误位置的音频。
+            // seeking_ 此时已经被 audio_thread 清除，所以用 seek_target_pos_ 单独判断。
+            if (!isnan(af->pts) && af->pts >= 0.0) {
+                double target = seek_target_pos_.load(std::memory_order_acquire);
+                const double backward_tol = hxc_calc_seek_backward_tolerance_sec(media_info_);
+                if (target > 0.0 && af->pts < (target - backward_tol)) {
+                    audio_queue_->next();
+                    return;  // 输出静音（stream 已 memset 为 0）
+                }
+            }
+
             AVFrame* frame = af->frame;
             
             // 重采样音频
