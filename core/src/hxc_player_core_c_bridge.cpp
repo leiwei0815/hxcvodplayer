@@ -398,21 +398,26 @@ int player_core_get_video_frame(PlayerCoreHandle* handle, VideoFrameDataC* frame
     if (!videoQueue || videoQueue->size() <= 0) {
         return -1;  // 没有可用帧
     }
-    
-    auto* vf = videoQueue->peek_readable();
+
+    // seek 后 packet_serial 会递增，需要跳过旧 serial 的帧。
+    // 此处全程使用非阻塞取帧，避免渲染线程在 seek 后长时间阻塞导致画面冻住。
+    int latest_video_serial = handle->core->get_video_packet_serial();
+
+    auto* vf = videoQueue->peek_last_nonblocking();
     if (!vf || !vf->frame) {
         return -1;
     }
 
-    int latest_video_serial = handle->core->get_video_packet_serial();
-    while (vf && vf->frame && vf->serial != latest_video_serial) {
+    // 丢弃所有 serial 过期的帧（非阻塞）
+    while (vf->serial != latest_video_serial) {
         videoQueue->next();
-        if (videoQueue->size() <= 0) {
-            return -1;
+        vf = videoQueue->peek_last_nonblocking();
+        if (!vf || !vf->frame) {
+            return -1;  // 队列空了，新帧还在解码中，本轮跳过
         }
-        vf = videoQueue->peek_readable();
     }
-    if (!vf || !vf->frame) {
+
+    if (!vf->frame) {
         return -1;
     }
     

@@ -758,7 +758,10 @@ void AndroidPlayer::renderLoop() {
             }
         } else {
             empty_count++;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // seek 后帧队列暂时为空（旧帧被丢弃，新帧还在解码中），用短间隔积极轮询
+            // 前 30 次空帧（约 100ms）用 3ms 快速轮询，之后降到 10ms 节省 CPU
+            int wait_ms = (empty_count <= 30) ? 3 : 10;
+            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
         }
     }
 
