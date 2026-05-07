@@ -1448,7 +1448,19 @@ static void audioQueueCallback(void *userData, AudioQueueRef queue, AudioQueueBu
         buffer->mAudioDataByteSize = 0;
         return;
     }
-    
+
+    // seek 后跳过早于目标位置的音频帧（输出静音），避免播放到错误位置的音频。
+    // 与 Android onAudioData 中的同等逻辑对称，统一在平台层处理。
+    double seekTarget = player_core_get_seek_target(_wrapper->handle());
+    if (seekTarget > 0.0) {
+        double pos = player_core_get_position(_wrapper->handle());
+        if (!isnan(pos) && pos < seekTarget - 0.3) {
+            memset(buffer->mAudioData, 0, buffer->mAudioDataBytesCapacity);
+            buffer->mAudioDataByteSize = buffer->mAudioDataBytesCapacity;
+            return;
+        }
+    }
+
     int got = player_core_get_audio_data(_wrapper->handle(), 
                                         (unsigned char*)buffer->mAudioData, 
                                         (int)buffer->mAudioDataBytesCapacity);

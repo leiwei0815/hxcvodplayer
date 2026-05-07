@@ -142,6 +142,8 @@ private:
     // 渲染线程
     std::thread render_thread_;
     std::atomic<bool> render_running_;
+    // seek/open 后 A/V sync warmup 剩余渲染帧数（渲染层自维护，不依赖 core 的解码计数器）
+    std::atomic<int> render_warmup_frames_{0};
     void renderLoop();
     // 用 OpenGL ES 渲染一帧 YUV，返回总耗时 ms，失败返回 -1
     // out_upload_ms / out_max_upload_ms：纹理上传耗时的累计和最大值（可传 nullptr 忽略）

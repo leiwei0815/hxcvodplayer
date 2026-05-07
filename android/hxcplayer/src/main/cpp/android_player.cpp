@@ -175,7 +175,8 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     if (result == 0) {
         LOGI("URL opened successfully");
         ensureAudioOutputForCurrentStream();
-        
+        render_warmup_frames_.store(40, std::memory_order_release);
+
         // ⏸️ 打开后自动暂停，等待用户点击播放
         player_core_pause(player_core_);
         LOGI("Video opened and paused, waiting for user to play");
@@ -221,6 +222,7 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
     if (result == 0) {
         LOGI("Custom HTTP opened successfully");
         ensureAudioOutputForCurrentStream();
+        render_warmup_frames_.store(40, std::memory_order_release);
 
         player_core_pause(player_core_);
         return true;
@@ -259,6 +261,7 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
     if (result == 0) {
         LOGI("Custom file opened successfully");
         ensureAudioOutputForCurrentStream();
+        render_warmup_frames_.store(40, std::memory_order_release);
 
         player_core_pause(player_core_);
         return true;
@@ -315,6 +318,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
                 audio_initialized_ = true;
             }
         }
+        render_warmup_frames_.store(40, std::memory_order_release);
         player_core_pause(player_core_);
         return true;
     }
@@ -408,6 +412,8 @@ void AndroidPlayer::seekTo(double position) {
     
     LOGD("Seek to: %f", position);
     player_core_seek(player_core_, position);
+    // seek 后重置渲染层 warmup 窗口（对齐 iOS _syncWarmupFramesRemaining=40）
+    render_warmup_frames_.store(40, std::memory_order_release);
 }
 
 void AndroidPlayer::setPlaybackRate(float rate) {
@@ -775,7 +781,9 @@ void AndroidPlayer::renderLoop() {
             double currentPTS   = frame_data.pts;
             double masterClock  = player_core_get_position(player_core_);
             double delay        = currentPTS - masterClock;
-            int    warmup       = player_core_get_post_seek_warmup(player_core_);
+            // render_warmup_frames_ 由 openURL/seekTo 在渲染层独立维护，
+            // 不依赖 core 的解码计数器（解码速度远快于渲染，不适合作渲染窗口基准）
+            int    warmup       = render_warmup_frames_.load(std::memory_order_acquire);
             bool   should_display = false;
             bool   should_consume = false;
 
@@ -865,6 +873,10 @@ void AndroidPlayer::renderLoop() {
 
             if (should_consume) {
                 player_core_consume_video_frame(player_core_);
+                // warmup 计数按渲染消费帧递减（不依赖解码速度）
+                if (warmup > 0) {
+                    render_warmup_frames_.fetch_sub(1, std::memory_order_acq_rel);
+                }
             }
 
             // 如果本轮不消费（视频超前等待），短暂 sleep 避免空转
