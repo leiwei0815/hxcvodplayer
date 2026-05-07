@@ -143,10 +143,13 @@ private:
     std::thread render_thread_;
     std::atomic<bool> render_running_;
     void renderLoop();
-    // 用 OpenGL ES 渲染一帧 YUV，返回耗时 ms，失败返回 -1
+    // 用 OpenGL ES 渲染一帧 YUV，返回总耗时 ms，失败返回 -1
+    // out_upload_ms / out_max_upload_ms：纹理上传耗时的累计和最大值（可传 nullptr 忽略）
     int renderFrame(void* y_data, void* u_data, void* v_data,
                    int y_linesize, int u_linesize, int v_linesize,
-                   int width, int height);
+                   int width, int height,
+                   int64_t* out_upload_ms = nullptr,
+                   int64_t* out_max_upload_ms = nullptr);
     
     // OpenSL ES 音频输出
     SLObjectItf engineObject_;

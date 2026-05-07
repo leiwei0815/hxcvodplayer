@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <inttypes.h>
 
 #define LOG_TAG "AndroidPlayer"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
@@ -710,6 +711,22 @@ void AndroidPlayer::renderLoop() {
     int empty_count = 0;
     bool gl_ready = false;
 
+    // 诊断统计
+    int64_t total_render_ms = 0;
+    int64_t total_upload_ms = 0;
+    int64_t max_render_ms = 0;
+    int64_t max_upload_ms = 0;
+    int diag_interval = 60;   // 每 60 帧打一次统计
+
+    // seek 等待诊断
+    int64_t empty_start_ms = 0;
+    bool in_empty_streak = false;
+
+    auto now_ms = []() -> int64_t {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+
     while (render_running_) {
         // 等待 Surface 就绪
         {
@@ -739,28 +756,74 @@ void AndroidPlayer::renderLoop() {
         }
 
         VideoFrameDataC frame_data;
+        auto t_get0 = now_ms();
         int result = player_core_get_video_frame(player_core_, &frame_data);
+        auto t_get1 = now_ms();
+
         if (result == 0) {
+            // 空帧阶段结束：打印等待耗时（可用于判断解码速度）
+            if (in_empty_streak) {
+                int64_t wait_ms = now_ms() - empty_start_ms;
+                LOGI("🎬 [DIAG] 帧等待结束: 空帧轮询耗时 %" PRId64 " ms (empty_count=%d) | 视频尺寸=%dx%d",
+                     wait_ms, empty_count, frame_data.width, frame_data.height);
+                in_empty_streak = false;
+            }
+            empty_count = 0;
+
             frame_count++;
+            auto t_render0 = now_ms();
             int cost = renderFrame(frame_data.y_data, frame_data.u_data, frame_data.v_data,
                                    frame_data.y_linesize, frame_data.u_linesize, frame_data.v_linesize,
-                                   frame_data.width, frame_data.height);
+                                   frame_data.width, frame_data.height,
+                                   &total_upload_ms, &max_upload_ms);
+            auto t_render1 = now_ms();
+            int64_t render_ms = t_render1 - t_render0;
+            total_render_ms += render_ms;
+            if (render_ms > max_render_ms) max_render_ms = render_ms;
+
             if (cost < 0) {
-                // EGL surface 失效（Activity 切换、Surface 重建等），重新初始化
                 LOGW("⚠️ renderFrame failed, reinitializing EGL...");
                 destroyEGL();
                 gl_ready = false;
             }
             player_core_consume_video_frame(player_core_);
-            empty_count = 0;
-            if (frame_count % 300 == 0) {
-                LOGD("✅ GL rendered %d frames", frame_count);
+
+            // 每 diag_interval 帧打一次诊断统计
+            if (frame_count % diag_interval == 0) {
+                LOGI("📊 [DIAG] 最近 %d 帧统计 | "
+                     "avg_render=%" PRId64 "ms max_render=%" PRId64 "ms "
+                     "avg_upload=%" PRId64 "ms max_upload=%" PRId64 "ms "
+                     "get_frame=%" PRId64 "ms",
+                     diag_interval,
+                     total_render_ms / diag_interval, max_render_ms,
+                     total_upload_ms / diag_interval, max_upload_ms,
+                     t_get1 - t_get0);
+                total_render_ms = 0; total_upload_ms = 0;
+                max_render_ms = 0;  max_upload_ms = 0;
+            }
+
+            // 慢帧单独警告（>33ms = 低于 30fps）
+            if (render_ms > 33) {
+                LOGW("⚠️ [DIAG] 慢帧警告: render_ms=%" PRId64 "ms upload_ms=%" PRId64 "ms | 视频=%dx%d surface=%dx%d",
+                     render_ms, render_ms,  // upload_ms 在 renderFrame 内部独立计时
+                     frame_data.width, frame_data.height,
+                     surface_width_, surface_height_);
             }
         } else {
             empty_count++;
-            // seek 后帧队列暂时为空（旧帧被丢弃，新帧还在解码中），用短间隔积极轮询
-            // 前 30 次空帧（约 100ms）用 3ms 快速轮询，之后降到 10ms 节省 CPU
-            int wait_ms = (empty_count <= 30) ? 3 : 10;
+            if (!in_empty_streak) {
+                empty_start_ms = now_ms();
+                in_empty_streak = true;
+                // 队列首次空：打印核心状态帮助排查是 seek 后等待还是卡解码
+                if (player_core_) {
+                    LOGI("⏳ [DIAG] 帧队列为空开始等待: state=%d pos=%.3f",
+                         player_core_get_state(player_core_),
+                         player_core_get_position(player_core_));
+                }
+            }
+            // seek 后帧队列暂时为空，用短间隔积极轮询
+            // 前 50 次（约 150ms）用 3ms 快速轮询，之后降到 16ms 节省 CPU
+            int wait_ms = (empty_count <= 50) ? 3 : 16;
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
         }
     }
@@ -772,7 +835,8 @@ void AndroidPlayer::renderLoop() {
 
 int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
                                int y_linesize, int u_linesize, int v_linesize,
-                               int width, int height) {
+                               int width, int height,
+                               int64_t* out_upload_ms, int64_t* out_max_upload_ms) {
     if (!y_data || width <= 0 || height <= 0) return -1;
     if (!gl_program_ || egl_surface_ == EGL_NO_SURFACE) return -1;
 
@@ -786,12 +850,18 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    // --- 上传 Y 纹理 ---
+    // --- 上传 Y/U/V 纹理（4K 时这一步是主要耗时）---
     int uv_w = u_linesize > 0 ? u_linesize : width / 2;
     int uv_h = height / 2;
     int v_w  = v_linesize > 0 ? v_linesize : width / 2;
 
     bool size_changed = (width != gl_last_video_w_ || height != gl_last_video_h_);
+    if (size_changed) {
+        LOGI("🎬 [DIAG] 视频尺寸变化: %dx%d -> %dx%d | Y_linesize=%d UV_linesize=%d",
+             gl_last_video_w_, gl_last_video_h_, width, height, y_linesize, uv_w);
+    }
+
+    auto t_upload0 = std::chrono::high_resolution_clock::now();
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, gl_tex_y_);
@@ -817,6 +887,16 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v_w, uv_h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
     } else {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, v_w, uv_h, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+    }
+
+    auto t_upload1 = std::chrono::high_resolution_clock::now();
+    int64_t upload_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_upload1 - t_upload0).count();
+    if (out_upload_ms) *out_upload_ms += upload_ms;
+    if (out_max_upload_ms && upload_ms > *out_max_upload_ms) *out_max_upload_ms = upload_ms;
+    // 单帧纹理上传超 10ms 时立即警告（4K = 3840*2160 Y 面约 8MB，应在 5ms 内完成）
+    if (upload_ms > 10) {
+        LOGW("⚠️ [DIAG] 纹理上传慢: upload_ms=%" PRId64 "ms | %dx%d Y_linesize=%d",
+             upload_ms, width, height, y_linesize);
     }
 
     gl_last_video_w_ = width;
