@@ -1564,6 +1564,11 @@ void PlayerCore::read_thread() {
                 if (audio_stream_ >= 0 && audio_stream_opened_ && audio_packet_queue_) {
                     audio_packet_queue_->put_nullpacket(audio_stream_);
                 }
+
+                // seek 开始时重置 skip_frame（video_thread 会根据 pts 动态开启/关闭）
+                if (video_codec_ctx_) {
+                    video_codec_ctx_->skip_frame = AVDISCARD_DEFAULT;
+                }
                 
                 // ⚠️ 5. 【关键修复】立即更新时钟到目标位置，避免进度条跳动
                 // 这样 get_master_clock() 会立即返回正确的 seek 位置
@@ -1954,6 +1959,15 @@ int PlayerCore::stream_component_open(int stream_index) {
         LOG_INFO("视频解码模式：软解");
     }
 
+    // 软解时开启多线程（参考 ijkplayer：thread_count = CPU 核数，最多 4）
+    // 硬解由 GPU 处理，无需设置 thread_count。
+    if (!request_video_hw_decode && codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        // frame-level 并行（H.264/H.265 都支持，兼容性好）
+        codec_ctx->thread_count = 0;   // 0 = FFmpeg 自动选择（通常 = CPU 核数，上限 16）
+        codec_ctx->thread_type  = FF_THREAD_FRAME;
+        LOG_INFO("视频软解多线程：thread_count=auto(0), thread_type=FRAME");
+    }
+
     // 打开解码器（若硬解打开失败，自动回退软解）
     int open_ret = avcodec_open2(codec_ctx, codec, nullptr);
     if (open_ret < 0 && request_video_hw_decode && hw_decode_enabled) {
@@ -1965,6 +1979,9 @@ int PlayerCore::stream_component_open(int stream_index) {
             LOG_ERROR("硬解回退软解失败：无法重新创建解码器上下文");
             return -1;
         }
+        // 回退到软解时同样启用多线程
+        codec_ctx->thread_count = 0;
+        codec_ctx->thread_type  = FF_THREAD_FRAME;
         open_ret = avcodec_open2(codec_ctx, codec, nullptr);
         hw_decode_enabled = false;
     }
@@ -2218,14 +2235,28 @@ void PlayerCore::video_thread() {
         
         // 计算帧时间戳
         pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(format_ctx_->streams[video_stream_]->time_base);
-        if (seeking_.load(std::memory_order_acquire) && !isnan(pts)) {
+        bool is_seeking = seeking_.load(std::memory_order_acquire);
+        if (is_seeking && !isnan(pts)) {
             double target = seek_target_pos_.load(std::memory_order_acquire);
             const double backward_tolerance_sec = hxc_calc_seek_backward_tolerance_sec(media_info_);
-            // seeking 期间，先丢弃明显早于目标的旧帧，避免把渲染时钟拉回。
+
             if (pts < (target - backward_tolerance_sec)) {
+                // 还未到目标位置：开启跳帧加速（只解码关键帧，跳过 B/P 帧）
+                // 这是 ijkplayer/ffplay 的核心优化，使 seek 追帧速度提升 5~10x
+                if (video_codec_ctx_ && video_codec_ctx_->skip_frame != AVDISCARD_NONREF) {
+                    video_codec_ctx_->skip_frame = AVDISCARD_NONREF;
+                    LOG_INFO("视频线程: seek 追帧中，启用 AVDISCARD_NONREF 跳帧加速 target=", target, " pts=", pts);
+                }
                 av_frame_unref(frame);
                 continue;
             }
+
+            // 已到达目标位置：恢复正常解码
+            if (video_codec_ctx_ && video_codec_ctx_->skip_frame != AVDISCARD_DEFAULT) {
+                video_codec_ctx_->skip_frame = AVDISCARD_DEFAULT;
+                LOG_INFO("视频线程: seek 追帧完成，恢复 AVDISCARD_DEFAULT target=", target, " pts=", pts);
+            }
+
             // 无音频流时，使用视频首帧判断 seek 完成，避免 seeking 状态卡住。
             bool use_video_as_seek_anchor = (audio_stream_ < 0 || !audio_stream_opened_);
             if (use_video_as_seek_anchor) {
@@ -2238,16 +2269,20 @@ void PlayerCore::video_thread() {
                              target, ", pts=", pts);
                 }
             }
+        } else if (!is_seeking && video_codec_ctx_ &&
+                   video_codec_ctx_->skip_frame != AVDISCARD_DEFAULT) {
+            // seek 已结束但 skip_frame 未复位（兜底）
+            video_codec_ctx_->skip_frame = AVDISCARD_DEFAULT;
         }
         
         // 计算帧持续时间
         duration = av_q2d(format_ctx_->streams[video_stream_]->time_base);
         
-        // ⚠️ 音画同步：在写入队列之前判断是否丢帧，避免 push 后再 next 导致消费端看不到帧
-        if (!isnan(pts)) {
+        // ⚠️ 音画同步丢帧：seeking 期间跳过（已用 skip_frame 加速追帧，不应再丢）
+        // 正常播放时，视频落后音频超过 100ms 才丢帧
+        if (!is_seeking && !isnan(pts)) {
             double diff = pts - get_master_clock();
             if (!isnan(diff) && diff <= -0.1) {
-                // 视频落后音频超过 100ms，丢弃此帧，不写入队列
                 av_frame_unref(frame);
                 continue;
             }
