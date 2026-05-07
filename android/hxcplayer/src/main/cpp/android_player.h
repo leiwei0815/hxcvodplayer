@@ -11,11 +11,10 @@
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
 
-// FFmpeg swscale for hardware-accelerated scaling
-extern "C" {
-#include <libswscale/swscale.h>
-#include <libavutil/imgutils.h>
-}
+// EGL / OpenGL ES 2.0
+#include <EGL/egl.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 
 // 前向声明
 struct PlayerCoreHandle;
@@ -106,32 +105,45 @@ private:
     // 核心播放器句柄
     PlayerCoreHandle* player_core_;
     
-    // Surface 相关
+    // Surface / EGL 相关
     ANativeWindow* native_window_;
     std::mutex window_mutex_;
-    std::mutex sws_mutex_;   // 保护 sws_ctx_ / rgb_buffer_ / last_video/target_width/height
     int surface_width_;
     int surface_height_;
     int aspect_ratio_mode_; // 0=FIT, 1=FILL
     int decode_mode_;       // 0=software, 1=hardware
-    bool surface_configured_;  // Surface 是否已配置
-    // Surface/尺寸变更代数：用于避免 setSurface/updateSurfaceSize 与 renderLoop 的竞态
     std::atomic<uint64_t> surface_generation_{0};
-    
-    // FFmpeg swscale context for YUV->RGB conversion
-    SwsContext* sws_ctx_;
-    uint8_t* rgb_buffer_;
-    int rgb_buffer_size_;
-    int last_video_width_;   // 上次视频尺寸
-    int last_video_height_;
-    int last_target_width_;  // 上次目标尺寸
-    int last_target_height_;
-    
+
+    // EGL 上下文（渲染线程独占）
+    EGLDisplay egl_display_;
+    EGLContext egl_context_;
+    EGLSurface egl_surface_;
+
+    // OpenGL ES 资源（渲染线程独占，无需锁）
+    GLuint gl_program_;
+    GLuint gl_tex_y_;   // Y  纹理
+    GLuint gl_tex_u_;   // U  纹理
+    GLuint gl_tex_v_;   // V  纹理
+    GLint  gl_uniform_y_;
+    GLint  gl_uniform_u_;
+    GLint  gl_uniform_v_;
+    GLint  gl_attrib_pos_;      // a_position location（initGLProgram 时缓存）
+    GLint  gl_attrib_tex_;      // a_texcoord location（Y 平面）
+    GLint  gl_attrib_tex_uv_;   // a_texcoord_uv location（UV 平面）
+    int    gl_last_video_w_;
+    int    gl_last_video_h_;
+
+    // EGL/GL 初始化与销毁（仅在渲染线程调用）
+    bool initEGL();
+    void destroyEGL();
+    bool initGLProgram();
+    void destroyGLProgram();
+
     // 渲染线程
     std::thread render_thread_;
     std::atomic<bool> render_running_;
     void renderLoop();
-    // 返回 swscale 耗时（ms），失败时返回 -1
+    // 用 OpenGL ES 渲染一帧 YUV，返回耗时 ms，失败返回 -1
     int renderFrame(void* y_data, void* u_data, void* v_data,
                    int y_linesize, int u_linesize, int v_linesize,
                    int width, int height);

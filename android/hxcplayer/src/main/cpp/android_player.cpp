@@ -1,6 +1,7 @@
 #include "android_player.h"
 #include "hxc_player_core_c_bridge.h"
 #include <android/log.h>
+#include <android/native_window.h>
 #include <cstring>
 #include <algorithm>
 #include <chrono>
@@ -19,14 +20,21 @@ AndroidPlayer::AndroidPlayer()
     , surface_height_(0)
     , aspect_ratio_mode_(0) // FIT
     , decode_mode_(0) // 默认软解
-    , surface_configured_(false)
-    , sws_ctx_(nullptr)
-    , rgb_buffer_(nullptr)
-    , rgb_buffer_size_(0)
-    , last_video_width_(0)
-    , last_video_height_(0)
-    , last_target_width_(0)
-    , last_target_height_(0)
+    , egl_display_(EGL_NO_DISPLAY)
+    , egl_context_(EGL_NO_CONTEXT)
+    , egl_surface_(EGL_NO_SURFACE)
+    , gl_program_(0)
+    , gl_tex_y_(0)
+    , gl_tex_u_(0)
+    , gl_tex_v_(0)
+    , gl_uniform_y_(-1)
+    , gl_uniform_u_(-1)
+    , gl_uniform_v_(-1)
+    , gl_attrib_pos_(-1)
+    , gl_attrib_tex_(-1)
+    , gl_attrib_tex_uv_(-1)
+    , gl_last_video_w_(0)
+    , gl_last_video_h_(0)
     , render_running_(false)
     , engineObject_(nullptr)
     , engineEngine_(nullptr)
@@ -67,7 +75,7 @@ AndroidPlayer::AndroidPlayer()
 AndroidPlayer::~AndroidPlayer() {
     LOGD("AndroidPlayer destroyed");
     
-    // 停止渲染线程
+    // 停止渲染线程（EGL/GL 资源在线程内销毁）
     render_running_ = false;
     if (render_thread_.joinable()) {
         render_thread_.join();
@@ -75,16 +83,6 @@ AndroidPlayer::~AndroidPlayer() {
     
     // 销毁音频输出
     destroyAudioOutput();
-    
-    // 释放 swscale 资源
-    if (sws_ctx_) {
-        sws_freeContext(sws_ctx_);
-        sws_ctx_ = nullptr;
-    }
-    if (rgb_buffer_) {
-        av_free(rgb_buffer_);
-        rgb_buffer_ = nullptr;
-    }
     
     // 释放窗口
     if (native_window_) {
@@ -109,7 +107,6 @@ void AndroidPlayer::setSurface(ANativeWindow* window) {
 
         if (native_window_) {
             ANativeWindow_release(native_window_);
-            surface_configured_ = false;
         }
 
         native_window_ = window;
@@ -118,22 +115,19 @@ void AndroidPlayer::setSurface(ANativeWindow* window) {
         if (native_window_) {
             ANativeWindow_acquire(native_window_);
             LOGD("Surface set: %p", native_window_);
-            surface_configured_ = false;
 
             if (!render_running_) {
                 render_running_ = true;
                 render_thread_ = std::thread(&AndroidPlayer::renderLoop, this);
             }
         } else {
+            // Surface 清除：native_window_ 已置 null，renderLoop 会检测到并销毁 EGL。
+            // 不在这里 join，让渲染线程自然退出（它会检测 native_window_ == null）。
+            // 若 player 被完全销毁，析构函数会 join。
             LOGD("Surface cleared");
-            render_running_ = false;
-            // 把 thread 移出来，锁外再 join
-            if (render_thread_.joinable()) {
-                thread_to_join = std::move(render_thread_);
-            }
         }
     }
-    // 锁已释放，renderFrame 可以正常退出，join 不会死锁
+    // 锁已释放，必要时在析构等待线程退出
     if (thread_to_join.joinable()) {
         thread_to_join.join();
     }
@@ -149,7 +143,6 @@ void AndroidPlayer::updateSurfaceSize(int width, int height) {
         
         surface_width_ = width;
         surface_height_ = height;
-        surface_configured_ = false;  // 标记需要重新配置
         surface_generation_.fetch_add(1, std::memory_order_relaxed);
         
         LOGI("✅ Surface size updated (will reconfigure on next frame)");
@@ -438,21 +431,7 @@ void AndroidPlayer::setAspectRatioMode(int mode) {
         player_core_set_aspect_ratio_mode(player_core_,
             mode == 1 ? ASPECT_RATIO_FILL : ASPECT_RATIO_FIT);
     }
-
-    // 重置 swscale context 以应用新的宽高比模式。
-    // sws_ctx_ 同时被渲染线程访问，必须持 sws_mutex_ 操作，避免 UAF/崩溃。
-    {
-        std::lock_guard<std::mutex> lock(sws_mutex_);
-        if (sws_ctx_) {
-            sws_freeContext(sws_ctx_);
-            sws_ctx_ = nullptr;
-            last_video_width_ = 0;
-            last_video_height_ = 0;
-            last_target_width_ = 0;
-            last_target_height_ = 0;
-            LOGI("🔄 Reset swscale context to apply new aspect ratio mode");
-        }
-    }
+    // OpenGL ES Shader 通过 uniform 控制宽高比，下一帧自动生效，无需重置
 }
 
 void AndroidPlayer::setDecodeMode(int mode) {
@@ -572,425 +551,358 @@ bool AndroidPlayer::consumePlaybackCompleted() {
     return completed;
 }
 
+// ========== OpenGL ES YUV 渲染 ==========
+
+// Vertex Shader：传两套 texcoord，Y 和 UV 独立处理 stride padding 与裁剪
+static const char* kVertexShader = R"(
+attribute vec4 a_position;
+attribute vec2 a_texcoord;    // Y 平面 texcoord（已折算 Y-stride padding）
+attribute vec2 a_texcoord_uv; // UV 平面 texcoord（已折算 UV-stride padding 与 FILL 裁剪）
+varying   vec2 v_texcoord;
+varying   vec2 v_texcoord_uv;
+void main() {
+    gl_Position    = a_position;
+    v_texcoord     = a_texcoord;
+    v_texcoord_uv  = a_texcoord_uv;
+}
+)";
+
+// Fragment Shader：Y 用 v_texcoord，U/V 用 v_texcoord_uv
+static const char* kFragmentShader = R"(
+precision mediump float;
+varying vec2      v_texcoord;
+varying vec2      v_texcoord_uv;
+uniform sampler2D u_tex_y;
+uniform sampler2D u_tex_u;
+uniform sampler2D u_tex_v;
+void main() {
+    float y = texture2D(u_tex_y, v_texcoord).r;
+    float u = texture2D(u_tex_u, v_texcoord_uv).r - 0.5;
+    float v = texture2D(u_tex_v, v_texcoord_uv).r - 0.5;
+    float r = y + 1.402  * v;
+    float g = y - 0.344  * u - 0.714 * v;
+    float b = y + 1.772  * u;
+    gl_FragColor = vec4(r, g, b, 1.0);
+}
+)";
+
+static GLuint compileShader(GLenum type, const char* src) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &src, nullptr);
+    glCompileShader(shader);
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char buf[512];
+        glGetShaderInfoLog(shader, sizeof(buf), nullptr, buf);
+        __android_log_print(ANDROID_LOG_ERROR, "AndroidPlayer", "Shader compile error: %s", buf);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+bool AndroidPlayer::initEGL() {
+    egl_display_ = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (egl_display_ == EGL_NO_DISPLAY) { LOGE("❌ eglGetDisplay failed"); return false; }
+    if (!eglInitialize(egl_display_, nullptr, nullptr)) { LOGE("❌ eglInitialize failed"); return false; }
+
+    EGLint attribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+        EGL_RED_SIZE,   8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig config;
+    EGLint num_configs = 0;
+    if (!eglChooseConfig(egl_display_, attribs, &config, 1, &num_configs) || num_configs == 0) {
+        LOGE("❌ eglChooseConfig failed"); return false;
+    }
+
+    EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    egl_context_ = eglCreateContext(egl_display_, config, EGL_NO_CONTEXT, ctx_attribs);
+    if (egl_context_ == EGL_NO_CONTEXT) { LOGE("❌ eglCreateContext failed"); return false; }
+
+    ANativeWindow* win = nullptr;
+    { std::lock_guard<std::mutex> lock(window_mutex_); win = native_window_; }
+    if (!win) { LOGE("❌ initEGL: native_window_ is null"); return false; }
+
+    egl_surface_ = eglCreateWindowSurface(egl_display_, config, win, nullptr);
+    if (egl_surface_ == EGL_NO_SURFACE) {
+        LOGE("❌ eglCreateWindowSurface failed: %d", eglGetError()); return false;
+    }
+    if (!eglMakeCurrent(egl_display_, egl_surface_, egl_surface_, egl_context_)) {
+        LOGE("❌ eglMakeCurrent failed"); return false;
+    }
+    LOGI("✅ EGL initialized");
+    return true;
+}
+
+void AndroidPlayer::destroyEGL() {
+    destroyGLProgram();
+    if (egl_display_ != EGL_NO_DISPLAY) {
+        eglMakeCurrent(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (egl_surface_ != EGL_NO_SURFACE) { eglDestroySurface(egl_display_, egl_surface_); egl_surface_ = EGL_NO_SURFACE; }
+        if (egl_context_ != EGL_NO_CONTEXT) { eglDestroyContext(egl_display_, egl_context_); egl_context_ = EGL_NO_CONTEXT; }
+        eglTerminate(egl_display_);
+        egl_display_ = EGL_NO_DISPLAY;
+    }
+    LOGI("EGL destroyed");
+}
+
+bool AndroidPlayer::initGLProgram() {
+    GLuint vs = compileShader(GL_VERTEX_SHADER,   kVertexShader);
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFragmentShader);
+    if (!vs || !fs) return false;
+
+    gl_program_ = glCreateProgram();
+    glAttachShader(gl_program_, vs);
+    glAttachShader(gl_program_, fs);
+    glLinkProgram(gl_program_);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    GLint ok = 0;
+    glGetProgramiv(gl_program_, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char buf[512]; glGetProgramInfoLog(gl_program_, sizeof(buf), nullptr, buf);
+        LOGE("❌ Program link error: %s", buf); return false;
+    }
+
+    gl_uniform_y_  = glGetUniformLocation(gl_program_, "u_tex_y");
+    gl_uniform_u_  = glGetUniformLocation(gl_program_, "u_tex_u");
+    gl_uniform_v_  = glGetUniformLocation(gl_program_, "u_tex_v");
+    gl_attrib_pos_    = glGetAttribLocation(gl_program_, "a_position");
+    gl_attrib_tex_    = glGetAttribLocation(gl_program_, "a_texcoord");
+    gl_attrib_tex_uv_ = glGetAttribLocation(gl_program_, "a_texcoord_uv");
+
+    GLuint textures[3];
+    glGenTextures(3, textures);
+    gl_tex_y_ = textures[0]; gl_tex_u_ = textures[1]; gl_tex_v_ = textures[2];
+    for (int i = 0; i < 3; i++) {
+        glBindTexture(GL_TEXTURE_2D, textures[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    LOGI("✅ GL program & textures initialized");
+    return true;
+}
+
+void AndroidPlayer::destroyGLProgram() {
+    if (gl_tex_y_) { glDeleteTextures(1, &gl_tex_y_); gl_tex_y_ = 0; }
+    if (gl_tex_u_) { glDeleteTextures(1, &gl_tex_u_); gl_tex_u_ = 0; }
+    if (gl_tex_v_) { glDeleteTextures(1, &gl_tex_v_); gl_tex_v_ = 0; }
+    if (gl_program_) { glDeleteProgram(gl_program_); gl_program_ = 0; }
+    gl_attrib_pos_    = -1;
+    gl_attrib_tex_    = -1;
+    gl_attrib_tex_uv_ = -1;
+    gl_last_video_w_  = 0;
+    gl_last_video_h_  = 0;
+}
+
 // ========== 视频渲染 ==========
 
 void AndroidPlayer::renderLoop() {
-    // LOGD("Render loop started");  // 关闭
-    
     int frame_count = 0;
     int empty_count = 0;
-    int frame_seq = 0;
-    int drop_count = 0;
-    int overload_score = 0;
-    int adaptive_level = 0; // 0=关闭，1=轻度（丢1/2），2=中度（丢2/3）
+    bool gl_ready = false;
 
     while (render_running_) {
+        // 等待 Surface 就绪
+        {
+            std::lock_guard<std::mutex> lock(window_mutex_);
+            if (!native_window_) {
+                if (gl_ready) { destroyEGL(); gl_ready = false; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                continue;
+            }
+        }
+
+        // 初始化 EGL（每次 Surface 重建后执行一次）
+        if (!gl_ready) {
+            if (!initEGL() || !initGLProgram()) {
+                LOGE("❌ GL init failed, retrying...");
+                destroyEGL();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            gl_ready = true;
+            LOGI("✅ Render loop: GL ready");
+        }
+
         if (!player_core_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(16));
             continue;
         }
 
-        // 获取视频帧
         VideoFrameDataC frame_data;
         int result = player_core_get_video_frame(player_core_, &frame_data);
         if (result == 0) {
             frame_count++;
-            frame_seq++;
-            // if (frame_count % 30 == 0) {  // 关闭
-            //     LOGI("Rendered %d frames", frame_count);
-            // }
-
-            bool should_drop = false;
-            if (adaptive_level == 1) {
-                should_drop = (frame_seq % 2 == 0);      // 约丢 50%
-            } else if (adaptive_level == 2) {
-                should_drop = (frame_seq % 3 != 0);      // 约丢 66%
+            int cost = renderFrame(frame_data.y_data, frame_data.u_data, frame_data.v_data,
+                                   frame_data.y_linesize, frame_data.u_linesize, frame_data.v_linesize,
+                                   frame_data.width, frame_data.height);
+            if (cost < 0) {
+                // EGL surface 失效（Activity 切换、Surface 重建等），重新初始化
+                LOGW("⚠️ renderFrame failed, reinitializing EGL...");
+                destroyEGL();
+                gl_ready = false;
             }
-
-            if (should_drop) {
-                drop_count++;
-            } else {
-                // ✅ 直接渲染帧，renderFrame 内部会处理锁
-                int render_cost_ms = renderFrame(frame_data.y_data, frame_data.u_data, frame_data.v_data,
-                                                 frame_data.y_linesize, frame_data.u_linesize, frame_data.v_linesize,
-                                                 frame_data.width, frame_data.height);
-
-                if (render_cost_ms < 0) {
-                    overload_score += 2;
-                } else if (render_cost_ms >= 24) {
-                    overload_score += 3;
-                } else if (render_cost_ms >= 20) {
-                    overload_score += 2;
-                } else if (render_cost_ms >= 17) {
-                    overload_score += 1;
-                } else {
-                    overload_score -= 2;
-                }
-            }
-
-            if (overload_score < 0) {
-                overload_score = 0;
-            }
-            if (overload_score > 40) {
-                overload_score = 40;
-            }
-
-            int new_level = adaptive_level;
-            if (overload_score >= 16) {
-                new_level = 2;
-            } else if (overload_score >= 8) {
-                new_level = 1;
-            } else if (overload_score <= 3) {
-                new_level = 0;
-            }
-
-            if (new_level != adaptive_level) {
-                adaptive_level = new_level;
-                LOGW("🎛️ Adaptive render level -> %d (overload_score=%d, dropped=%d/%d)",
-                     adaptive_level, overload_score, drop_count, frame_count);
-            }
-
-            // 通知核心播放器帧已消费
             player_core_consume_video_frame(player_core_);
-            empty_count = 0;  // 重置空帧计数
+            empty_count = 0;
+            if (frame_count % 300 == 0) {
+                LOGD("✅ GL rendered %d frames", frame_count);
+            }
         } else {
-            // 没有新帧，等待更长时间以减少 CPU 占用
             empty_count++;
-            // if (empty_count == 1 || empty_count % 100 == 0) {
-            //     LOGD("No video frame available, count=%d, result=%d", empty_count, result);
-            // }
-            // ⚠️ 增加等待时间，从 5ms 增加到 10ms，减少 CPU 占用和内存压力
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 
-    // LOGD("Render loop stopped, total frames rendered: %d", frame_count);  // 关闭
+    // 线程退出时清理 GL/EGL（必须在同一线程完成）
+    if (gl_ready) { destroyEGL(); }
+    LOGI("Render loop exited, total frames: %d", frame_count);
 }
 
 int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
                                int y_linesize, int u_linesize, int v_linesize,
                                int width, int height) {
-    // 🔒 获取 window 和 surface 尺寸
-    ANativeWindow* window = nullptr;
-    int surface_w = 0;
-    int surface_h = 0;
-    bool needs_configure = false;
-    uint64_t captured_gen = 0;
-    
+    if (!y_data || width <= 0 || height <= 0) return -1;
+    if (!gl_program_ || egl_surface_ == EGL_NO_SURFACE) return -1;
+
+    int surface_w = 0, surface_h = 0;
     {
         std::lock_guard<std::mutex> lock(window_mutex_);
-        if (!native_window_ || !y_data) {
-            return -1;
-        }
-        
-        window = native_window_;
-        ANativeWindow_acquire(window);
         surface_w = surface_width_;
         surface_h = surface_height_;
-        needs_configure = !surface_configured_;
-        captured_gen = surface_generation_.load(std::memory_order_relaxed);
     }
-    
-    // 📐 成熟播放器常用策略：
-    // - FIT：完整源帧等比缩放到 surface 内（留黑边）
-    // - FILL：先对源帧中心裁剪到目标宽高比，再缩放到 surface（不先放大后裁剪）
-    // 这样可避免目标尺寸膨胀导致内存抖动和黑屏。
-    int dst_width = surface_w;
-    int dst_height = surface_h;
-    int draw_offset_x = 0;
-    int draw_offset_y = 0;
-    int src_crop_x = 0;
-    int src_crop_y = 0;
-    int src_crop_w = width;
-    int src_crop_h = height;
-    
-    static int last_logged_mode = -1;  // 记录上次日志的模式
-    float video_aspect = (float)width / (float)height;
+    if (surface_w <= 0 || surface_h <= 0) return -1;
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    // --- 上传 Y 纹理 ---
+    int uv_w = u_linesize > 0 ? u_linesize : width / 2;
+    int uv_h = height / 2;
+    int v_w  = v_linesize > 0 ? v_linesize : width / 2;
+
+    bool size_changed = (width != gl_last_video_w_ || height != gl_last_video_h_);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gl_tex_y_);
+    if (size_changed) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, y_linesize > 0 ? y_linesize : width, height,
+                     0, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_data);
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, y_linesize > 0 ? y_linesize : width, height,
+                        GL_LUMINANCE, GL_UNSIGNED_BYTE, y_data);
+    }
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, gl_tex_u_);
+    if (size_changed) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_w, uv_h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_w, uv_h, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+    }
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, gl_tex_v_);
+    if (size_changed) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v_w, uv_h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, v_w, uv_h, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+    }
+
+    gl_last_video_w_ = width;
+    gl_last_video_h_ = height;
+
+    // --- 计算 texcoord（处理 stride padding）---
+    int y_tex_w = y_linesize > 0 ? y_linesize : width;
+    float y_u_scale = (float)width  / (float)y_tex_w;   // 有效像素宽占纹理宽的比例
+    float y_v_scale = 1.0f;
+    float uv_u_scale = (float)(width / 2) / (float)(uv_w > 0 ? uv_w : width / 2);
+
+    // --- 计算顶点坐标（FIT / FILL）---
+    float vx0 = -1.0f, vx1 = 1.0f, vy0 = -1.0f, vy1 = 1.0f;
+    float tx0 = 0.0f, tx1 = y_u_scale, ty0 = 0.0f, ty1 = y_v_scale;
+    float utx0 = 0.0f, utx1 = uv_u_scale, uty0 = 0.0f, uty1 = 1.0f;
+
+    float video_aspect   = (float)width  / (float)height;
     float surface_aspect = (float)surface_w / (float)surface_h;
-    
+
     if (aspect_ratio_mode_ == 0) {
-        // FIT：完整视频缩放到 surface 内，黑边由后续清屏填充
+        // FIT：视频完整显示，两侧或上下留黑边
         if (video_aspect > surface_aspect) {
-            dst_width = surface_w;
-            dst_height = (int)(surface_w / video_aspect);
+            float scale = surface_aspect / video_aspect;
+            vy0 = -scale; vy1 = scale;
         } else {
-            dst_height = surface_h;
-            dst_width = (int)(surface_h * video_aspect);
-        }
-        draw_offset_x = (surface_w - dst_width) / 2;
-        draw_offset_y = (surface_h - dst_height) / 2;
-        
-        if (last_logged_mode != 0) {
-            LOGI("📐 FIT mode: video=%dx%d (%.2f), surface=%dx%d (%.2f) -> draw=%dx%d",
-                 width, height, video_aspect, surface_w, surface_h, surface_aspect, dst_width, dst_height);
-            last_logged_mode = 0;
+            float scale = video_aspect / surface_aspect;
+            vx0 = -scale; vx1 = scale;
         }
     } else {
-        // FILL：先裁剪源帧，再缩放到 surface，避免 target > surface 的放大开销。
-        dst_width = surface_w;
-        dst_height = surface_h;
-        
+        // FILL：铺满 surface，通过裁剪 texcoord 来裁视频
         if (video_aspect > surface_aspect) {
-            // 视频更宽，裁左右
-            src_crop_w = (int)(height * surface_aspect);
-            src_crop_h = height;
-            src_crop_x = (width - src_crop_w) / 2;
-            src_crop_y = 0;
+            float ratio  = surface_aspect / video_aspect;
+            float margin = (1.0f - ratio) * 0.5f;
+            tx0 = margin * y_u_scale;    tx1 = (1.0f - margin) * y_u_scale;
+            utx0 = margin * uv_u_scale;  utx1 = (1.0f - margin) * uv_u_scale;
         } else {
-            // 视频更高，裁上下
-            src_crop_w = width;
-            src_crop_h = (int)(width / surface_aspect);
-            src_crop_x = 0;
-            src_crop_y = (height - src_crop_h) / 2;
-        }
-        
-        // YUV420 对齐到偶数，避免 UV 平面偏移错误
-        src_crop_x = std::max(0, src_crop_x & ~1);
-        src_crop_y = std::max(0, src_crop_y & ~1);
-        src_crop_w = std::max(2, src_crop_w & ~1);
-        src_crop_h = std::max(2, src_crop_h & ~1);
-        
-        if (src_crop_x + src_crop_w > width) {
-            src_crop_w = (width - src_crop_x) & ~1;
-        }
-        if (src_crop_y + src_crop_h > height) {
-            src_crop_h = (height - src_crop_y) & ~1;
-        }
-        
-        if (last_logged_mode != 1) {
-            LOGI("📐 FILL mode: video=%dx%d (%.2f), surface=%dx%d (%.2f) -> src_crop=%dx%d@(%d,%d), draw=%dx%d",
-                 width, height, video_aspect, surface_w, surface_h, surface_aspect,
-                 src_crop_w, src_crop_h, src_crop_x, src_crop_y, dst_width, dst_height);
-            last_logged_mode = 1;
+            float ratio  = video_aspect / surface_aspect;
+            float margin = (1.0f - ratio) * 0.5f;
+            ty0 = margin;  ty1 = 1.0f - margin;
+            uty0 = margin; uty1 = 1.0f - margin;
         }
     }
-    
-    if (dst_width <= 0) dst_width = surface_w;
-    if (dst_height <= 0) dst_height = surface_h;
-    
-    // ✅ 只在首次或尺寸变化时配置 Surface
-    // 注意：swap/分屏切换时 setSurface/updateSurfaceSize 可能与渲染线程并发发生，
-    // 若这里使用旧尺寸去 setBuffersGeometry，会导致后续 lock 的 buffer stride 与预期不一致并闪烁。
-    if (needs_configure && surface_w > 0 && surface_h > 0) {
-        // 在真正配置前再读一次“最新尺寸 + generation”，避免使用旧 snapshot 配置
-        int cfg_w = surface_w;
-        int cfg_h = surface_h;
-        uint64_t cfg_gen = captured_gen;
-        {
-            std::lock_guard<std::mutex> lock(window_mutex_);
-            // 若窗口已被替换/清空，直接丢帧，等待下一帧拿到正确 window
-            if (!native_window_ || native_window_ != window) {
-                ANativeWindow_release(window);
-                return -1;
-            }
-            cfg_w = surface_width_;
-            cfg_h = surface_height_;
-            cfg_gen = surface_generation_.load(std::memory_order_relaxed);
-        }
 
-        // generation 变化说明期间发生过 setSurface/resize：丢弃本帧，避免配置错
-        if (cfg_gen != captured_gen) {
-            ANativeWindow_release(window);
-            return -1;
-        }
-
-        LOGI("🔧 Configuring surface: %dx%d", cfg_w, cfg_h);
-        int result = ANativeWindow_setBuffersGeometry(
-            window, cfg_w, cfg_h, WINDOW_FORMAT_RGB_565);
-        
-        if (result != 0) {
-            LOGE("❌ Failed to configure surface: %d", result);
-            ANativeWindow_release(window);
-            return -1;
-        }
-        
-        std::lock_guard<std::mutex> lock(window_mutex_);
-        // 只有 generation 未变化时才认为配置成功
-        if (surface_generation_.load(std::memory_order_relaxed) == captured_gen) {
-            surface_configured_ = true;
-        }
-        LOGI("✅ Surface configured successfully");
-    }
-    
-    // 🎨 锁定 Surface 缓冲区
-    ANativeWindow_Buffer buffer;
-    int lock_result = ANativeWindow_lock(window, &buffer, nullptr);
-    if (lock_result != 0) {
-        LOGE("❌ Failed to lock window buffer: %d", lock_result);
-        ANativeWindow_release(window);
-        return -1;
-    }
-    
-    if (!buffer.bits) {
-        LOGE("❌ Buffer bits is null");
-        ANativeWindow_unlockAndPost(window);
-        ANativeWindow_release(window);
-        return -1;
-    }
-    
-    // 🖼️ 使用 FFmpeg swscale 进行硬件加速的 YUV->RGB 转换和缩放
-    // sws_ctx_ / rgb_buffer_ 会被 setAspectRatioMode（UI 线程）并发修改，必须持 sws_mutex_。
-
-    // 检查是否需要重新创建 swscale context，并完成 YUV→RGB 转换，整段持锁保护
-    std::lock_guard<std::mutex> sws_lock(sws_mutex_);
-
-    if (!sws_ctx_ ||
-        src_crop_w != last_video_width_ || src_crop_h != last_video_height_ ||
-        dst_width != last_target_width_ || dst_height != last_target_height_) {
-
-        if (sws_ctx_) {
-            sws_freeContext(sws_ctx_);
-        }
-
-        // 创建 swscale context (YUV420P -> RGB565)
-        sws_ctx_ = sws_getContext(
-            src_crop_w, src_crop_h, AV_PIX_FMT_YUV420P,
-            dst_width, dst_height, AV_PIX_FMT_RGB565LE,
-            SWS_FAST_BILINEAR,
-            nullptr, nullptr, nullptr
-        );
-
-        if (!sws_ctx_) {
-            LOGE("Failed to create swscale context");
-            ANativeWindow_unlockAndPost(window);
-            ANativeWindow_release(window);
-            return -1;
-        }
-
-        last_video_width_ = src_crop_w;
-        last_video_height_ = src_crop_h;
-        last_target_width_ = dst_width;
-        last_target_height_ = dst_height;
-
-        LOGI("✅ Created swscale context: src_crop=%dx%d -> dst=%dx%d", src_crop_w, src_crop_h, dst_width, dst_height);
-    }
-
-    // 准备源数据（YUV420P，带源裁剪）
-    const uint8_t* src_data[4] = {
-        ((uint8_t*)y_data) + src_crop_y * y_linesize + src_crop_x,
-        ((uint8_t*)u_data) + (src_crop_y / 2) * u_linesize + (src_crop_x / 2),
-        ((uint8_t*)v_data) + (src_crop_y / 2) * v_linesize + (src_crop_x / 2),
-        nullptr
+    // --- 顶点数组：position(2) + Y-texcoord(2) + UV-texcoord(2)，stride = 6 floats ---
+    // Y 和 UV 使用独立的 texcoord 列，以正确处理 stride padding 与 FILL 裁剪不同的情况
+    const float verts[] = {
+        // pos_x  pos_y   Y_s   Y_t   UV_s   UV_t
+        vx0, vy1,  tx0, ty0,  utx0, uty0,  // 左上
+        vx0, vy0,  tx0, ty1,  utx0, uty1,  // 左下
+        vx1, vy0,  tx1, ty1,  utx1, uty1,  // 右下
+        vx0, vy1,  tx0, ty0,  utx0, uty0,  // 左上（第二个三角形）
+        vx1, vy0,  tx1, ty1,  utx1, uty1,  // 右下
+        vx1, vy1,  tx1, ty0,  utx1, uty0,  // 右上
     };
-    int src_linesize[4] = { y_linesize, u_linesize, v_linesize, 0 };
 
-    // 分配临时缓冲区（避免直接写入 ANativeWindow buffer）
-    int temp_stride = dst_width * 2;  // RGB565 = 2 bytes per pixel
-    int temp_size = temp_stride * dst_height;
+    glViewport(0, 0, surface_w, surface_h);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
 
-    // ⚠️ 限制最大分配大小，防止异常参数导致 OOM
-    const int MAX_RGB_BUFFER_SIZE = 3840 * 2160 * 2;  // 4K RGB565 约 16MB
-    if (temp_size > MAX_RGB_BUFFER_SIZE) {
-        LOGE("❌ Frame too large after fallback: %dx%d (max: 3840x2160)", dst_width, dst_height);
-        ANativeWindow_unlockAndPost(window);
-        ANativeWindow_release(window);
+    glUseProgram(gl_program_);
+    glUniform1i(gl_uniform_y_, 0);
+    glUniform1i(gl_uniform_u_, 1);
+    glUniform1i(gl_uniform_v_, 2);
+
+    // 使用 initGLProgram 缓存的 attrib location，避免每帧调用 glGetAttribLocation
+    if (gl_attrib_pos_ < 0 || gl_attrib_tex_ < 0 || gl_attrib_tex_uv_ < 0) return -1;
+
+    // stride = 6 floats：[pos_x, pos_y, Y_s, Y_t, UV_s, UV_t]
+    const GLsizei stride = 6 * sizeof(float);
+    glVertexAttribPointer(gl_attrib_pos_,    2, GL_FLOAT, GL_FALSE, stride, verts);
+    glEnableVertexAttribArray(gl_attrib_pos_);
+    glVertexAttribPointer(gl_attrib_tex_,    2, GL_FLOAT, GL_FALSE, stride, verts + 2);
+    glEnableVertexAttribArray(gl_attrib_tex_);
+    glVertexAttribPointer(gl_attrib_tex_uv_, 2, GL_FLOAT, GL_FALSE, stride, verts + 4);
+    glEnableVertexAttribArray(gl_attrib_tex_uv_);
+
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    glDisableVertexAttribArray(gl_attrib_pos_);
+    glDisableVertexAttribArray(gl_attrib_tex_);
+    glDisableVertexAttribArray(gl_attrib_tex_uv_);
+
+    if (!eglSwapBuffers(egl_display_, egl_surface_)) {
+        LOGE("❌ eglSwapBuffers failed: 0x%x", eglGetError());
         return -1;
     }
 
-    if (!rgb_buffer_ || rgb_buffer_size_ < temp_size) {
-        if (rgb_buffer_) {
-            av_free(rgb_buffer_);
-        }
-        rgb_buffer_ = (uint8_t*)av_malloc(temp_size);
-        if (!rgb_buffer_) {
-            LOGE("❌ Failed to allocate RGB buffer: %d bytes", temp_size);
-            ANativeWindow_unlockAndPost(window);
-            ANativeWindow_release(window);
-            return -1;
-        }
-        rgb_buffer_size_ = temp_size;
-        LOGI("📦 Allocated RGB buffer: %d bytes (%dx%d)", temp_size, dst_width, dst_height);
-    }
-
-    // 准备目标数据（渲染到临时缓冲区）
-    uint8_t* dst_data[4] = { rgb_buffer_, nullptr, nullptr, nullptr };
-    int dst_linesize[4] = { temp_stride, 0, 0, 0 };
-    
-    // 执行转换和缩放
-    auto start_time = std::chrono::high_resolution_clock::now();
-    int result = sws_scale(sws_ctx_, src_data, src_linesize, 0, src_crop_h, dst_data, dst_linesize);
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-    
-    if (result != dst_height) {
-        LOGE("❌ swscale failed: expected %d lines, got %d", dst_height, result);
-        ANativeWindow_unlockAndPost(window);
-        ANativeWindow_release(window);
-        return -1;
-    }
-    
-    if (duration > 16) {  // 超过一帧时间（60fps）
-        LOGW("⚠️ swscale slow: %lld ms", duration);
-    }
-    
-    // 复制到 ANativeWindow buffer（FIT 留黑边；FILL 全屏）
-    uint16_t* dst_buffer = (uint16_t*)buffer.bits;
-    uint16_t* src_buffer = (uint16_t*)rgb_buffer_;
-    
-    // 安全检查
-    // stride < surface_w 说明 surface 缓冲区尚未按最新尺寸配置（常见于 swap/分屏切换的竞态）。
-    // 此时丢帧并强制下帧重新配置，避免连续报错与画面闪烁。
-    if (buffer.stride < surface_w) {
-        LOGW("⚠️ Buffer stride too small (drop frame): stride=%d < expected_w=%d", buffer.stride, surface_w);
-        {
-            std::lock_guard<std::mutex> lock(window_mutex_);
-            surface_configured_ = false;
-            surface_generation_.fetch_add(1, std::memory_order_relaxed);
-        }
-        ANativeWindow_unlockAndPost(window);
-        ANativeWindow_release(window);
-        return -1;
-    }
-    // resize 竞态下可能出现 width/height 暂时比预期小，若继续拷贝可能导致半屏或越界写。
-    if (buffer.width < surface_w || buffer.height < surface_h) {
-        LOGW("⚠️ Buffer size mismatch (drop frame): actual=%dx%d expected=%dx%d",
-             buffer.width, buffer.height, surface_w, surface_h);
-        {
-            std::lock_guard<std::mutex> lock(window_mutex_);
-            surface_configured_ = false;
-            surface_generation_.fetch_add(1, std::memory_order_relaxed);
-        }
-        ANativeWindow_unlockAndPost(window);
-        ANativeWindow_release(window);
-        return -1;
-    }
-    
-    int copy_width = dst_width;
-    int copy_height = dst_height;
-    int offset_x = draw_offset_x;
-    int offset_y = draw_offset_y;
-    copy_width = std::min(copy_width, std::max(0, buffer.stride - offset_x));
-    copy_height = std::min(copy_height, std::max(0, buffer.height - offset_y));
-    if (copy_width <= 0 || copy_height <= 0) {
-        LOGW("⚠️ Copy area invalid (drop frame): copy=%dx%d offset=%d,%d stride=%d height=%d",
-             dst_width, dst_height, offset_x, offset_y, buffer.stride, buffer.height);
-        ANativeWindow_unlockAndPost(window);
-        ANativeWindow_release(window);
-        return -1;
-    }
-    
-    // FIT 模式下需要黑边背景
-    if (aspect_ratio_mode_ == 0 && (offset_x > 0 || offset_y > 0 ||
-                                    copy_width < surface_w || copy_height < surface_h)) {
-        memset(buffer.bits, 0, buffer.stride * buffer.height * 2);
-    }
-    
-    // 逐行复制到目标位置
-    for (int i = 0; i < copy_height; i++) {
-        uint16_t* dst_line = dst_buffer + (offset_y + i) * buffer.stride + offset_x;
-        uint16_t* src_line = src_buffer + i * dst_width;
-        memcpy(dst_line, src_line, copy_width * 2);
-    }
-    
-    static int frame_count = 0;
-    frame_count++;
-    if (frame_count % 60 == 0) {  // 每60帧输出一次
-        LOGD("✅ Rendered %d frames successfully", frame_count);
-    }
-    
-    ANativeWindow_unlockAndPost(window);
-    ANativeWindow_release(window);
-    return (int)duration;
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return (int)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 }
 
 // ========== OpenSL ES 音频输出 ==========

@@ -135,6 +135,10 @@ target_link_libraries(hxcplayer
     # OpenSL ES (音频输出)
     OpenSLES
 
+    # EGL / OpenGL ES 2.0（视频渲染）
+    EGL
+    GLESv2
+
     # C++ 标准库
     c++_shared
 
