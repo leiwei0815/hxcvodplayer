@@ -126,13 +126,11 @@ void AndroidPlayer::setSurface(ANativeWindow* window) {
                 render_thread_ = std::thread(&AndroidPlayer::renderLoop, this);
             }
             // Surface cleared: renderLoop detects native_window_==null and destroys EGL.
-            LOGD("Surface cleared");
             // Surface cleared: renderLoop detects native_window_==null.
             LOGD("Surface cleared");
         }
     // Lock released; join render thread if needed
     if (thread_to_join.joinable()) {
-    // 锁已释放，必要时在析构等待线程退�?    if (thread_to_join.joinable()) {
         thread_to_join.join();
     }
 }
@@ -558,7 +556,8 @@ bool AndroidPlayer::consumePlaybackCompleted() {
 
 // ========== OpenGL ES YUV 渲染 ==========
 
-// Vertex Shader：传两套 texcoord，Y �?UV 独立处理 stride padding 与裁�?static const char* kVertexShader = R"(
+// Vertex Shader
+static const char* kVertexShader = R"(
 attribute vec4 a_position;
 attribute vec2 a_texcoord;    // Y texcoord
 attribute vec2 a_texcoord_uv; // UV texcoord
@@ -918,7 +917,8 @@ void AndroidPlayer::renderLoop() {
                     }
                 }
 
-                // �?diag_interval 帧打一次诊断统�?                if (frame_count % diag_interval == 0) {
+                // every diag_interval frames, log stats
+                if (frame_count % diag_interval == 0) {
                     LOGI("📊 [DIAG] 最�?%d �?| "
                          "avg_render=%" PRId64 "ms max_render=%" PRId64 "ms "
                          "avg_upload=%" PRId64 "ms max_upload=%" PRId64 "ms "
@@ -939,7 +939,8 @@ void AndroidPlayer::renderLoop() {
 
             if (should_consume) {
                 player_core_consume_video_frame(player_core_);
-                // warmup 计数按渲染消费帧递减（不依赖解码速度�?                if (warmup > 0) {
+                // warmup: decrement per rendered frame
+                if (warmup > 0) {
                     render_warmup_frames_.fetch_sub(1, std::memory_order_acq_rel);
                 }
             }
@@ -959,12 +960,14 @@ void AndroidPlayer::renderLoop() {
                          player_core_get_position(player_core_));
                 }
             }
-            // seek 后帧队列暂时为空，用短间隔积极轮�?            int wait_ms = (empty_count <= 50) ? 3 : 16;
+            // short poll after seek when queue is empty
+            int wait_ms = (empty_count <= 50) ? 3 : 16;
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
         }
     }
 
-    // 线程退出时清理 GL/EGL（必须在同一线程完成�?    if (gl_ready) { destroyEGL(); }
+    // thread exit: clean up GL/EGL (must be on same thread)
+    if (gl_ready) { destroyEGL(); }
     LOGI("Render loop exited, total frames: %d", frame_count);
 }
 
@@ -1076,7 +1079,8 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     }
 
     // --- 顶点数组：position(2) + Y-texcoord(2) + UV-texcoord(2)，stride = 6 floats ---
-    // Y �?UV 使用独立�?texcoord 列，以正确处�?stride padding �?FILL 裁剪不同的情�?    const float verts[] = {
+    // Y and UV use separate texcoord columns to handle stride padding and FILL clipping
+    const float verts[] = {
         // pos_x  pos_y   Y_s   Y_t   UV_s   UV_t
         vx0, vy1,  tx0, ty0,  utx0, uty0,  // 左上
         vx0, vy0,  tx0, ty1,  utx0, uty1,  // 左下
@@ -1397,7 +1401,8 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         return;
     }
 
-    // 循环填充缓冲区，直到填满或没有数�?    int total_bytes_read = 0;
+    // fill buffer in a loop until full or no more data
+    int total_bytes_read = 0;
     while (total_bytes_read < audio_buffer_size_) {
         int bytes_read = player_core_get_audio_data(
             player_core_, 
@@ -1417,23 +1422,27 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     callback_count++;
     
     if (total_bytes_read > 0) {
-        // �?00次回调输出一次日志（已屏蔽，日志太多�?        // if (callback_count % 100 == 0) {
+        // log every 100 callbacks (disabled: too noisy)
+        // if (callback_count % 100 == 0) {
         //     LOGI("🎵 Audio callback #%d: total_bytes=%d, buffer_size=%d (%.1f%%)", 
         //          callback_count, total_bytes_read, audio_buffer_size_,
         //          (total_bytes_read * 100.0) / audio_buffer_size_);
         // }
         
-        // 填充剩余部分为静�?        if (total_bytes_read < audio_buffer_size_) {
+        // fill remaining bytes with silence
+        if (total_bytes_read < audio_buffer_size_) {
             memset(audio_buffer_ + total_bytes_read, 0, audio_buffer_size_ - total_bytes_read);
             
-            // 音频欠载日志（已屏蔽�?            // if (callback_count % 100 == 0) {
+            // audio underrun log (disabled)
+            // if (callback_count % 100 == 0) {
             //     LOGW("🎵 Audio underrun: only got %d bytes, needed %d (%.1f%%)", 
             //          total_bytes_read, audio_buffer_size_,
             //          (total_bytes_read * 100.0) / audio_buffer_size_);
             // }
         }
     } else {
-        // 没有数据，填充静�?        if (callback_count % 100 == 0) {
+        // no data: output silence
+        if (callback_count % 100 == 0) {
             LOGW("🎵 No audio data available, filling silence");
         }
         memset(audio_buffer_, 0, audio_buffer_size_);
