@@ -417,7 +417,8 @@ void AndroidPlayer::play() {
         // audible sound before any picture (especially noticeable in dual-player).
         // A 500ms deadline ensures audio is not muted forever if video decoding stalls.
         audio_start_pending_.store(true, std::memory_order_release);
-        audio_start_deadline_ms_ = now_ms() + 500;
+        audio_start_deadline_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() + 500;
         LOGI("[ctrl] play: audio deferred until first video frame (deadline +500ms)");
     } else {
         LOGD("No audio interface (audio disabled)");
