@@ -133,12 +133,20 @@ AndroidPlayer::~AndroidPlayer() {
     destroyAudioOutput();
 
     // 5. Tear down player core (clear callbacks first)
-    if (player_core_) {
-        player_core_set_playback_completed_callback(player_core_, nullptr, nullptr);
-        player_core_set_loading_callback(player_core_, nullptr, nullptr);
-        player_core_set_error_callback(player_core_, nullptr, nullptr);
-        player_core_destroy(player_core_);
+    //    Null out player_core_ while holding audio_mutex_ so any
+    //    in-flight audio callback that races past audio_active_ check
+    //    will see nullptr and return silence safely.
+    PlayerCoreHandle* core_to_destroy = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(audio_mutex_);
+        core_to_destroy = player_core_;
         player_core_ = nullptr;
+    }
+    if (core_to_destroy) {
+        player_core_set_playback_completed_callback(core_to_destroy, nullptr, nullptr);
+        player_core_set_loading_callback(core_to_destroy, nullptr, nullptr);
+        player_core_set_error_callback(core_to_destroy, nullptr, nullptr);
+        player_core_destroy(core_to_destroy);
     }
     LOGI("[lifecycle] AndroidPlayer destroyed this=%p", (void*)this);
 }
@@ -584,38 +592,38 @@ bool AndroidPlayer::consumePlaybackCompleted() {
 
 // Vertex shader: two separate texcoord sets so Y and UV can have different
 // stride-padding and FILL crop offsets.
-static const char* kVertexShader = R"(#version 300 es
-in vec4 a_position;
-in vec2 a_texcoord;
-in vec2 a_texcoord_uv;
-out vec2 v_texcoord;
-out vec2 v_texcoord_uv;
-void main() {
-    gl_Position   = a_position;
-    v_texcoord    = a_texcoord;
-    v_texcoord_uv = a_texcoord_uv;
-}
-)";
+static const char* kVertexShader =
+    "#version 300 es\n"
+    "in vec4 a_position;\n"
+    "in vec2 a_texcoord;\n"
+    "in vec2 a_texcoord_uv;\n"
+    "out vec2 v_texcoord;\n"
+    "out vec2 v_texcoord_uv;\n"
+    "void main() {\n"
+    "    gl_Position   = a_position;\n"
+    "    v_texcoord    = a_texcoord;\n"
+    "    v_texcoord_uv = a_texcoord_uv;\n"
+    "}\n";
 
 // Fragment shader: BT.601 limited-range YUV -> RGB
-static const char* kFragmentShader = R"(#version 300 es
-precision mediump float;
-in vec2      v_texcoord;
-in vec2      v_texcoord_uv;
-uniform sampler2D u_tex_y;
-uniform sampler2D u_tex_u;
-uniform sampler2D u_tex_v;
-out vec4 fragColor;
-void main() {
-    float y = texture(u_tex_y, v_texcoord).r;
-    float u = texture(u_tex_u, v_texcoord_uv).r - 0.5;
-    float v = texture(u_tex_v, v_texcoord_uv).r - 0.5;
-    float r = y + 1.402  * v;
-    float g = y - 0.344  * u - 0.714 * v;
-    float b = y + 1.772  * u;
-    fragColor = vec4(r, g, b, 1.0);
-}
-)";
+static const char* kFragmentShader =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "in vec2      v_texcoord;\n"
+    "in vec2      v_texcoord_uv;\n"
+    "uniform sampler2D u_tex_y;\n"
+    "uniform sampler2D u_tex_u;\n"
+    "uniform sampler2D u_tex_v;\n"
+    "out vec4 fragColor;\n"
+    "void main() {\n"
+    "    float y = texture(u_tex_y, v_texcoord).r;\n"
+    "    float u = texture(u_tex_u, v_texcoord_uv).r - 0.5;\n"
+    "    float v = texture(u_tex_v, v_texcoord_uv).r - 0.5;\n"
+    "    float r = y + 1.402  * v;\n"
+    "    float g = y - 0.344  * u - 0.714 * v;\n"
+    "    float b = y + 1.772  * u;\n"
+    "    fragColor = vec4(r, g, b, 1.0);\n"
+    "}\n";
 
 static GLuint compileShader(GLenum type, const char* src) {
     GLuint shader = glCreateShader(type);
