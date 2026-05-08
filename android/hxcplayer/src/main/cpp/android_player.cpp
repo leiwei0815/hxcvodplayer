@@ -1004,13 +1004,23 @@ void AndroidPlayer::renderLoop() {
             if (std::isnan(pts) || std::isinf(pts)) {
                 should_display = should_consume = true;
             } else if (is_first_or_seek) {
-                // Force-display: audio clock may be far ahead after a seek or
-                // when two players start simultaneously (split-screen resource
-                // contention). Skip the normal drop guard for this one frame.
-                LOGI("[sync] %s forced: pts=%.3f clk=%.3f delay=%.3f",
-                     frame_count == 0 ? "first frame" : "post-seek frame",
-                     pts, clock, delay);
-                should_display = should_consume = true;
+                // Force-display only when video is close enough to the audio clock.
+                // If the first/post-seek frame is more than 1s behind the clock,
+                // keep dropping frames to catch up first; otherwise the viewer
+                // sees a flash of old content before the picture snaps to the
+                // correct position.
+                if (delay < -1.0) {
+                    // Still too far behind -- drop silently and keep catching up.
+                    should_consume = true;
+                    LOGI_RATE(30, "[sync] %s catching up: pts=%.3f clk=%.3f delay=%.3f",
+                              frame_count == 0 ? "first frame" : "post-seek frame",
+                              pts, clock, delay);
+                } else {
+                    LOGI("[sync] %s forced: pts=%.3f clk=%.3f delay=%.3f",
+                         frame_count == 0 ? "first frame" : "post-seek frame",
+                         pts, clock, delay);
+                    should_display = should_consume = true;
+                }
             } else if (delay < -5.0) {
                 // Clock severely out of sync (e.g. core not yet updated after seek).
                 // Force display instead of entering a drop loop.
