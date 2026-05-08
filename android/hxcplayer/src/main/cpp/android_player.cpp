@@ -21,7 +21,7 @@ AndroidPlayer::AndroidPlayer()
     , surface_width_(0)
     , surface_height_(0)
     , aspect_ratio_mode_(0) // FIT
-    , decode_mode_(0) // 默认软解
+    , decode_mode_(0) // ?????
     , egl_display_(EGL_NO_DISPLAY)
     , egl_context_(EGL_NO_CONTEXT)
     , egl_surface_(EGL_NO_SURFACE)
@@ -56,28 +56,28 @@ AndroidPlayer::AndroidPlayer()
 {
     LOGD("AndroidPlayer created");
     
-    // 创建核心播放器
+    // ????????????????
     player_core_ = player_core_create();
     if (!player_core_) {
         LOGE("Failed to create player core");
     } else {
-        // 注册底层加载状态回调（网络抖动时用于显示 loading）
+        // ??????????????????????????????????????????????? loading??
         player_core_set_loading_callback(player_core_, loadingStateCallback, this);
-        // 注册底层错误回调（播放中错误透传给业务层）
+        // ?????????????????????????????????????????????
         player_core_set_error_callback(player_core_, errorStateCallback, this);
-        // 注册播放完成回调
+        // ????????????????????
         player_core_set_playback_completed_callback(player_core_, playbackCompletedCallback, this);
-        LOGI("[播放完成] 已注册 playbackCompletedCallback");
+        LOGI("[???????????] ????? playbackCompletedCallback");
     }
     
-    // ⚠️ 不在这里初始化音频，等到打开视频后根据实际音频参数初始化
+    // ???? ?????????????????????????????????????????????????????????????????
     LOGI("Audio will be initialized after opening video");
 }
 
 AndroidPlayer::~AndroidPlayer() {
     LOGD("AndroidPlayer destroyed");
     
-    // 停止渲染线程（EGL/GL 资源在线程内销毁）
+    // ????????????EGL/GL ??????????????????
     // Prevent audio callback from accessing player_core_
     audio_active_ = false;
 
@@ -86,16 +86,16 @@ AndroidPlayer::~AndroidPlayer() {
         render_thread_.join();
     }
     
-    // 销毁音频输出
+    // ??????????????
     destroyAudioOutput();
     
-    // 释放窗口
+    // ?????????
     if (native_window_) {
         ANativeWindow_release(native_window_);
         native_window_ = nullptr;
     }
     
-    // 销毁核心播放器
+    // ????????????????
     if (player_core_) {
         player_core_set_playback_completed_callback(player_core_, nullptr, nullptr);
         player_core_destroy(player_core_);
@@ -104,8 +104,8 @@ AndroidPlayer::~AndroidPlayer() {
 }
 
 void AndroidPlayer::setSurface(ANativeWindow* window) {
-    // 先在锁外决定是否需要停止渲染线程，再释放锁后 join，
-    // 避免持锁 join 时与 renderFrame 内的锁形成死锁。
+    // ?????????????????????????????????????????????????? join??
+    // ?????????? join ????? renderFrame ????????????????????
     std::thread thread_to_join;
     {
         std::lock_guard<std::mutex> lock(window_mutex_);
@@ -126,13 +126,13 @@ void AndroidPlayer::setSurface(ANativeWindow* window) {
                 render_thread_ = std::thread(&AndroidPlayer::renderLoop, this);
             }
         } else {
-            // Surface 清除：native_window_ 已置 null，renderLoop 会检测到并销毁 EGL。
-            // 不在这里 join，让渲染线程自然退出（它会检测 native_window_ == null）。
-            // 若 player 被完全销毁，析构函数会 join。
+            // Surface ???????native_window_ ?? null??renderLoop ?????????????? EGL???
+            // ????????? join???????????????????????????????? native_window_ == null?????
+            // ??? player ?????????????????????????? join???
             LOGD("Surface cleared");
         }
     }
-    // 锁已释放，必要时在析构等待线程退出
+    // ????????????????????????????????????????
     if (thread_to_join.joinable()) {
         thread_to_join.join();
     }
@@ -141,21 +141,21 @@ void AndroidPlayer::setSurface(ANativeWindow* window) {
 void AndroidPlayer::updateSurfaceSize(int width, int height) {
     std::lock_guard<std::mutex> lock(window_mutex_);
     
-    // 尺寸变化时，标记需要重新配置 Surface
+    // ????????????????????????????? Surface
     if (surface_width_ != width || surface_height_ != height) {
-        LOGI("📐 Surface size changing: %dx%d -> %dx%d", 
+        LOGI("???? Surface size changing: %dx%d -> %dx%d", 
              surface_width_, surface_height_, width, height);
         
         surface_width_ = width;
         surface_height_ = height;
-        surface_generation_.fetch_add(1, std::memory_order_relaxed);
+        // Size change only affects viewport in renderFrame, no EGL surface rebuild needed
         
-        LOGI("✅ Surface size updated (will reconfigure on next frame)");
+        LOGI("??? Surface size updated (will reconfigure on next frame)");
     }
 }
 
 bool AndroidPlayer::openURL(const char* url) {
-    return openURL(url, 0.0);  // 默认从头开始
+    return openURL(url, 0.0);  // ??????????
 }
 
 bool AndroidPlayer::openURL(const char* url, double start_position) {
@@ -170,17 +170,17 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
 
-    // 始终使用带起始位置的 API，确保 start_position=0 也能显式重置到起点。
-    // 原来 start_position==0 时走 player_core_open(url)，core 可能沿用上次缓存进度，
-    // 导致重播时从"首次带入进度"而非 0 开始播放。
+    // ????????????????? API???? start_position=0 ???????????????????????
+    // ???? start_position==0 ???? player_core_open(url)??core ????????????????????
+    // ???????????????"??????????"????? 0 ?????????????
     int result = player_core_open_with_start_position(player_core_, url, start_position);
     
     if (result == 0) {
         LOGI("URL opened successfully");
         ensureAudioOutputForCurrentStream();
-        render_warmup_frames_.store(8, std::memory_order_release);
+        render_warmup_frames_.store(4, std::memory_order_release);
 
-        // ⏸️ 打开后自动暂停，等待用户点击播放
+        // ?? ??????????????????????????????????????????
         player_core_pause(player_core_);
         LOGI("Video opened and paused, waiting for user to play");
         
@@ -225,7 +225,7 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
     if (result == 0) {
         LOGI("Custom HTTP opened successfully");
         ensureAudioOutputForCurrentStream();
-        render_warmup_frames_.store(8, std::memory_order_release);
+        render_warmup_frames_.store(4, std::memory_order_release);
 
         player_core_pause(player_core_);
         return true;
@@ -264,7 +264,7 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
     if (result == 0) {
         LOGI("Custom file opened successfully");
         ensureAudioOutputForCurrentStream();
-        render_warmup_frames_.store(8, std::memory_order_release);
+        render_warmup_frames_.store(4, std::memory_order_release);
 
         player_core_pause(player_core_);
         return true;
@@ -321,7 +321,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
                 audio_initialized_ = true;
             }
         }
-        render_warmup_frames_.store(8, std::memory_order_release);
+        render_warmup_frames_.store(4, std::memory_order_release);
         player_core_pause(player_core_);
         return true;
     }
@@ -341,7 +341,7 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
                                       int key_mode,
                                       const char* key_material_b64,
                                       const char* key_iv_hex) {
-    // 兼容旧命名入口，统一收敛到 SecureSession。
+    // ?????????????????????????????? SecureSession???
     return openWithSecureSession(url,
                                  auth_token,
                                  video_id,
@@ -359,10 +359,10 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
 void AndroidPlayer::play() {
     if (!player_core_) return;
     
-    LOGI("▶️ Play called");
+    LOGI("???? Play called");
     player_core_play(player_core_);
     
-    // 启动音频播放
+    // ???????????????
     if (playItf_) {
         LOGD("Starting audio playback");
         SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
@@ -374,7 +374,7 @@ void AndroidPlayer::play() {
     } else {
         LOGD("No audio interface (audio disabled)");
     }
-    LOGI("▶️ Play completed");
+    LOGI("???? Play completed");
 }
 
 void AndroidPlayer::pause() {
@@ -383,7 +383,7 @@ void AndroidPlayer::pause() {
     LOGD("Pause");
     player_core_pause(player_core_);
     
-    // 暂停音频
+    // ??????????
     if (playItf_) {
         SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
         if (result != SL_RESULT_SUCCESS) {
@@ -396,12 +396,12 @@ void AndroidPlayer::stop() {
     if (!player_core_) return;
 
     LOGD("Stop");
-    // 主动丢弃上一次播放结束的 pending 事件，避免 stop 后立刻 open 新资源时
-    // 第一次 consume 仍返回 true，误触发应用层 onPlaybackCompleted 回调。
+    // ????????????????????????? pending ????????? stop ??????? open ?????????
+    // ???? consume ?????? true????????????? onPlaybackCompleted ????????
     has_pending_playback_completed_.store(false, std::memory_order_release);
     player_core_stop(player_core_);
 
-    // 停止音频
+    // ????????
     if (playItf_) {
         SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
         if (result != SL_RESULT_SUCCESS) {
@@ -415,8 +415,8 @@ void AndroidPlayer::seekTo(double position) {
     
     LOGD("Seek to: %f", position);
     player_core_seek(player_core_, position);
-    // seek 后重置渲染层 warmup 窗口（对齐 iOS _syncWarmupFramesRemaining=40）
-    render_warmup_frames_.store(8, std::memory_order_release);
+    // seek ???????????? warmup ??????? iOS _syncWarmupFramesRemaining=40??
+    render_warmup_frames_.store(4, std::memory_order_release);
 }
 
 void AndroidPlayer::setPlaybackRate(float rate) {
@@ -430,19 +430,19 @@ void AndroidPlayer::setVolume(float volume) {
     if (!player_core_) return;
     
     LOGD("Set volume: %f (core only)", volume);
-    // 只在 Core 层控制音量（OpenSL ES VolumeItf 会触发 AppOps 崩溃）
+    // ???? Core ????????????????OpenSL ES VolumeItf ????? AppOps ?????
     player_core_set_volume(player_core_, volume);
 }
 
 void AndroidPlayer::setAspectRatioMode(int mode) {
     aspect_ratio_mode_ = mode;
-    LOGI("✅ Set aspect ratio mode: %d (%s)", mode, mode == 0 ? "FIT" : "FILL");
+    LOGI("??? Set aspect ratio mode: %d (%s)", mode, mode == 0 ? "FIT" : "FILL");
 
     if (player_core_) {
         player_core_set_aspect_ratio_mode(player_core_,
             mode == 1 ? ASPECT_RATIO_FILL : ASPECT_RATIO_FIT);
     }
-    // OpenGL ES Shader 通过 uniform 控制宽高比，下一帧自动生效，无需重置
+    // OpenGL ES Shader ????? uniform ??????????????????????????????????????????
 }
 
 void AndroidPlayer::setDecodeMode(int mode) {
@@ -540,15 +540,15 @@ void AndroidPlayer::errorStateCallback(int error_code, const char* error_msg, vo
     player->has_pending_error_.store(true, std::memory_order_release);
 }
 
-// ========== 播放完成 ==========
+// ========== ??????????? ==========
 
 void AndroidPlayer::playbackCompletedCallback(void* user_data) {
     auto* player = static_cast<AndroidPlayer*>(user_data);
     if (!player) {
-        LOGW("[播放完成] android_player 层：收到回调但 player 为 null");
+        LOGW("[???????????] android_player ????????????????? player ? null");
         return;
     }
-    LOGI("[播放完成] android_player 层：core 回调触发，position=%.3f duration=%.3f state=%d",
+    LOGI("[???????????] android_player ????core ??????????position=%.3f duration=%.3f state=%d",
          player->getPosition(), player->getDuration(), player->getState());
     player->has_pending_playback_completed_.store(true, std::memory_order_release);
 }
@@ -556,19 +556,19 @@ void AndroidPlayer::playbackCompletedCallback(void* user_data) {
 bool AndroidPlayer::consumePlaybackCompleted() {
     bool completed = has_pending_playback_completed_.exchange(false, std::memory_order_acq_rel);
     if (completed) {
-        LOGI("[播放完成] android_player 层：consumePlaybackCompleted=true，position=%.3f duration=%.3f state=%d",
+        LOGI("[???????????] android_player ????consumePlaybackCompleted=true??position=%.3f duration=%.3f state=%d",
              getPosition(), getDuration(), getState());
     }
     return completed;
 }
 
-// ========== OpenGL ES YUV 渲染 ==========
+// ========== OpenGL ES YUV ???? ==========
 
-// Vertex Shader：传两套 texcoord，Y 和 UV 独立处理 stride padding 与裁剪
+// Vertex Shader?????? texcoord??Y ??? UV ????????? stride padding ??????
 static const char* kVertexShader = R"(
 attribute vec4 a_position;
-attribute vec2 a_texcoord;    // Y 平面 texcoord（已折算 Y-stride padding）
-attribute vec2 a_texcoord_uv; // UV 平面 texcoord（已折算 UV-stride padding 与 FILL 裁剪）
+attribute vec2 a_texcoord;    // Y ?? texcoord???????? Y-stride padding??
+attribute vec2 a_texcoord_uv; // UV ?? texcoord???????? UV-stride padding ?? FILL ??????
 varying   vec2 v_texcoord;
 varying   vec2 v_texcoord_uv;
 void main() {
@@ -578,7 +578,7 @@ void main() {
 }
 )";
 
-// Fragment Shader：Y 用 v_texcoord，U/V 用 v_texcoord_uv
+// Fragment Shader??Y ??? v_texcoord??U/V ??? v_texcoord_uv
 static const char* kFragmentShader = R"(
 precision mediump float;
 varying vec2      v_texcoord;
@@ -708,7 +708,7 @@ bool AndroidPlayer::initGLProgram() {
     glGetProgramiv(gl_program_, GL_LINK_STATUS, &ok);
     if (!ok) {
         char buf[512]; glGetProgramInfoLog(gl_program_, sizeof(buf), nullptr, buf);
-        LOGE("❌ Program link error: %s", buf); return false;
+        LOGE("?? Program link error: %s", buf); return false;
     }
 
     gl_uniform_y_  = glGetUniformLocation(gl_program_, "u_tex_y");
@@ -729,7 +729,7 @@ bool AndroidPlayer::initGLProgram() {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
     glBindTexture(GL_TEXTURE_2D, 0);
-    LOGI("✅ GL program & textures initialized");
+    LOGI("??? GL program & textures initialized");
     return true;
 }
 
@@ -758,7 +758,7 @@ void AndroidPlayer::redrawLastFrame() {
 }
 
 
-// ========== 视频渲染 ==========
+// ========== ???????? ==========
 
 void AndroidPlayer::renderLoop() {
     int frame_count = 0;
@@ -766,14 +766,14 @@ void AndroidPlayer::renderLoop() {
     int empty_count = 0;
     bool gl_ready = false;
 
-    // 诊断统计
+    // ????????
     int64_t total_render_ms = 0;
     int64_t total_upload_ms = 0;
     int64_t max_render_ms = 0;
     int64_t max_upload_ms = 0;
-    int diag_interval = 60;   // 每 60 帧打一次统计
+    int diag_interval = 60;   // ? 60 ??????????
 
-    // seek 等待诊断
+    // seek ?????????
     int64_t empty_start_ms = 0;
     bool in_empty_streak = false;
 
@@ -783,18 +783,21 @@ void AndroidPlayer::renderLoop() {
     };
 
     while (render_running_) {
-        // 等待 Surface 就绪
+        // ???? Surface ??
         {
             std::lock_guard<std::mutex> lock(window_mutex_);
             if (!native_window_) {
-                // Only destroy EGL surface, keep context/program for hot-swap
-                if (gl_ready) { destroyEGLSurface(); }
+                // Only destroy EGL surface once, keep context/program for hot-swap
+                if (gl_ready && egl_surface_ != EGL_NO_SURFACE) {
+                    destroyEGLSurface();
+                    LOGI("Surface null: EGL surface released, keeping context");
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(16));
                 continue;
             }
         }
 
-        // 初始化 EGL（每次 Surface 重建后执行一次）
+        // ???????? EGL???? Surface ????????????????
         // Initialize EGL context once; re-create surface on each surface change
         if (!gl_ready) {
             // Step1: create EGL context (only once per player lifetime)
@@ -869,43 +872,51 @@ void AndroidPlayer::renderLoop() {
         auto t_get1 = now_ms();
 
         if (result == 0) {
-            // 空帧等待阶段结束
+            // ??????????????
             if (in_empty_streak) {
                 int64_t wait_ms = now_ms() - empty_start_ms;
-                LOGI("🎬 [DIAG] 帧等待结束: 空帧轮询耗时 %" PRId64 " ms (empty_count=%d) | 视频尺寸=%dx%d",
+                LOGI("???? [DIAG] ?????????: ?????????? %" PRId64 " ms (empty_count=%d) | ??????=%dx%d",
                      wait_ms, empty_count, frame_data.width, frame_data.height);
                 in_empty_streak = false;
             }
             empty_count = 0;
 
-            // ── A/V sync（对齐 iOS renderVideoFrame 逻辑）────────────────────
+            // ?????? A/V sync???? iOS renderVideoFrame ???????????????????????????????????????????????????????????????????
             double currentPTS   = frame_data.pts;
             double masterClock  = player_core_get_position(player_core_);
             double delay        = currentPTS - masterClock;
-            // render_warmup_frames_ 由 openURL/seekTo 在渲染层独立维护，
-            // 不依赖 core 的解码计数器（解码速度远快于渲染，不适合作渲染窗口基准）
+            // render_warmup_frames_ ??? openURL/seekTo ????????????????????
+            // ???? core ??????????????????????????????????????????????????????
             int    warmup       = render_warmup_frames_.load(std::memory_order_acquire);
             bool   should_display = false;
             bool   should_consume = false;
 
             if (std::isnan(currentPTS)) {
-                // PTS 无效：直接显示
+                // PTS ??????????????????
                 should_display = true;
                 should_consume = true;
             } else if (delay < -5.0) {
-                // 时钟严重未同步（seek 后初期）：强制显示，不丢帧
-                LOGI("🔄 [SYNC] 时钟未同步: pts=%.3f clock=%.3f delay=%.3f, 强制显示",
+                // ??????????????????seek ?????????????????????????
+                LOGI("???? [SYNC] ????????????: pts=%.3f clock=%.3f delay=%.3f, ????????",
                      currentPTS, masterClock, delay);
                 should_display = true;
                 should_consume = true;
             } else if (warmup > 0) {
-                // seek 结束后 warmup 阶段：放宽同步策略，优先连续出图
-                if (delay > 2.0) {
-                    // 视频超前过大：等待音频追上，不消费帧
+                // Warmup phase (after open/seek) - Tencent player approach:
+                // Show the first frames immediately so the user sees a picture ASAP
+                // instead of a black screen while audio is already playing.
+                if (warmup >= 3) {
+                    // No frame shown yet: display immediately regardless of audio clock.
+                    // KEY FIX for 'sound before video': don't wait for audio clock
+                    // to settle before showing the first picture.
+                    should_display = true;
+                    should_consume = true;
+                } else if (delay > 1.5) {
+                    // Video is well ahead of audio: hold frame
                     should_display = false;
                     should_consume = false;
-                } else if (delay < -0.5) {
-                    // 视频落后过多：跳帧（只消费不显示）
+                } else if (delay < -1.0) {
+                    // Video is behind audio: skip to catch up
                     should_display = false;
                     should_consume = true;
                 } else {
@@ -913,26 +924,26 @@ void AndroidPlayer::renderLoop() {
                     should_consume = true;
                 }
             } else {
-                // 正常播放：精确 A/V sync
-                // syncThreshold ≈ max(20ms, min(100ms, frameInterval * 1.5))
-                double frame_interval = 1.0 / 30.0;
-                double sync_threshold = std::min(0.10, std::max(0.02, frame_interval * 1.5));
+                // Normal playback: A/V sync (Tencent/ExoPlayer style)
+                // 50ms sync window, 2s max ahead threshold
+                const double sync_threshold = 0.05; // 50ms
                 if (delay <= -sync_threshold) {
-                    // 视频落后：跳帧
+                    // Video behind audio: drop frame to catch up
                     should_display = false;
                     should_consume = true;
-                } else if (delay <= sync_threshold) {
-                    // 在同步窗口内：正常显示
+                } else if (delay <= 0.5) {
+                    // In sync window (up to 500ms ahead): display normally
                     should_display = true;
                     should_consume = true;
-                } else if (delay > 0.35 && delay <= 1.0) {
-                    // 视频轻度超前：强制显示防止长时间无画面
+                } else if (delay <= 2.0) {
+                    // Video moderately ahead: force display to prevent freeze
+                    // Tencent player ~2s 'must render' threshold
                     should_display = true;
                     should_consume = true;
                 }
-                // else: 视频超前 > 1s：等待音频追上，不消费
+                // else: video > 2s ahead of audio, hold and wait
             }
-            // ────────────────────────────────────────────────────────────────
+            // ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 
             if (should_display) {
                 frame_count++;
@@ -947,14 +958,14 @@ void AndroidPlayer::renderLoop() {
                 if (render_ms > max_render_ms) max_render_ms = render_ms;
 
                 if (cost < 0) {
-                    LOGW("⚠️ renderFrame failed, reinitializing EGL...");
+                    LOGW("???? renderFrame failed, reinitializing EGL...");
                     destroyEGL();
                     gl_ready = false;
                 }
 
-                // 每 diag_interval 帧打一次诊断统计
+                // ? diag_interval ???????????????
                 if (frame_count % diag_interval == 0) {
-                    LOGI("📊 [DIAG] 最近 %d 帧 | "
+                    LOGI("???? [DIAG] ????? %d ? | "
                          "avg_render=%" PRId64 "ms max_render=%" PRId64 "ms "
                          "avg_upload=%" PRId64 "ms max_upload=%" PRId64 "ms "
                          "get_frame=%" PRId64 "ms",
@@ -966,7 +977,7 @@ void AndroidPlayer::renderLoop() {
                     max_render_ms = 0;  max_upload_ms = 0;
                 }
                 if (render_ms > 33) {
-                    LOGW("⚠️ [DIAG] 慢帧: render_ms=%" PRId64 "ms | %dx%d surface=%dx%d",
+                    LOGW("???? [DIAG] ????: render_ms=%" PRId64 "ms | %dx%d surface=%dx%d",
                          render_ms, frame_data.width, frame_data.height,
                          surface_width_, surface_height_);
                 }
@@ -974,13 +985,13 @@ void AndroidPlayer::renderLoop() {
 
             if (should_consume) {
                 player_core_consume_video_frame(player_core_);
-                // warmup 计数按渲染消费帧递减（不依赖解码速度）
+                // warmup ???????????????????????????????????
                 if (warmup > 0) {
                     render_warmup_frames_.fetch_sub(1, std::memory_order_acq_rel);
                 }
             }
 
-            // 如果本轮不消费（视频超前等待），短暂 sleep 避免空转
+            // ?????????????????????????????????????? sleep ??????
             if (!should_consume) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
@@ -990,18 +1001,25 @@ void AndroidPlayer::renderLoop() {
                 empty_start_ms = now_ms();
                 in_empty_streak = true;
                 if (player_core_) {
-                    LOGI("⏳ [DIAG] 帧队列为空开始等待: state=%d pos=%.3f",
+                    LOGI("[DIAG] Frame queue empty, waiting: state=%d pos=%.3f",
                          player_core_get_state(player_core_),
                          player_core_get_position(player_core_));
                 }
             }
-            // seek 后帧队列暂时为空，用短间隔积极轮询
+            // Tencent player weak-network strategy: after 200ms of empty queue,
+            // redraw the last cached frame to maintain a static picture instead
+            // of showing black. This is the 'freeze frame on buffering' behavior.
+            if (empty_count == 12 && gl_ready) {
+                // ~200ms of empty frames: freeze on last frame
+                redrawLastFrame();
+            }
+            // Fast poll first 50 iterations, then slow down
             int wait_ms = (empty_count <= 50) ? 3 : 16;
             std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
         }
     }
 
-    // 线程退出时清理 GL/EGL（必须在同一线程完成）
+    // ???????????????? GL/EGL??????????????????????
     destroyEGL();
     LOGI("Render loop exited, total frames: %d", frame_count);
 }
@@ -1023,14 +1041,14 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    // --- 上传 Y/U/V 纹理（4K 时这一步是主要耗时）---
+    // --- ??? Y/U/V ?????4K ?????????????????????---
     int uv_w = u_linesize > 0 ? u_linesize : width / 2;
     int uv_h = height / 2;
     int v_w  = v_linesize > 0 ? v_linesize : width / 2;
 
     bool size_changed = (width != gl_last_video_w_ || height != gl_last_video_h_);
     if (size_changed) {
-        LOGI("🎬 [DIAG] 视频尺寸变化: %dx%d -> %dx%d | Y_linesize=%d UV_linesize=%d",
+        LOGI("???? [DIAG] ???????????: %dx%d -> %dx%d | Y_linesize=%d UV_linesize=%d",
              gl_last_video_w_, gl_last_video_h_, width, height, y_linesize, uv_w);
     }
 
@@ -1066,22 +1084,22 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     int64_t upload_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_upload1 - t_upload0).count();
     if (out_upload_ms) *out_upload_ms += upload_ms;
     if (out_max_upload_ms && upload_ms > *out_max_upload_ms) *out_max_upload_ms = upload_ms;
-    // 单帧纹理上传超 10ms 时立即警告（4K = 3840*2160 Y 面约 8MB，应在 5ms 内完成）
+    // ??????????? 10ms ????????????4K = 3840*2160 Y ?? 8MB??????? 5ms ??????????
     if (upload_ms > 10) {
-        LOGW("⚠️ [DIAG] 纹理上传慢: upload_ms=%" PRId64 "ms | %dx%d Y_linesize=%d",
+        LOGW("???? [DIAG] ?????????: upload_ms=%" PRId64 "ms | %dx%d Y_linesize=%d",
              upload_ms, width, height, y_linesize);
     }
 
     gl_last_video_w_ = width;
     gl_last_video_h_ = height;
 
-    // --- 计算 texcoord（处理 stride padding）---
+    // --- ??? texcoord?????? stride padding??---
     int y_tex_w = y_linesize > 0 ? y_linesize : width;
-    float y_u_scale = (float)width  / (float)y_tex_w;   // 有效像素宽占纹理宽的比例
+    float y_u_scale = (float)width  / (float)y_tex_w;   // ???????????????????????
     float y_v_scale = 1.0f;
     float uv_u_scale = (float)(width / 2) / (float)(uv_w > 0 ? uv_w : width / 2);
 
-    // --- 计算顶点坐标（FIT / FILL）---
+    // --- ????????????FIT / FILL??---
     float vx0 = -1.0f, vx1 = 1.0f, vy0 = -1.0f, vy1 = 1.0f;
     float tx0 = 0.0f, tx1 = y_u_scale, ty0 = 0.0f, ty1 = y_v_scale;
     float utx0 = 0.0f, utx1 = uv_u_scale, uty0 = 0.0f, uty1 = 1.0f;
@@ -1090,7 +1108,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     float surface_aspect = (float)surface_w / (float)surface_h;
 
     if (aspect_ratio_mode_ == 0) {
-        // FIT：视频完整显示，两侧或上下留黑边
+        // FIT????????????????????????????????
         if (video_aspect > surface_aspect) {
             float scale = surface_aspect / video_aspect;
             vy0 = -scale; vy1 = scale;
@@ -1099,7 +1117,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
             vx0 = -scale; vx1 = scale;
         }
     } else {
-        // FILL：铺满 surface，通过裁剪 texcoord 来裁视频
+        // FILL?????? surface??????????? texcoord ??????
         if (video_aspect > surface_aspect) {
             float ratio  = surface_aspect / video_aspect;
             float margin = (1.0f - ratio) * 0.5f;
@@ -1113,16 +1131,16 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         }
     }
 
-    // --- 顶点数组：position(2) + Y-texcoord(2) + UV-texcoord(2)，stride = 6 floats ---
-    // Y 和 UV 使用独立的 texcoord 列，以正确处理 stride padding 与 FILL 裁剪不同的情况
+    // --- ???????????position(2) + Y-texcoord(2) + UV-texcoord(2)??stride = 6 floats ---
+    // Y ??? UV ???????????? texcoord ???????????? stride padding ?? FILL ????????????????
     const float verts[] = {
         // pos_x  pos_y   Y_s   Y_t   UV_s   UV_t
-        vx0, vy1,  tx0, ty0,  utx0, uty0,  // 左上
-        vx0, vy0,  tx0, ty1,  utx0, uty1,  // 左下
-        vx1, vy0,  tx1, ty1,  utx1, uty1,  // 右下
-        vx0, vy1,  tx0, ty0,  utx0, uty0,  // 左上（第二个三角形）
-        vx1, vy0,  tx1, ty1,  utx1, uty1,  // 右下
-        vx1, vy1,  tx1, ty0,  utx1, uty0,  // 右上
+        vx0, vy1,  tx0, ty0,  utx0, uty0,  // ???
+        vx0, vy0,  tx0, ty1,  utx0, uty1,  // ???
+        vx1, vy0,  tx1, ty1,  utx1, uty1,  // ???
+        vx0, vy1,  tx0, ty0,  utx0, uty0,  // ????????????????
+        vx1, vy0,  tx1, ty1,  utx1, uty1,  // ???
+        vx1, vy1,  tx1, ty0,  utx1, uty0,  // ???
     };
 
     glViewport(0, 0, surface_w, surface_h);
@@ -1134,10 +1152,10 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     glUniform1i(gl_uniform_u_, 1);
     glUniform1i(gl_uniform_v_, 2);
 
-    // 使用 initGLProgram 缓存的 attrib location，避免每帧调用 glGetAttribLocation
+    // ???? initGLProgram ??????? attrib location????????????? glGetAttribLocation
     if (gl_attrib_pos_ < 0 || gl_attrib_tex_ < 0 || gl_attrib_tex_uv_ < 0) return -1;
 
-    // stride = 6 floats：[pos_x, pos_y, Y_s, Y_t, UV_s, UV_t]
+    // stride = 6 floats??[pos_x, pos_y, Y_s, Y_t, UV_s, UV_t]
     const GLsizei stride = 6 * sizeof(float);
     glVertexAttribPointer(gl_attrib_pos_,    2, GL_FLOAT, GL_FALSE, stride, verts);
     glEnableVertexAttribArray(gl_attrib_pos_);
@@ -1153,7 +1171,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     glDisableVertexAttribArray(gl_attrib_tex_uv_);
 
     if (!eglSwapBuffers(egl_display_, egl_surface_)) {
-        LOGE("❌ eglSwapBuffers failed: 0x%x", eglGetError());
+        LOGE("?? eglSwapBuffers failed: 0x%x", eglGetError());
         return -1;
     }
 
@@ -1177,14 +1195,14 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     return (int)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 }
 
-// ========== OpenSL ES 音频输出 ==========
+// ========== OpenSL ES ?????????? ==========
 
 bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     SLresult result;
     
     LOGI("Initializing audio output: %d Hz, %d channels", sample_rate, channels);
     
-    // 创建引擎
+    // ?????????
     result = slCreateEngine(&engineObject_, 0, nullptr, 0, nullptr, nullptr);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to create engine: %d", result);
@@ -1204,7 +1222,7 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
 
-    // 创建输出混音器
+    // ????????????????
     result = (*engineEngine_)->CreateOutputMix(engineEngine_, &outputMixObject_, 0, nullptr, nullptr);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to create output mix: %d", result);
@@ -1219,13 +1237,13 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
     
-    // 配置音频源 (PCM)
+    // ?????????? (PCM)
     SLDataLocator_AndroidSimpleBufferQueue loc_bufq = {
         SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 2
     };
 
-    // ✅ 根据实际视频的音频格式动态配置
-    // 采样率映射
+    // ??? ???????????????????????????????
+    // ????????????
     SLuint32 sl_sample_rate;
     switch (sample_rate) {
         case 8000:  sl_sample_rate = SL_SAMPLINGRATE_8; break;
@@ -1245,14 +1263,14 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
             break;
     }
     
-    // 声道配置
+    // ???????
     SLuint32 channel_mask;
     if (channels == 1) {
         channel_mask = SL_SPEAKER_FRONT_CENTER;
     } else {
-        // 2 或更多声道，使用立体声
+        // 2 ??????????????????????
         channel_mask = SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT;
-        channels = 2; // 强制为立体声
+        channels = 2; // ??????????
     }
     
     SLDataFormat_PCM format_pcm = {
@@ -1269,11 +1287,11 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
 
     SLDataSource audioSrc = {&loc_bufq, &format_pcm};
     
-    // 配置音频接收器
+    // ??????????????????
     SLDataLocator_OutputMix loc_outmix = {SL_DATALOCATOR_OUTPUTMIX, outputMixObject_};
     SLDataSink audioSnk = {&loc_outmix, nullptr};
     
-    // 创建音频播放器（不请求 VOLUME 接口，避免 AppOps 限制）
+    // ???????????????????????? VOLUME ?????????? AppOps ????????
     const SLInterfaceID ids[1] = {SL_IID_BUFFERQUEUE};
     const SLboolean req[1] = {SL_BOOLEAN_TRUE};
     
@@ -1292,7 +1310,7 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
 
-    // 获取播放接口
+    // ???????????????
     result = (*playerObject_)->GetInterface(playerObject_, SL_IID_PLAY, &playItf_);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to get play interface: %d", result);
@@ -1300,7 +1318,7 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
 
-    // 获取缓冲队列接口
+    // ????????????????????
     result = (*playerObject_)->GetInterface(playerObject_, SL_IID_BUFFERQUEUE, &bufferQueueItf_);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to get buffer queue interface: %d", result);
@@ -1308,7 +1326,7 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
 
-    // 注册回调
+    // ?????????
     result = (*bufferQueueItf_)->RegisterCallback(bufferQueueItf_, audioCallback, this);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to register callback: %d", result);
@@ -1316,37 +1334,37 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
     
-    // ⚠️ 不再使用 VolumeItf（避免 AppOps CONTROL_AUDIO 崩溃）
-    // 音量控制改为只在 Core 层处理
+    // ???? ???????? VolumeItf?????? AppOps CONTROL_AUDIO ?????
+    // ???????????????????? Core ??????
     volumeItf_ = nullptr;
     LOGI("Volume control disabled (using core volume only to avoid AppOps crash)");
     
-    // 保存音频参数
+    // ?????????????
     audio_sample_rate_ = sample_rate;
     audio_channels_ = channels;
     
-    // 计算合适的缓冲区大小
-    // 目标：~5ms 的音频数据（从 10ms 减少，降低内存占用）
-    // 公式：bytes = sample_rate * channels * bytes_per_sample * duration
+    // ?????????????????????
+    // ???????~5ms ???????????????? 10ms ???????????????????????
+    // ??????bytes = sample_rate * channels * bytes_per_sample * duration
     audio_buffer_size_ = (sample_rate * channels * 2 * 5) / 1000;  // 16-bit = 2 bytes
     
-    // 对齐到 4 字节边界
+    // ????? 4 ?????????
     audio_buffer_size_ = (audio_buffer_size_ + 3) & ~3;
     
-    // 限制在最大范围内（更严格的限制）
+    // ????????????????????????????????????????
     if (audio_buffer_size_ > MAX_AUDIO_BUFFER_SIZE) {
         audio_buffer_size_ = MAX_AUDIO_BUFFER_SIZE;
-        LOGW("⚠️ Audio buffer size capped to %d bytes", MAX_AUDIO_BUFFER_SIZE);
+        LOGW("???? Audio buffer size capped to %d bytes", MAX_AUDIO_BUFFER_SIZE);
     }
     if (audio_buffer_size_ < 960) {
-        audio_buffer_size_ = 960;  // 最小 960 字节（从 1KB 减少）
+        audio_buffer_size_ = 960;  // ???? 960 ????????? 1KB ???????
     }
     
-    LOGI("🎵 Audio buffer size calculated: %d bytes (%.1f ms)", 
+    LOGI("???? Audio buffer size calculated: %d bytes (%.1f ms)", 
          audio_buffer_size_, 
          (audio_buffer_size_ * 1000.0) / (sample_rate * channels * 2));
     
-    // 初始填充缓冲区
+    // ?????????????????
     memset(audio_buffer_, 0, audio_buffer_size_);
     (*bufferQueueItf_)->Enqueue(bufferQueueItf_, audio_buffer_, audio_buffer_size_);
     
@@ -1460,7 +1478,7 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         return;
     }
 
-    // 循环填充缓冲区，直到填满或没有数据
+    // ?????????????????????????????????????
     int total_bytes_read = 0;
     while (total_bytes_read < audio_buffer_size_) {
         int bytes_read = player_core_get_audio_data(
@@ -1481,32 +1499,32 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     callback_count++;
     
     if (total_bytes_read > 0) {
-        // 每100次回调输出一次日志（已屏蔽，日志太多）
+        // ?100??????????????????????????????????????
         // if (callback_count % 100 == 0) {
-        //     LOGI("🎵 Audio callback #%d: total_bytes=%d, buffer_size=%d (%.1f%%)", 
+        //     LOGI("???? Audio callback #%d: total_bytes=%d, buffer_size=%d (%.1f%%)", 
         //          callback_count, total_bytes_read, audio_buffer_size_,
         //          (total_bytes_read * 100.0) / audio_buffer_size_);
         // }
         
-        // 填充剩余部分为静音
+        // ?????????????????????
         if (total_bytes_read < audio_buffer_size_) {
             memset(audio_buffer_ + total_bytes_read, 0, audio_buffer_size_ - total_bytes_read);
             
-            // 音频欠载日志（已屏蔽）
+            // ?????????????????????
             // if (callback_count % 100 == 0) {
-            //     LOGW("🎵 Audio underrun: only got %d bytes, needed %d (%.1f%%)", 
+            //     LOGW("???? Audio underrun: only got %d bytes, needed %d (%.1f%%)", 
             //          total_bytes_read, audio_buffer_size_,
             //          (total_bytes_read * 100.0) / audio_buffer_size_);
             // }
         }
     } else {
-        // 没有数据，填充静音
+        // ???????????????????
         if (callback_count % 100 == 0) {
-            LOGW("🎵 No audio data available, filling silence");
+            LOGW("???? No audio data available, filling silence");
         }
         memset(audio_buffer_, 0, audio_buffer_size_);
     }
     
-    // 入队下一个缓冲区
+    // ???????????????????
     (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
 }
