@@ -60,7 +60,8 @@ AndroidPlayer::AndroidPlayer()
     if (!player_core_) {
         LOGE("Failed to create player core");
     } else {
-        // 注册底层加载状态回调（网络抖动时用于显�?loading�?        player_core_set_loading_callback(player_core_, loadingStateCallback, this);
+        // loading callback
+        player_core_set_loading_callback(player_core_, loadingStateCallback, this);
         // 注册底层错误回调（播放中错误透传给业务层�?        player_core_set_error_callback(player_core_, errorStateCallback, this);
         // 注册播放完成回调
         player_core_set_playback_completed_callback(player_core_, playbackCompletedCallback, this);
@@ -74,7 +75,8 @@ AndroidPlayer::AndroidPlayer()
 AndroidPlayer::~AndroidPlayer() {
     LOGD("AndroidPlayer destroyed");
 
-    // �?先禁�?audio callback 访问 player_core_（必须在 destroy player_core 之前�?    audio_active_.store(false, std::memory_order_seq_cst);
+    // before destroy player_core
+    audio_active_.store(false, std::memory_order_seq_cst);
 
     // �?停止渲染线程（EGL/GL 资源在线程内销毁）
     render_running_ = false;
@@ -92,7 +94,8 @@ AndroidPlayer::~AndroidPlayer() {
         native_window_ = nullptr;
     }
 
-    // �?销毁核心播放器（此�?audio callback 已不可能再访问它�?    if (player_core_) {
+    // destroy player_core
+    if (player_core_) {
         player_core_set_playback_completed_callback(player_core_, nullptr, nullptr);
         player_core_set_loading_callback(player_core_, nullptr, nullptr);
         player_core_set_error_callback(player_core_, nullptr, nullptr);
@@ -102,7 +105,8 @@ AndroidPlayer::~AndroidPlayer() {
 }
 
 void AndroidPlayer::setSurface(ANativeWindow* window) {
-    // 先在锁外决定是否需要停止渲染线程，再释放锁�?join�?    // 避免持锁 join 时与 renderFrame 内的锁形成死锁�?    std::thread thread_to_join;
+    // avoid deadlock
+    std::thread thread_to_join;
     {
         std::lock_guard<std::mutex> lock(window_mutex_);
 
@@ -121,10 +125,13 @@ void AndroidPlayer::setSurface(ANativeWindow* window) {
                 render_running_ = true;
                 render_thread_ = std::thread(&AndroidPlayer::renderLoop, this);
             }
-        } else {
-            // Surface 清除：native_window_ 已置 null，renderLoop 会检测到并销�?EGL�?            // 不在这里 join，让渲染线程自然退出（它会检�?native_window_ == null）�?            // �?player 被完全销毁，析构函数�?join�?            LOGD("Surface cleared");
+            // Surface cleared: renderLoop detects native_window_==null and destroys EGL.
+            LOGD("Surface cleared");
+            // Surface cleared: renderLoop detects native_window_==null.
+            LOGD("Surface cleared");
         }
-    }
+    // Lock released; join render thread if needed
+    if (thread_to_join.joinable()) {
     // 锁已释放，必要时在析构等待线程退�?    if (thread_to_join.joinable()) {
         thread_to_join.join();
     }
@@ -161,7 +168,8 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
 
-    // 始终使用带起始位置的 API，确�?start_position=0 也能显式重置到起点�?    // 原来 start_position==0 时走 player_core_open(url)，core 可能沿用上次缓存进度�?    // 导致重播时从"首次带入进度"而非 0 开始播放�?    int result = player_core_open_with_start_position(player_core_, url, start_position);
+    // Always use start_position API so start_position=0 also resets to beginning.
+    int result = player_core_open_with_start_position(player_core_, url, start_position);
     
     if (result == 0) {
         LOGI("URL opened successfully");
@@ -384,7 +392,8 @@ void AndroidPlayer::stop() {
 
     LOGD("Stop");
     // 主动丢弃上一次播放结束的 pending 事件，避�?stop 后立�?open 新资源时
-    // 第一�?consume 仍返�?true，误触发应用�?onPlaybackCompleted 回调�?    has_pending_playback_completed_.store(false, std::memory_order_release);
+    // Consume flag atomically
+    has_pending_playback_completed_.store(false, std::memory_order_release);
     player_core_stop(player_core_);
 
     // 停止音频
@@ -401,7 +410,8 @@ void AndroidPlayer::seekTo(double position) {
     
     LOGD("Seek to: %f", position);
     player_core_seek(player_core_, position);
-    // seek 后重置渲染层 warmup 窗口（对�?iOS _syncWarmupFramesRemaining=40�?    render_warmup_frames_.store(8, std::memory_order_release);
+    // seek/open warmup
+    render_warmup_frames_.store(8, std::memory_order_release);
 }
 
 void AndroidPlayer::setPlaybackRate(float rate) {
@@ -550,7 +560,9 @@ bool AndroidPlayer::consumePlaybackCompleted() {
 
 // Vertex Shader：传两套 texcoord，Y �?UV 独立处理 stride padding 与裁�?static const char* kVertexShader = R"(
 attribute vec4 a_position;
-attribute vec2 a_texcoord;    // Y 平面 texcoord（已折算 Y-stride padding�?attribute vec2 a_texcoord_uv; // UV 平面 texcoord（已折算 UV-stride padding �?FILL 裁剪�?varying   vec2 v_texcoord;
+attribute vec2 a_texcoord;    // Y texcoord
+attribute vec2 a_texcoord_uv; // UV texcoord
+varying   vec2 v_texcoord;
 varying   vec2 v_texcoord_uv;
 void main() {
     gl_Position    = a_position;
@@ -835,7 +847,8 @@ void AndroidPlayer::renderLoop() {
                 // PTS 无效：直接显�?                should_display = true;
                 should_consume = true;
             } else if (delay < -5.0) {
-                // 时钟严重未同步（seek 后初期）：强制显示，不丢�?                LOGI("🔄 [SYNC] 时钟未同�? pts=%.3f clock=%.3f delay=%.3f, 强制显示",
+                // clock not synced (post-seek): force display
+                LOGI("?? [SYNC] clock unsynced: pts=%.3f clock=%.3f delay=%.3f, force display",
                      currentPTS, masterClock, delay);
                 should_display = true;
                 should_consume = true;
@@ -888,7 +901,8 @@ void AndroidPlayer::renderLoop() {
                     gl_ready = false;
                     last_surface_gen = UINT64_MAX;
                 } else {
-                    // 缓存最后成功渲染的帧数据，�?Surface 切换后立即重�?                    int y_stride = frame_data.y_linesize > 0 ? frame_data.y_linesize : frame_data.width;
+                    // cache last rendered frame for redraw after surface switch
+                    int y_stride = frame_data.y_linesize > 0 ? frame_data.y_linesize : frame_data.width;
                     int uv_stride = frame_data.u_linesize > 0 ? frame_data.u_linesize : frame_data.width / 2;
                     int y_size  = y_stride  * frame_data.height;
                     int uv_size = uv_stride * (frame_data.height / 2);
@@ -1287,7 +1301,8 @@ void AndroidPlayer::destroyAudioOutput() {
             (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
         }
 
-        // �?等待当前正在执行�?callback 结束：尝试获�?audio_mutex_（callback 持锁时会阻塞�?        //    拿到锁后立刻释放，只是为了确�?callback 已离开临界�?        {
+        // Wait for any in-flight callback to exit critical section
+        {
             std::lock_guard<std::mutex> lk(audio_mutex_);
             // callback 已退出或不会再进入临界区，此�?Destroy 安全
         }
@@ -1367,7 +1382,8 @@ void AndroidPlayer::audioCallback(SLAndroidSimpleBufferQueueItf bq, void* contex
 
 void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     int buf_size = audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096;
-    // audio_active_ �?false 说明正在析构�?player_core_ 即将失效，只填静�?    if (!audio_active_.load(std::memory_order_acquire) || !player_core_ || audio_buffer_size_ == 0) {
+    // audio_active_=false means destructor is running; just output silence
+    if (!audio_active_.load(std::memory_order_acquire) || !player_core_ || audio_buffer_size_ == 0) {
         memset(audio_buffer_, 0, buf_size);
         (*bq)->Enqueue(bq, audio_buffer_, buf_size);
         return;
