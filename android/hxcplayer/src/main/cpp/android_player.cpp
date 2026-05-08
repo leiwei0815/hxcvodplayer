@@ -449,6 +449,7 @@ void AndroidPlayer::seekTo(double position) {
     if (!player_core_) return;
 
     LOGI("[ctrl] seekTo: %.3fs (current pos=%.3f state=%d)", position, player_core_get_position(player_core_), player_core_get_state(player_core_));
+    seek_just_happened_.store(true, std::memory_order_release);
     player_core_seek(player_core_, position);
     render_cv_.notify_one();
 }
@@ -977,15 +978,19 @@ void AndroidPlayer::renderLoop() {
 
             if (std::isnan(pts) || std::isinf(pts)) {
                 should_display = should_consume = true;
-            } else if (frame_count == 0) {
-                // First frame: always display regardless of audio clock.
-                // When two players start simultaneously (split-screen), audio clock
-                // may advance 500ms~1s before the first video frame arrives due to
-                // CPU/IO contention. Without this guard the first frame would be
-                // dropped (delay < -kSyncThreshold) and the video would appear to
-                // start late, making the audio-ahead problem worse.
-                LOGI("[sync] first frame forced: pts=%.3f clk=%.3f delay=%.3f",
-                     pts, clock, delay);
+            } else if (frame_count == 0 || seek_just_happened_.exchange(false, std::memory_order_acq_rel)) {
+                // Force-display the first frame ever, and the first frame after
+                // each seek.  In both cases the audio clock may have advanced
+                // significantly before the video decoder produces a frame (slow
+                // seek / dual-player contention), so the normal drop guard
+                // (delay < -50 ms) must not apply here.
+                if (frame_count == 0) {
+                    LOGI("[sync] first frame forced: pts=%.3f clk=%.3f delay=%.3f",
+                         pts, clock, delay);
+                } else {
+                    LOGI("[sync] post-seek frame forced: pts=%.3f clk=%.3f delay=%.3f",
+                         pts, clock, delay);
+                }
                 should_display = should_consume = true;
             } else if (delay < -kSyncThreshold) {
                 should_display = false;
