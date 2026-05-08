@@ -277,6 +277,8 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
         LOGI("Custom HTTP opened successfully");
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
+        sync_warmup_frames_.store(20, std::memory_order_release);
+        last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         render_cv_.notify_one();
         return true;
     } else {
@@ -315,6 +317,8 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
         LOGI("Custom file opened successfully");
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
+        sync_warmup_frames_.store(20, std::memory_order_release);
+        last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         render_cv_.notify_one();
         return true;
     } else {
@@ -365,6 +369,8 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     if (result == 0) {
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
+        sync_warmup_frames_.store(20, std::memory_order_release);
+        last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         render_cv_.notify_one();
         return true;
     }
