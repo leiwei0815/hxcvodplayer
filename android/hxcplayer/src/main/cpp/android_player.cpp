@@ -9,6 +9,11 @@
 #include <thread>
 #include <inttypes.h>
 #include <unistd.h>  // gettid()
+// EGL_OPENGL_ES3_BIT may not be defined in older EGL headers
+#ifndef EGL_OPENGL_ES3_BIT
+#define EGL_OPENGL_ES3_BIT 0x00000040
+#endif
+
 
 #define LOG_TAG "HXC"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
@@ -579,35 +584,36 @@ bool AndroidPlayer::consumePlaybackCompleted() {
 
 // Vertex shader: two separate texcoord sets so Y and UV can have different
 // stride-padding and FILL crop offsets.
-static const char* kVertexShader = R"(
-attribute vec4 a_position;
-attribute vec2 a_texcoord;    // Y  plane texcoord (accounts for Y  stride padding)
-attribute vec2 a_texcoord_uv; // UV plane texcoord (accounts for UV stride padding / FILL crop)
-varying   vec2 v_texcoord;
-varying   vec2 v_texcoord_uv;
+static const char* kVertexShader = R"(#version 300 es
+in vec4 a_position;
+in vec2 a_texcoord;
+in vec2 a_texcoord_uv;
+out vec2 v_texcoord;
+out vec2 v_texcoord_uv;
 void main() {
-    gl_Position    = a_position;
-    v_texcoord     = a_texcoord;
-    v_texcoord_uv  = a_texcoord_uv;
+    gl_Position   = a_position;
+    v_texcoord    = a_texcoord;
+    v_texcoord_uv = a_texcoord_uv;
 }
 )";
 
 // Fragment shader: BT.601 limited-range YUV -> RGB
-static const char* kFragmentShader = R"(
+static const char* kFragmentShader = R"(#version 300 es
 precision mediump float;
-varying vec2      v_texcoord;
-varying vec2      v_texcoord_uv;
+in vec2      v_texcoord;
+in vec2      v_texcoord_uv;
 uniform sampler2D u_tex_y;
 uniform sampler2D u_tex_u;
 uniform sampler2D u_tex_v;
+out vec4 fragColor;
 void main() {
-    float y = texture2D(u_tex_y, v_texcoord).r;
-    float u = texture2D(u_tex_u, v_texcoord_uv).r - 0.5;
-    float v = texture2D(u_tex_v, v_texcoord_uv).r - 0.5;
+    float y = texture(u_tex_y, v_texcoord).r;
+    float u = texture(u_tex_u, v_texcoord_uv).r - 0.5;
+    float v = texture(u_tex_v, v_texcoord_uv).r - 0.5;
     float r = y + 1.402  * v;
     float g = y - 0.344  * u - 0.714 * v;
     float b = y + 1.772  * u;
-    gl_FragColor = vec4(r, g, b, 1.0);
+    fragColor = vec4(r, g, b, 1.0);
 }
 )";
 
@@ -635,27 +641,38 @@ bool AndroidPlayer::initEGLContext() {
     // Choose config once and reuse for both context and surface creation.
     // Adding alpha channel (EGL_ALPHA_SIZE=8) avoids black-frame artifacts
     // when the surface is first attached to a TextureView.
-    EGLint attribs[] = {
+    // Prefer ES3 (required for PBO); fall back to ES2 on older devices.
+    EGLint attribs3[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+        EGL_RED_SIZE,   8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLint attribs2[] = {
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
         EGL_RED_SIZE,   8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
         EGL_ALPHA_SIZE, 8,
         EGL_NONE
     };
+    EGLint attribs2_noalpha[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+        EGL_RED_SIZE,   8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_NONE
+    };
     EGLint num_configs = 0;
-    if (!eglChooseConfig(egl_display_, attribs, &egl_config_, 1, &num_configs) || num_configs == 0) {
-        // Fallback: try without alpha
-        EGLint attribs_noalpha[] = {
-            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-            EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
-            EGL_RED_SIZE,   8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
-            EGL_NONE
-        };
-        if (!eglChooseConfig(egl_display_, attribs_noalpha, &egl_config_, 1, &num_configs) || num_configs == 0) {
-            LOGE("eglChooseConfig failed"); return false;
+    int    gl_version  = 3;
+    if (!eglChooseConfig(egl_display_, attribs3, &egl_config_, 1, &num_configs) || num_configs == 0) {
+        gl_version = 2;
+        if (!eglChooseConfig(egl_display_, attribs2, &egl_config_, 1, &num_configs) || num_configs == 0) {
+            if (!eglChooseConfig(egl_display_, attribs2_noalpha, &egl_config_, 1, &num_configs) || num_configs == 0) {
+                LOGE("eglChooseConfig failed"); return false;
+            }
         }
     }
-    EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, gl_version, EGL_NONE };
     egl_context_ = eglCreateContext(egl_display_, egl_config_, EGL_NO_CONTEXT, ctx_attribs);
     if (egl_context_ == EGL_NO_CONTEXT) { LOGE("eglCreateContext failed"); return false; }
     // Log key EGL config attributes for diagnostics
