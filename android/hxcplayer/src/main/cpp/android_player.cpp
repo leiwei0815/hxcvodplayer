@@ -178,7 +178,7 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     if (result == 0) {
         LOGI("URL opened successfully");
         ensureAudioOutputForCurrentStream();
-        render_warmup_frames_.store(40, std::memory_order_release);
+        render_warmup_frames_.store(8, std::memory_order_release);
 
         // ⏸️ 打开后自动暂停，等待用户点击播放
         player_core_pause(player_core_);
@@ -225,7 +225,7 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
     if (result == 0) {
         LOGI("Custom HTTP opened successfully");
         ensureAudioOutputForCurrentStream();
-        render_warmup_frames_.store(40, std::memory_order_release);
+        render_warmup_frames_.store(8, std::memory_order_release);
 
         player_core_pause(player_core_);
         return true;
@@ -264,7 +264,7 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
     if (result == 0) {
         LOGI("Custom file opened successfully");
         ensureAudioOutputForCurrentStream();
-        render_warmup_frames_.store(40, std::memory_order_release);
+        render_warmup_frames_.store(8, std::memory_order_release);
 
         player_core_pause(player_core_);
         return true;
@@ -321,7 +321,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
                 audio_initialized_ = true;
             }
         }
-        render_warmup_frames_.store(40, std::memory_order_release);
+        render_warmup_frames_.store(8, std::memory_order_release);
         player_core_pause(player_core_);
         return true;
     }
@@ -416,7 +416,7 @@ void AndroidPlayer::seekTo(double position) {
     LOGD("Seek to: %f", position);
     player_core_seek(player_core_, position);
     // seek 后重置渲染层 warmup 窗口（对齐 iOS _syncWarmupFramesRemaining=40）
-    render_warmup_frames_.store(40, std::memory_order_release);
+    render_warmup_frames_.store(8, std::memory_order_release);
 }
 
 void AndroidPlayer::setPlaybackRate(float rate) {
@@ -787,7 +787,8 @@ void AndroidPlayer::renderLoop() {
         {
             std::lock_guard<std::mutex> lock(window_mutex_);
             if (!native_window_) {
-                if (gl_ready) { destroyEGL(); gl_ready = false; }
+                // Only destroy EGL surface, keep context/program for hot-swap
+                if (gl_ready) { destroyEGLSurface(); }
                 std::this_thread::sleep_for(std::chrono::milliseconds(16));
                 continue;
             }
@@ -796,14 +797,19 @@ void AndroidPlayer::renderLoop() {
         // 初始化 EGL（每次 Surface 重建后执行一次）
         // Initialize EGL context once; re-create surface on each surface change
         if (!gl_ready) {
-            if (!initEGLContext()) {
-                LOGE("EGL context init failed, retrying...");
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
+            // Initialize EGL context and GL program only if not already done
+            if (egl_context_ == EGL_NO_CONTEXT) {
+                if (!initEGLContext() || !initGLProgram()) {
+                    LOGE("EGL context or GL program init failed, retrying...");
+                    destroyEGL();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
+                }
+                LOGI("EGL context and GL program initialized (new)");
             }
-            if (!initEGLSurface() || !initGLProgram()) {
-                LOGE("EGL surface or GL program init failed, retrying...");
-                destroyEGL();
+            // Always create EGL surface for current window
+            if (!initEGLSurface()) {
+                LOGE("EGL surface init failed, retrying...");
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
@@ -816,22 +822,32 @@ void AndroidPlayer::renderLoop() {
         {
             uint64_t new_gen = surface_generation_.load(std::memory_order_relaxed);
             if (new_gen != current_surface_gen) {
-                LOGI("Surface generation changed, hot-swapping EGL surface");
                 ANativeWindow* win = nullptr;
                 { std::lock_guard<std::mutex> lock(window_mutex_); win = native_window_; }
                 if (win) {
-                    if (initEGLSurface()) {
-                        current_surface_gen = new_gen;
-                        LOGI("EGL surface hot-swap OK");
-                        redrawLastFrame();
-                    } else {
-                        LOGE("EGL surface hot-swap failed, full reinit");
+                    // If context was lost (shouldn't happen, but be safe), do full reinit
+                    if (egl_context_ == EGL_NO_CONTEXT) {
+                        LOGI("Surface gen changed but context lost, full reinit");
                         destroyEGL();
                         gl_ready = false;
+                    } else {
+                        LOGI("Surface generation changed %llu->%llu, hot-swapping EGL surface",
+                             (unsigned long long)current_surface_gen, (unsigned long long)new_gen);
+                        if (initEGLSurface()) {
+                            current_surface_gen = new_gen;
+                            LOGI("EGL surface hot-swap OK, redrawing last frame");
+                            redrawLastFrame();
+                        } else {
+                            LOGE("EGL surface hot-swap failed, full reinit");
+                            destroyEGL();
+                            gl_ready = false;
+                        }
                     }
                 } else {
+                    // Surface cleared, destroy EGL surface only
                     destroyEGLSurface();
                     current_surface_gen = new_gen;
+                    LOGI("Surface cleared (gen=%llu), EGL surface released", (unsigned long long)new_gen);
                 }
                 continue;
             }
@@ -980,7 +996,7 @@ void AndroidPlayer::renderLoop() {
     }
 
     // 线程退出时清理 GL/EGL（必须在同一线程完成）
-    if (gl_ready) { destroyEGL(); }
+    destroyEGL();
     LOGI("Render loop exited, total frames: %d", frame_count);
 }
 
