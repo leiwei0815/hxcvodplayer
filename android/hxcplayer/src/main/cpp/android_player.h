@@ -134,25 +134,25 @@ private:
     int    gl_last_video_w_;
     int    gl_last_video_h_;
 
-    // 最后一帧缓存（暂停时 Surface 切换后立即重绘，避免黑屏）
+    // last frame cache for redraw after surface switch
     std::vector<uint8_t> last_frame_y_;
     std::vector<uint8_t> last_frame_u_;
     std::vector<uint8_t> last_frame_v_;
-    int last_frame_width_     = 0;
-    int last_frame_height_    = 0;
-    int last_frame_y_stride_  = 0;
-    int last_frame_u_stride_  = 0;
-    int last_frame_v_stride_  = 0;
+    int last_frame_width_{0};
+    int last_frame_height_{0};
+    int last_frame_y_stride_{0};
+    int last_frame_u_stride_{0};
+    int last_frame_v_stride_{0};
+
 
     // EGL/GL 初始化与销毁（仅在渲染线程调用）
-    bool initEGLContext();       // 创建 Display + Context（只需一次）
-    bool initEGLSurface();       // 创建 EGL Window Surface（Surface 变化时复用 Context）
-    bool initEGL();              // 完整初始化（含 Context + Surface）
-    void destroyEGLSurface();    // 只销毁 EGL Surface，保留 Context
+    bool initEGLContext();
+    bool initEGLSurface();
+    void destroyEGLSurface();
     void destroyEGL();
     bool initGLProgram();
     void destroyGLProgram();
-    void redrawLastFrame();      // 用缓存的最后一帧重绘到当前 Surface
+    void redrawLastFrame();
 
     // 渲染线程
     std::thread render_thread_;
@@ -191,8 +191,6 @@ private:
     uint8_t audio_buffer_[MAX_AUDIO_BUFFER_SIZE];
     int audio_buffer_size_;   // 实际使用的缓冲区大小
     std::mutex audio_mutex_;
-    // audio_active_ 为 false 时 onAudioData 只填静音，不访问 player_core_
-    // 在 destroyAudioOutput 之前、player_core_ destroy 之前置 false
     std::atomic<bool> audio_active_{false};
 
     // 加载状态（用于业务层显示 loading 动画）
