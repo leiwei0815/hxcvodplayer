@@ -210,6 +210,9 @@ private:
     int               audio_buffer_size_;
     std::mutex        audio_mutex_;
     std::atomic<bool> audio_active_{false};
+    int               audio_cb_count_{0};
+    int               audio_underrun_count_{0};
+    int               audio_partial_count_{0};
 
     // -----------------------------------------------------------------------
     // Event forwarding (core callbacks -> JNI poll)

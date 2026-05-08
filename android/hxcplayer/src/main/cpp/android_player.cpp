@@ -129,19 +129,21 @@ AndroidPlayer::~AndroidPlayer() {
         }
     }
 
-    // 4. Destroy audio
-    destroyAudioOutput();
-
-    // 5. Tear down player core (clear callbacks first)
-    //    Null out player_core_ while holding audio_mutex_ so any
-    //    in-flight audio callback that races past audio_active_ check
-    //    will see nullptr and return silence safely.
+    // 4. Null out player_core_ under audio_mutex_ BEFORE destroying the audio
+    //    player object.  This guarantees that any audio callback which fires
+    //    during or after playerObject_->Destroy() will see player_core_==nullptr
+    //    and return silence instead of calling swr_convert on a freed context.
     PlayerCoreHandle* core_to_destroy = nullptr;
     {
         std::lock_guard<std::mutex> lock(audio_mutex_);
         core_to_destroy = player_core_;
         player_core_ = nullptr;
     }
+
+    // 5. Now safe to destroy the audio engine (callbacks see player_core_==nullptr)
+    destroyAudioOutput();
+
+    // 6. Tear down player core (callbacks already neutralised above)
     if (core_to_destroy) {
         player_core_set_playback_completed_callback(core_to_destroy, nullptr, nullptr);
         player_core_set_loading_callback(core_to_destroy, nullptr, nullptr);
@@ -1653,10 +1655,10 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         }
     }
 
-    static int  callback_count   = 0;
-    static int  underrun_count   = 0;
-    static int  partial_count    = 0;
-    callback_count++;
+    audio_cb_count_++;
+    int& callback_count = audio_cb_count_;
+    int& underrun_count = audio_underrun_count_;
+    int& partial_count  = audio_partial_count_;
 
     if (total_bytes_read > 0) {
         if (total_bytes_read < audio_buffer_size_) {
