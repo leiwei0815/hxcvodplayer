@@ -403,32 +403,23 @@ void AndroidPlayer::play() {
     render_cv_.notify_one();
 
     if (playItf_) {
-        // Keep OpenSL ES in PAUSED state until the first video frame is rendered.
-        // The render thread will flip it to PLAYING after frame_count becomes 1.
-        // This prevents audio starting before the video picture appears.
-        // For audio-only streams there is no render thread activity, so we fall
-        // back to direct PLAYING (frame_count stays 0).
-        audio_start_pending_.store(true, std::memory_order_release);
-        SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
+        LOGD("Starting audio playback");
+        SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
         if (result != SL_RESULT_SUCCESS) {
-            LOGE("Failed to set play state to PAUSED (pre-start): %d", result);
-            // Fall back: start audio immediately so playback still works
-            audio_start_pending_.store(false, std::memory_order_release);
-            (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+            LOGE("Failed to set play state to PLAYING: %d", result);
         } else {
-            LOGD("Audio pre-started (PAUSED), waiting for first video frame");
+            LOGD("Audio play state set to PLAYING");
         }
     } else {
         LOGD("No audio interface (audio disabled)");
     }
-    LOGI("[ctrl] play: dispatched to core, audio waiting for first frame");
+    LOGI("[ctrl] play: dispatched to core + audio");
 }
 
 void AndroidPlayer::pause() {
     if (!player_core_) return;
 
     LOGI("[ctrl] pause: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
-    audio_start_pending_.store(false, std::memory_order_release); // cancel any pending audio start
     player_core_pause(player_core_);
 
     if (playItf_) {
@@ -444,7 +435,6 @@ void AndroidPlayer::stop() {
 
     LOGI("[ctrl] stop: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
     has_pending_playback_completed_.store(false, std::memory_order_release);
-    audio_start_pending_.store(false, std::memory_order_release); // cancel any pending audio start
     player_core_stop(player_core_);
 
     if (playItf_) {
@@ -987,6 +977,16 @@ void AndroidPlayer::renderLoop() {
 
             if (std::isnan(pts) || std::isinf(pts)) {
                 should_display = should_consume = true;
+            } else if (frame_count == 0) {
+                // First frame: always display regardless of audio clock.
+                // When two players start simultaneously (split-screen), audio clock
+                // may advance 500ms~1s before the first video frame arrives due to
+                // CPU/IO contention. Without this guard the first frame would be
+                // dropped (delay < -kSyncThreshold) and the video would appear to
+                // start late, making the audio-ahead problem worse.
+                LOGI("[sync] first frame forced: pts=%.3f clk=%.3f delay=%.3f",
+                     pts, clock, delay);
+                should_display = should_consume = true;
             } else if (delay < -kSyncThreshold) {
                 should_display = false;
                 should_consume = true;
@@ -994,10 +994,6 @@ void AndroidPlayer::renderLoop() {
                     LOGI_RATE(30, "[sync] large drop: pts=%.3f clk=%.3f delay=%.3f", pts, clock, delay);
                 }
             } else if (clock <= 0.0) {
-                // Audio clock not yet started: show first frame immediately (Tencent fast-path)
-                if (frame_count == 0) {
-                    LOGI("[sync] first frame displayed (audio clock not yet running): pts=%.3f", pts);
-                }
                 should_display = should_consume = true;
             } else if (delay <= kMaxAhead) {
                 should_display = should_consume = true;
@@ -1015,18 +1011,6 @@ void AndroidPlayer::renderLoop() {
                 int64_t render_ms = now_ms() - t0;
                 total_render_ms += render_ms;
                 if (render_ms > max_render_ms) max_render_ms = render_ms;
-
-                // After each successfully rendered frame, check if audio is
-                // held in PAUSED state waiting for the first picture.
-                // Use exchange so only one frame triggers the transition.
-                if (audio_start_pending_.load(std::memory_order_acquire) &&
-                    audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
-                    if (playItf_) {
-                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
-                        LOGI("[sync] first frame rendered -> audio PLAYING (r=%d pos=%.3f)",
-                             r, player_core_ ? player_core_get_position(player_core_) : 0.0);
-                    }
-                }
 
                 if (cost < 0) {
                     LOGW("[render] renderFrame failed eglErr=0x%x, will reinit surface", eglGetError());
@@ -1077,16 +1061,6 @@ void AndroidPlayer::renderLoop() {
                      player_core_get_state(player_core_),
                      player_core_get_position(player_core_));
 
-                // Safety fallback: if audio was held in PAUSED state waiting for
-                // the first frame but no frame has arrived for >2 s, release it
-                // anyway (audio-only stream, or decoder stuck).
-                if (audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
-                    if (playItf_) {
-                        (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
-                        LOGW("[sync] audio start fallback (no video frame after %" PRId64 "ms)",
-                             now_ms() - empty_start_ms);
-                    }
-                }
             }
             if (empty_count == 12) redrawLastFrame();
             // condvar 16ms timeout handles the pace; no extra sleep needed

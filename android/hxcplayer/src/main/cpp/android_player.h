@@ -210,7 +210,6 @@ private:
     int               audio_buffer_size_;
     std::mutex        audio_mutex_;
     std::atomic<bool> audio_active_{false};
-    std::atomic<bool> audio_start_pending_{false}; // set by play(), cleared by render thread on first frame
     int               audio_cb_count_{0};
     int               audio_underrun_count_{0};
     int               audio_partial_count_{0};
