@@ -211,6 +211,7 @@ private:
     int               audio_buffer_size_;
     std::mutex        audio_mutex_;
     std::atomic<bool> audio_active_{false};
+    std::atomic<int>  audio_cb_in_flight_{0};
     std::atomic<bool> seek_just_happened_{false};
     // When true: audio start is deferred until the first video frame is rendered
     // (avoids audible sound before any picture on dual-player scenarios).

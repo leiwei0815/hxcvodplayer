@@ -144,6 +144,19 @@ AndroidPlayer::~AndroidPlayer() {
     // 5. Now safe to destroy the audio engine (callbacks see player_core_==nullptr)
     destroyAudioOutput();
 
+    // 5b. Wait for any audio callback that was already past the null-check and is
+    //     currently executing inside player_core_get_audio_data / swr_convert to finish.
+    //     destroyAudioOutput() stops new callbacks from being scheduled, but the
+    //     OpenSL ES driver may have already dispatched one final callback before
+    //     the Destroy() call completed.  Spin-wait (max ~50ms) to be safe.
+    {
+        int spin = 0;
+        while (audio_cb_in_flight_.load(std::memory_order_acquire) > 0 && spin < 500) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            spin++;
+        }
+    }
+
     // 6. Tear down player core (callbacks already neutralised above)
     if (core_to_destroy) {
         player_core_set_playback_completed_callback(core_to_destroy, nullptr, nullptr);
@@ -1742,11 +1755,15 @@ void AndroidPlayer::audioCallback(SLAndroidSimpleBufferQueueItf bq, void* contex
 }
 
 void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
+    // Track in-flight callbacks so the destructor can wait for them to finish.
+    audio_cb_in_flight_.fetch_add(1, std::memory_order_acquire);
+
     // If player is being destroyed, output silence
     if (!audio_active_ || !player_core_ || audio_buffer_size_ == 0) {
         int sz = audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096;
         memset(audio_buffer_, 0, sz);
         (*bq)->Enqueue(bq, audio_buffer_, sz);
+        audio_cb_in_flight_.fetch_sub(1, std::memory_order_release);
         return;
     }
     
@@ -1755,6 +1772,7 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     if (!audio_active_ || !player_core_) {
         memset(audio_buffer_, 0, audio_buffer_size_);
         (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
+        audio_cb_in_flight_.fetch_sub(1, std::memory_order_release);
         return;
     }
 
@@ -1801,4 +1819,5 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     }
 
     (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
+    audio_cb_in_flight_.fetch_sub(1, std::memory_order_release);
 }
