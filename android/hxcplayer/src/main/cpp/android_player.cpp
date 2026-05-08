@@ -797,19 +797,25 @@ void AndroidPlayer::renderLoop() {
         // 初始化 EGL（每次 Surface 重建后执行一次）
         // Initialize EGL context once; re-create surface on each surface change
         if (!gl_ready) {
-            // Initialize EGL context and GL program only if not already done
+            // Step1: create EGL context (only once per player lifetime)
             if (egl_context_ == EGL_NO_CONTEXT) {
-                if (!initEGLContext() || !initGLProgram()) {
-                    LOGE("EGL context or GL program init failed, retrying...");
+                if (!initEGLContext()) {
+                    LOGE("EGL context init failed, retrying...");
                     destroyEGL();
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     continue;
                 }
-                LOGI("EGL context and GL program initialized (new)");
             }
-            // Always create EGL surface for current window
+            // Step2: create EGL surface and call eglMakeCurrent
             if (!initEGLSurface()) {
                 LOGE("EGL surface init failed, retrying...");
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            // Step3: compile GL shaders/program (requires active GL context)
+            if (gl_program_ == 0 && !initGLProgram()) {
+                LOGE("GL program init failed, retrying...");
+                destroyEGL();
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
