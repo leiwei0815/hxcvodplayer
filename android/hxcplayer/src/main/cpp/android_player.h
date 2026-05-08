@@ -13,10 +13,10 @@
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
 
-// EGL / OpenGL ES 2.0
+// EGL / OpenGL ES 3.0  (PBO requires GLES3)
 #include <EGL/egl.h>
-#include <GLES2/gl2.h>
-#include <GLES2/gl2ext.h>
+#include <GLES3/gl3.h>
+#include <GLES3/gl3ext.h>
 
 // Forward declarations
 struct PlayerCoreHandle;
