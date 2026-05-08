@@ -683,6 +683,25 @@ bool AndroidPlayer::initEGLContext() {
     EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, gl_version, EGL_NONE };
     egl_context_ = eglCreateContext(egl_display_, egl_config_, EGL_NO_CONTEXT, ctx_attribs);
     if (egl_context_ == EGL_NO_CONTEXT) { LOGE("eglCreateContext failed"); return false; }
+    // Create a minimal 1x1 pbuffer surface so we can call eglMakeCurrent now.
+    // This makes the GL context current immediately, allowing initGLProgram()
+    // to compile shaders before the real window surface arrives.
+    // The pbuffer is replaced by the real window surface in initEGLSurface().
+    EGLint pbuf_attribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+    EGLSurface pbuf = eglCreatePbufferSurface(egl_display_, egl_config_, pbuf_attribs);
+    if (pbuf == EGL_NO_SURFACE) {
+        // Pbuffer not supported on this config - try a simpler config
+        LOGW("[egl] pbuffer create failed (0x%x), GL init may fail", eglGetError());
+    } else {
+        if (!eglMakeCurrent(egl_display_, pbuf, pbuf, egl_context_)) {
+            LOGW("[egl] eglMakeCurrent(pbuffer) failed: 0x%x", eglGetError());
+            eglDestroySurface(egl_display_, pbuf);
+        } else {
+            // Store pbuffer so initEGLSurface can clean it up when window arrives
+            egl_surface_ = pbuf;
+        }
+    }
+
     // Log key EGL config attributes for diagnostics
     EGLint r=0,g=0,b=0,a=0,d=0;
     eglGetConfigAttrib(egl_display_, egl_config_, EGL_RED_SIZE,   &r);
@@ -690,7 +709,9 @@ bool AndroidPlayer::initEGLContext() {
     eglGetConfigAttrib(egl_display_, egl_config_, EGL_BLUE_SIZE,  &b);
     eglGetConfigAttrib(egl_display_, egl_config_, EGL_ALPHA_SIZE, &a);
     eglGetConfigAttrib(egl_display_, egl_config_, EGL_DEPTH_SIZE, &d);
-    LOGI("[egl] context ready: RGBA=%d%d%d%d depth=%d config=%p", r,g,b,a,d,(void*)egl_config_);
+    LOGI("[egl] context ready: RGBA=%d%d%d%d depth=%d gl_ver=ES%d config=%p pbuf=%s",
+         r,g,b,a,d, gl_version, (void*)egl_config_,
+         (egl_surface_ != EGL_NO_SURFACE) ? "ok" : "failed");
     return true;
 }
 
