@@ -203,9 +203,21 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         LOGE("Player core not initialized");
         return false;
     }
-    
+
     LOGI("[open] openURL start_pos=%.3f url=%s", start_position, url ? url : "(null)");
-    
+
+    // Always stop first so the core FSM is in a clean IDLE state before open.
+    // This is critical for replay: when playback ends the core reaches a terminal
+    // state (state==-1) and a fresh open() will fail unless we reset it first.
+    int cur_state = player_core_get_state(player_core_);
+    if (cur_state != 0) { // 0 == IDLE
+        LOGI("[open] pre-stop core (state=%d) before open", cur_state);
+        player_core_stop(player_core_);
+        if (playItf_) {
+            (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
+        }
+    }
+
     player_core_set_decode_mode(player_core_,
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
@@ -385,29 +397,38 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
 
 void AndroidPlayer::play() {
     if (!player_core_) return;
-    
+
     LOGI("[ctrl] play: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
     player_core_play(player_core_);
     render_cv_.notify_one();
 
     if (playItf_) {
-        LOGD("Starting audio playback");
-        SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+        // Keep OpenSL ES in PAUSED state until the first video frame is rendered.
+        // The render thread will flip it to PLAYING after frame_count becomes 1.
+        // This prevents audio starting before the video picture appears.
+        // For audio-only streams there is no render thread activity, so we fall
+        // back to direct PLAYING (frame_count stays 0).
+        audio_start_pending_.store(true, std::memory_order_release);
+        SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
         if (result != SL_RESULT_SUCCESS) {
-            LOGE("Failed to set play state to PLAYING: %d", result);
+            LOGE("Failed to set play state to PAUSED (pre-start): %d", result);
+            // Fall back: start audio immediately so playback still works
+            audio_start_pending_.store(false, std::memory_order_release);
+            (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
         } else {
-            LOGD("Audio play state set to PLAYING");
+            LOGD("Audio pre-started (PAUSED), waiting for first video frame");
         }
     } else {
         LOGD("No audio interface (audio disabled)");
     }
-    LOGI("[ctrl] play: dispatched to core + audio");
+    LOGI("[ctrl] play: dispatched to core, audio waiting for first frame");
 }
 
 void AndroidPlayer::pause() {
     if (!player_core_) return;
-    
+
     LOGI("[ctrl] pause: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
+    audio_start_pending_.store(false, std::memory_order_release); // cancel any pending audio start
     player_core_pause(player_core_);
 
     if (playItf_) {
@@ -422,8 +443,8 @@ void AndroidPlayer::stop() {
     if (!player_core_) return;
 
     LOGI("[ctrl] stop: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
-    // Clear any pending completion event so it doesn't fire after a subsequent open()
     has_pending_playback_completed_.store(false, std::memory_order_release);
+    audio_start_pending_.store(false, std::memory_order_release); // cancel any pending audio start
     player_core_stop(player_core_);
 
     if (playItf_) {
@@ -995,6 +1016,18 @@ void AndroidPlayer::renderLoop() {
                 total_render_ms += render_ms;
                 if (render_ms > max_render_ms) max_render_ms = render_ms;
 
+                // After each successfully rendered frame, check if audio is
+                // held in PAUSED state waiting for the first picture.
+                // Use exchange so only one frame triggers the transition.
+                if (audio_start_pending_.load(std::memory_order_acquire) &&
+                    audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
+                    if (playItf_) {
+                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                        LOGI("[sync] first frame rendered -> audio PLAYING (r=%d pos=%.3f)",
+                             r, player_core_ ? player_core_get_position(player_core_) : 0.0);
+                    }
+                }
+
                 if (cost < 0) {
                     LOGW("[render] renderFrame failed eglErr=0x%x, will reinit surface", eglGetError());
                     destroyEGLSurface();
@@ -1043,6 +1076,17 @@ void AndroidPlayer::renderLoop() {
                      now_ms() - empty_start_ms,
                      player_core_get_state(player_core_),
                      player_core_get_position(player_core_));
+
+                // Safety fallback: if audio was held in PAUSED state waiting for
+                // the first frame but no frame has arrived for >2 s, release it
+                // anyway (audio-only stream, or decoder stuck).
+                if (audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
+                    if (playItf_) {
+                        (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                        LOGW("[sync] audio start fallback (no video frame after %" PRId64 "ms)",
+                             now_ms() - empty_start_ms);
+                    }
+                }
             }
             if (empty_count == 12) redrawLastFrame();
             // condvar 16ms timeout handles the pace; no extra sleep needed
