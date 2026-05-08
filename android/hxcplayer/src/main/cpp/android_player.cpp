@@ -4,6 +4,7 @@
 #include <android/native_window.h>
 #include <cstring>
 #include <cmath>
+#include <limits>
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -228,6 +229,9 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         LOGI("[open] openURL OK");
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
+        // Reset sync state for the new stream
+        sync_warmup_frames_.store(20, std::memory_order_release);
+        last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         render_cv_.notify_one(); // wake render thread -- frames may be ready
         LOGI("Video opened and paused, waiting for user to play");
 
@@ -450,6 +454,8 @@ void AndroidPlayer::seekTo(double position) {
 
     LOGI("[ctrl] seekTo: %.3fs (current pos=%.3f state=%d)", position, player_core_get_position(player_core_), player_core_get_state(player_core_));
     seek_just_happened_.store(true, std::memory_order_release);
+    sync_warmup_frames_.store(40, std::memory_order_release); // wider warmup after seek
+    last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
     player_core_seek(player_core_, position);
     render_cv_.notify_one();
 }
@@ -970,43 +976,79 @@ void AndroidPlayer::renderLoop() {
             empty_count = 0;
 
             double pts   = frame_data.pts;
+            // Subtract estimated hardware output-queue latency so we compare
+            // video PTS against "what the user is actually hearing", not "what
+            // has been submitted to the OpenSL ES driver".  Mirrors iOS logic.
             double clock = player_core_get_position(player_core_);
+            if (audio_output_latency_sec_ > 0.0) {
+                clock -= audio_output_latency_sec_;
+                if (clock < 0.0) clock = 0.0;
+            }
             double delay = pts - clock;
 
             bool should_display = false;
             bool should_consume = false;
 
+            // --- First/post-seek fast-path ---
+            bool is_first_or_seek = (frame_count == 0) ||
+                                     seek_just_happened_.exchange(false, std::memory_order_acq_rel);
             if (std::isnan(pts) || std::isinf(pts)) {
                 should_display = should_consume = true;
-            } else if (frame_count == 0 || seek_just_happened_.exchange(false, std::memory_order_acq_rel)) {
-                // Force-display the first frame ever, and the first frame after
-                // each seek.  In both cases the audio clock may have advanced
-                // significantly before the video decoder produces a frame (slow
-                // seek / dual-player contention), so the normal drop guard
-                // (delay < -50 ms) must not apply here.
-                if (frame_count == 0) {
-                    LOGI("[sync] first frame forced: pts=%.3f clk=%.3f delay=%.3f",
-                         pts, clock, delay);
-                } else {
-                    LOGI("[sync] post-seek frame forced: pts=%.3f clk=%.3f delay=%.3f",
-                         pts, clock, delay);
+            } else if (is_first_or_seek) {
+                // Force-display: audio clock may be far ahead after a seek or
+                // when two players start simultaneously (split-screen resource
+                // contention). Skip the normal drop guard for this one frame.
+                LOGI("[sync] %s forced: pts=%.3f clk=%.3f delay=%.3f",
+                     frame_count == 0 ? "first frame" : "post-seek frame",
+                     pts, clock, delay);
+                should_display = should_consume = true;
+            } else if (delay < -5.0) {
+                // Clock severely out of sync (e.g. core not yet updated after seek).
+                // Force display instead of entering a drop loop.
+                LOGI_RATE(10, "[sync] clock unsync forced: pts=%.3f clk=%.3f delay=%.3f",
+                          pts, clock, delay);
+                should_display = should_consume = true;
+            } else {
+                // Dynamic sync threshold based on actual frame interval
+                // (same algorithm as iOS HXCPlayerControl.mm).
+                double frame_interval = 1.0 / 30.0;
+                if (!std::isnan(last_sync_video_pts_) && pts > last_sync_video_pts_) {
+                    double delta = pts - last_sync_video_pts_;
+                    if (delta > 0.0 && delta < 0.2) frame_interval = delta;
                 }
-                should_display = should_consume = true;
-            } else if (delay < -kSyncThreshold) {
-                should_display = false;
-                should_consume = true;
-                if (delay < -5.0) {
-                    LOGI_RATE(30, "[sync] large drop: pts=%.3f clk=%.3f delay=%.3f", pts, clock, delay);
+                double playback_rate = player_core_get_playback_rate(player_core_);
+                if (playback_rate <= 0.0) playback_rate = 1.0;
+                double sync_threshold = std::min(0.100, std::max(0.020,
+                                            frame_interval * 1.5)) / playback_rate;
+
+                int warmup = sync_warmup_frames_.load(std::memory_order_acquire);
+                if (warmup > 0) {
+                    // Relaxed window after open/seek: mirror iOS warmup logic.
+                    // Tolerate ?500ms without dropping; >500ms ahead: wait.
+                    if (delay > 0.5) {
+                        // video too far ahead -- hold
+                    } else if (delay < -0.5) {
+                        should_consume = true; // drop silently
+                    } else {
+                        should_display = should_consume = true;
+                    }
+                    sync_warmup_frames_.store(warmup - 1, std::memory_order_release);
+                } else if (delay <= -sync_threshold) {
+                    // Video is behind: drop frame (don't display)
+                    should_consume = true;
+                    if (delay < -1.0) {
+                        LOGI_RATE(30, "[sync] drop: pts=%.3f clk=%.3f delay=%.3f thr=%.3f",
+                                  pts, clock, delay, sync_threshold);
+                    }
+                } else if (delay <= kMaxAhead) {
+                    should_display = should_consume = true;
                 }
-            } else if (clock <= 0.0) {
-                should_display = should_consume = true;
-            } else if (delay <= kMaxAhead) {
-                should_display = should_consume = true;
+                // else: video > 2s ahead of audio -- hold frame (don't consume)
             }
-            // else: video > 2s ahead of audio -- hold frame
 
             if (should_display) {
                 frame_count++;
+                last_sync_video_pts_ = pts; // track for dynamic frame-interval estimation
                 auto t0 = now_ms();
                 int cost = renderFrame(
                     frame_data.y_data, frame_data.u_data, frame_data.v_data,
@@ -1551,9 +1593,23 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
          audio_buffer_size_,
          (audio_buffer_size_ * 1000.0) / (sample_rate * channels * 2));
 
+    // Estimate the hardware output queue latency (bytes already enqueued but
+    // not yet heard).  The render thread subtracts this from the audio master
+    // clock so it compares video PTS against "what the user is actually hearing"
+    // rather than "what has been submitted to the driver".  Mirrors iOS logic in
+    // HXCPlayerControl.mm (_audioOutputLatencySec).
+    {
+        double bytes_per_sec = (double)sample_rate * channels * 2.0; // 16-bit PCM
+        double queued_sec    = (bytes_per_sec > 0.0)
+                               ? (double)audio_buffer_size_ / bytes_per_sec
+                               : 0.0;
+        audio_output_latency_sec_ = std::min(0.200, std::max(0.0, queued_sec * 0.85));
+        LOGI("Audio output latency estimate: %.1f ms", audio_output_latency_sec_ * 1000.0);
+    }
+
     memset(audio_buffer_, 0, audio_buffer_size_);
     (*bufferQueueItf_)->Enqueue(bufferQueueItf_, audio_buffer_, audio_buffer_size_);
-    
+
     LOGI("Audio output initialized successfully with %d Hz, %d channels", sample_rate, channels);
     audio_active_ = true;
     return true;

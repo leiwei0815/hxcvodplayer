@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <memory>
 #include <cstdint>
+#include <limits>
 #include <vector>
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
@@ -211,6 +212,10 @@ private:
     std::mutex        audio_mutex_;
     std::atomic<bool> audio_active_{false};
     std::atomic<bool> seek_just_happened_{false};
+    // AV sync helpers (mirroring iOS HXCPlayerControl logic)
+    double            audio_output_latency_sec_{0.0}; // estimated hw output queue delay
+    std::atomic<int>  sync_warmup_frames_{0};         // relaxed sync window after open/seek
+    double            last_sync_video_pts_{std::numeric_limits<double>::quiet_NaN()};
     int               audio_cb_count_{0};
     int               audio_underrun_count_{0};
     int               audio_partial_count_{0};
