@@ -212,6 +212,10 @@ private:
     std::mutex        audio_mutex_;
     std::atomic<bool> audio_active_{false};
     std::atomic<bool> seek_just_happened_{false};
+    // When true: audio start is deferred until the first video frame is rendered
+    // (avoids audible sound before any picture on dual-player scenarios).
+    std::atomic<bool> audio_start_pending_{false};
+    int64_t           audio_start_deadline_ms_{0}; // wall-clock deadline for the deferred start
     // AV sync helpers (mirroring iOS HXCPlayerControl logic)
     double            audio_output_latency_sec_{0.0}; // estimated hw output queue delay
     std::atomic<int>  sync_warmup_frames_{0};         // relaxed sync window after open/seek

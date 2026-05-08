@@ -413,13 +413,12 @@ void AndroidPlayer::play() {
     render_cv_.notify_one();
 
     if (playItf_) {
-        LOGD("Starting audio playback");
-        SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
-        if (result != SL_RESULT_SUCCESS) {
-            LOGE("Failed to set play state to PLAYING: %d", result);
-        } else {
-            LOGD("Audio play state set to PLAYING");
-        }
+        // Defer audio start until the first video frame is rendered to prevent
+        // audible sound before any picture (especially noticeable in dual-player).
+        // A 500ms deadline ensures audio is not muted forever if video decoding stalls.
+        audio_start_pending_.store(true, std::memory_order_release);
+        audio_start_deadline_ms_ = now_ms() + 500;
+        LOGI("[ctrl] play: audio deferred until first video frame (deadline +500ms)");
     } else {
         LOGD("No audio interface (audio disabled)");
     }
@@ -430,6 +429,8 @@ void AndroidPlayer::pause() {
     if (!player_core_) return;
 
     LOGI("[ctrl] pause: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
+    // Cancel any pending deferred audio start.
+    audio_start_pending_.store(false, std::memory_order_release);
     player_core_pause(player_core_);
 
     if (playItf_) {
@@ -444,6 +445,7 @@ void AndroidPlayer::stop() {
     if (!player_core_) return;
 
     LOGI("[ctrl] stop: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
+    audio_start_pending_.store(false, std::memory_order_release);
     has_pending_playback_completed_.store(false, std::memory_order_release);
     player_core_stop(player_core_);
 
@@ -1053,6 +1055,14 @@ void AndroidPlayer::renderLoop() {
             }
 
             if (should_display) {
+                // If this is the first rendered frame and audio start was deferred,
+                // start audio now so picture and sound appear together.
+                if (frame_count == 0 && audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
+                    if (playItf_) {
+                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                        LOGI("[sync] audio started on first frame: result=%d", r);
+                    }
+                }
                 frame_count++;
                 last_sync_video_pts_ = pts; // track for dynamic frame-interval estimation
                 auto t0 = now_ms();
@@ -1102,14 +1112,25 @@ void AndroidPlayer::renderLoop() {
 
         } else {
             empty_count++;
+            // Safety valve: if audio start was deferred but no video frame arrived
+            // within the deadline, start audio anyway to avoid permanent mute.
+            if (audio_start_pending_.load(std::memory_order_acquire) &&
+                now_ms() >= audio_start_deadline_ms_) {
+                if (audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
+                    if (playItf_) {
+                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                        LOGI("[sync] audio deadline fallback: result=%d", r);
+                    }
+                }
+            }
             if (!in_empty_streak) {
                 empty_start_ms  = now_ms();
                 in_empty_streak = true;
                 LOGI("[render] frame queue empty: state=%d pos=%.3f",
                      player_core_get_state(player_core_),
                      player_core_get_position(player_core_));
-            } else if (empty_count % 60 == 0) {
-                LOGI("[render] still buffering: empty_ms=%" PRId64 " state=%d pos=%.3f",
+            } else if (empty_count % 300 == 0) {
+                LOGI_RATE(1, "[render] still buffering: empty_ms=%" PRId64 " state=%d pos=%.3f",
                      now_ms() - empty_start_ms,
                      player_core_get_state(player_core_),
                      player_core_get_position(player_core_));
@@ -1757,14 +1778,12 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         memset(audio_buffer_, 0, audio_buffer_size_);
     }
 
-    // Print audio stats every 200 callbacks (~1s at 5ms/cb)
+    // Print audio stats every 200 callbacks (~1s at 5ms/cb); only log anomalies
     if (callback_count % 200 == 0) {
         double pos = player_core_ ? player_core_get_position(player_core_) : 0.0;
         if (underrun_count > 0 || partial_count > 0) {
             LOGW("[audio] cb=%d pos=%.1fs underrun=%d partial=%d (last 200)",
                  callback_count, pos, underrun_count, partial_count);
-        } else {
-            LOGI("[audio] cb=%d pos=%.1fs ok", callback_count, pos);
         }
         underrun_count = 0;
         partial_count  = 0;
