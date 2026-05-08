@@ -8,23 +8,43 @@
 #include <chrono>
 #include <thread>
 #include <inttypes.h>
+#include <unistd.h>  // gettid()
 
-#define LOG_TAG "AndroidPlayer"
+#define LOG_TAG "HXC"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// Rate-limited logging: prints at most once every N calls.
+// Usage: LOGI_RATE(100, "msg %d", val);
+#define LOGI_RATE(N, ...) do { \
+    static int _rl_cnt = 0; \
+    if (++_rl_cnt % (N) == 1) { \
+        LOGI(__VA_ARGS__); \
+    } \
+} while(0)
+#define LOGW_RATE(N, ...) do { \
+    static int _rl_cnt = 0; \
+    if (++_rl_cnt % (N) == 1) { \
+        LOGW(__VA_ARGS__); \
+    } \
+} while(0)
+
 AndroidPlayer::AndroidPlayer()
     : player_core_(nullptr)
     , native_window_(nullptr)
+    , pending_window_(nullptr)
+    , window_changed_(false)
+    , stop_requested_(false)
     , surface_width_(0)
     , surface_height_(0)
-    , aspect_ratio_mode_(0) // FIT
-    , decode_mode_(0) // ?????
+    , aspect_ratio_mode_(0)
+    , decode_mode_(0)
     , egl_display_(EGL_NO_DISPLAY)
     , egl_context_(EGL_NO_CONTEXT)
     , egl_surface_(EGL_NO_SURFACE)
+    , egl_config_(nullptr)
     , gl_program_(0)
     , gl_tex_y_(0)
     , gl_tex_u_(0)
@@ -37,7 +57,11 @@ AndroidPlayer::AndroidPlayer()
     , gl_attrib_tex_uv_(-1)
     , gl_last_video_w_(0)
     , gl_last_video_h_(0)
-    , render_running_(false)
+    , gl_pbo_y_{}
+    , gl_pbo_y_sz_(0)
+    , gl_pbo_uv_sz_(0)
+    , gl_pbo_idx_(0)
+    , gl_pbo_first_frame_(true)
     , engineObject_(nullptr)
     , engineEngine_(nullptr)
     , outputMixObject_(nullptr)
@@ -49,113 +73,114 @@ AndroidPlayer::AndroidPlayer()
     , audio_sample_rate_(0)
     , audio_channels_(0)
     , audio_buffer_size_(0)
-    , is_loading_(false)
-    , has_pending_error_(false)
-    , last_error_code_(0)
-    , has_pending_playback_completed_(false)
 {
-    LOGD("AndroidPlayer created");
-    
-    // ????????????????
+    LOGI("[lifecycle] AndroidPlayer created this=%p", (void*)this);
+
     player_core_ = player_core_create();
     if (!player_core_) {
         LOGE("Failed to create player core");
     } else {
-        // ??????????????????????????????????????????????? loading??
         player_core_set_loading_callback(player_core_, loadingStateCallback, this);
-        // ?????????????????????????????????????????????
         player_core_set_error_callback(player_core_, errorStateCallback, this);
-        // ????????????????????
         player_core_set_playback_completed_callback(player_core_, playbackCompletedCallback, this);
-        LOGI("[???????????] ????? playbackCompletedCallback");
+        LOGI("Player core created, callbacks registered");
     }
-    
-    // ???? ?????????????????????????????????????????????????????????????????
-    LOGI("Audio will be initialized after opening video");
+
+    // Start render thread immediately. It will block on render_cv_ until a
+    // surface is provided.
+    render_running_ = true;
+    render_thread_  = std::thread(&AndroidPlayer::renderLoop, this);
 }
 
 AndroidPlayer::~AndroidPlayer() {
-    LOGD("AndroidPlayer destroyed");
-    
-    // ????????????EGL/GL ??????????????????
-    // Prevent audio callback from accessing player_core_
+    LOGI("[lifecycle] AndroidPlayer destroying this=%p", (void*)this);
+
+    // 1. Stop audio callback before anything else (avoids use-after-free on player_core_)
     audio_active_ = false;
 
-    render_running_ = false;
+    // 2. Signal render thread to exit and wake it immediately via condvar
+    {
+        std::lock_guard<std::mutex> lock(render_mutex_);
+        stop_requested_ = true;
+        // Release any pending_window_ we may have queued
+        if (pending_window_) {
+            ANativeWindow_release(pending_window_);
+            pending_window_ = nullptr;
+        }
+    }
+    render_cv_.notify_all();
+
     if (render_thread_.joinable()) {
         render_thread_.join();
     }
-    
-    // ??????????????
-    destroyAudioOutput();
-    
-    // ?????????
-    if (native_window_) {
-        ANativeWindow_release(native_window_);
-        native_window_ = nullptr;
+    LOGD("Render thread joined");
+
+    // 3. Release the native_window_ we hold (render thread is gone, safe now)
+    {
+        std::lock_guard<std::mutex> lock(render_mutex_);
+        if (native_window_) {
+            ANativeWindow_release(native_window_);
+            native_window_ = nullptr;
+        }
     }
-    
-    // ????????????????
+
+    // 4. Destroy audio
+    destroyAudioOutput();
+
+    // 5. Tear down player core (clear callbacks first)
     if (player_core_) {
         player_core_set_playback_completed_callback(player_core_, nullptr, nullptr);
+        player_core_set_loading_callback(player_core_, nullptr, nullptr);
+        player_core_set_error_callback(player_core_, nullptr, nullptr);
         player_core_destroy(player_core_);
         player_core_ = nullptr;
     }
+    LOGI("[lifecycle] AndroidPlayer destroyed this=%p", (void*)this);
 }
 
 void AndroidPlayer::setSurface(ANativeWindow* window) {
-    // ?????????????????????????????????????????????????? join??
-    // ?????????? join ????? renderFrame ????????????????????
-    std::thread thread_to_join;
+    // Acquire reference before taking the lock (avoids holding lock during syscall)
+    if (window) ANativeWindow_acquire(window);
+
     {
-        std::lock_guard<std::mutex> lock(window_mutex_);
+        std::lock_guard<std::mutex> lock(render_mutex_);
 
-        if (native_window_) {
-            ANativeWindow_release(native_window_);
+        // Discard any not-yet-consumed pending window
+        if (pending_window_) {
+            ANativeWindow_release(pending_window_);
+            pending_window_ = nullptr;
         }
 
-        native_window_ = window;
-        surface_generation_.fetch_add(1, std::memory_order_relaxed);
+        pending_window_ = window; // null means "clear surface"
+        window_changed_ = true;
 
-        if (native_window_) {
-            ANativeWindow_acquire(native_window_);
-            LOGD("Surface set: %p", native_window_);
-
-            if (!render_running_) {
-                render_running_ = true;
-                render_thread_ = std::thread(&AndroidPlayer::renderLoop, this);
+        if (window) {
+            int w = ANativeWindow_getWidth(window);
+            int h = ANativeWindow_getHeight(window);
+            if (w > 0 && h > 0) {
+                surface_width_  = w;
+                surface_height_ = h;
             }
+            LOGI("[surface] setSurface: queued window=%p size=%dx%d", window, surface_width_, surface_height_);
         } else {
-            // Surface ???????native_window_ ?? null??renderLoop ?????????????? EGL???
-            // ????????? join???????????????????????????????? native_window_ == null?????
-            // ??? player ?????????????????????????? join???
-            LOGD("Surface cleared");
+            LOGI("[surface] setSurface: queued clear (null)");
         }
     }
-    // ????????????????????????????????????????
-    if (thread_to_join.joinable()) {
-        thread_to_join.join();
-    }
+    render_cv_.notify_one();
 }
 
 void AndroidPlayer::updateSurfaceSize(int width, int height) {
-    std::lock_guard<std::mutex> lock(window_mutex_);
-    
-    // ????????????????????????????? Surface
+    if (width <= 0 || height <= 0) return;
+    std::lock_guard<std::mutex> lock(render_mutex_);
     if (surface_width_ != width || surface_height_ != height) {
-        LOGI("???? Surface size changing: %dx%d -> %dx%d", 
-             surface_width_, surface_height_, width, height);
-        
-        surface_width_ = width;
+        LOGI("[surface] updateSurfaceSize: %dx%d -> %dx%d", surface_width_, surface_height_, width, height);
+        surface_width_  = width;
         surface_height_ = height;
-        // Size change only affects viewport in renderFrame, no EGL surface rebuild needed
-        
-        LOGI("??? Surface size updated (will reconfigure on next frame)");
     }
 }
 
 bool AndroidPlayer::openURL(const char* url) {
-    return openURL(url, 0.0);  // ??????????
+    return openURL(url, 0.0);
 }
 
 bool AndroidPlayer::openURL(const char* url, double start_position) {
@@ -164,26 +189,21 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         return false;
     }
     
-    LOGI("Opening URL: %s, start_position: %.2f", url, start_position);
+    LOGI("[open] openURL start_pos=%.3f url=%s", start_position, url ? url : "(null)");
     
     player_core_set_decode_mode(player_core_,
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
 
-    // ????????????????? API???? start_position=0 ???????????????????????
-    // ???? start_position==0 ???? player_core_open(url)??core ????????????????????
-    // ???????????????"??????????"????? 0 ?????????????
     int result = player_core_open_with_start_position(player_core_, url, start_position);
     
     if (result == 0) {
-        LOGI("URL opened successfully");
+        LOGI("[open] openURL OK");
         ensureAudioOutputForCurrentStream();
-        render_warmup_frames_.store(4, std::memory_order_release);
-
-        // ?? ??????????????????????????????????????????
         player_core_pause(player_core_);
+        render_cv_.notify_one(); // wake render thread -- frames may be ready
         LOGI("Video opened and paused, waiting for user to play");
-        
+
         return true;
     } else {
         LOGE("Failed to open URL: %s (error code: %d)", url, result);
@@ -225,9 +245,8 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
     if (result == 0) {
         LOGI("Custom HTTP opened successfully");
         ensureAudioOutputForCurrentStream();
-        render_warmup_frames_.store(4, std::memory_order_release);
-
         player_core_pause(player_core_);
+        render_cv_.notify_one();
         return true;
     } else {
         LOGE("Failed to open with custom HTTP: %d", result);
@@ -264,9 +283,8 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
     if (result == 0) {
         LOGI("Custom file opened successfully");
         ensureAudioOutputForCurrentStream();
-        render_warmup_frames_.store(4, std::memory_order_release);
-
         player_core_pause(player_core_);
+        render_cv_.notify_one();
         return true;
     } else {
         LOGE("Failed to open with custom file: %d", result);
@@ -314,15 +332,9 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
 
     int result = player_core_open_with_mode(player_core_, &source, &config);
     if (result == 0) {
-        int sample_rate = player_core_get_audio_sample_rate(player_core_);
-        int channels = player_core_get_audio_channels(player_core_);
-        if (sample_rate > 0 && channels > 0 && !audio_initialized_) {
-            if (initAudioOutput(sample_rate, channels)) {
-                audio_initialized_ = true;
-            }
-        }
-        render_warmup_frames_.store(4, std::memory_order_release);
+        ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
+        render_cv_.notify_one();
         return true;
     }
     LOGE("Failed to open secure hls: %d", result);
@@ -341,7 +353,7 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
                                       int key_mode,
                                       const char* key_material_b64,
                                       const char* key_iv_hex) {
-    // ?????????????????????????????? SecureSession???
+    // Legacy alias: forward to openWithSecureSession
     return openWithSecureSession(url,
                                  auth_token,
                                  video_id,
@@ -359,10 +371,10 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
 void AndroidPlayer::play() {
     if (!player_core_) return;
     
-    LOGI("???? Play called");
+    LOGI("[ctrl] play: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
     player_core_play(player_core_);
-    
-    // ???????????????
+    render_cv_.notify_one();
+
     if (playItf_) {
         LOGD("Starting audio playback");
         SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
@@ -374,16 +386,15 @@ void AndroidPlayer::play() {
     } else {
         LOGD("No audio interface (audio disabled)");
     }
-    LOGI("???? Play completed");
+    LOGI("[ctrl] play: dispatched to core + audio");
 }
 
 void AndroidPlayer::pause() {
     if (!player_core_) return;
     
-    LOGD("Pause");
+    LOGI("[ctrl] pause: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
     player_core_pause(player_core_);
-    
-    // ??????????
+
     if (playItf_) {
         SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
         if (result != SL_RESULT_SUCCESS) {
@@ -395,13 +406,11 @@ void AndroidPlayer::pause() {
 void AndroidPlayer::stop() {
     if (!player_core_) return;
 
-    LOGD("Stop");
-    // ????????????????????????? pending ????????? stop ??????? open ?????????
-    // ???? consume ?????? true????????????? onPlaybackCompleted ????????
+    LOGI("[ctrl] stop: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
+    // Clear any pending completion event so it doesn't fire after a subsequent open()
     has_pending_playback_completed_.store(false, std::memory_order_release);
     player_core_stop(player_core_);
 
-    // ????????
     if (playItf_) {
         SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
         if (result != SL_RESULT_SUCCESS) {
@@ -412,11 +421,10 @@ void AndroidPlayer::stop() {
 
 void AndroidPlayer::seekTo(double position) {
     if (!player_core_) return;
-    
-    LOGD("Seek to: %f", position);
+
+    LOGI("[ctrl] seekTo: %.3fs (current pos=%.3f state=%d)", position, player_core_get_position(player_core_), player_core_get_state(player_core_));
     player_core_seek(player_core_, position);
-    // seek ???????????? warmup ??????? iOS _syncWarmupFramesRemaining=40??
-    render_warmup_frames_.store(4, std::memory_order_release);
+    render_cv_.notify_one();
 }
 
 void AndroidPlayer::setPlaybackRate(float rate) {
@@ -430,19 +438,21 @@ void AndroidPlayer::setVolume(float volume) {
     if (!player_core_) return;
     
     LOGD("Set volume: %f (core only)", volume);
-    // ???? Core ????????????????OpenSL ES VolumeItf ????? AppOps ?????
+    // Volume is applied inside the core; we do not use OpenSL ES VolumeItf
+    // to avoid triggering Android AppOps CONTROL_AUDIO permission checks.
     player_core_set_volume(player_core_, volume);
 }
 
 void AndroidPlayer::setAspectRatioMode(int mode) {
     aspect_ratio_mode_ = mode;
-    LOGI("??? Set aspect ratio mode: %d (%s)", mode, mode == 0 ? "FIT" : "FILL");
+    LOGI("Set aspect ratio mode: %d (%s)", mode, mode == 0 ? "FIT" : "FILL");
 
     if (player_core_) {
         player_core_set_aspect_ratio_mode(player_core_,
             mode == 1 ? ASPECT_RATIO_FILL : ASPECT_RATIO_FIT);
     }
-    // OpenGL ES Shader ????? uniform ??????????????????????????????????????????
+    // The GLSL shader uses texcoord scaling instead of a uniform for aspect ratio,
+    // so no shader reload is needed here -- the change takes effect on the next frame.
 }
 
 void AndroidPlayer::setDecodeMode(int mode) {
@@ -508,6 +518,8 @@ void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
         return;
     }
     player->is_loading_.store(is_loading, std::memory_order_release);
+    LOGI("[state] loading=%s pos=%.3f", is_loading ? "true" : "false",
+         player->player_core_ ? player_core_get_position(player->player_core_) : 0.0);
 }
 
 bool AndroidPlayer::consumeLastError(int& error_code, std::string& error_message) {
@@ -538,17 +550,18 @@ void AndroidPlayer::errorStateCallback(int error_code, const char* error_msg, vo
         player->last_error_message_ = error_msg ? error_msg : "unknown error";
     }
     player->has_pending_error_.store(true, std::memory_order_release);
+    LOGE("[state] error: code=%d msg=%s", error_code, error_msg ? error_msg : "");
 }
 
-// ========== ??????????? ==========
+// ========== Playback-completed callback ==========
 
 void AndroidPlayer::playbackCompletedCallback(void* user_data) {
     auto* player = static_cast<AndroidPlayer*>(user_data);
     if (!player) {
-        LOGW("[???????????] android_player ????????????????? player ? null");
+        LOGW("[playbackCompleted] player is null");
         return;
     }
-    LOGI("[???????????] android_player ????core ??????????position=%.3f duration=%.3f state=%d",
+    LOGI("[playbackCompleted] pos=%.3f dur=%.3f state=%d",
          player->getPosition(), player->getDuration(), player->getState());
     player->has_pending_playback_completed_.store(true, std::memory_order_release);
 }
@@ -556,19 +569,20 @@ void AndroidPlayer::playbackCompletedCallback(void* user_data) {
 bool AndroidPlayer::consumePlaybackCompleted() {
     bool completed = has_pending_playback_completed_.exchange(false, std::memory_order_acq_rel);
     if (completed) {
-        LOGI("[???????????] android_player ????consumePlaybackCompleted=true??position=%.3f duration=%.3f state=%d",
+        LOGI("[playbackCompleted] consumed: pos=%.3f dur=%.3f state=%d",
              getPosition(), getDuration(), getState());
     }
     return completed;
 }
 
-// ========== OpenGL ES YUV ???? ==========
+// ========== OpenGL ES YUV renderer ==========
 
-// Vertex Shader?????? texcoord??Y ??? UV ????????? stride padding ??????
+// Vertex shader: two separate texcoord sets so Y and UV can have different
+// stride-padding and FILL crop offsets.
 static const char* kVertexShader = R"(
 attribute vec4 a_position;
-attribute vec2 a_texcoord;    // Y ?? texcoord???????? Y-stride padding??
-attribute vec2 a_texcoord_uv; // UV ?? texcoord???????? UV-stride padding ?? FILL ??????
+attribute vec2 a_texcoord;    // Y  plane texcoord (accounts for Y  stride padding)
+attribute vec2 a_texcoord_uv; // UV plane texcoord (accounts for UV stride padding / FILL crop)
 varying   vec2 v_texcoord;
 varying   vec2 v_texcoord_uv;
 void main() {
@@ -578,7 +592,7 @@ void main() {
 }
 )";
 
-// Fragment Shader??Y ??? v_texcoord??U/V ??? v_texcoord_uv
+// Fragment shader: BT.601 limited-range YUV -> RGB
 static const char* kFragmentShader = R"(
 precision mediump float;
 varying vec2      v_texcoord;
@@ -606,7 +620,7 @@ static GLuint compileShader(GLenum type, const char* src) {
     if (!ok) {
         char buf[512];
         glGetShaderInfoLog(shader, sizeof(buf), nullptr, buf);
-        __android_log_print(ANDROID_LOG_ERROR, "AndroidPlayer", "Shader compile error: %s", buf);
+        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Shader compile error: %s", buf);
         glDeleteShader(shader);
         return 0;
     }
@@ -618,56 +632,73 @@ bool AndroidPlayer::initEGLContext() {
     if (egl_display_ == EGL_NO_DISPLAY) { LOGE("eglGetDisplay failed"); return false; }
     if (!eglInitialize(egl_display_, nullptr, nullptr)) { LOGE("eglInitialize failed"); return false; }
 
+    // Choose config once and reuse for both context and surface creation.
+    // Adding alpha channel (EGL_ALPHA_SIZE=8) avoids black-frame artifacts
+    // when the surface is first attached to a TextureView.
     EGLint attribs[] = {
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
         EGL_RED_SIZE,   8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
         EGL_NONE
     };
-    EGLConfig config;
     EGLint num_configs = 0;
-    if (!eglChooseConfig(egl_display_, attribs, &config, 1, &num_configs) || num_configs == 0) {
-        LOGE("eglChooseConfig failed"); return false;
+    if (!eglChooseConfig(egl_display_, attribs, &egl_config_, 1, &num_configs) || num_configs == 0) {
+        // Fallback: try without alpha
+        EGLint attribs_noalpha[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+            EGL_RED_SIZE,   8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+            EGL_NONE
+        };
+        if (!eglChooseConfig(egl_display_, attribs_noalpha, &egl_config_, 1, &num_configs) || num_configs == 0) {
+            LOGE("eglChooseConfig failed"); return false;
+        }
     }
     EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-    egl_context_ = eglCreateContext(egl_display_, config, EGL_NO_CONTEXT, ctx_attribs);
+    egl_context_ = eglCreateContext(egl_display_, egl_config_, EGL_NO_CONTEXT, ctx_attribs);
     if (egl_context_ == EGL_NO_CONTEXT) { LOGE("eglCreateContext failed"); return false; }
-    LOGI("EGL context initialized");
+    // Log key EGL config attributes for diagnostics
+    EGLint r=0,g=0,b=0,a=0,d=0;
+    eglGetConfigAttrib(egl_display_, egl_config_, EGL_RED_SIZE,   &r);
+    eglGetConfigAttrib(egl_display_, egl_config_, EGL_GREEN_SIZE, &g);
+    eglGetConfigAttrib(egl_display_, egl_config_, EGL_BLUE_SIZE,  &b);
+    eglGetConfigAttrib(egl_display_, egl_config_, EGL_ALPHA_SIZE, &a);
+    eglGetConfigAttrib(egl_display_, egl_config_, EGL_DEPTH_SIZE, &d);
+    LOGI("[egl] context ready: RGBA=%d%d%d%d depth=%d config=%p", r,g,b,a,d,(void*)egl_config_);
     return true;
 }
 
-bool AndroidPlayer::initEGLSurface() {
+bool AndroidPlayer::initEGLSurface(ANativeWindow* win) {
     if (egl_display_ == EGL_NO_DISPLAY || egl_context_ == EGL_NO_CONTEXT) {
         LOGE("initEGLSurface: context not ready");
         return false;
     }
-    ANativeWindow* win = nullptr;
-    { std::lock_guard<std::mutex> lock(window_mutex_); win = native_window_; }
-    if (!win) { LOGE("initEGLSurface: native_window_ is null"); return false; }
+    if (!win) { LOGE("initEGLSurface: win is null"); return false; }
 
-    EGLint attribs[] = {
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
-        EGL_RED_SIZE,   8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
-        EGL_NONE
-    };
-    EGLConfig config;
-    EGLint num_configs = 0;
-    eglChooseConfig(egl_display_, attribs, &config, 1, &num_configs);
-
+    // Tear down any existing surface first
     if (egl_surface_ != EGL_NO_SURFACE) {
         eglMakeCurrent(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroySurface(egl_display_, egl_surface_);
         egl_surface_ = EGL_NO_SURFACE;
     }
-    egl_surface_ = eglCreateWindowSurface(egl_display_, config, win, nullptr);
+
+    egl_surface_ = eglCreateWindowSurface(egl_display_, egl_config_, win, nullptr);
     if (egl_surface_ == EGL_NO_SURFACE) {
-        LOGE("eglCreateWindowSurface failed: %d", eglGetError()); return false;
+        LOGE("eglCreateWindowSurface failed: 0x%x", eglGetError());
+        return false;
     }
     if (!eglMakeCurrent(egl_display_, egl_surface_, egl_surface_, egl_context_)) {
-        LOGE("eglMakeCurrent failed"); return false;
+        LOGE("eglMakeCurrent failed: 0x%x", eglGetError());
+        eglDestroySurface(egl_display_, egl_surface_);
+        egl_surface_ = EGL_NO_SURFACE;
+        return false;
     }
-    LOGI("EGL surface initialized");
+    eglSwapInterval(egl_display_, 0); // render at video frame rate, not vsync
+    EGLint sw=0, sh=0;
+    eglQuerySurface(egl_display_, egl_surface_, EGL_WIDTH,  &sw);
+    eglQuerySurface(egl_display_, egl_surface_, EGL_HEIGHT, &sh);
+    LOGI("[egl] surface created: win=%p egl_size=%dx%d", (void*)win, sw, sh);
     return true;
 }
 
@@ -708,7 +739,7 @@ bool AndroidPlayer::initGLProgram() {
     glGetProgramiv(gl_program_, GL_LINK_STATUS, &ok);
     if (!ok) {
         char buf[512]; glGetProgramInfoLog(gl_program_, sizeof(buf), nullptr, buf);
-        LOGE("?? Program link error: %s", buf); return false;
+        LOGE("GL program link error: %s", buf); return false;
     }
 
     gl_uniform_y_  = glGetUniformLocation(gl_program_, "u_tex_y");
@@ -729,11 +760,21 @@ bool AndroidPlayer::initGLProgram() {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
     glBindTexture(GL_TEXTURE_2D, 0);
-    LOGI("??? GL program & textures initialized");
+    LOGI("GL program & textures initialized");
     return true;
 }
 
 void AndroidPlayer::destroyGLProgram() {
+    // Delete PBOs before textures / program
+    if (gl_pbo_y_[0]) {
+        glDeleteBuffers(6, gl_pbo_y_);
+        memset(gl_pbo_y_, 0, sizeof(gl_pbo_y_));
+    }
+    gl_pbo_y_sz_        = 0;
+    gl_pbo_uv_sz_       = 0;
+    gl_pbo_idx_         = 0;
+    gl_pbo_first_frame_ = true;
+
     if (gl_tex_y_) { glDeleteTextures(1, &gl_tex_y_); gl_tex_y_ = 0; }
     if (gl_tex_u_) { glDeleteTextures(1, &gl_tex_u_); gl_tex_u_ = 0; }
     if (gl_tex_v_) { glDeleteTextures(1, &gl_tex_v_); gl_tex_v_ = 0; }
@@ -758,270 +799,294 @@ void AndroidPlayer::redrawLastFrame() {
 }
 
 
-// ========== ???????? ==========
+// ========== Render loop ==========
+//
+// Architecture (aligned with Tencent/IJKPlayer):
+//
+//  - The render thread owns ALL EGL objects.
+//  - condition_variable (render_cv_) replaces all fixed sleeps.
+//    Woken by: setSurface(), play(), seekTo(), open*(), ~AndroidPlayer().
+//  - EGL context lives for the entire player lifetime (created once).
+//  - EGL window surface is rebuilt whenever native_window_ changes.
+//  - No warmup counter.  The A/V clock is the sole gate.
+//    When audio clock == 0 (not yet started) we display immediately so the
+//    first picture appears before the audio engine warms up.
 
 void AndroidPlayer::renderLoop() {
-    int frame_count = 0;
-    uint64_t current_surface_gen = surface_generation_.load(std::memory_order_relaxed);
-    int empty_count = 0;
-    bool gl_ready = false;
+    // One-time EGL context + GL program setup
+    if (!initEGLContext()) {
+        LOGE("renderLoop: initEGLContext failed");
+        render_running_ = false;
+        return;
+    }
+    if (!initGLProgram()) {
+        LOGE("renderLoop: initGLProgram failed");
+        destroyEGL();
+        render_running_ = false;
+        return;
+    }
+    LOGI("[render] loop started: tid=%d EGL context + GL program ready",
+         (int)gettid());
 
-    // ????????
-    int64_t total_render_ms = 0;
-    int64_t total_upload_ms = 0;
-    int64_t max_render_ms = 0;
-    int64_t max_upload_ms = 0;
-    int diag_interval = 60;   // ? 60 ??????????
+    bool    surface_ready   = false;
+    int     frame_count     = 0;
+    int     empty_count     = 0;
+    bool    in_empty_streak = false;
+    int64_t empty_start_ms  = 0;
 
-    // seek ?????????
-    int64_t empty_start_ms = 0;
-    bool in_empty_streak = false;
+    int64_t total_render_ms = 0, total_upload_ms = 0;
+    int64_t max_render_ms   = 0, max_upload_ms   = 0;
+    const int kDiagInterval = 60;
+
+    const double kSyncThreshold = 0.050; // 50 ms: drop if video is behind
+    const double kMaxAhead      = 2.000; // 2 s:  hold if video is too far ahead
 
     auto now_ms = []() -> int64_t {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     };
 
-    while (render_running_) {
-        // ???? Surface ??
+    while (true) {
+        // --- Wait for work, surface change, or stop ---
         {
-            std::lock_guard<std::mutex> lock(window_mutex_);
-            if (!native_window_) {
-                // Only destroy EGL surface once, keep context/program for hot-swap
-                if (gl_ready && egl_surface_ != EGL_NO_SURFACE) {
-                    destroyEGLSurface();
-                    LOGI("Surface null: EGL surface released, keeping context");
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(16));
-                continue;
-            }
-        }
+            std::unique_lock<std::mutex> lock(render_mutex_);
 
-        // ???????? EGL???? Surface ????????????????
-        // Initialize EGL context once; re-create surface on each surface change
-        if (!gl_ready) {
-            // Step1: create EGL context (only once per player lifetime)
-            if (egl_context_ == EGL_NO_CONTEXT) {
-                if (!initEGLContext()) {
-                    LOGE("EGL context init failed, retrying...");
-                    destroyEGL();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    continue;
-                }
+            if (!window_changed_) {
+                render_cv_.wait_for(lock, std::chrono::milliseconds(16),
+                    [this]{ return window_changed_ || stop_requested_; });
             }
-            // Step2: create EGL surface and call eglMakeCurrent
-            if (!initEGLSurface()) {
-                LOGE("EGL surface init failed, retrying...");
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
-            // Step3: compile GL shaders/program (requires active GL context)
-            if (gl_program_ == 0 && !initGLProgram()) {
-                LOGE("GL program init failed, retrying...");
-                destroyEGL();
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
-            gl_ready = true;
-            current_surface_gen = surface_generation_.load(std::memory_order_relaxed);
-            LOGI("Render loop: GL ready, surface_gen=%llu", (unsigned long long)current_surface_gen);
-        }
 
-        // Detect surface change and hot-swap EGL surface (keep context & GL program)
-        {
-            uint64_t new_gen = surface_generation_.load(std::memory_order_relaxed);
-            if (new_gen != current_surface_gen) {
-                ANativeWindow* win = nullptr;
-                { std::lock_guard<std::mutex> lock(window_mutex_); win = native_window_; }
-                if (win) {
-                    // If context was lost (shouldn't happen, but be safe), do full reinit
-                    if (egl_context_ == EGL_NO_CONTEXT) {
-                        LOGI("Surface gen changed but context lost, full reinit");
-                        destroyEGL();
-                        gl_ready = false;
+            if (stop_requested_) break;
+
+            if (window_changed_) {
+                window_changed_ = false;
+                ANativeWindow* new_win = pending_window_;
+                pending_window_ = nullptr;
+
+                ANativeWindow* old_win = native_window_;
+                native_window_ = new_win; // transfer ownership (ref acquired in setSurface)
+
+                lock.unlock();
+
+                if (new_win) {
+                    if (initEGLSurface(new_win)) {
+                        surface_ready = true;
+                        gl_pbo_first_frame_ = true;
+                        // Read the actual EGL surface size (may differ from ANativeWindow size)
+                        EGLint egl_w = 0, egl_h = 0;
+                        eglQuerySurface(egl_display_, egl_surface_, EGL_WIDTH,  &egl_w);
+                        eglQuerySurface(egl_display_, egl_surface_, EGL_HEIGHT, &egl_h);
+                        LOGI("[render] surface ready: win=%p egl=%dx%d",
+                             (void*)new_win, egl_w, egl_h);
+                        redrawLastFrame();
                     } else {
-                        LOGI("Surface generation changed %llu->%llu, hot-swapping EGL surface",
-                             (unsigned long long)current_surface_gen, (unsigned long long)new_gen);
-                        if (initEGLSurface()) {
-                            current_surface_gen = new_gen;
-                            LOGI("EGL surface hot-swap OK, redrawing last frame");
-                            redrawLastFrame();
-                        } else {
-                            LOGE("EGL surface hot-swap failed, full reinit");
-                            destroyEGL();
-                            gl_ready = false;
-                        }
+                        LOGE("[render] initEGLSurface failed -- will retry on next setSurface");
+                        surface_ready = false;
                     }
                 } else {
-                    // Surface cleared, destroy EGL surface only
                     destroyEGLSurface();
-                    current_surface_gen = new_gen;
-                    LOGI("Surface cleared (gen=%llu), EGL surface released", (unsigned long long)new_gen);
+                    surface_ready = false;
+                    LOGI("[render] surface released (null window)");
                 }
-                continue;
+
+                if (old_win) ANativeWindow_release(old_win);
+                continue; // lock re-acquired by unique_lock dtor is harmless; just loop
             }
         }
-        if (!player_core_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
-            continue;
-        }
 
+        if (!surface_ready || !player_core_) continue;
+
+        // --- Fetch next decoded video frame ---
         VideoFrameDataC frame_data;
-        auto t_get0 = now_ms();
-        int result = player_core_get_video_frame(player_core_, &frame_data);
-        auto t_get1 = now_ms();
+        int get_result = player_core_get_video_frame(player_core_, &frame_data);
 
-        if (result == 0) {
-            // ??????????????
+        if (get_result == 0) {
             if (in_empty_streak) {
-                int64_t wait_ms = now_ms() - empty_start_ms;
-                LOGI("???? [DIAG] ?????????: ?????????? %" PRId64 " ms (empty_count=%d) | ??????=%dx%d",
-                     wait_ms, empty_count, frame_data.width, frame_data.height);
+                LOGI("[render] buffer refilled after %" PRId64 "ms (empty_cnt=%d) frame=%dx%d",
+                     now_ms() - empty_start_ms, empty_count,
+                     frame_data.width, frame_data.height);
                 in_empty_streak = false;
             }
             empty_count = 0;
 
-            // ?????? A/V sync???? iOS renderVideoFrame ???????????????????????????????????????????????????????????????????
-            double currentPTS   = frame_data.pts;
-            double masterClock  = player_core_get_position(player_core_);
-            double delay        = currentPTS - masterClock;
-            // render_warmup_frames_ ??? openURL/seekTo ????????????????????
-            // ???? core ??????????????????????????????????????????????????????
-            int    warmup       = render_warmup_frames_.load(std::memory_order_acquire);
-            bool   should_display = false;
-            bool   should_consume = false;
+            double pts   = frame_data.pts;
+            double clock = player_core_get_position(player_core_);
+            double delay = pts - clock;
 
-            if (std::isnan(currentPTS)) {
-                // PTS ??????????????????
-                should_display = true;
+            bool should_display = false;
+            bool should_consume = false;
+
+            if (std::isnan(pts) || std::isinf(pts)) {
+                should_display = should_consume = true;
+            } else if (delay < -kSyncThreshold) {
+                should_display = false;
                 should_consume = true;
-            } else if (delay < -5.0) {
-                // ??????????????????seek ?????????????????????????
-                LOGI("???? [SYNC] ????????????: pts=%.3f clock=%.3f delay=%.3f, ????????",
-                     currentPTS, masterClock, delay);
-                should_display = true;
-                should_consume = true;
-            } else if (warmup > 0) {
-                // Warmup phase (after open/seek) - Tencent player approach:
-                // Show the first frames immediately so the user sees a picture ASAP
-                // instead of a black screen while audio is already playing.
-                if (warmup >= 3) {
-                    // No frame shown yet: display immediately regardless of audio clock.
-                    // KEY FIX for 'sound before video': don't wait for audio clock
-                    // to settle before showing the first picture.
-                    should_display = true;
-                    should_consume = true;
-                } else if (delay > 1.5) {
-                    // Video is well ahead of audio: hold frame
-                    should_display = false;
-                    should_consume = false;
-                } else if (delay < -1.0) {
-                    // Video is behind audio: skip to catch up
-                    should_display = false;
-                    should_consume = true;
-                } else {
-                    should_display = true;
-                    should_consume = true;
+                if (delay < -5.0) {
+                    LOGI_RATE(30, "[sync] large drop: pts=%.3f clk=%.3f delay=%.3f", pts, clock, delay);
                 }
-            } else {
-                // Normal playback: A/V sync (Tencent/ExoPlayer style)
-                // 50ms sync window, 2s max ahead threshold
-                const double sync_threshold = 0.05; // 50ms
-                if (delay <= -sync_threshold) {
-                    // Video behind audio: drop frame to catch up
-                    should_display = false;
-                    should_consume = true;
-                } else if (delay <= 0.5) {
-                    // In sync window (up to 500ms ahead): display normally
-                    should_display = true;
-                    should_consume = true;
-                } else if (delay <= 2.0) {
-                    // Video moderately ahead: force display to prevent freeze
-                    // Tencent player ~2s 'must render' threshold
-                    should_display = true;
-                    should_consume = true;
+            } else if (clock <= 0.0) {
+                // Audio clock not yet started: show first frame immediately (Tencent fast-path)
+                if (frame_count == 0) {
+                    LOGI("[sync] first frame displayed (audio clock not yet running): pts=%.3f", pts);
                 }
-                // else: video > 2s ahead of audio, hold and wait
+                should_display = should_consume = true;
+            } else if (delay <= kMaxAhead) {
+                should_display = should_consume = true;
             }
-            // ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+            // else: video > 2s ahead of audio -- hold frame
 
             if (should_display) {
                 frame_count++;
-                auto t_render0 = now_ms();
-                int cost = renderFrame(frame_data.y_data, frame_data.u_data, frame_data.v_data,
-                                       frame_data.y_linesize, frame_data.u_linesize, frame_data.v_linesize,
-                                       frame_data.width, frame_data.height,
-                                       &total_upload_ms, &max_upload_ms);
-                auto t_render1 = now_ms();
-                int64_t render_ms = t_render1 - t_render0;
+                auto t0 = now_ms();
+                int cost = renderFrame(
+                    frame_data.y_data, frame_data.u_data, frame_data.v_data,
+                    frame_data.y_linesize, frame_data.u_linesize, frame_data.v_linesize,
+                    frame_data.width, frame_data.height,
+                    &total_upload_ms, &max_upload_ms);
+                int64_t render_ms = now_ms() - t0;
                 total_render_ms += render_ms;
                 if (render_ms > max_render_ms) max_render_ms = render_ms;
 
                 if (cost < 0) {
-                    LOGW("???? renderFrame failed, reinitializing EGL...");
-                    destroyEGL();
-                    gl_ready = false;
+                    LOGW("[render] renderFrame failed eglErr=0x%x, will reinit surface", eglGetError());
+                    destroyEGLSurface();
+                    surface_ready = false;
+                    std::lock_guard<std::mutex> lk(render_mutex_);
+                    if (native_window_) {
+                        ANativeWindow_acquire(native_window_);
+                        pending_window_ = native_window_;
+                        window_changed_ = true;
+                    }
+                    continue;
                 }
 
-                // ? diag_interval ???????????????
-                if (frame_count % diag_interval == 0) {
-                    LOGI("???? [DIAG] ????? %d ? | "
-                         "avg_render=%" PRId64 "ms max_render=%" PRId64 "ms "
-                         "avg_upload=%" PRId64 "ms max_upload=%" PRId64 "ms "
-                         "get_frame=%" PRId64 "ms",
-                         diag_interval,
-                         total_render_ms / diag_interval, max_render_ms,
-                         total_upload_ms / diag_interval, max_upload_ms,
-                         t_get1 - t_get0);
-                    total_render_ms = 0; total_upload_ms = 0;
-                    max_render_ms = 0;  max_upload_ms = 0;
+                if (frame_count % kDiagInterval == 0) {
+                    double pos = player_core_ ? player_core_get_position(player_core_) : 0.0;
+                    LOGI("[perf] %d frames pos=%.1fs | avg_render=%" PRId64 "ms max=%" PRId64
+                         "ms avg_upload=%" PRId64 "ms max=%" PRId64 "ms",
+                         kDiagInterval, pos,
+                         total_render_ms / kDiagInterval, max_render_ms,
+                         total_upload_ms / kDiagInterval, max_upload_ms);
+                    total_render_ms = total_upload_ms = max_render_ms = max_upload_ms = 0;
                 }
-                if (render_ms > 33) {
-                    LOGW("???? [DIAG] ????: render_ms=%" PRId64 "ms | %dx%d surface=%dx%d",
+                if (render_ms > 33)
+                    LOGW("[perf] slow frame %" PRId64 "ms %dx%d surf=%dx%d",
                          render_ms, frame_data.width, frame_data.height,
                          surface_width_, surface_height_);
-                }
             }
 
             if (should_consume) {
                 player_core_consume_video_frame(player_core_);
-                // warmup ???????????????????????????????????
-                if (warmup > 0) {
-                    render_warmup_frames_.fetch_sub(1, std::memory_order_acq_rel);
-                }
-            }
-
-            // ?????????????????????????????????????? sleep ??????
-            if (!should_consume) {
+            } else {
+                // Video ahead of clock: brief sleep then re-check
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
+
         } else {
             empty_count++;
             if (!in_empty_streak) {
-                empty_start_ms = now_ms();
+                empty_start_ms  = now_ms();
                 in_empty_streak = true;
-                if (player_core_) {
-                    LOGI("[DIAG] Frame queue empty, waiting: state=%d pos=%.3f",
-                         player_core_get_state(player_core_),
-                         player_core_get_position(player_core_));
-                }
+                LOGI("[render] frame queue empty: state=%d pos=%.3f",
+                     player_core_get_state(player_core_),
+                     player_core_get_position(player_core_));
+            } else if (empty_count % 60 == 0) {
+                LOGI("[render] still buffering: empty_ms=%" PRId64 " state=%d pos=%.3f",
+                     now_ms() - empty_start_ms,
+                     player_core_get_state(player_core_),
+                     player_core_get_position(player_core_));
             }
-            // Tencent player weak-network strategy: after 200ms of empty queue,
-            // redraw the last cached frame to maintain a static picture instead
-            // of showing black. This is the 'freeze frame on buffering' behavior.
-            if (empty_count == 12 && gl_ready) {
-                // ~200ms of empty frames: freeze on last frame
-                redrawLastFrame();
-            }
-            // Fast poll first 50 iterations, then slow down
-            int wait_ms = (empty_count <= 50) ? 3 : 16;
-            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+            if (empty_count == 12) redrawLastFrame();
+            // condvar 16ms timeout handles the pace; no extra sleep needed
         }
     }
 
-    // ???????????????? GL/EGL??????????????????????
     destroyEGL();
-    LOGI("Render loop exited, total frames: %d", frame_count);
+    render_running_ = false;
+    LOGI("[render] loop exited: total_frames=%d", frame_count);
+}
+
+// ---------------------------------------------------------------------------
+// PBO-accelerated texture upload helper
+//
+// We keep a double-buffer of PBOs per plane.  On each frame:
+//   - eglSwapBuffers completes the draw using the texture uploaded LAST frame
+//   - We fill the "next" PBO with DMA via glMapBufferRange
+//   - We kick off the async GPU upload (glUnmapBuffer / glTexSubImage2D from PBO)
+//
+// This hides the CPU-GPU copy latency behind the draw call, which is the main
+// cause of >16ms render times on 4K (3840x2160 Y plane = 8 MB per frame).
+// ---------------------------------------------------------------------------
+
+// Ensure PBOs exist and match the current frame dimensions.
+// Called on the render thread (EGL context is current).
+bool AndroidPlayer::ensurePBOs(int y_w, int y_h, int uv_w, int uv_h) {
+    int y_sz  = y_w  * y_h;
+    int uv_sz = uv_w * uv_h;
+
+    bool need_recreate = (gl_pbo_y_sz_  != y_sz  ||
+                          gl_pbo_uv_sz_ != uv_sz ||
+                          gl_pbo_y_[0]  == 0);
+    if (!need_recreate) return true;
+
+    // Delete old PBOs
+    if (gl_pbo_y_[0]) { glDeleteBuffers(6, gl_pbo_y_); }
+    memset(gl_pbo_y_, 0, sizeof(gl_pbo_y_));
+    gl_pbo_y_sz_  = 0;
+    gl_pbo_uv_sz_ = 0;
+
+    glGenBuffers(6, gl_pbo_y_);  // [0,1]=Y  [2,3]=U  [4,5]=V
+
+    auto alloc = [&](GLuint id, int sz) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, id);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, sz, nullptr, GL_STREAM_DRAW);
+    };
+    alloc(gl_pbo_y_[0], y_sz);  alloc(gl_pbo_y_[1], y_sz);
+    alloc(gl_pbo_y_[2], uv_sz); alloc(gl_pbo_y_[3], uv_sz);
+    alloc(gl_pbo_y_[4], uv_sz); alloc(gl_pbo_y_[5], uv_sz);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    gl_pbo_y_sz_  = y_sz;
+    gl_pbo_uv_sz_ = uv_sz;
+    gl_pbo_idx_   = 0;
+    LOGI("[PBO] Allocated 6 PBOs: Y=%d bytes UV=%d bytes", y_sz, uv_sz);
+    return true;
+}
+
+// Upload one plane using the PBO double-buffer ping-pong.
+// idx_write : PBO index we write CPU data into this frame
+// idx_read  : PBO index the GPU reads from this frame (previous write)
+static void uploadPlanePBO(GLenum tex_unit, GLuint tex_id,
+                            GLuint pbo_write, GLuint pbo_read,
+                            GLint  internal_fmt, GLenum fmt,
+                            int tex_w, int tex_h,
+                            const void* src, int sz,
+                            bool size_changed) {
+    // Step A: bind pbo_read and kick async upload to texture
+    glActiveTexture(tex_unit);
+    glBindTexture(GL_TEXTURE_2D, tex_id);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_read);
+    if (size_changed) {
+        glTexImage2D(GL_TEXTURE_2D, 0, internal_fmt, tex_w, tex_h,
+                     0, fmt, GL_UNSIGNED_BYTE, nullptr /* from PBO */);
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, tex_w, tex_h,
+                        fmt, GL_UNSIGNED_BYTE, nullptr /* from PBO */);
+    }
+
+    // Step B: fill pbo_write with new CPU data via DMA mapping
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_write);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, sz, nullptr, GL_STREAM_DRAW); // orphan
+    void* dst = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, sz,
+                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    if (dst) {
+        memcpy(dst, src, sz);
+        glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+    } else {
+        // Fallback: upload synchronously if mapping fails
+        glBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, sz, src);
+    }
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 }
 
 int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
@@ -1031,9 +1096,9 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     if (!y_data || width <= 0 || height <= 0) return -1;
     if (!gl_program_ || egl_surface_ == EGL_NO_SURFACE) return -1;
 
-    int surface_w = 0, surface_h = 0;
+    int surface_w, surface_h;
     {
-        std::lock_guard<std::mutex> lock(window_mutex_);
+        std::lock_guard<std::mutex> lock(render_mutex_);
         surface_w = surface_width_;
         surface_h = surface_height_;
     }
@@ -1041,74 +1106,134 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    // --- ??? Y/U/V ?????4K ?????????????????????---
-    int uv_w = u_linesize > 0 ? u_linesize : width / 2;
-    int uv_h = height / 2;
-    int v_w  = v_linesize > 0 ? v_linesize : width / 2;
+    int y_tex_w  = y_linesize  > 0 ? y_linesize  : width;
+    int uv_w     = u_linesize  > 0 ? u_linesize  : width  / 2;
+    int v_tex_w  = v_linesize  > 0 ? v_linesize  : width  / 2;
+    int uv_h     = height / 2;
+    int y_sz     = y_tex_w * height;
+    int uv_sz    = uv_w    * uv_h;
+    int v_sz     = v_tex_w * uv_h;
 
     bool size_changed = (width != gl_last_video_w_ || height != gl_last_video_h_);
     if (size_changed) {
-        LOGI("???? [DIAG] ???????????: %dx%d -> %dx%d | Y_linesize=%d UV_linesize=%d",
-             gl_last_video_w_, gl_last_video_h_, width, height, y_linesize, uv_w);
+        LOGI("[DIAG] Video size: %dx%d -> %dx%d | Y_stride=%d UV_stride=%d",
+             gl_last_video_w_, gl_last_video_h_, width, height, y_tex_w, uv_w);
     }
 
+    // --- Texture upload ---
     auto t_upload0 = std::chrono::high_resolution_clock::now();
 
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, gl_tex_y_);
-    if (size_changed) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, y_linesize > 0 ? y_linesize : width, height,
-                     0, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_data);
-    } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, y_linesize > 0 ? y_linesize : width, height,
-                        GL_LUMINANCE, GL_UNSIGNED_BYTE, y_data);
-    }
+    // Use PBO double-buffering for 4K (>= 1920x1080) to overlap CPU copy with GPU draw.
+    // For smaller resolutions the overhead of PBO setup isn't worth it.
+    const bool use_pbo = (width >= 1920) &&
+                         ensurePBOs(y_tex_w, height, uv_w, uv_h);
 
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, gl_tex_u_);
-    if (size_changed) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_w, uv_h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+    if (use_pbo) {
+        int wi = gl_pbo_idx_;          // write index (0 or 1)
+        int ri = 1 - wi;               // read  index
+        // On the very first frame pbo_read is uninitialized: fall back to sync
+        // upload for that one frame so the texture contains valid data.
+        if (gl_pbo_first_frame_) {
+            // First-frame sync upload so the texture is valid immediately
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, gl_tex_y_);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, y_tex_w, height,
+                         0, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_data);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, gl_tex_u_);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_w, uv_h,
+                         0, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, gl_tex_v_);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v_tex_w, uv_h,
+                         0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+            // Pre-fill write PBOs for next frame
+            auto fill_pbo = [](GLuint id, const void* src, int sz) {
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, id);
+                glBufferData(GL_PIXEL_UNPACK_BUFFER, sz, nullptr, GL_STREAM_DRAW);
+                void* dst = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, sz,
+                                              GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+                if (dst) { memcpy(dst, src, sz); glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER); }
+                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+            };
+            fill_pbo(gl_pbo_y_[wi],   y_data, y_sz);
+            fill_pbo(gl_pbo_y_[2+wi], u_data, uv_sz);
+            fill_pbo(gl_pbo_y_[4+wi], v_data, v_sz);
+            gl_pbo_first_frame_ = false;
+        } else {
+            uploadPlanePBO(GL_TEXTURE0, gl_tex_y_,
+                           gl_pbo_y_[wi],   gl_pbo_y_[ri],
+                           GL_LUMINANCE, GL_LUMINANCE,
+                           y_tex_w, height, y_data, y_sz, size_changed);
+            uploadPlanePBO(GL_TEXTURE1, gl_tex_u_,
+                           gl_pbo_y_[2+wi], gl_pbo_y_[2+ri],
+                           GL_LUMINANCE, GL_LUMINANCE,
+                           uv_w, uv_h, u_data, uv_sz, size_changed);
+            uploadPlanePBO(GL_TEXTURE2, gl_tex_v_,
+                           gl_pbo_y_[4+wi], gl_pbo_y_[4+ri],
+                           GL_LUMINANCE, GL_LUMINANCE,
+                           v_tex_w, uv_h, v_data, v_sz, size_changed);
+        }
+        gl_pbo_idx_ = 1 - gl_pbo_idx_; // ping-pong
     } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_w, uv_h, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
-    }
-
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, gl_tex_v_);
-    if (size_changed) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v_w, uv_h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
-    } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, v_w, uv_h, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+        // Standard synchronous upload (SD / HD content, or PBO not available)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, gl_tex_y_);
+        if (size_changed) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, y_tex_w, height,
+                         0, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_data);
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, y_tex_w, height,
+                            GL_LUMINANCE, GL_UNSIGNED_BYTE, y_data);
+        }
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, gl_tex_u_);
+        if (size_changed) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_w, uv_h,
+                         0, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_w, uv_h,
+                            GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+        }
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, gl_tex_v_);
+        if (size_changed) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v_tex_w, uv_h,
+                         0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, v_tex_w, uv_h,
+                            GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+        }
     }
 
     auto t_upload1 = std::chrono::high_resolution_clock::now();
-    int64_t upload_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_upload1 - t_upload0).count();
-    if (out_upload_ms) *out_upload_ms += upload_ms;
-    if (out_max_upload_ms && upload_ms > *out_max_upload_ms) *out_max_upload_ms = upload_ms;
-    // ??????????? 10ms ????????????4K = 3840*2160 Y ?? 8MB??????? 5ms ??????????
+    int64_t upload_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t_upload1 - t_upload0).count();
+    if (out_upload_ms)     *out_upload_ms     += upload_ms;
+    if (out_max_upload_ms && upload_ms > *out_max_upload_ms)
+        *out_max_upload_ms = upload_ms;
     if (upload_ms > 10) {
-        LOGW("???? [DIAG] ?????????: upload_ms=%" PRId64 "ms | %dx%d Y_linesize=%d",
-             upload_ms, width, height, y_linesize);
+        LOGW("[DIAG] Slow upload: %" PRId64 "ms | %dx%d Y_stride=%d pbo=%d",
+             upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
     }
 
     gl_last_video_w_ = width;
     gl_last_video_h_ = height;
 
-    // --- ??? texcoord?????? stride padding??---
-    int y_tex_w = y_linesize > 0 ? y_linesize : width;
-    float y_u_scale = (float)width  / (float)y_tex_w;   // ???????????????????????
-    float y_v_scale = 1.0f;
+    // --- Compute vertex / texcoord layout ---
+    float y_u_scale  = (float)width      / (float)y_tex_w;
+    float y_v_scale  = 1.0f;
     float uv_u_scale = (float)(width / 2) / (float)(uv_w > 0 ? uv_w : width / 2);
 
-    // --- ????????????FIT / FILL??---
     float vx0 = -1.0f, vx1 = 1.0f, vy0 = -1.0f, vy1 = 1.0f;
-    float tx0 = 0.0f, tx1 = y_u_scale, ty0 = 0.0f, ty1 = y_v_scale;
+    float tx0 = 0.0f,  tx1 = y_u_scale,  ty0 = 0.0f, ty1 = y_v_scale;
     float utx0 = 0.0f, utx1 = uv_u_scale, uty0 = 0.0f, uty1 = 1.0f;
 
-    float video_aspect   = (float)width  / (float)height;
+    float video_aspect   = (float)width    / (float)height;
     float surface_aspect = (float)surface_w / (float)surface_h;
 
     if (aspect_ratio_mode_ == 0) {
-        // FIT????????????????????????????????
+        // FIT: letterbox / pillarbox
         if (video_aspect > surface_aspect) {
             float scale = surface_aspect / video_aspect;
             vy0 = -scale; vy1 = scale;
@@ -1117,32 +1242,30 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
             vx0 = -scale; vx1 = scale;
         }
     } else {
-        // FILL?????? surface??????????? texcoord ??????
+        // FILL: crop via texcoord
         if (video_aspect > surface_aspect) {
             float ratio  = surface_aspect / video_aspect;
             float margin = (1.0f - ratio) * 0.5f;
-            tx0 = margin * y_u_scale;    tx1 = (1.0f - margin) * y_u_scale;
-            utx0 = margin * uv_u_scale;  utx1 = (1.0f - margin) * uv_u_scale;
+            tx0  = margin * y_u_scale;    tx1  = (1.0f - margin) * y_u_scale;
+            utx0 = margin * uv_u_scale;   utx1 = (1.0f - margin) * uv_u_scale;
         } else {
             float ratio  = video_aspect / surface_aspect;
             float margin = (1.0f - ratio) * 0.5f;
-            ty0 = margin;  ty1 = 1.0f - margin;
+            ty0 = margin;  ty1  = 1.0f - margin;
             uty0 = margin; uty1 = 1.0f - margin;
         }
     }
 
-    // --- ???????????position(2) + Y-texcoord(2) + UV-texcoord(2)??stride = 6 floats ---
-    // Y ??? UV ???????????? texcoord ???????????? stride padding ?? FILL ????????????????
     const float verts[] = {
-        // pos_x  pos_y   Y_s   Y_t   UV_s   UV_t
-        vx0, vy1,  tx0, ty0,  utx0, uty0,  // ???
-        vx0, vy0,  tx0, ty1,  utx0, uty1,  // ???
-        vx1, vy0,  tx1, ty1,  utx1, uty1,  // ???
-        vx0, vy1,  tx0, ty0,  utx0, uty0,  // ????????????????
-        vx1, vy0,  tx1, ty1,  utx1, uty1,  // ???
-        vx1, vy1,  tx1, ty0,  utx1, uty0,  // ???
+        vx0, vy1,  tx0, ty0,  utx0, uty0,
+        vx0, vy0,  tx0, ty1,  utx0, uty1,
+        vx1, vy0,  tx1, ty1,  utx1, uty1,
+        vx0, vy1,  tx0, ty0,  utx0, uty0,
+        vx1, vy0,  tx1, ty1,  utx1, uty1,
+        vx1, vy1,  tx1, ty0,  utx1, uty0,
     };
 
+    // --- Draw ---
     glViewport(0, 0, surface_w, surface_h);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -1152,10 +1275,8 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     glUniform1i(gl_uniform_u_, 1);
     glUniform1i(gl_uniform_v_, 2);
 
-    // ???? initGLProgram ??????? attrib location????????????? glGetAttribLocation
     if (gl_attrib_pos_ < 0 || gl_attrib_tex_ < 0 || gl_attrib_tex_uv_ < 0) return -1;
 
-    // stride = 6 floats??[pos_x, pos_y, Y_s, Y_t, UV_s, UV_t]
     const GLsizei stride = 6 * sizeof(float);
     glVertexAttribPointer(gl_attrib_pos_,    2, GL_FLOAT, GL_FALSE, stride, verts);
     glEnableVertexAttribArray(gl_attrib_pos_);
@@ -1171,18 +1292,29 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     glDisableVertexAttribArray(gl_attrib_tex_uv_);
 
     if (!eglSwapBuffers(egl_display_, egl_surface_)) {
-        LOGE("?? eglSwapBuffers failed: 0x%x", eglGetError());
+        EGLint err = eglGetError();
+        // EGL_BAD_SURFACE / EGL_CONTEXT_LOST are recoverable via re-init
+        LOGE("[EGL] eglSwapBuffers failed: 0x%x", err);
         return -1;
     }
 
-    // Cache last frame for redraw after surface switch
+    // Cache last frame so we can redraw after a surface hot-swap
     {
-        int y_sz = (y_linesize > 0 ? y_linesize : width) * height;
-        int u_sz = (u_linesize > 0 ? u_linesize : width / 2) * (height / 2);
-        int v_sz = (v_linesize > 0 ? v_linesize : width / 2) * (height / 2);
-        last_frame_y_.assign(static_cast<uint8_t*>(y_data), static_cast<uint8_t*>(y_data) + y_sz);
-        last_frame_u_.assign(static_cast<uint8_t*>(u_data), static_cast<uint8_t*>(u_data) + u_sz);
-        last_frame_v_.assign(static_cast<uint8_t*>(v_data), static_cast<uint8_t*>(v_data) + v_sz);
+        int y_stride  = y_linesize  > 0 ? y_linesize  : width;
+        int uv_stride = u_linesize  > 0 ? u_linesize  : width / 2;
+        int vs_stride = v_linesize  > 0 ? v_linesize  : width / 2;
+        int y_cache_sz  = y_stride  * height;
+        int u_cache_sz  = uv_stride * (height / 2);
+        int v_cache_sz  = vs_stride * (height / 2);
+
+        if (width != last_frame_width_ || height != last_frame_height_) {
+            last_frame_y_.resize(y_cache_sz);
+            last_frame_u_.resize(u_cache_sz);
+            last_frame_v_.resize(v_cache_sz);
+        }
+        memcpy(last_frame_y_.data(), y_data, y_cache_sz);
+        memcpy(last_frame_u_.data(), u_data, u_cache_sz);
+        memcpy(last_frame_v_.data(), v_data, v_cache_sz);
         last_frame_width_    = width;
         last_frame_height_   = height;
         last_frame_y_stride_ = y_linesize;
@@ -1190,19 +1322,17 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         last_frame_v_stride_ = v_linesize;
     }
 
-
     auto t1 = std::chrono::high_resolution_clock::now();
     return (int)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 }
 
-// ========== OpenSL ES ?????????? ==========
+// ========== OpenSL ES audio output ==========
 
 bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     SLresult result;
-    
+
     LOGI("Initializing audio output: %d Hz, %d channels", sample_rate, channels);
-    
-    // ?????????
+
     result = slCreateEngine(&engineObject_, 0, nullptr, 0, nullptr, nullptr);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to create engine: %d", result);
@@ -1222,7 +1352,6 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
 
-    // ????????????????
     result = (*engineEngine_)->CreateOutputMix(engineEngine_, &outputMixObject_, 0, nullptr, nullptr);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to create output mix: %d", result);
@@ -1237,13 +1366,12 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
     
-    // ?????????? (PCM)
+    // PCM buffer-queue data source
     SLDataLocator_AndroidSimpleBufferQueue loc_bufq = {
         SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 2
     };
 
-    // ??? ???????????????????????????????
-    // ????????????
+    // Map Hz -> OpenSL ES enum
     SLuint32 sl_sample_rate;
     switch (sample_rate) {
         case 8000:  sl_sample_rate = SL_SAMPLINGRATE_8; break;
@@ -1263,14 +1391,12 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
             break;
     }
     
-    // ???????
     SLuint32 channel_mask;
     if (channels == 1) {
         channel_mask = SL_SPEAKER_FRONT_CENTER;
     } else {
-        // 2 ??????????????????????
         channel_mask = SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT;
-        channels = 2; // ??????????
+        channels = 2; // clamp to stereo
     }
     
     SLDataFormat_PCM format_pcm = {
@@ -1287,11 +1413,10 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
 
     SLDataSource audioSrc = {&loc_bufq, &format_pcm};
     
-    // ??????????????????
     SLDataLocator_OutputMix loc_outmix = {SL_DATALOCATOR_OUTPUTMIX, outputMixObject_};
     SLDataSink audioSnk = {&loc_outmix, nullptr};
-    
-    // ???????????????????????? VOLUME ?????????? AppOps ????????
+
+    // We request only BUFFERQUEUE; omitting VOLUME avoids Android AppOps CONTROL_AUDIO checks.
     const SLInterfaceID ids[1] = {SL_IID_BUFFERQUEUE};
     const SLboolean req[1] = {SL_BOOLEAN_TRUE};
     
@@ -1310,7 +1435,6 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
 
-    // ???????????????
     result = (*playerObject_)->GetInterface(playerObject_, SL_IID_PLAY, &playItf_);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to get play interface: %d", result);
@@ -1318,7 +1442,6 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
 
-    // ????????????????????
     result = (*playerObject_)->GetInterface(playerObject_, SL_IID_BUFFERQUEUE, &bufferQueueItf_);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to get buffer queue interface: %d", result);
@@ -1326,7 +1449,6 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
 
-    // ?????????
     result = (*bufferQueueItf_)->RegisterCallback(bufferQueueItf_, audioCallback, this);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to register callback: %d", result);
@@ -1334,37 +1456,30 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         return false;
     }
     
-    // ???? ???????? VolumeItf?????? AppOps CONTROL_AUDIO ?????
-    // ???????????????????? Core ??????
+    // VolumeItf is intentionally omitted to avoid AppOps CONTROL_AUDIO permission checks.
+    // Volume is managed entirely inside the core.
     volumeItf_ = nullptr;
-    LOGI("Volume control disabled (using core volume only to avoid AppOps crash)");
-    
-    // ?????????????
+    LOGI("Volume control: core-only (OpenSL ES VolumeItf disabled)");
+
     audio_sample_rate_ = sample_rate;
-    audio_channels_ = channels;
-    
-    // ?????????????????????
-    // ???????~5ms ???????????????? 10ms ???????????????????????
-    // ??????bytes = sample_rate * channels * bytes_per_sample * duration
-    audio_buffer_size_ = (sample_rate * channels * 2 * 5) / 1000;  // 16-bit = 2 bytes
-    
-    // ????? 4 ?????????
-    audio_buffer_size_ = (audio_buffer_size_ + 3) & ~3;
-    
-    // ????????????????????????????????????????
+    audio_channels_    = channels;
+
+    // Target ~5ms per callback (bytes = rate * ch * 2 bytes/sample * 0.005s)
+    audio_buffer_size_ = (sample_rate * channels * 2 * 5) / 1000;
+    audio_buffer_size_ = (audio_buffer_size_ + 3) & ~3;  // 4-byte align
+
     if (audio_buffer_size_ > MAX_AUDIO_BUFFER_SIZE) {
         audio_buffer_size_ = MAX_AUDIO_BUFFER_SIZE;
-        LOGW("???? Audio buffer size capped to %d bytes", MAX_AUDIO_BUFFER_SIZE);
+        LOGW("Audio buffer size capped to %d bytes", MAX_AUDIO_BUFFER_SIZE);
     }
     if (audio_buffer_size_ < 960) {
-        audio_buffer_size_ = 960;  // ???? 960 ????????? 1KB ???????
+        audio_buffer_size_ = 960; // floor at ~10ms @ 48kHz stereo
     }
-    
-    LOGI("???? Audio buffer size calculated: %d bytes (%.1f ms)", 
-         audio_buffer_size_, 
+
+    LOGI("Audio buffer: %d bytes (%.1f ms)",
+         audio_buffer_size_,
          (audio_buffer_size_ * 1000.0) / (sample_rate * channels * 2));
-    
-    // ?????????????????
+
     memset(audio_buffer_, 0, audio_buffer_size_);
     (*bufferQueueItf_)->Enqueue(bufferQueueItf_, audio_buffer_, audio_buffer_size_);
     
@@ -1478,15 +1593,13 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         return;
     }
 
-    // ?????????????????????????????????????
+    // Drain the core audio queue into the output buffer
     int total_bytes_read = 0;
     while (total_bytes_read < audio_buffer_size_) {
         int bytes_read = player_core_get_audio_data(
-            player_core_, 
-            audio_buffer_ + total_bytes_read, 
-            audio_buffer_size_ - total_bytes_read
-        );
-        
+            player_core_,
+            audio_buffer_ + total_bytes_read,
+            audio_buffer_size_ - total_bytes_read);
         if (bytes_read > 0) {
             total_bytes_read += bytes_read;
         } else {
@@ -1494,37 +1607,35 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         }
     }
 
-    
-    static int callback_count = 0;
+    static int  callback_count   = 0;
+    static int  underrun_count   = 0;
+    static int  partial_count    = 0;
     callback_count++;
-    
+
     if (total_bytes_read > 0) {
-        // ?100??????????????????????????????????????
-        // if (callback_count % 100 == 0) {
-        //     LOGI("???? Audio callback #%d: total_bytes=%d, buffer_size=%d (%.1f%%)", 
-        //          callback_count, total_bytes_read, audio_buffer_size_,
-        //          (total_bytes_read * 100.0) / audio_buffer_size_);
-        // }
-        
-        // ?????????????????????
         if (total_bytes_read < audio_buffer_size_) {
-            memset(audio_buffer_ + total_bytes_read, 0, audio_buffer_size_ - total_bytes_read);
-            
-            // ?????????????????????
-            // if (callback_count % 100 == 0) {
-            //     LOGW("???? Audio underrun: only got %d bytes, needed %d (%.1f%%)", 
-            //          total_bytes_read, audio_buffer_size_,
-            //          (total_bytes_read * 100.0) / audio_buffer_size_);
-            // }
+            partial_count++;
+            // Zero-pad the tail (partial underrun)
+            memset(audio_buffer_ + total_bytes_read, 0,
+                   audio_buffer_size_ - total_bytes_read);
         }
     } else {
-        // ???????????????????
-        if (callback_count % 100 == 0) {
-            LOGW("???? No audio data available, filling silence");
-        }
+        underrun_count++;
         memset(audio_buffer_, 0, audio_buffer_size_);
     }
-    
-    // ???????????????????
+
+    // Print audio stats every 200 callbacks (~1s at 5ms/cb)
+    if (callback_count % 200 == 0) {
+        double pos = player_core_ ? player_core_get_position(player_core_) : 0.0;
+        if (underrun_count > 0 || partial_count > 0) {
+            LOGW("[audio] cb=%d pos=%.1fs underrun=%d partial=%d (last 200)",
+                 callback_count, pos, underrun_count, partial_count);
+        } else {
+            LOGI("[audio] cb=%d pos=%.1fs ok", callback_count, pos);
+        }
+        underrun_count = 0;
+        partial_count  = 0;
+    }
+
     (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
 }
