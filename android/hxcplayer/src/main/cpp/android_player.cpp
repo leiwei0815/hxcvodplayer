@@ -547,11 +547,13 @@ void AndroidPlayer::seekTo(double position) {
     seek_target_sec_.store(position, std::memory_order_release);
     // 约 1 秒左右的渲染 tick 追赶窗口，避免 seek 后先看到大量旧帧。
     seek_fast_catchup_frames_.store(72, std::memory_order_release);
-    seek_catchup_deadline_ms_ = now_ms() + 650;
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    seek_catchup_deadline_ms_ = now + 650;
     seek_lower_bound_active_.store(true, std::memory_order_release);
-    seek_lower_bound_deadline_ms_ = now_ms() + 2000;
+    seek_lower_bound_deadline_ms_ = now + 2000;
     seek_audio_wait_video_.store(true, std::memory_order_release);
-    seek_audio_wait_deadline_ms_ = now_ms() + 1200;
+    seek_audio_wait_deadline_ms_ = now + 1200;
     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
         LOGI("[sync] seek pause audio waiting first target frame: result=%d", r);
