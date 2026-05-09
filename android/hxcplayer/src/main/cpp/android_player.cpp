@@ -348,6 +348,11 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         LOGI("[open] openURL OK");
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
+        bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
+        DECODEI("evt=open_result method=openURL requested=%s hw_active=%d final_mode=%s",
+                decode_mode_ == 1 ? "hardware" : "software",
+                hw_active ? 1 : 0,
+                hw_active ? "hardware" : "software");
         // Reset sync state for the new stream
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
@@ -415,6 +420,11 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
         LOGI("Custom HTTP opened successfully");
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
+        bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
+        DECODEI("evt=open_result method=openWithCustomHTTP requested=%s hw_active=%d final_mode=%s",
+                decode_mode_ == 1 ? "hardware" : "software",
+                hw_active ? 1 : 0,
+                hw_active ? "hardware" : "software");
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         render_cv_.notify_one();
@@ -457,6 +467,11 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
         LOGI("Custom file opened successfully");
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
+        bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
+        DECODEI("evt=open_result method=openWithCustomFile requested=%s hw_active=%d final_mode=%s",
+                decode_mode_ == 1 ? "hardware" : "software",
+                hw_active ? 1 : 0,
+                hw_active ? "hardware" : "software");
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         render_cv_.notify_one();
@@ -511,6 +526,11 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     if (result == 0) {
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
+        bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
+        DECODEI("evt=open_result method=openWithSecureSession requested=%s hw_active=%d final_mode=%s",
+                decode_mode_ == 1 ? "hardware" : "software",
+                hw_active ? 1 : 0,
+                hw_active ? "hardware" : "software");
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         render_cv_.notify_one();
