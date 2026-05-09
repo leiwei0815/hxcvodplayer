@@ -248,6 +248,8 @@ private:
     int                 consecutive_drop_count_{0};
     // Severe-lag detector for soft re-anchor (prevents endless drop loops).
     int64_t             severe_lag_start_ms_{0};
+    // Severe-lag detector for "video stuck but queue not empty" audio pause.
+    int64_t             severe_lag_audio_pause_start_ms_{0};
     int64_t             last_soft_reanchor_ms_{0};
     int                 soft_reanchor_count_{0};
     int               audio_cb_count_{0};
