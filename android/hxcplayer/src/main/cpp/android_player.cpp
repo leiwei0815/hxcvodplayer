@@ -226,10 +226,25 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     int cur_state = player_core_get_state(player_core_);
     if (cur_state != 0) { // 0 == IDLE
         LOGI("[open] pre-stop core (state=%d) before open", cur_state);
-        player_core_stop(player_core_);
+
+        // 1. Stop new audio callbacks from being scheduled, and pause OpenSL ES.
+        audio_start_pending_.store(false, std::memory_order_release);
         if (playItf_) {
             (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
         }
+
+        // 2. Wait for any in-flight audio callback to finish before stopping the
+        //    core (which resets / frees the SwrContext used by swr_convert).
+        {
+            int spin = 0;
+            while (audio_cb_in_flight_.load(std::memory_order_acquire) > 0 && spin < 500) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                spin++;
+            }
+        }
+
+        // 3. Now safe to stop/reset the player core.
+        player_core_stop(player_core_);
     }
 
     player_core_set_decode_mode(player_core_,
@@ -461,14 +476,21 @@ void AndroidPlayer::stop() {
     LOGI("[ctrl] stop: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
     audio_start_pending_.store(false, std::memory_order_release);
     has_pending_playback_completed_.store(false, std::memory_order_release);
-    player_core_stop(player_core_);
 
+    // Stop OpenSL ES first to prevent new audio callbacks, then wait for
+    // any in-flight callback to exit before stopping the core (which resets
+    // the SwrContext that swr_convert uses).
     if (playItf_) {
-        SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
-        if (result != SL_RESULT_SUCCESS) {
-            LOGE("Failed to set play state to STOPPED: %d", result);
+        (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
+    }
+    {
+        int spin = 0;
+        while (audio_cb_in_flight_.load(std::memory_order_acquire) > 0 && spin < 200) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            spin++;
         }
     }
+    player_core_stop(player_core_);
 }
 
 void AndroidPlayer::seekTo(double position) {
