@@ -315,6 +315,13 @@ int player_core_is_video_hardware_decoding(PlayerCoreHandle* handle) {
     return handle->core->is_video_hardware_decoding() ? 1 : 0;
 }
 
+const char* player_core_get_video_decode_diagnostic(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return "";
+    static thread_local std::string decode_diag;
+    decode_diag = handle->core->get_video_decode_diagnostic();
+    return decode_diag.c_str();
+}
+
 void player_core_seek(PlayerCoreHandle* handle, double pos) {
     if (handle && handle->core) {
         handle->audio_seek_serial.fetch_add(1, std::memory_order_acq_rel);

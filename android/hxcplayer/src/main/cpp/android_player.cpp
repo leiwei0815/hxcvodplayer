@@ -349,15 +349,19 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
-        DECODEI("evt=open_result method=openURL requested=%s hw_active=%d final_mode=%s",
+        const char* decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+        DECODEI("evt=open_result method=openURL requested=%s hw_active=%d final_mode=%s diag=%s",
                 decode_mode_ == 1 ? "hardware" : "software",
                 hw_active ? 1 : 0,
-                hw_active ? "hardware" : "software");
+                hw_active ? "hardware" : "software",
+                decode_diag ? decode_diag : "");
         // Reset sync state for the new stream
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         audio_rebuffer_pending_.store(false, std::memory_order_release);
         audio_rebuffer_deadline_ms_ = 0;
+        audio_rebuffer_paused_at_ms_ = 0;
+        audio_rebuffer_min_resume_at_ms_ = 0;
         seek_target_sec_.store(-1.0, std::memory_order_release);
         seek_from_sec_.store(-1.0, std::memory_order_release);
         seek_fast_catchup_frames_.store(0, std::memory_order_release);
@@ -421,10 +425,12 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
-        DECODEI("evt=open_result method=openWithCustomHTTP requested=%s hw_active=%d final_mode=%s",
+        const char* decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+        DECODEI("evt=open_result method=openWithCustomHTTP requested=%s hw_active=%d final_mode=%s diag=%s",
                 decode_mode_ == 1 ? "hardware" : "software",
                 hw_active ? 1 : 0,
-                hw_active ? "hardware" : "software");
+                hw_active ? "hardware" : "software",
+                decode_diag ? decode_diag : "");
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         render_cv_.notify_one();
@@ -468,10 +474,12 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
-        DECODEI("evt=open_result method=openWithCustomFile requested=%s hw_active=%d final_mode=%s",
+        const char* decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+        DECODEI("evt=open_result method=openWithCustomFile requested=%s hw_active=%d final_mode=%s diag=%s",
                 decode_mode_ == 1 ? "hardware" : "software",
                 hw_active ? 1 : 0,
-                hw_active ? "hardware" : "software");
+                hw_active ? "hardware" : "software",
+                decode_diag ? decode_diag : "");
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         render_cv_.notify_one();
@@ -527,10 +535,12 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
-        DECODEI("evt=open_result method=openWithSecureSession requested=%s hw_active=%d final_mode=%s",
+        const char* decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+        DECODEI("evt=open_result method=openWithSecureSession requested=%s hw_active=%d final_mode=%s diag=%s",
                 decode_mode_ == 1 ? "hardware" : "software",
                 hw_active ? 1 : 0,
-                hw_active ? "hardware" : "software");
+                hw_active ? "hardware" : "software",
+                decode_diag ? decode_diag : "");
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
         render_cv_.notify_one();
@@ -581,6 +591,8 @@ void AndroidPlayer::play() {
     render_cv_.notify_one();
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
+    audio_rebuffer_paused_at_ms_ = 0;
+    audio_rebuffer_min_resume_at_ms_ = 0;
     seek_recovery_active_.store(false, std::memory_order_release);
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
@@ -611,6 +623,8 @@ void AndroidPlayer::pause() {
     audio_start_pending_.store(false, std::memory_order_release);
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
+    audio_rebuffer_paused_at_ms_ = 0;
+    audio_rebuffer_min_resume_at_ms_ = 0;
     seek_recovery_active_.store(false, std::memory_order_release);
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
@@ -635,6 +649,8 @@ void AndroidPlayer::stop() {
     audio_start_pending_.store(false, std::memory_order_release);
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
+    audio_rebuffer_paused_at_ms_ = 0;
+    audio_rebuffer_min_resume_at_ms_ = 0;
     seek_recovery_active_.store(false, std::memory_order_release);
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
@@ -679,6 +695,8 @@ void AndroidPlayer::seekTo(double position) {
     seek_audio_wait_deadline_ms_ = now + 6000;
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
+    audio_rebuffer_paused_at_ms_ = 0;
+    audio_rebuffer_min_resume_at_ms_ = 0;
     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
         LOGI("[sync] seek pause audio waiting first target frame: result=%d", r);
@@ -1342,6 +1360,7 @@ void AndroidPlayer::renderLoop() {
                 double lag_pause_threshold = (playback_rate >= 2.0) ? -2.8 : -2.2;
                 int64_t lag_pause_trigger_ms = (playback_rate >= 2.5) ? 320 : ((playback_rate >= 2.0) ? 420 : 700);
                 int64_t lag_pause_fallback_ms = (playback_rate >= 2.0) ? 1400 : 1800;
+                int64_t lag_pause_min_hold_ms = (playback_rate >= 2.5) ? 900 : ((playback_rate >= 2.0) ? 800 : 600);
                 if (delay <= lag_pause_threshold) {
                     if (severe_lag_audio_pause_start_ms_ == 0) severe_lag_audio_pause_start_ms_ = now;
                     int64_t severe_lag_ms = now - severe_lag_audio_pause_start_ms_;
@@ -1350,9 +1369,11 @@ void AndroidPlayer::renderLoop() {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
                         if (r == SL_RESULT_SUCCESS) {
                             audio_rebuffer_pending_.store(true, std::memory_order_release);
+                            audio_rebuffer_paused_at_ms_ = now;
+                            audio_rebuffer_min_resume_at_ms_ = now + lag_pause_min_hold_ms;
                             audio_rebuffer_deadline_ms_ = now + lag_pause_fallback_ms;
-                            SYNCW("evt=severe_lag_pause_audio lag_ms=%" PRId64 " delay=%.3f rate=%.2f trigger_ms=%" PRId64 " fallback_ms=%" PRId64,
-                                  severe_lag_ms, delay, playback_rate, lag_pause_trigger_ms, lag_pause_fallback_ms);
+                            SYNCW("evt=severe_lag_pause_audio lag_ms=%" PRId64 " delay=%.3f rate=%.2f trigger_ms=%" PRId64 " hold_ms=%" PRId64 " fallback_ms=%" PRId64,
+                                  severe_lag_ms, delay, playback_rate, lag_pause_trigger_ms, lag_pause_min_hold_ms, lag_pause_fallback_ms);
                         }
                     }
                 } else {
@@ -1622,10 +1643,16 @@ void AndroidPlayer::renderLoop() {
                 // If we previously paused audio due to prolonged video starvation,
                 // resume audio as soon as video starts presenting again.
                 if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
-                    audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
-                    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
-                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
-                        LOGI("[sync] audio resumed after video rebuffer: result=%d", r);
+                    audio_rebuffer_pending_.load(std::memory_order_acquire)) {
+                    if (now >= audio_rebuffer_min_resume_at_ms_) {
+                        if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
+                            audio_rebuffer_paused_at_ms_ = 0;
+                            audio_rebuffer_min_resume_at_ms_ = 0;
+                            if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                                SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                                LOGI("[sync] audio resumed after video rebuffer: result=%d", r);
+                            }
+                        }
                     }
                 }
                 // If this is the first rendered frame and audio start was deferred,
@@ -1750,6 +1777,8 @@ void AndroidPlayer::renderLoop() {
             if (likely_4k) rebuffer_trigger_ms = std::max<int64_t>(160, rebuffer_trigger_ms - 20);
             int64_t rebuffer_fallback_ms = high_rate ? 850 : 700;
             if (likely_4k) rebuffer_fallback_ms += 150;
+            int64_t rebuffer_min_hold_ms = high_rate ? 650 : 450;
+            if (likely_4k) rebuffer_min_hold_ms += 150;
             if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 high_rate && in_empty_streak &&
                 !in_loading &&
@@ -1761,12 +1790,14 @@ void AndroidPlayer::renderLoop() {
                     SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
                     if (r == SL_RESULT_SUCCESS) {
                         audio_rebuffer_pending_.store(true, std::memory_order_release);
+                        audio_rebuffer_paused_at_ms_ = now;
+                        audio_rebuffer_min_resume_at_ms_ = now + rebuffer_min_hold_ms;
                         audio_rebuffer_deadline_ms_ = now + rebuffer_fallback_ms;
                         LOGW("[sync] video starvation -> pause audio: empty_ms=%" PRId64 " trig=%" PRId64 " fallback=%" PRId64 " rate=%.2f last=%dx%d",
                              empty_ms, rebuffer_trigger_ms, rebuffer_fallback_ms, playback_rate, gl_last_video_w_, gl_last_video_h_);
                         SYNCW("evt=video_starvation_pause_audio empty_ms=%" PRId64 " trigger_ms=%" PRId64
-                              " fallback_ms=%" PRId64 " rate=%.2f last_video_w=%d last_video_h=%d",
-                              empty_ms, rebuffer_trigger_ms, rebuffer_fallback_ms,
+                              " hold_ms=%" PRId64 " fallback_ms=%" PRId64 " rate=%.2f last_video_w=%d last_video_h=%d",
+                              empty_ms, rebuffer_trigger_ms, rebuffer_min_hold_ms, rebuffer_fallback_ms,
                               playback_rate, gl_last_video_w_, gl_last_video_h_);
                     }
                 }
@@ -1777,6 +1808,8 @@ void AndroidPlayer::renderLoop() {
                 audio_rebuffer_pending_.load(std::memory_order_acquire) &&
                 now >= audio_rebuffer_deadline_ms_) {
                 if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
+                    audio_rebuffer_paused_at_ms_ = 0;
+                    audio_rebuffer_min_resume_at_ms_ = 0;
                     if (core_playing && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] audio rebuffer fallback resume: result=%d", r);

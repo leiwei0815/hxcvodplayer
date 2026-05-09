@@ -224,6 +224,8 @@ private:
     // pause OpenSL audio to avoid "audio keeps moving but video frozen".
     std::atomic<bool> audio_rebuffer_pending_{false};
     int64_t           audio_rebuffer_deadline_ms_{0};
+    int64_t           audio_rebuffer_paused_at_ms_{0};
+    int64_t           audio_rebuffer_min_resume_at_ms_{0};
     // AV sync helpers (mirroring iOS HXCPlayerControl logic)
     double            audio_output_latency_sec_{0.0}; // estimated hw output queue delay
     std::atomic<int>  sync_warmup_frames_{0};         // relaxed sync window after open/seek

@@ -221,6 +221,11 @@ static bool hxc_try_enable_hw_decode(AVCodecContext *codec_ctx, const AVCodec *c
 
 }  // namespace
 
+std::string PlayerCore::get_video_decode_diagnostic() const {
+    std::lock_guard<std::mutex> lock(video_decode_diag_mutex_);
+    return video_decode_diag_;
+}
+
 PlayerCore::PlayerCore()
     : state_(PlayerState::Idle)
     , format_ctx_(nullptr)
@@ -1948,14 +1953,30 @@ int PlayerCore::stream_component_open(int stream_index) {
         return -1;
     }
 
+    bool is_video_stream = codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
     bool request_video_hw_decode =
-        (codecpar->codec_type == AVMEDIA_TYPE_VIDEO && config_.decode_mode == DecodeMode::Hardware);
+        (is_video_stream && config_.decode_mode == DecodeMode::Hardware);
     bool hw_decode_enabled = false;
+    std::string decode_diag;
+    if (is_video_stream) {
+        decode_diag = request_video_hw_decode ? "requested=hardware" : "requested=software";
+    }
     if (request_video_hw_decode) {
+        enum AVHWDeviceType device_type = hxc_platform_hw_device_type();
+        if (device_type == AV_HWDEVICE_TYPE_NONE) {
+            decode_diag += " reason=platform_hw_device_none";
+        } else if (!hxc_codec_supports_hw_device(codec, device_type)) {
+            decode_diag += " reason=codec_not_support_hw_device";
+        }
         hw_decode_enabled = hxc_try_enable_hw_decode(codec_ctx, codec);
+        if (!hw_decode_enabled &&
+            decode_diag.find("reason=") == std::string::npos) {
+            decode_diag += " reason=hw_device_create_or_ref_failed";
+        }
         LOG_INFO("视频解码模式：请求硬解，启用结果=", hw_decode_enabled ? 1 : 0);
     } else if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
         LOG_INFO("视频解码模式：软解");
+        decode_diag += " reason=software_requested";
     }
 
     // 软解多线程：使用 SLICE 级并行（帧内切片并行），不改变帧的输出顺序，
@@ -1971,6 +1992,9 @@ int PlayerCore::stream_component_open(int stream_index) {
     int open_ret = avcodec_open2(codec_ctx, codec, nullptr);
     if (open_ret < 0 && request_video_hw_decode && hw_decode_enabled) {
         LOG_WARNING("硬解打开失败，自动回退软解。ret=", open_ret);
+        if (is_video_stream) {
+            decode_diag += " reason=hw_open2_failed_fallback_soft";
+        }
         avcodec_free_context(&codec_ctx);
         codec_ctx = alloc_codec_context();
         if (!codec_ctx) {
@@ -1985,6 +2009,10 @@ int PlayerCore::stream_component_open(int stream_index) {
         hw_decode_enabled = false;
     }
     if (open_ret < 0) {
+        if (is_video_stream) {
+            std::lock_guard<std::mutex> lock(video_decode_diag_mutex_);
+            video_decode_diag_ = decode_diag + " final=open_failed";
+        }
         LOG_ERROR("打开解码器失败~ ret=", open_ret);
         emit_error(ERROR_CODEC_OPEN_FAILED, "打开解码器失败");
         avcodec_free_context(&codec_ctx);
@@ -1994,6 +2022,10 @@ int PlayerCore::stream_component_open(int stream_index) {
     if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
         video_codec_ctx_ = codec_ctx;
         video_hw_decode_active_.store(hw_decode_enabled, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(video_decode_diag_mutex_);
+            video_decode_diag_ = decode_diag + (hw_decode_enabled ? " final=hardware" : " final=software");
+        }
         LOG_INFO("视频解码最终模式: ", hw_decode_enabled ? "硬解" : "软解");
         
         LOG_INFO("创建视频解码器...");

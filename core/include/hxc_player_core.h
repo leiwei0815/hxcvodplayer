@@ -168,6 +168,7 @@ public:
     double get_position() const;    // 当前播放位置（秒）
     double get_duration() const;    // 总时长（秒）
     bool is_video_hardware_decoding() const { return video_hw_decode_active_.load(std::memory_order_acquire); }
+    std::string get_video_decode_diagnostic() const;
     
     // 获取帧队列（用于渲染）
     FrameQueue<VideoFrame>* get_video_queue() { return video_queue_.get(); }
@@ -356,6 +357,8 @@ private:
     std::atomic<int>   post_seek_warmup_frames_{0}; // seek 结束后放宽 A/V 同步丢帧阈值的剩余帧数
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
     std::atomic<bool> video_hw_decode_active_{false}; // 当前视频流是否在硬解
+    mutable std::mutex video_decode_diag_mutex_;
+    std::string video_decode_diag_;
     std::atomic<int64_t> io_last_packet_us_{0}; // 最近一次成功读取 packet 的时间（us）
     std::atomic<bool> io_watchdog_disabled_{false}; // 是否禁用阻塞读 watchdog（用于 loopback HTTP）
     int64_t io_interrupt_timeout_us_{8000000};   // 阻塞读中断阈值（us）
