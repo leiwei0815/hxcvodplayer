@@ -1163,6 +1163,7 @@ void AndroidPlayer::renderLoop() {
             bool in_seek_recovery = seek_recovery_active_.load(std::memory_order_acquire);
             bool high_rate_4k = (playback_rate >= 2.0f) &&
                                 (frame_data.width >= 3840 || gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160);
+            bool ultra_high_rate_4k = high_rate_4k && playback_rate >= 2.5f;
 
             // Soft re-anchor safeguard: if we stay severely behind for too long under
             // high-rate 4K playback, perform one bounded seek near audio clock to break
@@ -1210,10 +1211,18 @@ void AndroidPlayer::renderLoop() {
             if (in_seek_recovery && lower_bound_active && seek_target_now >= 0.0 &&
                 !std::isnan(pts) && !std::isinf(pts)) {
                 double seek_epsilon_sec = 0.035;
+                if (ultra_high_rate_4k) {
+                    // At 2.5x/3x 4K, keep the gate but avoid waiting too long
+                    // for exact PTS equality, which can look like a freeze.
+                    seek_epsilon_sec = 0.10;
+                }
                 // If seek recovery is slow, relax lower-bound gradually instead of
                 // exiting gate and resuming audio too early.
                 if (now >= seek_lower_bound_deadline_ms_) {
                     seek_epsilon_sec = 0.250;
+                    if (ultra_high_rate_4k) {
+                        seek_epsilon_sec = 0.350;
+                    }
                 }
                 if (pts + seek_epsilon_sec < seek_target_now) {
                     should_consume = true;
@@ -1304,27 +1313,14 @@ void AndroidPlayer::renderLoop() {
                 if (high_rate_4k) {
                     // Avoid endless drop loops after seek: burst-drop + periodic latest-frame display.
                     consecutive_drop_count_++;
-                    if (consecutive_drop_count_ >= 8) {
+                    int severe_cadence = ultra_high_rate_4k ? 3 : 8;
+                    if (consecutive_drop_count_ >= severe_cadence) {
                         should_display = should_consume = true;
                         consecutive_drop_count_ = 0;
                         LOGI_RATE(10, "[sync] severe behind cadence display: pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
                                   pts, clock, delay, playback_rate);
                     } else {
                         should_consume = true;
-                    }
-                    // Freeze audio clock shortly so video can catch up instead of diverging forever.
-                    if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
-                        !audio_rebuffer_pending_.load(std::memory_order_acquire) &&
-                        delay < -4.0 &&
-                        player_core_is_playing(player_core_) &&
-                        playItf_ &&
-                        current_volume_.load(std::memory_order_relaxed) > 0.0f) {
-                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
-                        if (r == SL_RESULT_SUCCESS) {
-                            audio_rebuffer_pending_.store(true, std::memory_order_release);
-                            audio_rebuffer_deadline_ms_ = now + 700;
-                            LOGW_RATE(10, "[sync] severe behind pause-audio: delay=%.3f rate=%.2f", delay, playback_rate);
-                        }
                     }
                 } else {
                     should_consume = true;
@@ -1345,6 +1341,14 @@ void AndroidPlayer::renderLoop() {
                 if (playback_rate >= 2.0 || frame_data.width >= 3840) {
                     sync_threshold = std::max(sync_threshold, 0.035);
                 }
+                // Exo-style tolerance widening:
+                // at ultra-high-rate 4K, allow a slightly larger late window
+                // before discarding, reducing excessive drop loops.
+                if (ultra_high_rate_4k) {
+                    sync_threshold = std::max(sync_threshold, 0.060);
+                } else if (high_rate_4k) {
+                    sync_threshold = std::max(sync_threshold, 0.045);
+                }
 
                 int warmup = sync_warmup_frames_.load(std::memory_order_acquire);
                 if (warmup > 0) {
@@ -1362,16 +1366,33 @@ void AndroidPlayer::renderLoop() {
                     bool high_rate_4k = (playback_rate >= 2.0f) &&
                                         (frame_data.width >= 3840 || gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160);
                     if (high_rate_4k && delay > -3.0) {
-                        // Cadence display for high-rate 4K: drop several frames to catch up,
-                        // but periodically show the latest decoded frame to avoid slideshow feel.
-                        consecutive_drop_count_++;
-                        if (consecutive_drop_count_ >= 4) {
+                        // Exo-style dynamic dropping:
+                        // tolerate slight lateness, then progressively increase
+                        // discard cadence as lag grows.
+                        if (ultra_high_rate_4k && delay > -0.25) {
                             should_display = should_consume = true;
-                            consecutive_drop_count_ = 0;
-                            LOGI_RATE(20, "[sync] high-rate cadence display: pts=%.3f clk=%.3f delay=%.3f",
-                                      pts, clock, delay);
                         } else {
-                            should_consume = true;
+                            consecutive_drop_count_++;
+                            int cadence_step = 4;
+                            if (ultra_high_rate_4k) {
+                                if (delay <= -2.5) {
+                                    cadence_step = 3; // drop 2, show 1
+                                } else if (delay <= -1.2) {
+                                    cadence_step = 2; // drop 1, show 1
+                                } else {
+                                    cadence_step = 1; // near-sync: keep smoothness
+                                }
+                            } else {
+                                cadence_step = (delay <= -2.0) ? 4 : 3;
+                            }
+                            if (consecutive_drop_count_ >= cadence_step) {
+                                should_display = should_consume = true;
+                                consecutive_drop_count_ = 0;
+                                LOGI_RATE(20, "[sync] high-rate cadence display: pts=%.3f clk=%.3f delay=%.3f step=%d",
+                                          pts, clock, delay, cadence_step);
+                            } else {
+                                should_consume = true;
+                            }
                         }
                     } else {
                         // Video is behind: drop frame (don't display)
@@ -1511,11 +1532,13 @@ void AndroidPlayer::renderLoop() {
             bool core_playing = player_core_is_playing(player_core_);
             bool high_rate = playback_rate >= 1.75;
             bool likely_4k = gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160;
+            bool ultra_high_rate_4k = likely_4k && playback_rate >= 2.5;
             int64_t rebuffer_trigger_ms = high_rate ? 180 : 260;
             if (likely_4k) rebuffer_trigger_ms = std::max<int64_t>(160, rebuffer_trigger_ms - 20);
             int64_t rebuffer_fallback_ms = high_rate ? 850 : 700;
             if (likely_4k) rebuffer_fallback_ms += 150;
-            if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
+            if (!ultra_high_rate_4k &&
+                !seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 (high_rate || likely_4k) && in_empty_streak &&
                 core_playing &&
                 !audio_rebuffer_pending_.load(std::memory_order_acquire)) {
