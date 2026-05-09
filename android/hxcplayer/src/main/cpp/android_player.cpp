@@ -1180,6 +1180,14 @@ void AndroidPlayer::renderLoop() {
     int     empty_count     = 0;
     bool    in_empty_streak = false;
     int64_t empty_start_ms  = 0;
+    // Software-decode 4K high-rate safeguard:
+    // if severe lag pause happens repeatedly in a short window, apply a
+    // temporary rate cap to pull A/V back into a recoverable range.
+    int64_t adaptive_rate_cap_until_ms = 0;
+    float   adaptive_rate_cap_value = 0.0f;
+    int64_t adaptive_rate_cap_recovery_start_ms = 0;
+    int64_t severe_lag_pause_last_ms = 0;
+    int     severe_lag_pause_burst_count = 0;
 
     int64_t total_render_ms = 0, total_upload_ms = 0;
     int64_t max_render_ms   = 0, max_upload_ms   = 0;
@@ -1277,16 +1285,30 @@ void AndroidPlayer::renderLoop() {
             float requested_rate = requested_playback_rate_.load(std::memory_order_relaxed);
             if (requested_rate <= 0.0f) requested_rate = (float)playback_rate;
             requested_rate = normalize_playback_rate(requested_rate);
-            // Keep UI-requested playback rate stable (e.g. 2.5x).
-            if (std::fabs(playback_rate - requested_rate) > 0.005f) {
-                player_core_set_playback_rate(player_core_, requested_rate);
-                playback_rate = requested_rate;
-            }
 
             bool should_display = false;
             bool should_consume = false;
             bool in_seek_recovery = seek_recovery_active_.load(std::memory_order_acquire);
             bool likely_4k = (frame_data.width >= 3840 || gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160);
+            bool hw_decode_active = player_core_is_video_hardware_decoding(player_core_) != 0;
+            bool sw_decode_4k = likely_4k && !hw_decode_active;
+            if (adaptive_rate_cap_until_ms > 0 && now >= adaptive_rate_cap_until_ms) {
+                SYNCI("evt=adaptive_rate_cap_expire cap=%.2f req=%.2f delay=%.3f",
+                      adaptive_rate_cap_value, requested_rate, delay);
+                adaptive_rate_cap_until_ms = 0;
+                adaptive_rate_cap_value = 0.0f;
+                adaptive_rate_cap_recovery_start_ms = 0;
+            }
+            float target_rate = requested_rate;
+            if (sw_decode_4k && adaptive_rate_cap_until_ms > now &&
+                adaptive_rate_cap_value > 0.0f && requested_rate > adaptive_rate_cap_value) {
+                target_rate = adaptive_rate_cap_value;
+            }
+            // Keep playback rate stable, but allow temporary cap for software 4K severe-lag recovery.
+            if (std::fabs(playback_rate - target_rate) > 0.005f) {
+                player_core_set_playback_rate(player_core_, target_rate);
+                playback_rate = target_rate;
+            }
             bool high_rate_4k = (playback_rate >= 2.0f) && likely_4k;
             bool ultra_high_rate_4k = high_rate_4k && playback_rate >= 2.5f;
             bool mid_rate_4k = !high_rate_4k && likely_4k && playback_rate >= 1.25f;
@@ -1374,6 +1396,22 @@ void AndroidPlayer::renderLoop() {
                             audio_rebuffer_deadline_ms_ = now + lag_pause_fallback_ms;
                             SYNCW("evt=severe_lag_pause_audio lag_ms=%" PRId64 " delay=%.3f rate=%.2f trigger_ms=%" PRId64 " hold_ms=%" PRId64 " fallback_ms=%" PRId64,
                                   severe_lag_ms, delay, playback_rate, lag_pause_trigger_ms, lag_pause_min_hold_ms, lag_pause_fallback_ms);
+                            if (sw_decode_4k && requested_rate >= 2.0f) {
+                                if (severe_lag_pause_last_ms > 0 && (now - severe_lag_pause_last_ms) <= 5000) {
+                                    severe_lag_pause_burst_count++;
+                                } else {
+                                    severe_lag_pause_burst_count = 1;
+                                }
+                                severe_lag_pause_last_ms = now;
+                                if (severe_lag_pause_burst_count >= 3) {
+                                    adaptive_rate_cap_value = 1.25f;
+                                    adaptive_rate_cap_until_ms = now + 12000;
+                                    adaptive_rate_cap_recovery_start_ms = 0;
+                                    severe_lag_pause_burst_count = 0;
+                                    SYNCI("evt=adaptive_rate_cap_apply req=%.2f cap=%.2f duration_ms=%d reason=sw_4k_repeated_severe_lag",
+                                          requested_rate, adaptive_rate_cap_value, 12000);
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1645,7 +1683,14 @@ void AndroidPlayer::renderLoop() {
                 if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                     audio_rebuffer_pending_.load(std::memory_order_acquire)) {
                     if (now >= audio_rebuffer_min_resume_at_ms_) {
-                        if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
+                        bool recover_enough = delay >= ((playback_rate >= 2.0) ? -1.0 : -0.75);
+                        bool resume_by_fallback = now >= audio_rebuffer_deadline_ms_;
+                        if (!recover_enough && !resume_by_fallback) {
+                            SYNCI_RATE(60, "evt=audio_rebuffer_resume_wait delay=%.3f rate=%.2f min_resume_in_ms=%" PRId64 " fallback_in_ms=%" PRId64,
+                                       delay, playback_rate,
+                                       (int64_t)std::max<int64_t>(0, audio_rebuffer_min_resume_at_ms_ - now),
+                                       (int64_t)std::max<int64_t>(0, audio_rebuffer_deadline_ms_ - now));
+                        } else if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
                             audio_rebuffer_paused_at_ms_ = 0;
                             audio_rebuffer_min_resume_at_ms_ = 0;
                             if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
@@ -1654,6 +1699,24 @@ void AndroidPlayer::renderLoop() {
                             }
                         }
                     }
+                }
+                if (sw_decode_4k && adaptive_rate_cap_until_ms > now &&
+                    adaptive_rate_cap_value > 0.0f) {
+                    if (delay >= -0.6) {
+                        if (adaptive_rate_cap_recovery_start_ms == 0) {
+                            adaptive_rate_cap_recovery_start_ms = now;
+                        } else if ((now - adaptive_rate_cap_recovery_start_ms) >= 2200) {
+                            SYNCI("evt=adaptive_rate_cap_release req=%.2f cap=%.2f delay=%.3f",
+                                  requested_rate, adaptive_rate_cap_value, delay);
+                            adaptive_rate_cap_until_ms = 0;
+                            adaptive_rate_cap_value = 0.0f;
+                            adaptive_rate_cap_recovery_start_ms = 0;
+                        }
+                    } else {
+                        adaptive_rate_cap_recovery_start_ms = 0;
+                    }
+                } else {
+                    adaptive_rate_cap_recovery_start_ms = 0;
                 }
                 // If this is the first rendered frame and audio start was deferred,
                 // start audio now so picture and sound appear together.

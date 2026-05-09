@@ -170,7 +170,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         CUSTOM_FILE
     }
 
-    /** 解码模式（默认软解，播放前设置） */
+    /** 解码模式（默认硬解，失败后由内核自动回退软解） */
     enum class DecodeMode {
         SOFTWARE,
         HARDWARE
@@ -313,7 +313,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastOpenUrl: String? = null
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
-    @Volatile private var decodeMode: DecodeMode = DecodeMode.SOFTWARE
+    @Volatile private var decodeMode: DecodeMode = DecodeMode.HARDWARE
 
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
     private var textureDecoderSurface: Surface? = null
