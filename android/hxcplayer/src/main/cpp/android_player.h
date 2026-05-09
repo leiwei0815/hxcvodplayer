@@ -235,15 +235,18 @@ private:
     // until the first frame reaches target PTS.
     std::atomic<bool>   seek_lower_bound_active_{false};
     int64_t             seek_lower_bound_deadline_ms_{0};
+    // Recovery state machine: while active, disable normal AV sync branches.
+    std::atomic<bool>   seek_recovery_active_{false};
+    int64_t             seek_recovery_deadline_ms_{0};
     // During seek, wait for first target video frame before resuming audio.
     std::atomic<bool>   seek_audio_wait_video_{false};
     int64_t             seek_audio_wait_deadline_ms_{0};
     // High-rate cadence: avoid long "all-drop then force old frame" behavior.
     int                 consecutive_drop_count_{0};
-    // Adaptive rate guard for 4K high-rate sync stability.
-    float               effective_playback_rate_{1.0f};
-    int                 adaptive_lag_score_{0};
-    int64_t             last_adaptive_rate_change_ms_{0};
+    // Severe-lag detector for soft re-anchor (prevents endless drop loops).
+    int64_t             severe_lag_start_ms_{0};
+    int64_t             last_soft_reanchor_ms_{0};
+    int                 soft_reanchor_count_{0};
     int               audio_cb_count_{0};
     int               audio_underrun_count_{0};
     int               audio_partial_count_{0};
