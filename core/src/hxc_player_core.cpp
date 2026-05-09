@@ -153,21 +153,42 @@ static enum AVHWDeviceType hxc_platform_hw_device_type() {
 #endif
 }
 
-static enum AVPixelFormat hxc_find_hw_pix_fmt_for_codec(const AVCodec *codec, enum AVHWDeviceType device_type) {
+struct HxcHwCodecConfig {
+    enum AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
+    int methods = 0;
+    bool found = false;
+};
+
+static HxcHwCodecConfig hxc_find_hw_codec_config(const AVCodec *codec, enum AVHWDeviceType device_type) {
+    HxcHwCodecConfig selected;
     if (!codec || device_type == AV_HWDEVICE_TYPE_NONE) {
-        return AV_PIX_FMT_NONE;
+        return selected;
     }
     for (int i = 0;; i++) {
         const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
         if (!config) {
             break;
         }
-        if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
-            config->device_type == device_type) {
-            return config->pix_fmt;
+        if (config->device_type != device_type) {
+            continue;
+        }
+        // Prefer configs that explicitly support HW_DEVICE_CTX, but do not reject
+        // valid HW_FRAMES_CTX / INTERNAL paths (common on some Android builds).
+        if (!selected.found || (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+            selected.pix_fmt = config->pix_fmt;
+            selected.methods = config->methods;
+            selected.found = true;
+            if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
+                break;
+            }
         }
     }
-    return AV_PIX_FMT_NONE;
+    return selected;
+}
+
+static enum AVPixelFormat hxc_find_hw_pix_fmt_for_codec(const AVCodec *codec, enum AVHWDeviceType device_type) {
+    HxcHwCodecConfig config = hxc_find_hw_codec_config(codec, device_type);
+    return config.found ? config.pix_fmt : AV_PIX_FMT_NONE;
 }
 
 static enum AVPixelFormat hxc_find_hw_pix_fmt_from_codec_ctx(const AVCodecContext *ctx) {
@@ -189,7 +210,7 @@ static enum AVPixelFormat hxc_hw_get_format(AVCodecContext *ctx, const enum AVPi
 }
 
 static bool hxc_codec_supports_hw_device(const AVCodec *codec, enum AVHWDeviceType device_type) {
-    return hxc_find_hw_pix_fmt_for_codec(codec, device_type) != AV_PIX_FMT_NONE;
+    return hxc_find_hw_codec_config(codec, device_type).found;
 }
 static bool hxc_try_enable_hw_decode(AVCodecContext *codec_ctx, const AVCodec *codec) {
     if (!codec_ctx || !codec) {
@@ -199,21 +220,23 @@ static bool hxc_try_enable_hw_decode(AVCodecContext *codec_ctx, const AVCodec *c
     if (device_type == AV_HWDEVICE_TYPE_NONE) {
         return false;
     }
-    if (!hxc_codec_supports_hw_device(codec, device_type)) {
+    HxcHwCodecConfig hw_config = hxc_find_hw_codec_config(codec, device_type);
+    if (!hw_config.found) {
         return false;
     }
-
-    AVBufferRef *hw_device_ctx = nullptr;
-    int ret = av_hwdevice_ctx_create(&hw_device_ctx, device_type, nullptr, nullptr, 0);
-    if (ret < 0 || !hw_device_ctx) {
-        LOG_WARNING("创建硬件解码设备失败，回退软解 ret=", ret);
-        return false;
-    }
-    codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-    av_buffer_unref(&hw_device_ctx);
-    if (!codec_ctx->hw_device_ctx) {
-        LOG_WARNING("硬件解码设备引用失败，回退软解");
-        return false;
+    if (hw_config.methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
+        AVBufferRef *hw_device_ctx = nullptr;
+        int ret = av_hwdevice_ctx_create(&hw_device_ctx, device_type, nullptr, nullptr, 0);
+        if (ret < 0 || !hw_device_ctx) {
+            LOG_WARNING("创建硬件解码设备失败，回退软解 ret=", ret);
+            return false;
+        }
+        codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+        av_buffer_unref(&hw_device_ctx);
+        if (!codec_ctx->hw_device_ctx) {
+            LOG_WARNING("硬件解码设备引用失败，回退软解");
+            return false;
+        }
     }
     codec_ctx->get_format = hxc_hw_get_format;
     return true;

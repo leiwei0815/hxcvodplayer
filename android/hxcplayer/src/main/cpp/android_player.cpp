@@ -1186,8 +1186,9 @@ void AndroidPlayer::renderLoop() {
     int64_t adaptive_rate_cap_until_ms = 0;
     float   adaptive_rate_cap_value = 0.0f;
     int64_t adaptive_rate_cap_recovery_start_ms = 0;
-    int64_t severe_lag_pause_last_ms = 0;
-    int     severe_lag_pause_burst_count = 0;
+    // For software 4K over-2x playback, downgrade rate in steps when sustained lag is detected.
+    int64_t sw4k_over2_last_lag_ms = 0;
+    int     sw4k_over2_lag_count = 0;
     // After seek lower-bound hit, some devices may report a temporary clock rollback
     // (audio clock catches up from an older anchor), producing large positive delay
     // and a short "hold/freeze". Keep a brief bypass window to avoid that freeze.
@@ -1400,20 +1401,37 @@ void AndroidPlayer::renderLoop() {
                             audio_rebuffer_deadline_ms_ = now + lag_pause_fallback_ms;
                             SYNCW("evt=severe_lag_pause_audio lag_ms=%" PRId64 " delay=%.3f rate=%.2f trigger_ms=%" PRId64 " hold_ms=%" PRId64 " fallback_ms=%" PRId64,
                                   severe_lag_ms, delay, playback_rate, lag_pause_trigger_ms, lag_pause_min_hold_ms, lag_pause_fallback_ms);
-                            if (sw_decode_4k && requested_rate >= 2.0f) {
-                                if (severe_lag_pause_last_ms > 0 && (now - severe_lag_pause_last_ms) <= 5000) {
-                                    severe_lag_pause_burst_count++;
+                            if (sw_decode_4k && requested_rate > 2.0f) {
+                                const int64_t over2_window_ms = 5000;
+                                if (sw4k_over2_last_lag_ms > 0 && (now - sw4k_over2_last_lag_ms) <= over2_window_ms) {
+                                    sw4k_over2_lag_count++;
                                 } else {
-                                    severe_lag_pause_burst_count = 1;
+                                    sw4k_over2_lag_count = 1;
                                 }
-                                severe_lag_pause_last_ms = now;
-                                if (severe_lag_pause_burst_count >= 3) {
-                                    adaptive_rate_cap_value = 1.25f;
-                                    adaptive_rate_cap_until_ms = now + 12000;
-                                    adaptive_rate_cap_recovery_start_ms = 0;
-                                    severe_lag_pause_burst_count = 0;
-                                    SYNCI("evt=adaptive_rate_cap_apply req=%.2f cap=%.2f duration_ms=%d reason=sw_4k_repeated_severe_lag",
-                                          requested_rate, adaptive_rate_cap_value, 12000);
+                                sw4k_over2_last_lag_ms = now;
+
+                                float new_cap = 0.0f;
+                                const char* reason = "";
+                                if (sw4k_over2_lag_count >= 4 && delay <= -4.0) {
+                                    new_cap = 1.75f;
+                                    reason = "sw4k_over2_persistent_lag";
+                                } else if (sw4k_over2_lag_count >= 2) {
+                                    new_cap = 2.00f;
+                                    reason = "sw4k_over2_unstable";
+                                }
+
+                                if (new_cap > 0.0f) {
+                                    bool need_apply = adaptive_rate_cap_value <= 0.0f ||
+                                                      new_cap < adaptive_rate_cap_value - 0.01f ||
+                                                      adaptive_rate_cap_until_ms <= now;
+                                    if (need_apply) {
+                                        adaptive_rate_cap_value = new_cap;
+                                        adaptive_rate_cap_until_ms = now + 15000;
+                                        adaptive_rate_cap_recovery_start_ms = 0;
+                                        SYNCI("evt=sw4k_auto_downrate req=%.2f cap=%.2f lag_count=%d window_ms=%" PRId64 " delay=%.3f reason=%s",
+                                              requested_rate, adaptive_rate_cap_value,
+                                              sw4k_over2_lag_count, over2_window_ms, delay, reason);
+                                    }
                                 }
                             }
                         }
@@ -1665,6 +1683,19 @@ void AndroidPlayer::renderLoop() {
                             should_display = should_consume = true;
                             consecutive_drop_count_ = 0;
                             LOGI_RATE(20, "[sync] mid-rate cadence display: pts=%.3f clk=%.3f delay=%.3f step=%d",
+                                      pts, clock, delay, cadence_step);
+                        } else {
+                            should_consume = true;
+                        }
+                    } else if (sw_decode_4k && playback_rate < 2.0 && delay > -2.0) {
+                        // Stability-first path for software-decoded 4K below 2x:
+                        // avoid long drop streaks and keep motion continuity.
+                        consecutive_drop_count_++;
+                        int cadence_step = (delay > -0.9) ? 2 : 3;
+                        if (consecutive_drop_count_ >= cadence_step) {
+                            should_display = should_consume = true;
+                            consecutive_drop_count_ = 0;
+                            LOGI_RATE(20, "[sync] sw4k_sub2x cadence display: pts=%.3f clk=%.3f delay=%.3f step=%d",
                                       pts, clock, delay, cadence_step);
                         } else {
                             should_consume = true;
