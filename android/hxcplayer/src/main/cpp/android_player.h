@@ -237,9 +237,8 @@ private:
     // During seek, wait for first target video frame before resuming audio.
     std::atomic<bool>   seek_audio_wait_video_{false};
     int64_t             seek_audio_wait_deadline_ms_{0};
-    // 防止高倍速下长期“只丢不显”导致画面冻结体感。
-    int                 drop_only_streak_{0};
-    int64_t             drop_only_streak_start_ms_{0};
+    // High-rate cadence: avoid long "all-drop then force old frame" behavior.
+    int                 consecutive_drop_count_{0};
     int               audio_cb_count_{0};
     int               audio_underrun_count_{0};
     int               audio_partial_count_{0};

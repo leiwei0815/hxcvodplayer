@@ -288,8 +288,7 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         seek_lower_bound_deadline_ms_ = 0;
         seek_audio_wait_video_.store(false, std::memory_order_release);
         seek_audio_wait_deadline_ms_ = 0;
-        drop_only_streak_ = 0;
-        drop_only_streak_start_ms_ = 0;
+        consecutive_drop_count_ = 0;
         render_cv_.notify_one(); // wake render thread -- frames may be ready
         LOGI("Video opened and paused, waiting for user to play");
 
@@ -473,8 +472,7 @@ void AndroidPlayer::play() {
     audio_rebuffer_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
-    drop_only_streak_ = 0;
-    drop_only_streak_start_ms_ = 0;
+    consecutive_drop_count_ = 0;
 
     if (playItf_) {
         // Defer audio start until the first video frame is rendered to prevent
@@ -500,8 +498,7 @@ void AndroidPlayer::pause() {
     audio_rebuffer_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
-    drop_only_streak_ = 0;
-    drop_only_streak_start_ms_ = 0;
+    consecutive_drop_count_ = 0;
     player_core_pause(player_core_);
 
     if (playItf_) {
@@ -521,8 +518,7 @@ void AndroidPlayer::stop() {
     audio_rebuffer_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
-    drop_only_streak_ = 0;
-    drop_only_streak_start_ms_ = 0;
+    consecutive_drop_count_ = 0;
     has_pending_playback_completed_.store(false, std::memory_order_release);
 
     // Stop OpenSL ES first to prevent new callbacks from being queued,
@@ -553,13 +549,14 @@ void AndroidPlayer::seekTo(double position) {
     seek_lower_bound_active_.store(true, std::memory_order_release);
     seek_lower_bound_deadline_ms_ = now + 2000;
     seek_audio_wait_video_.store(true, std::memory_order_release);
-    seek_audio_wait_deadline_ms_ = now + 1200;
+    seek_audio_wait_deadline_ms_ = now + 2200;
+    audio_rebuffer_pending_.store(false, std::memory_order_release);
+    audio_rebuffer_deadline_ms_ = 0;
     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
         LOGI("[sync] seek pause audio waiting first target frame: result=%d", r);
     }
-    drop_only_streak_ = 0;
-    drop_only_streak_start_ms_ = 0;
+    consecutive_drop_count_ = 0;
     last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
     player_core_seek(player_core_, position);
     render_cv_.notify_one();
@@ -1130,7 +1127,7 @@ void AndroidPlayer::renderLoop() {
             double seek_target_now = seek_target_sec_.load(std::memory_order_acquire);
             if (lower_bound_active && seek_target_now >= 0.0 &&
                 !std::isnan(pts) && !std::isinf(pts)) {
-                constexpr double kSeekLowerBoundEpsilonSec = 0.005; // 5ms guard
+                constexpr double kSeekLowerBoundEpsilonSec = 0.035; // 35ms: easier hit under high-rate
                 if (pts + kSeekLowerBoundEpsilonSec < seek_target_now) {
                     should_consume = true;
                     LOGW_RATE(20, "[sync] seek lower-bound drop: pts=%.3f target=%.3f",
@@ -1231,11 +1228,27 @@ void AndroidPlayer::renderLoop() {
                     }
                     sync_warmup_frames_.store(warmup - 1, std::memory_order_release);
                 } else if (delay <= -sync_threshold) {
-                    // Video is behind: drop frame (don't display)
-                    should_consume = true;
-                    if (delay < -1.0) {
-                        LOGI_RATE(30, "[sync] drop: pts=%.3f clk=%.3f delay=%.3f thr=%.3f",
-                                  pts, clock, delay, sync_threshold);
+                    bool high_rate_4k = (playback_rate >= 2.0) &&
+                                        (frame_data.width >= 3840 || gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160);
+                    if (high_rate_4k && delay > -3.0) {
+                        // Cadence display for high-rate 4K: drop several frames to catch up,
+                        // but periodically show the latest decoded frame to avoid slideshow feel.
+                        consecutive_drop_count_++;
+                        if (consecutive_drop_count_ >= 4) {
+                            should_display = should_consume = true;
+                            consecutive_drop_count_ = 0;
+                            LOGI_RATE(20, "[sync] high-rate cadence display: pts=%.3f clk=%.3f delay=%.3f",
+                                      pts, clock, delay);
+                        } else {
+                            should_consume = true;
+                        }
+                    } else {
+                        // Video is behind: drop frame (don't display)
+                        should_consume = true;
+                        if (delay < -1.0) {
+                            LOGI_RATE(30, "[sync] drop: pts=%.3f clk=%.3f delay=%.3f thr=%.3f",
+                                      pts, clock, delay, sync_threshold);
+                        }
                     }
                 } else if (delay <= kMaxAhead) {
                     should_display = should_consume = true;
@@ -1244,8 +1257,7 @@ void AndroidPlayer::renderLoop() {
             }
 
             if (should_display) {
-                drop_only_streak_ = 0;
-                drop_only_streak_start_ms_ = 0;
+                consecutive_drop_count_ = 0;
                 if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
@@ -1255,7 +1267,8 @@ void AndroidPlayer::renderLoop() {
                 }
                 // If we previously paused audio due to prolonged video starvation,
                 // resume audio as soon as video starts presenting again.
-                if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
+                if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
+                    audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] audio resumed after video rebuffer: result=%d", r);
@@ -1313,60 +1326,11 @@ void AndroidPlayer::renderLoop() {
             }
 
             if (should_consume) {
-                bool guard_forced_display = false;
-                bool drop_only = !should_display;
-                if (drop_only) {
-                    if (drop_only_streak_ == 0) {
-                        drop_only_streak_start_ms_ = now_ms();
-                    }
-                    drop_only_streak_++;
-                    int64_t drop_only_ms = now_ms() - drop_only_streak_start_ms_;
-                    // 保护：避免“连续丢帧太久完全不出画面”。
-                    if ((drop_only_streak_ >= 90 || drop_only_ms >= 450) &&
-                        !std::isnan(pts) && !std::isinf(pts)) {
-                        guard_forced_display = true;
-                        LOGW_RATE(10, "[sync] drop-only guard force display: pts=%.3f clk=%.3f delay=%.3f streak=%d ms=%" PRId64,
-                                  pts, clock, delay, drop_only_streak_, drop_only_ms);
-                    }
-                } else {
-                    drop_only_streak_ = 0;
-                    drop_only_streak_start_ms_ = 0;
-                }
-
-                if (guard_forced_display) {
-                    // Guard 触发后，先渲染一帧再 consume，避免画面长期冻结。
-                    frame_count++;
-                    last_sync_video_pts_ = pts;
-                    auto t0 = now_ms();
-                    int cost = renderFrame(
-                        frame_data.y_data, frame_data.u_data, frame_data.v_data,
-                        frame_data.y_linesize, frame_data.u_linesize, frame_data.v_linesize,
-                        frame_data.width, frame_data.height,
-                        &total_upload_ms, &max_upload_ms);
-                    int64_t render_ms = now_ms() - t0;
-                    total_render_ms += render_ms;
-                    if (render_ms > max_render_ms) max_render_ms = render_ms;
-                    if (cost < 0) {
-                        LOGW("[render] renderFrame failed eglErr=0x%x, will reinit surface", eglGetError());
-                        destroyEGLSurface();
-                        surface_ready = false;
-                        std::lock_guard<std::mutex> lk(render_mutex_);
-                        if (native_window_) {
-                            ANativeWindow_acquire(native_window_);
-                            pending_window_ = native_window_;
-                            window_changed_ = true;
-                        }
-                        continue;
-                    }
-                    drop_only_streak_ = 0;
-                    drop_only_streak_start_ms_ = 0;
-                }
-
                 player_core_consume_video_frame(player_core_);
                 // We just consumed a frame; likely another one is ready soon.
                 // In catch-up mode (high rate / far behind), don't sleep so seek recovery
                 // can drain stale frames quickly.
-                if (!should_display && !guard_forced_display &&
+                if (!should_display &&
                     (delay < -0.20 || playback_rate >= 1.75)) {
                     wait_ms = 0;
                 } else {
@@ -1385,7 +1349,8 @@ void AndroidPlayer::renderLoop() {
             empty_count++;
             // Safety valve: if audio start was deferred but no video frame arrived
             // within the deadline, start audio anyway to avoid permanent mute.
-            if (audio_start_pending_.load(std::memory_order_acquire) &&
+            if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
+                audio_start_pending_.load(std::memory_order_acquire) &&
                 now_ms() >= audio_start_deadline_ms_) {
                 if (audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
@@ -1399,6 +1364,7 @@ void AndroidPlayer::renderLoop() {
             // doesn't hear a long "audio-only" segment and then permanent A/V drift.
             int64_t now = now_ms();
             if (seek_audio_wait_video_.load(std::memory_order_acquire) &&
+                !seek_lower_bound_active_.load(std::memory_order_acquire) &&
                 now >= seek_audio_wait_deadline_ms_) {
                 if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
@@ -1416,7 +1382,9 @@ void AndroidPlayer::renderLoop() {
             if (likely_4k) rebuffer_trigger_ms = std::max<int64_t>(160, rebuffer_trigger_ms - 20);
             int64_t rebuffer_fallback_ms = high_rate ? 850 : 700;
             if (likely_4k) rebuffer_fallback_ms += 150;
-            if ((high_rate || likely_4k) && in_empty_streak && !audio_rebuffer_pending_.load(std::memory_order_acquire)) {
+            if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
+                (high_rate || likely_4k) && in_empty_streak &&
+                !audio_rebuffer_pending_.load(std::memory_order_acquire)) {
                 int64_t empty_ms = now - empty_start_ms;
                 if (empty_ms >= rebuffer_trigger_ms && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                     SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
@@ -1430,7 +1398,8 @@ void AndroidPlayer::renderLoop() {
             }
             // Deadline fallback: if starvation persists too long, resume audio
             // to avoid extended silence under poor network/device conditions.
-            if (audio_rebuffer_pending_.load(std::memory_order_acquire) &&
+            if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
+                audio_rebuffer_pending_.load(std::memory_order_acquire) &&
                 now >= audio_rebuffer_deadline_ms_) {
                 if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
