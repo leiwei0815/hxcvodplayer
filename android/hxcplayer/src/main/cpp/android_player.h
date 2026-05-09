@@ -213,6 +213,7 @@ private:
     std::atomic<bool>  audio_active_{false};
     std::atomic<int>   audio_cb_in_flight_{0};
     std::atomic<float> current_volume_{1.0f}; // last value passed to setVolume()
+    std::atomic<float> requested_playback_rate_{1.0f}; // rate requested by upper layer
     std::atomic<bool> seek_just_happened_{false};
     // When true: audio start is deferred until the first video frame is rendered
     // (avoids audible sound before any picture on dual-player scenarios).
@@ -239,6 +240,10 @@ private:
     int64_t             seek_audio_wait_deadline_ms_{0};
     // High-rate cadence: avoid long "all-drop then force old frame" behavior.
     int                 consecutive_drop_count_{0};
+    // Adaptive rate guard for 4K high-rate sync stability.
+    float               effective_playback_rate_{1.0f};
+    int                 adaptive_lag_score_{0};
+    int64_t             last_adaptive_rate_change_ms_{0};
     int               audio_cb_count_{0};
     int               audio_underrun_count_{0};
     int               audio_partial_count_{0};

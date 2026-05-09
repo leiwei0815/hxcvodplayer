@@ -289,6 +289,9 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         seek_audio_wait_video_.store(false, std::memory_order_release);
         seek_audio_wait_deadline_ms_ = 0;
         consecutive_drop_count_ = 0;
+        effective_playback_rate_ = requested_playback_rate_.load(std::memory_order_relaxed);
+        adaptive_lag_score_ = 0;
+        last_adaptive_rate_change_ms_ = 0;
         render_cv_.notify_one(); // wake render thread -- frames may be ready
         LOGI("Video opened and paused, waiting for user to play");
 
@@ -473,6 +476,9 @@ void AndroidPlayer::play() {
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
     consecutive_drop_count_ = 0;
+    effective_playback_rate_ = requested_playback_rate_.load(std::memory_order_relaxed);
+    adaptive_lag_score_ = 0;
+    last_adaptive_rate_change_ms_ = 0;
 
     if (playItf_) {
         // Defer audio start until the first video frame is rendered to prevent
@@ -499,6 +505,7 @@ void AndroidPlayer::pause() {
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
     consecutive_drop_count_ = 0;
+    adaptive_lag_score_ = 0;
     player_core_pause(player_core_);
 
     if (playItf_) {
@@ -519,6 +526,7 @@ void AndroidPlayer::stop() {
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
     consecutive_drop_count_ = 0;
+    adaptive_lag_score_ = 0;
     has_pending_playback_completed_.store(false, std::memory_order_release);
 
     // Stop OpenSL ES first to prevent new callbacks from being queued,
@@ -557,6 +565,7 @@ void AndroidPlayer::seekTo(double position) {
         LOGI("[sync] seek pause audio waiting first target frame: result=%d", r);
     }
     consecutive_drop_count_ = 0;
+    adaptive_lag_score_ = 0;
     last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
     player_core_seek(player_core_, position);
     render_cv_.notify_one();
@@ -566,6 +575,10 @@ void AndroidPlayer::setPlaybackRate(float rate) {
     if (!player_core_) return;
     
     LOGD("Set playback rate: %f", rate);
+    requested_playback_rate_.store(rate, std::memory_order_relaxed);
+    effective_playback_rate_ = rate;
+    adaptive_lag_score_ = 0;
+    last_adaptive_rate_change_ms_ = 0;
     player_core_set_playback_rate(player_core_, rate);
 }
 
@@ -1109,12 +1122,65 @@ void AndroidPlayer::renderLoop() {
                 if (clock < 0.0) clock = 0.0;
             }
             double delay = pts - clock;
+            int64_t now = now_ms();
             double playback_rate = player_core_get_playback_rate(player_core_);
             if (playback_rate <= 0.0) playback_rate = 1.0;
+            float requested_rate = requested_playback_rate_.load(std::memory_order_relaxed);
+            if (requested_rate <= 0.0f) requested_rate = (float)playback_rate;
+            bool likely_4k_stream = frame_data.width >= 3840 || gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160;
+            bool can_adapt_rate = requested_rate >= 2.0f
+                    && likely_4k_stream
+                    && !seek_audio_wait_video_.load(std::memory_order_acquire);
+
+            // Adaptive playback-rate guard:
+            // if video consistently lags behind audio at high-rate 4K, temporarily
+            // lower the effective rate to re-sync, then step back toward requested.
+            if (can_adapt_rate) {
+                if (delay < -2.5) {
+                    adaptive_lag_score_ = std::min(20, adaptive_lag_score_ + 2);
+                } else if (delay < -1.2) {
+                    adaptive_lag_score_ = std::min(20, adaptive_lag_score_ + 1);
+                } else if (delay > -0.5) {
+                    adaptive_lag_score_ = std::max(0, adaptive_lag_score_ - 1);
+                }
+
+                bool cooldown_ok = (last_adaptive_rate_change_ms_ == 0) ||
+                                   (now - last_adaptive_rate_change_ms_ >= 500);
+                if (cooldown_ok && adaptive_lag_score_ >= 8 && effective_playback_rate_ > 1.75f) {
+                    float new_rate = std::max(1.75f, effective_playback_rate_ - 0.20f);
+                    if (new_rate < effective_playback_rate_) {
+                        effective_playback_rate_ = new_rate;
+                        player_core_set_playback_rate(player_core_, effective_playback_rate_);
+                        last_adaptive_rate_change_ms_ = now;
+                        LOGW("[sync] adaptive rate down: req=%.2f eff=%.2f delay=%.3f score=%d",
+                             requested_rate, effective_playback_rate_, delay, adaptive_lag_score_);
+                    }
+                } else if (cooldown_ok && adaptive_lag_score_ <= 1 &&
+                           effective_playback_rate_ + 0.01f < requested_rate &&
+                           delay > -0.7) {
+                    float new_rate = std::min(requested_rate, effective_playback_rate_ + 0.10f);
+                    if (new_rate > effective_playback_rate_) {
+                        effective_playback_rate_ = new_rate;
+                        player_core_set_playback_rate(player_core_, effective_playback_rate_);
+                        last_adaptive_rate_change_ms_ = now;
+                        LOGI("[sync] adaptive rate up: req=%.2f eff=%.2f delay=%.3f score=%d",
+                             requested_rate, effective_playback_rate_, delay, adaptive_lag_score_);
+                    }
+                }
+                playback_rate = effective_playback_rate_;
+            } else {
+                // Outside high-rate adaptation scope, stay on requested rate.
+                if (std::fabs(effective_playback_rate_ - requested_rate) > 0.01f) {
+                    effective_playback_rate_ = requested_rate;
+                    player_core_set_playback_rate(player_core_, effective_playback_rate_);
+                    last_adaptive_rate_change_ms_ = now;
+                    adaptive_lag_score_ = 0;
+                }
+                playback_rate = effective_playback_rate_;
+            }
 
             bool should_display = false;
             bool should_consume = false;
-            int64_t now = now_ms();
 
             // Tencent-like behavior: after seek, drop frames older than target PTS
             // (lower bound) until we hit the first eligible frame.
@@ -1196,10 +1262,11 @@ void AndroidPlayer::renderLoop() {
                     should_display = should_consume = true;
                 }
             } else if (!should_consume && delay < -5.0) {
-                // Safety: never stay in long drop-only loops under severe skew.
-                LOGI_RATE(10, "[sync] severe behind forced: pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
+                // On severe lag, prioritize catch-up by dropping stale frames.
+                // Let cadence logic handle periodic display when delay shrinks.
+                should_consume = true;
+                LOGI_RATE(10, "[sync] severe behind drop: pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
                           pts, clock, delay, playback_rate);
-                should_display = should_consume = true;
             } else if (!should_consume) {
                 // Dynamic sync threshold based on actual frame interval
                 // (same algorithm as iOS HXCPlayerControl.mm).
@@ -1228,7 +1295,7 @@ void AndroidPlayer::renderLoop() {
                     }
                     sync_warmup_frames_.store(warmup - 1, std::memory_order_release);
                 } else if (delay <= -sync_threshold) {
-                    bool high_rate_4k = (playback_rate >= 2.0) &&
+                    bool high_rate_4k = (requested_rate >= 2.0f) &&
                                         (frame_data.width >= 3840 || gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160);
                     if (high_rate_4k && delay > -3.0) {
                         // Cadence display for high-rate 4K: drop several frames to catch up,
