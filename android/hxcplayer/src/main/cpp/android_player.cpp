@@ -508,7 +508,12 @@ void AndroidPlayer::setVolume(float volume) {
     // If volume is raised from 0 to non-zero while the player is running,
     // ensure the OpenSL ES audio output is actually playing (it may have been
     // skipped during the deferred-start path when the player was muted).
-    if (prev <= 0.0f && volume > 0.0f && playItf_ && audio_active_) {
+    // Guard with core playing state to avoid resuming OpenSL while app is paused.
+    if (prev <= 0.0f
+        && volume > 0.0f
+        && playItf_
+        && audio_active_
+        && player_core_is_playing(player_core_)) {
         SLuint32 state = 0;
         if ((*playItf_)->GetPlayState(playItf_, &state) == SL_RESULT_SUCCESS &&
             state != SL_PLAYSTATE_PLAYING) {
@@ -1797,12 +1802,14 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     // The destructor and openURL both acquire this lock BEFORE destroying/stopping
     // the core, so swr_convert() inside player_core_get_audio_data() is guaranteed
     // to finish before the SwrContext is freed.
-    std::unique_lock<std::mutex> lock(audio_mutex_);
+    // Keep audio_mutex_ held until after Enqueue:
+    // destroyAudioOutput/openURL acquire the same lock before tearing down core/OpenSL,
+    // so this prevents enqueue-on-destroy races.
+    std::lock_guard<std::mutex> lock(audio_mutex_);
 
     if (!audio_active_ || !player_core_ || audio_buffer_size_ == 0) {
         int sz = audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096;
         memset(audio_buffer_, 0, sz);
-        lock.unlock();
         (*bq)->Enqueue(bq, audio_buffer_, sz);
         return;
     }
@@ -1844,6 +1851,5 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         audio_partial_count_  = 0;
     }
 
-    lock.unlock();
     (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
 }
