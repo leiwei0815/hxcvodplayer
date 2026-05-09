@@ -12,6 +12,7 @@ import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import kotlin.jvm.JvmOverloads
+import kotlin.math.abs
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
@@ -40,7 +41,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val context: Context,
     private val renderViewType: VideoRenderViewType = VideoRenderViewType.SURFACE_VIEW
 ) {
-
     /** 视频输出目标：SurfaceView（默认）或 TextureView */
     enum class VideoRenderViewType {
         /**
@@ -56,6 +56,9 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     companion object {
         private const val TAG = "HXCPlayerControl"
+        private const val MIN_PLAYBACK_RATE = 0.5f
+        private const val MAX_PLAYBACK_RATE = 3.0f
+        private const val MAX_PLAYBACK_RATE_SNAP_EPSILON = 0.01f
 
         init {
             System.loadLibrary("hxcplayer")
@@ -861,7 +864,12 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun setPlaybackRate(rate: Float) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        nativeSetPlaybackRate(handle, rate.coerceIn(0.5f, 3.0f))
+        var normalizedRate = if (rate.isFinite()) rate else 1.0f
+        normalizedRate = normalizedRate.coerceIn(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
+        if (abs(normalizedRate - MAX_PLAYBACK_RATE) <= MAX_PLAYBACK_RATE_SNAP_EPSILON) {
+            normalizedRate = MAX_PLAYBACK_RATE
+        }
+        nativeSetPlaybackRate(handle, normalizedRate)
     }
 
     // 设置音量

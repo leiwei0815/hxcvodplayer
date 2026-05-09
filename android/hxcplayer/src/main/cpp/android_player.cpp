@@ -67,6 +67,24 @@
     } \
 } while(0)
 
+namespace {
+constexpr float kMinPlaybackRate = 0.5f;
+constexpr float kMaxPlaybackRate = 3.0f;
+constexpr float kMaxPlaybackRateSnapEpsilon = 0.01f;
+
+inline float normalize_playback_rate(float rate) {
+    if (!std::isfinite(rate)) return 1.0f;
+    if (rate < kMinPlaybackRate) return kMinPlaybackRate;
+    if (rate > kMaxPlaybackRate) return kMaxPlaybackRate;
+    // Snap near-upper-bound values to exact 3.0x so "3.0" never falls back
+    // to 2.99x because of float precision / formatting jitter.
+    if (std::fabs(rate - kMaxPlaybackRate) <= kMaxPlaybackRateSnapEpsilon) {
+        return kMaxPlaybackRate;
+    }
+    return rate;
+}
+}  // namespace
+
 AndroidPlayer::AndroidPlayer()
     : player_core_(nullptr)
     , native_window_(nullptr)
@@ -581,10 +599,11 @@ void AndroidPlayer::seekTo(double position) {
 
 void AndroidPlayer::setPlaybackRate(float rate) {
     if (!player_core_) return;
-    
-    LOGD("Set playback rate: %f", rate);
-    requested_playback_rate_.store(rate, std::memory_order_relaxed);
-    player_core_set_playback_rate(player_core_, rate);
+
+    float normalized_rate = normalize_playback_rate(rate);
+    LOGD("Set playback rate: req=%f normalized=%f", rate, normalized_rate);
+    requested_playback_rate_.store(normalized_rate, std::memory_order_relaxed);
+    player_core_set_playback_rate(player_core_, normalized_rate);
 }
 
 void AndroidPlayer::setVolume(float volume) {
@@ -1132,8 +1151,9 @@ void AndroidPlayer::renderLoop() {
             if (playback_rate <= 0.0) playback_rate = 1.0;
             float requested_rate = requested_playback_rate_.load(std::memory_order_relaxed);
             if (requested_rate <= 0.0f) requested_rate = (float)playback_rate;
+            requested_rate = normalize_playback_rate(requested_rate);
             // Keep UI-requested playback rate stable (e.g. 2.5x).
-            if (std::fabs(playback_rate - requested_rate) > 0.01f) {
+            if (std::fabs(playback_rate - requested_rate) > 0.005f) {
                 player_core_set_playback_rate(player_core_, requested_rate);
                 playback_rate = requested_rate;
             }
@@ -1147,12 +1167,14 @@ void AndroidPlayer::renderLoop() {
             // Soft re-anchor safeguard: if we stay severely behind for too long under
             // high-rate 4K playback, perform one bounded seek near audio clock to break
             // out of endless drop loops.
-            if (!in_seek_recovery && high_rate_4k && delay < -4.0) {
+            if (!in_seek_recovery && high_rate_4k && delay < -5.0 &&
+                player_core_is_playing(player_core_)) {
                 if (severe_lag_start_ms_ == 0) severe_lag_start_ms_ = now;
-                bool lag_persistent = (now - severe_lag_start_ms_) >= 1200;
+                bool lag_persistent = (now - severe_lag_start_ms_) >= 2200;
                 bool reanchor_cooldown_ok = (last_soft_reanchor_ms_ == 0) ||
-                                            (now - last_soft_reanchor_ms_) >= 3000;
-                if (lag_persistent && reanchor_cooldown_ok) {
+                                            (now - last_soft_reanchor_ms_) >= 8000;
+                bool reanchor_budget_ok = soft_reanchor_count_ < 2;
+                if (lag_persistent && reanchor_cooldown_ok && reanchor_budget_ok) {
                     double target = clock - 0.15;
                     if (target < 0.0) target = 0.0;
                     seek_just_happened_.store(true, std::memory_order_release);
@@ -1294,6 +1316,7 @@ void AndroidPlayer::renderLoop() {
                     if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                         !audio_rebuffer_pending_.load(std::memory_order_acquire) &&
                         delay < -4.0 &&
+                        player_core_is_playing(player_core_) &&
                         playItf_ &&
                         current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
@@ -1485,6 +1508,7 @@ void AndroidPlayer::renderLoop() {
             }
             double playback_rate = player_core_get_playback_rate(player_core_);
             if (playback_rate <= 0.0) playback_rate = 1.0;
+            bool core_playing = player_core_is_playing(player_core_);
             bool high_rate = playback_rate >= 1.75;
             bool likely_4k = gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160;
             int64_t rebuffer_trigger_ms = high_rate ? 180 : 260;
@@ -1493,6 +1517,7 @@ void AndroidPlayer::renderLoop() {
             if (likely_4k) rebuffer_fallback_ms += 150;
             if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 (high_rate || likely_4k) && in_empty_streak &&
+                core_playing &&
                 !audio_rebuffer_pending_.load(std::memory_order_acquire)) {
                 int64_t empty_ms = now - empty_start_ms;
                 if (empty_ms >= rebuffer_trigger_ms && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
@@ -1511,7 +1536,7 @@ void AndroidPlayer::renderLoop() {
                 audio_rebuffer_pending_.load(std::memory_order_acquire) &&
                 now >= audio_rebuffer_deadline_ms_) {
                 if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
-                    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                    if (core_playing && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] audio rebuffer fallback resume: result=%d", r);
                     }
