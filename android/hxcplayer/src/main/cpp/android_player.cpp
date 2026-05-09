@@ -17,9 +17,33 @@
 
 
 #define LOG_TAG "HXC"
+// Runtime log level:
+//   0 = ERROR only (release default)
+//   1 = WARN + ERROR
+//   2 = INFO + WARN + ERROR
+//   3 = DEBUG + INFO + WARN + ERROR
+#ifndef HXC_PLAYER_RUNTIME_LOG_LEVEL
+#define HXC_PLAYER_RUNTIME_LOG_LEVEL 0
+#endif
+
+#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 3
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGD(...) ((void)0)
+#endif
+
+#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 2
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGI(...) ((void)0)
+#endif
+
+#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 1
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGW(...) ((void)0)
+#endif
+
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // Rate-limited logging: prints at most once every N calls.
@@ -28,6 +52,12 @@
     static int _rl_cnt = 0; \
     if (++_rl_cnt % (N) == 1) { \
         LOGI(__VA_ARGS__); \
+    } \
+} while(0)
+#define LOGD_RATE(N, ...) do { \
+    static int _rl_cnt = 0; \
+    if (++_rl_cnt % (N) == 1) { \
+        LOGD(__VA_ARGS__); \
     } \
 } while(0)
 #define LOGW_RATE(N, ...) do { \
@@ -1019,9 +1049,10 @@ void AndroidPlayer::renderLoop() {
 
         if (get_result == 0) {
             if (in_empty_streak) {
-                LOGI("[render] buffer refilled after %" PRId64 "ms (empty_cnt=%d) frame=%dx%d",
-                     now_ms() - empty_start_ms, empty_count,
-                     frame_data.width, frame_data.height);
+                // Hot path in dual-player scenes: keep as debug + rate-limited.
+                LOGD_RATE(30, "[render] buffer refilled after %" PRId64 "ms (empty_cnt=%d) frame=%dx%d",
+                          now_ms() - empty_start_ms, empty_count,
+                          frame_data.width, frame_data.height);
                 in_empty_streak = false;
             }
             empty_count = 0;
@@ -1189,14 +1220,15 @@ void AndroidPlayer::renderLoop() {
             if (!in_empty_streak) {
                 empty_start_ms  = now_ms();
                 in_empty_streak = true;
-                LOGI("[render] frame queue empty: state=%d pos=%.3f",
-                     player_core_get_state(player_core_),
-                     player_core_get_position(player_core_));
+                // Hot path in dual-player scenes: keep as debug + rate-limited.
+                LOGD_RATE(30, "[render] frame queue empty: state=%d pos=%.3f",
+                          player_core_get_state(player_core_),
+                          player_core_get_position(player_core_));
             } else if (empty_count % 300 == 0) {
-                LOGI_RATE(1, "[render] still buffering: empty_ms=%" PRId64 " state=%d pos=%.3f",
-                     now_ms() - empty_start_ms,
-                     player_core_get_state(player_core_),
-                     player_core_get_position(player_core_));
+                LOGD_RATE(10, "[render] still buffering: empty_ms=%" PRId64 " state=%d pos=%.3f",
+                          now_ms() - empty_start_ms,
+                          player_core_get_state(player_core_),
+                          player_core_get_position(player_core_));
 
             }
             if (empty_count == 12) redrawLastFrame();
