@@ -949,6 +949,10 @@ void AndroidPlayer::renderLoop() {
     const double kSyncThreshold = 0.050; // 50 ms: drop if video is behind
     const double kMaxAhead      = 2.000; // 2 s:  hold if video is too far ahead
 
+    // Adaptive wait: shorten when we know there's work to do soon.
+    // Default 16ms (~60fps). Lengthened when queue is empty (decoder filling).
+    int wait_ms = 16;
+
     auto now_ms = []() -> int64_t {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -960,7 +964,7 @@ void AndroidPlayer::renderLoop() {
             std::unique_lock<std::mutex> lock(render_mutex_);
 
             if (!window_changed_) {
-                render_cv_.wait_for(lock, std::chrono::milliseconds(16),
+                render_cv_.wait_for(lock, std::chrono::milliseconds(wait_ms),
                     [this]{ return window_changed_ || stop_requested_; });
             }
 
@@ -1152,9 +1156,16 @@ void AndroidPlayer::renderLoop() {
 
             if (should_consume) {
                 player_core_consume_video_frame(player_core_);
+                // We just consumed a frame; likely another one is ready soon.
+                // Use a short wait so we check quickly without busy-spinning.
+                wait_ms = 8;
             } else {
-                // Video ahead of clock: brief sleep then re-check
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                // Video ahead of clock: sleep proportional to how far ahead,
+                // capped at 16ms. This lets the audio clock advance and avoids
+                // wasting CPU while waiting for the right presentation time.
+                int ahead_ms = (int)(delay * 1000.0);
+                wait_ms = std::min(16, std::max(4, ahead_ms / 2));
+                std::this_thread::sleep_for(std::chrono::milliseconds(4));
             }
 
         } else {
@@ -1184,7 +1195,11 @@ void AndroidPlayer::renderLoop() {
 
             }
             if (empty_count == 12) redrawLastFrame();
-            // condvar 16ms timeout handles the pace; no extra sleep needed
+            // When the frame queue is empty the decoder is still filling it.
+            // Sleep briefly to yield CPU to decode threads, then use a longer
+            // condvar wait so we don't spin faster than decoding produces frames.
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            wait_ms = 16; // reset to normal pace; decoder needs time
         }
     }
 
