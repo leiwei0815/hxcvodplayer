@@ -242,6 +242,27 @@ static bool hxc_try_enable_hw_decode(AVCodecContext *codec_ctx, const AVCodec *c
     return true;
 }
 
+#if defined(__ANDROID__)
+static const char* hxc_get_android_mediacodec_decoder_name(enum AVCodecID codec_id) {
+    switch (codec_id) {
+        case AV_CODEC_ID_H264:
+            return "h264_mediacodec";
+        case AV_CODEC_ID_HEVC:
+            return "hevc_mediacodec";
+        case AV_CODEC_ID_MPEG4:
+            return "mpeg4_mediacodec";
+        case AV_CODEC_ID_VP8:
+            return "vp8_mediacodec";
+        case AV_CODEC_ID_VP9:
+            return "vp9_mediacodec";
+        case AV_CODEC_ID_AV1:
+            return "av1_mediacodec";
+        default:
+            return nullptr;
+    }
+}
+#endif
+
 }  // namespace
 
 std::string PlayerCore::get_video_decode_diagnostic() const {
@@ -1946,8 +1967,32 @@ int PlayerCore::stream_component_open(int stream_index) {
     AVStream* stream = format_ctx_->streams[stream_index];
     AVCodecParameters* codecpar = stream->codecpar;
     
-    // 查找解码器
+    bool is_video_stream = codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
+    bool request_video_hw_decode =
+        (is_video_stream && config_.decode_mode == DecodeMode::Hardware);
+
+    // 查找解码器（默认先拿通用解码器，作为最终回退）
     const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
+    const AVCodec* fallback_codec = codec;
+#if defined(__ANDROID__)
+    bool use_android_mediacodec_decoder = false;
+    bool android_mediacodec_decoder_missing = false;
+    bool android_mediacodec_name_unsupported = false;
+    if (request_video_hw_decode) {
+        const char* hw_decoder_name = hxc_get_android_mediacodec_decoder_name(codecpar->codec_id);
+        if (hw_decoder_name) {
+            const AVCodec* hw_codec = avcodec_find_decoder_by_name(hw_decoder_name);
+            if (hw_codec) {
+                codec = hw_codec;
+                use_android_mediacodec_decoder = true;
+            } else {
+                android_mediacodec_decoder_missing = true;
+            }
+        } else {
+            android_mediacodec_name_unsupported = true;
+        }
+    }
+#endif
     if (!codec) {
         std::ostringstream oss;
         oss << "找不到解码器 codecID:" << codecpar->codec_id;
@@ -1976,15 +2021,33 @@ int PlayerCore::stream_component_open(int stream_index) {
         return -1;
     }
 
-    bool is_video_stream = codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
-    bool request_video_hw_decode =
-        (is_video_stream && config_.decode_mode == DecodeMode::Hardware);
     bool hw_decode_enabled = false;
     std::string decode_diag;
     if (is_video_stream) {
         decode_diag = request_video_hw_decode ? "requested=hardware" : "requested=software";
+        if (codec && codec->name) {
+            decode_diag += std::string(" decoder=") + codec->name;
+        }
+#if defined(__ANDROID__)
+        if (request_video_hw_decode) {
+            decode_diag += std::string(" hw_decoder=") +
+                           (use_android_mediacodec_decoder ? "mediacodec_named" : "default_decoder");
+            if (android_mediacodec_decoder_missing) {
+                decode_diag += " hint=mediacodec_decoder_not_found";
+            } else if (android_mediacodec_name_unsupported) {
+                decode_diag += " hint=codec_no_mediacodec_mapping";
+            }
+        }
+#endif
     }
     if (request_video_hw_decode) {
+#if defined(__ANDROID__)
+        if (use_android_mediacodec_decoder) {
+            // Android 显式 mediacodec 解码器路径：由解码器内部走硬件链路。
+            hw_decode_enabled = true;
+        } else
+#endif
+        {
         enum AVHWDeviceType device_type = hxc_platform_hw_device_type();
         if (device_type == AV_HWDEVICE_TYPE_NONE) {
             decode_diag += " reason=platform_hw_device_none";
@@ -1996,6 +2059,7 @@ int PlayerCore::stream_component_open(int stream_index) {
             decode_diag.find("reason=") == std::string::npos) {
             decode_diag += " reason=hw_device_create_or_ref_failed";
         }
+        }
         LOG_INFO("视频解码模式：请求硬解，启用结果=", hw_decode_enabled ? 1 : 0);
     } else if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
         LOG_INFO("视频解码模式：软解");
@@ -2005,7 +2069,8 @@ int PlayerCore::stream_component_open(int stream_index) {
     // 软解多线程：使用 SLICE 级并行（帧内切片并行），不改变帧的输出顺序，
     // iOS AVSampleBufferDisplayLayer 和 Android OpenGL ES 渲染都安全。
     // FF_THREAD_FRAME（帧级并行）会打乱帧顺序，对 iOS 渲染层有兼容风险，故不使用。
-    if (!request_video_hw_decode && codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+    // 注意：即便请求了硬解，只要最终未启用硬解，也必须开启软解多线程。
+    if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO && (!request_video_hw_decode || !hw_decode_enabled)) {
         codec_ctx->thread_count = 0;                 // 0 = FFmpeg 自动选核数
         codec_ctx->thread_type  = FF_THREAD_SLICE;   // slice-level: 帧内并行，顺序不变
         LOG_INFO("视频软解多线程：thread_count=auto(0), thread_type=SLICE");
@@ -2018,6 +2083,7 @@ int PlayerCore::stream_component_open(int stream_index) {
         if (is_video_stream) {
             decode_diag += " reason=hw_open2_failed_fallback_soft";
         }
+        codec = fallback_codec ? fallback_codec : codec;
         avcodec_free_context(&codec_ctx);
         codec_ctx = alloc_codec_context();
         if (!codec_ctx) {

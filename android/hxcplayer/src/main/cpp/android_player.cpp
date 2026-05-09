@@ -1412,7 +1412,7 @@ void AndroidPlayer::renderLoop() {
 
                                 float new_cap = 0.0f;
                                 const char* reason = "";
-                                if (sw4k_over2_lag_count >= 4 && delay <= -4.0) {
+                                if (sw4k_over2_lag_count >= 3 && delay <= -3.0) {
                                     new_cap = 1.75f;
                                     reason = "sw4k_over2_persistent_lag";
                                 } else if (sw4k_over2_lag_count >= 2) {
