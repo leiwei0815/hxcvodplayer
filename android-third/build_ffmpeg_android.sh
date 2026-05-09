@@ -205,6 +205,8 @@ build_ffmpeg() {
         --disable-decoders \
         --enable-decoder=h264 \
         --enable-decoder=hevc \
+        --enable-decoder=h264_mediacodec \
+        --enable-decoder=hevc_mediacodec \
         --enable-decoder=mpeg4 \
         --enable-decoder=aac \
         --enable-decoder=mp3 \
