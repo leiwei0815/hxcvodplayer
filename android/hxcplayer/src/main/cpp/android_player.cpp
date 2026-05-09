@@ -1188,6 +1188,10 @@ void AndroidPlayer::renderLoop() {
     int64_t adaptive_rate_cap_recovery_start_ms = 0;
     int64_t severe_lag_pause_last_ms = 0;
     int     severe_lag_pause_burst_count = 0;
+    // After seek lower-bound hit, some devices may report a temporary clock rollback
+    // (audio clock catches up from an older anchor), producing large positive delay
+    // and a short "hold/freeze". Keep a brief bypass window to avoid that freeze.
+    int64_t post_seek_ahead_bypass_until_ms = 0;
 
     int64_t total_render_ms = 0, total_upload_ms = 0;
     int64_t max_render_ms   = 0, max_upload_ms   = 0;
@@ -1311,7 +1315,7 @@ void AndroidPlayer::renderLoop() {
             }
             bool high_rate_4k = (playback_rate >= 2.0f) && likely_4k;
             bool ultra_high_rate_4k = high_rate_4k && playback_rate >= 2.5f;
-            bool mid_rate_4k = !high_rate_4k && likely_4k && playback_rate >= 1.25f;
+            bool mid_rate_4k = false; // rollback: avoid mid-rate (1.25~1.75x) aggressive sync policy
             SYNCI_RATE(120, "evt=sync_snapshot pts=%.3f clk=%.3f delay=%.3f rate=%.2f video_w=%d video_h=%d is_4k=%d is_high_rate_4k=%d is_ultra_high_rate_4k=%d",
                        pts, clock, delay, playback_rate, frame_data.width, frame_data.height,
                        likely_4k ? 1 : 0, high_rate_4k ? 1 : 0, ultra_high_rate_4k ? 1 : 0);
@@ -1319,7 +1323,7 @@ void AndroidPlayer::renderLoop() {
             // Soft re-anchor safeguard: if we stay severely behind for too long under
             // 4K high/mid-rate playback, perform one bounded seek near audio clock to
             // break out of endless drop loops (especially after rate changes).
-            bool reanchor_candidate_4k = likely_4k && playback_rate >= 1.25f;
+            bool reanchor_candidate_4k = likely_4k && playback_rate >= 2.0f;
             double reanchor_delay_threshold = -3.2;
             int64_t reanchor_lag_persistent_ms = 3000;
             int64_t reanchor_cooldown_ms = 6000;
@@ -1378,7 +1382,7 @@ void AndroidPlayer::renderLoop() {
             // users don't hear "audio keeps moving while picture is frozen".
             if (!in_seek_recovery && !seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 !audio_rebuffer_pending_.load(std::memory_order_acquire) &&
-                player_core_is_playing(player_core_) && likely_4k) {
+                player_core_is_playing(player_core_) && high_rate_4k) {
                 double lag_pause_threshold = (playback_rate >= 2.0) ? -2.8 : -2.2;
                 int64_t lag_pause_trigger_ms = (playback_rate >= 2.5) ? 320 : ((playback_rate >= 2.0) ? 420 : 700);
                 int64_t lag_pause_fallback_ms = (playback_rate >= 2.0) ? 1400 : 1800;
@@ -1432,6 +1436,11 @@ void AndroidPlayer::renderLoop() {
                     // At 2.5x/3x 4K, avoid waiting for strict PTS equality.
                     seek_epsilon_sec = 0.10;
                 }
+                if (sw_decode_4k && playback_rate >= 2.0) {
+                    // Software-decode 4K high-rate seek can take long to catch target.
+                    // Allow a wider lower-bound window to avoid prolonged frozen waits.
+                    seek_epsilon_sec = std::max(seek_epsilon_sec, 0.35);
+                }
                 double seek_from_now = seek_from_sec_.load(std::memory_order_acquire);
                 bool is_backward_seek = seek_from_now >= 0.0 &&
                                         (seek_from_now - seek_target_now) > 0.5;
@@ -1443,6 +1452,10 @@ void AndroidPlayer::renderLoop() {
                     seek_epsilon_sec = 0.250;
                     if (ultra_high_rate_4k) {
                         seek_epsilon_sec = 0.350;
+                    }
+                    if (sw_decode_4k && playback_rate >= 2.0) {
+                        // After deadline, prioritize quick visual recovery over exact seek hit.
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, 1.80);
                     }
                 }
                 if (pts + seek_epsilon_sec < seek_target_now) {
@@ -1469,6 +1482,7 @@ void AndroidPlayer::renderLoop() {
                     seek_recovery_deadline_ms_ = 0;
                     in_seek_recovery = false;
                     sync_warmup_frames_.store(24, std::memory_order_release);
+                    post_seek_ahead_bypass_until_ms = now + 5000;
                     should_display = should_consume = true;
                     LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f", pts, seek_target_now);
                     SYNCI("evt=seek_lower_bound_hit pts=%.3f target=%.3f", pts, seek_target_now);
@@ -1665,6 +1679,15 @@ void AndroidPlayer::renderLoop() {
                     }
                 } else if (delay <= kMaxAhead) {
                     should_display = should_consume = true;
+                } else if (!in_seek_recovery &&
+                           high_rate_4k &&
+                           post_seek_ahead_bypass_until_ms > now) {
+                    // Seek just recovered, but clock may temporarily roll back.
+                    // Bypass "ahead hold" briefly so users don't see frozen picture.
+                    should_display = should_consume = true;
+                    SYNCI_RATE(30, "evt=post_seek_ahead_bypass pts=%.3f clk=%.3f delay=%.3f rate=%.2f bypass_left_ms=%" PRId64,
+                               pts, clock, delay, playback_rate,
+                               (int64_t)std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now));
                 }
                 // else: video > 2s ahead of audio -- hold frame (don't consume)
             }
@@ -1832,7 +1855,7 @@ void AndroidPlayer::renderLoop() {
             double playback_rate = player_core_get_playback_rate(player_core_);
             if (playback_rate <= 0.0) playback_rate = 1.0;
             bool core_playing = player_core_is_playing(player_core_);
-            bool high_rate = playback_rate >= 1.75;
+            bool high_rate = playback_rate >= 2.0;
             bool likely_4k = gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160;
             bool in_loading = is_loading_.load(std::memory_order_acquire);
             bool in_sync_warmup = sync_warmup_frames_.load(std::memory_order_acquire) > 0;
