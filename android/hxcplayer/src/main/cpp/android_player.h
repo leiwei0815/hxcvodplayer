@@ -218,10 +218,17 @@ private:
     // (avoids audible sound before any picture on dual-player scenarios).
     std::atomic<bool> audio_start_pending_{false};
     int64_t           audio_start_deadline_ms_{0}; // wall-clock deadline for the deferred start
+    // High-rate rebuffer: when video starvation lasts too long, temporarily
+    // pause OpenSL audio to avoid "audio keeps moving but video frozen".
+    std::atomic<bool> audio_rebuffer_pending_{false};
+    int64_t           audio_rebuffer_deadline_ms_{0};
     // AV sync helpers (mirroring iOS HXCPlayerControl logic)
     double            audio_output_latency_sec_{0.0}; // estimated hw output queue delay
     std::atomic<int>  sync_warmup_frames_{0};         // relaxed sync window after open/seek
     double            last_sync_video_pts_{std::numeric_limits<double>::quiet_NaN()};
+    // Seek 后短时间内用于“快速追赶”的目标位点（仅高倍速/高分辨率启用）。
+    std::atomic<double> seek_target_sec_{-1.0};
+    std::atomic<int>    seek_fast_catchup_frames_{0};
     int               audio_cb_count_{0};
     int               audio_underrun_count_{0};
     int               audio_partial_count_{0};

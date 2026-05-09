@@ -23,7 +23,7 @@
 //   2 = INFO + WARN + ERROR
 //   3 = DEBUG + INFO + WARN + ERROR
 #ifndef HXC_PLAYER_RUNTIME_LOG_LEVEL
-#define HXC_PLAYER_RUNTIME_LOG_LEVEL 0
+#define HXC_PLAYER_RUNTIME_LOG_LEVEL 2
 #endif
 
 #if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 3
@@ -279,6 +279,10 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         // Reset sync state for the new stream
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
+        audio_rebuffer_pending_.store(false, std::memory_order_release);
+        audio_rebuffer_deadline_ms_ = 0;
+        seek_target_sec_.store(-1.0, std::memory_order_release);
+        seek_fast_catchup_frames_.store(0, std::memory_order_release);
         render_cv_.notify_one(); // wake render thread -- frames may be ready
         LOGI("Video opened and paused, waiting for user to play");
 
@@ -458,6 +462,8 @@ void AndroidPlayer::play() {
     LOGI("[ctrl] play: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
     player_core_play(player_core_);
     render_cv_.notify_one();
+    audio_rebuffer_pending_.store(false, std::memory_order_release);
+    audio_rebuffer_deadline_ms_ = 0;
 
     if (playItf_) {
         // Defer audio start until the first video frame is rendered to prevent
@@ -479,6 +485,8 @@ void AndroidPlayer::pause() {
     LOGI("[ctrl] pause: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
     // Cancel any pending deferred audio start.
     audio_start_pending_.store(false, std::memory_order_release);
+    audio_rebuffer_pending_.store(false, std::memory_order_release);
+    audio_rebuffer_deadline_ms_ = 0;
     player_core_pause(player_core_);
 
     if (playItf_) {
@@ -494,6 +502,8 @@ void AndroidPlayer::stop() {
 
     LOGI("[ctrl] stop: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
     audio_start_pending_.store(false, std::memory_order_release);
+    audio_rebuffer_pending_.store(false, std::memory_order_release);
+    audio_rebuffer_deadline_ms_ = 0;
     has_pending_playback_completed_.store(false, std::memory_order_release);
 
     // Stop OpenSL ES first to prevent new callbacks from being queued,
@@ -515,6 +525,9 @@ void AndroidPlayer::seekTo(double position) {
     LOGI("[ctrl] seekTo: %.3fs (current pos=%.3f state=%d)", position, player_core_get_position(player_core_), player_core_get_state(player_core_));
     seek_just_happened_.store(true, std::memory_order_release);
     sync_warmup_frames_.store(40, std::memory_order_release); // wider warmup after seek
+    seek_target_sec_.store(position, std::memory_order_release);
+    // 约 1 秒左右的渲染 tick 追赶窗口，避免 seek 后先看到大量旧帧。
+    seek_fast_catchup_frames_.store(72, std::memory_order_release);
     last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
     player_core_seek(player_core_, position);
     render_cv_.notify_one();
@@ -1067,6 +1080,8 @@ void AndroidPlayer::renderLoop() {
                 if (clock < 0.0) clock = 0.0;
             }
             double delay = pts - clock;
+            double playback_rate = player_core_get_playback_rate(player_core_);
+            if (playback_rate <= 0.0) playback_rate = 1.0;
 
             bool should_display = false;
             bool should_consume = false;
@@ -1074,9 +1089,35 @@ void AndroidPlayer::renderLoop() {
             // --- First/post-seek fast-path ---
             bool is_first_or_seek = (frame_count == 0) ||
                                      seek_just_happened_.exchange(false, std::memory_order_acq_rel);
-            if (std::isnan(pts) || std::isinf(pts)) {
+            int seek_catchup_left = seek_fast_catchup_frames_.load(std::memory_order_acquire);
+            double seek_target = seek_target_sec_.load(std::memory_order_acquire);
+            bool seek_catchup_enabled = seek_catchup_left > 0
+                    && seek_target >= 0.0
+                    && (playback_rate >= 1.75 || frame_data.width >= 3840);
+            if (seek_catchup_enabled && !std::isnan(pts) && !std::isinf(pts)) {
+                double behind_seek_target = seek_target - pts;
+                // 高倍速下阈值更紧一些，减少“先播旧画面再追上”的时间。
+                double seek_drop_threshold = (playback_rate >= 2.25) ? 0.45 : 0.60;
+                if (frame_data.width >= 3840) {
+                    seek_drop_threshold = std::min(seek_drop_threshold, 0.50);
+                }
+                if (behind_seek_target > seek_drop_threshold) {
+                    // 关键借鉴：高倍速 seek 后先快速丢弃“明显早于目标位点”的旧帧，
+                    // 降低“先回放旧画面再追上”的体感卡顿。
+                    should_consume = true;
+                    seek_fast_catchup_frames_.fetch_sub(1, std::memory_order_acq_rel);
+                    LOGW_RATE(20, "[sync] seek catchup drop: pts=%.3f target=%.3f behind=%.3f thr=%.3f left=%d",
+                              pts, seek_target, behind_seek_target, seek_drop_threshold, seek_catchup_left);
+                } else {
+                    seek_fast_catchup_frames_.store(0, std::memory_order_release);
+                }
+            } else if (seek_catchup_left > 0 && !seek_catchup_enabled) {
+                seek_fast_catchup_frames_.store(0, std::memory_order_release);
+            }
+
+            if (!should_consume && (std::isnan(pts) || std::isinf(pts))) {
                 should_display = should_consume = true;
-            } else if (is_first_or_seek) {
+            } else if (!should_consume && is_first_or_seek) {
                 // Force-display only when video is close enough to the audio clock.
                 // If the first/post-seek frame is more than 1s behind the clock,
                 // keep dropping frames to catch up first; otherwise the viewer
@@ -1094,13 +1135,22 @@ void AndroidPlayer::renderLoop() {
                          pts, clock, delay);
                     should_display = should_consume = true;
                 }
-            } else if (delay < -5.0) {
-                // Clock severely out of sync (e.g. core not yet updated after seek).
-                // Force display instead of entering a drop loop.
-                LOGI_RATE(10, "[sync] clock unsync forced: pts=%.3f clk=%.3f delay=%.3f",
-                          pts, clock, delay);
-                should_display = should_consume = true;
-            } else {
+            } else if (!should_consume && delay < -5.0) {
+                // On high playback rate / 4K streams, force-rendering stale frames causes
+                // visible "freeze + jump". Prefer fast drop-only catch-up so we can reach
+                // near-live PTS sooner after seek.
+                bool prefer_drop_catchup = (playback_rate >= 1.75) || (frame_data.width >= 3840);
+                if (prefer_drop_catchup) {
+                    should_consume = true;
+                    LOGW_RATE(10, "[sync] severe behind -> drop-only catchup: pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
+                              pts, clock, delay, playback_rate);
+                } else {
+                    // Keep legacy behavior on normal-rate streams to avoid prolonged blank.
+                    LOGI_RATE(10, "[sync] clock unsync forced: pts=%.3f clk=%.3f delay=%.3f",
+                              pts, clock, delay);
+                    should_display = should_consume = true;
+                }
+            } else if (!should_consume) {
                 // Dynamic sync threshold based on actual frame interval
                 // (same algorithm as iOS HXCPlayerControl.mm).
                 double frame_interval = 1.0 / 30.0;
@@ -1108,8 +1158,6 @@ void AndroidPlayer::renderLoop() {
                     double delta = pts - last_sync_video_pts_;
                     if (delta > 0.0 && delta < 0.2) frame_interval = delta;
                 }
-                double playback_rate = player_core_get_playback_rate(player_core_);
-                if (playback_rate <= 0.0) playback_rate = 1.0;
                 double sync_threshold = std::min(0.100, std::max(0.020,
                                             frame_interval * 1.5)) / playback_rate;
 
@@ -1139,6 +1187,14 @@ void AndroidPlayer::renderLoop() {
             }
 
             if (should_display) {
+                // If we previously paused audio due to prolonged video starvation,
+                // resume audio as soon as video starts presenting again.
+                if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
+                    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                        LOGI("[sync] audio resumed after video rebuffer: result=%d", r);
+                    }
+                }
                 // If this is the first rendered frame and audio start was deferred,
                 // start audio now so picture and sound appear together.
                 // Skip if volume is 0 (muted player, e.g. small window in split-screen).
@@ -1193,8 +1249,13 @@ void AndroidPlayer::renderLoop() {
             if (should_consume) {
                 player_core_consume_video_frame(player_core_);
                 // We just consumed a frame; likely another one is ready soon.
-                // Use a short wait so we check quickly without busy-spinning.
-                wait_ms = 8;
+                // In catch-up mode (high rate / far behind), don't sleep so seek recovery
+                // can drain stale frames quickly.
+                if (!should_display && (delay < -0.20 || playback_rate >= 1.75)) {
+                    wait_ms = 0;
+                } else {
+                    wait_ms = 8;
+                }
             } else {
                 // Video ahead of clock: sleep proportional to how far ahead,
                 // capped at 16ms. This lets the audio clock advance and avoids
@@ -1214,6 +1275,41 @@ void AndroidPlayer::renderLoop() {
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] audio deadline fallback: result=%d", r);
+                    }
+                }
+            }
+            // High-rate/4K starvation path:
+            // if video queue stays empty for a while, pause OpenSL audio so user
+            // doesn't hear a long "audio-only" segment and then permanent A/V drift.
+            int64_t now = now_ms();
+            double playback_rate = player_core_get_playback_rate(player_core_);
+            if (playback_rate <= 0.0) playback_rate = 1.0;
+            bool high_rate = playback_rate >= 1.75;
+            bool likely_4k = gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160;
+            int64_t rebuffer_trigger_ms = high_rate ? 180 : 260;
+            if (likely_4k) rebuffer_trigger_ms = std::max<int64_t>(160, rebuffer_trigger_ms - 20);
+            int64_t rebuffer_fallback_ms = high_rate ? 850 : 700;
+            if (likely_4k) rebuffer_fallback_ms += 150;
+            if ((high_rate || likely_4k) && in_empty_streak && !audio_rebuffer_pending_.load(std::memory_order_acquire)) {
+                int64_t empty_ms = now - empty_start_ms;
+                if (empty_ms >= rebuffer_trigger_ms && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                    SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
+                    if (r == SL_RESULT_SUCCESS) {
+                        audio_rebuffer_pending_.store(true, std::memory_order_release);
+                        audio_rebuffer_deadline_ms_ = now + rebuffer_fallback_ms;
+                        LOGW("[sync] video starvation -> pause audio: empty_ms=%" PRId64 " trig=%" PRId64 " fallback=%" PRId64 " rate=%.2f last=%dx%d",
+                             empty_ms, rebuffer_trigger_ms, rebuffer_fallback_ms, playback_rate, gl_last_video_w_, gl_last_video_h_);
+                    }
+                }
+            }
+            // Deadline fallback: if starvation persists too long, resume audio
+            // to avoid extended silence under poor network/device conditions.
+            if (audio_rebuffer_pending_.load(std::memory_order_acquire) &&
+                now >= audio_rebuffer_deadline_ms_) {
+                if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
+                    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                        LOGI("[sync] audio rebuffer fallback resume: result=%d", r);
                     }
                 }
             }
