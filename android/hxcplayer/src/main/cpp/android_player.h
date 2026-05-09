@@ -229,6 +229,17 @@ private:
     // Seek 后短时间内用于“快速追赶”的目标位点（仅高倍速/高分辨率启用）。
     std::atomic<double> seek_target_sec_{-1.0};
     std::atomic<int>    seek_fast_catchup_frames_{0};
+    int64_t             seek_catchup_deadline_ms_{0};
+    // Tencent-like seek lower-bound gate: drop frames older than seek target
+    // until the first frame reaches target PTS.
+    std::atomic<bool>   seek_lower_bound_active_{false};
+    int64_t             seek_lower_bound_deadline_ms_{0};
+    // During seek, wait for first target video frame before resuming audio.
+    std::atomic<bool>   seek_audio_wait_video_{false};
+    int64_t             seek_audio_wait_deadline_ms_{0};
+    // 防止高倍速下长期“只丢不显”导致画面冻结体感。
+    int                 drop_only_streak_{0};
+    int64_t             drop_only_streak_start_ms_{0};
     int               audio_cb_count_{0};
     int               audio_underrun_count_{0};
     int               audio_partial_count_{0};
