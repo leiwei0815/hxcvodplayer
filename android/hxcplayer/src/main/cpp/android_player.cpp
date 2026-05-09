@@ -16,7 +16,7 @@
 #endif
 
 
-#define LOG_TAG "HXC"
+#define LOG_TAG "HXCSDK"
 // Runtime log level:
 //   0 = ERROR only (release default)
 //   1 = WARN + ERROR
@@ -45,6 +45,58 @@
 #endif
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// Independent tags for focused troubleshooting (adb logcat -s HXCSDK_PERF HXCSDK_SYNC ...).
+#define LOG_TAG_PERF   "HXCSDK_PERF"
+#define LOG_TAG_SYNC   "HXCSDK_SYNC"
+#define LOG_TAG_DECODE "HXCSDK_DECODE"
+#define LOG_TAG_PBO    "HXCSDK_PBO"
+
+#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 3
+#define TAGD(TAG, ...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+#else
+#define TAGD(TAG, ...) ((void)0)
+#endif
+
+#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 2
+#define TAGI(TAG, ...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#else
+#define TAGI(TAG, ...) ((void)0)
+#endif
+
+#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 1
+#define TAGW(TAG, ...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
+#else
+#define TAGW(TAG, ...) ((void)0)
+#endif
+
+#define TAGE(TAG, ...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+#define TAGI_RATE(TAG, N, ...) do { \
+    static int _tag_rl_cnt = 0; \
+    if (++_tag_rl_cnt % (N) == 1) { \
+        TAGI(TAG, __VA_ARGS__); \
+    } \
+} while(0)
+
+#define TAGW_RATE(TAG, N, ...) do { \
+    static int _tag_rl_cnt = 0; \
+    if (++_tag_rl_cnt % (N) == 1) { \
+        TAGW(TAG, __VA_ARGS__); \
+    } \
+} while(0)
+
+#define PERFI(...)      TAGI(LOG_TAG_PERF, __VA_ARGS__)
+#define PERFW(...)      TAGW(LOG_TAG_PERF, __VA_ARGS__)
+#define PERFI_RATE(...) TAGI_RATE(LOG_TAG_PERF, __VA_ARGS__)
+#define SYNCI(...)      TAGI(LOG_TAG_SYNC, __VA_ARGS__)
+#define SYNCW(...)      TAGW(LOG_TAG_SYNC, __VA_ARGS__)
+#define SYNCI_RATE(...) TAGI_RATE(LOG_TAG_SYNC, __VA_ARGS__)
+#define SYNCW_RATE(...) TAGW_RATE(LOG_TAG_SYNC, __VA_ARGS__)
+#define DECODEI(...)    TAGI(LOG_TAG_DECODE, __VA_ARGS__)
+#define PBOD(...)       TAGD(LOG_TAG_PBO, __VA_ARGS__)
+#define PBOI(...)       TAGI(LOG_TAG_PBO, __VA_ARGS__)
+#define PBOW(...)       TAGW(LOG_TAG_PBO, __VA_ARGS__)
 
 // Rate-limited logging: prints at most once every N calls.
 // Usage: LOGI_RATE(100, "msg %d", val);
@@ -94,7 +146,7 @@ AndroidPlayer::AndroidPlayer()
     , surface_width_(0)
     , surface_height_(0)
     , aspect_ratio_mode_(0)
-    , decode_mode_(0)
+    , decode_mode_(1) // Exo/IJK-like default: prefer hardware decode on Android
     , egl_display_(EGL_NO_DISPLAY)
     , egl_context_(EGL_NO_CONTEXT)
     , egl_surface_(EGL_NO_SURFACE)
@@ -284,6 +336,8 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         player_core_stop(player_core_);
     }
 
+    DECODEI("evt=open method=openURL decode_mode=%s",
+            decode_mode_ == 1 ? "hardware" : "software");
     player_core_set_decode_mode(player_core_,
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
@@ -300,6 +354,7 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         audio_rebuffer_pending_.store(false, std::memory_order_release);
         audio_rebuffer_deadline_ms_ = 0;
         seek_target_sec_.store(-1.0, std::memory_order_release);
+        seek_from_sec_.store(-1.0, std::memory_order_release);
         seek_fast_catchup_frames_.store(0, std::memory_order_release);
         seek_catchup_deadline_ms_ = 0;
         seek_lower_bound_active_.store(false, std::memory_order_release);
@@ -333,6 +388,8 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
         LOGE("Player core not initialized");
         return false;
     }
+    DECODEI("evt=open method=openWithCustomHTTP decode_mode=%s",
+            decode_mode_ == 1 ? "hardware" : "software");
     player_core_set_decode_mode(player_core_,
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
@@ -372,6 +429,8 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
         LOGE("Player core not initialized");
         return false;
     }
+    DECODEI("evt=open method=openWithCustomFile decode_mode=%s",
+            decode_mode_ == 1 ? "hardware" : "software");
     player_core_set_decode_mode(player_core_,
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
@@ -433,6 +492,8 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         LOGE("Player core not initialized");
         return false;
     }
+    DECODEI("evt=open method=openWithSecureSession decode_mode=%s",
+            decode_mode_ == 1 ? "hardware" : "software");
     player_core_set_decode_mode(player_core_,
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
@@ -489,6 +550,12 @@ void AndroidPlayer::play() {
     if (!player_core_) return;
 
     LOGI("[ctrl] play: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
+    DECODEI("evt=play_start decode_mode=%s hw_active=%d",
+            decode_mode_ == 1 ? "hardware" : "software",
+            player_core_is_video_hardware_decoding(player_core_) ? 1 : 0);
+    SYNCI("evt=play_start pos=%.3f rate=%.2f",
+          player_core_get_position(player_core_),
+          player_core_get_playback_rate(player_core_));
     player_core_play(player_core_);
     render_cv_.notify_one();
     audio_rebuffer_pending_.store(false, std::memory_order_release);
@@ -569,9 +636,11 @@ void AndroidPlayer::stop() {
 void AndroidPlayer::seekTo(double position) {
     if (!player_core_) return;
 
-    LOGI("[ctrl] seekTo: %.3fs (current pos=%.3f state=%d)", position, player_core_get_position(player_core_), player_core_get_state(player_core_));
+    double seek_from = player_core_get_position(player_core_);
+    LOGI("[ctrl] seekTo: %.3fs (current pos=%.3f state=%d)", position, seek_from, player_core_get_state(player_core_));
     seek_just_happened_.store(true, std::memory_order_release);
     sync_warmup_frames_.store(40, std::memory_order_release); // wider warmup after seek
+    seek_from_sec_.store(seek_from, std::memory_order_release);
     seek_target_sec_.store(position, std::memory_order_release);
     // 约 1 秒左右的渲染 tick 追赶窗口，避免 seek 后先看到大量旧帧。
     seek_fast_catchup_frames_.store(72, std::memory_order_release);
@@ -602,6 +671,7 @@ void AndroidPlayer::setPlaybackRate(float rate) {
 
     float normalized_rate = normalize_playback_rate(rate);
     LOGD("Set playback rate: req=%f normalized=%f", rate, normalized_rate);
+    SYNCI("evt=playback_rate_request req=%.3f normalized=%.3f", rate, normalized_rate);
     requested_playback_rate_.store(normalized_rate, std::memory_order_relaxed);
     player_core_set_playback_rate(player_core_, normalized_rate);
 }
@@ -646,6 +716,7 @@ void AndroidPlayer::setAspectRatioMode(int mode) {
 
 void AndroidPlayer::setDecodeMode(int mode) {
     decode_mode_ = (mode == 1) ? 1 : 0;
+    DECODEI("evt=set_decode_mode decode_mode=%s", decode_mode_ == 1 ? "hardware" : "software");
     if (player_core_) {
         player_core_set_decode_mode(player_core_,
                                     decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
@@ -1049,6 +1120,7 @@ void AndroidPlayer::renderLoop() {
     }
     LOGI("[render] loop started: tid=%d EGL context + GL program ready",
          (int)gettid());
+    PERFI("evt=render_loop_start tid=%d", (int)gettid());
 
     bool    surface_ready   = false;
     int     frame_count     = 0;
@@ -1165,6 +1237,9 @@ void AndroidPlayer::renderLoop() {
             bool high_rate_4k = (playback_rate >= 2.0f) && likely_4k;
             bool ultra_high_rate_4k = high_rate_4k && playback_rate >= 2.5f;
             bool mid_rate_4k = !high_rate_4k && likely_4k && playback_rate >= 1.25f;
+            SYNCI_RATE(120, "evt=sync_snapshot pts=%.3f clk=%.3f delay=%.3f rate=%.2f video_w=%d video_h=%d is_4k=%d is_high_rate_4k=%d is_ultra_high_rate_4k=%d",
+                       pts, clock, delay, playback_rate, frame_data.width, frame_data.height,
+                       likely_4k ? 1 : 0, high_rate_4k ? 1 : 0, ultra_high_rate_4k ? 1 : 0);
 
             // Soft re-anchor safeguard: if we stay severely behind for too long under
             // high-rate 4K playback, perform one bounded seek near audio clock to break
@@ -1199,6 +1274,8 @@ void AndroidPlayer::renderLoop() {
                     soft_reanchor_count_++;
                     LOGW("[sync] soft re-anchor seek: target=%.3f clk=%.3f delay=%.3f count=%d",
                          target, clock, delay, soft_reanchor_count_);
+                    SYNCW("evt=soft_reanchor_seek target=%.3f clk=%.3f delay=%.3f count=%d",
+                          target, clock, delay, soft_reanchor_count_);
                     continue;
                 }
             } else if (!in_seek_recovery) {
@@ -1213,13 +1290,17 @@ void AndroidPlayer::renderLoop() {
                 !std::isnan(pts) && !std::isinf(pts)) {
                 double seek_epsilon_sec = 0.035;
                 if (ultra_high_rate_4k) {
-                    // At 2.5x/3x 4K, keep the gate but avoid waiting too long
-                    // for exact PTS equality, which can look like a freeze.
+                    // At 2.5x/3x 4K, avoid waiting for strict PTS equality.
                     seek_epsilon_sec = 0.10;
                 }
+                double seek_from_now = seek_from_sec_.load(std::memory_order_acquire);
+                bool is_backward_seek = seek_from_now >= 0.0 &&
+                                        (seek_from_now - seek_target_now) > 0.5;
+                double stale_future_margin_sec = ultra_high_rate_4k ? 6.0 : 3.5;
                 // If seek recovery is slow, relax lower-bound gradually instead of
                 // exiting gate and resuming audio too early.
-                if (now >= seek_lower_bound_deadline_ms_) {
+                bool lower_bound_deadline_elapsed = now >= seek_lower_bound_deadline_ms_;
+                if (lower_bound_deadline_elapsed) {
                     seek_epsilon_sec = 0.250;
                     if (ultra_high_rate_4k) {
                         seek_epsilon_sec = 0.350;
@@ -1229,6 +1310,18 @@ void AndroidPlayer::renderLoop() {
                     should_consume = true;
                     LOGW_RATE(20, "[sync] seek lower-bound drop: pts=%.3f target=%.3f",
                               pts, seek_target_now);
+                    SYNCW_RATE(20, "evt=seek_lower_bound_drop pts=%.3f target=%.3f",
+                               pts, seek_target_now);
+                } else if (is_backward_seek &&
+                           !lower_bound_deadline_elapsed &&
+                           pts > seek_target_now + stale_future_margin_sec) {
+                    // Backward seek: before lower-bound deadline, do not accept
+                    // far-future stale frames as the first target hit.
+                    should_consume = true;
+                    LOGW_RATE(20, "[sync] seek lower-bound stale-future drop: pts=%.3f target=%.3f from=%.3f margin=%.3f",
+                              pts, seek_target_now, seek_from_now, stale_future_margin_sec);
+                    SYNCW_RATE(20, "evt=seek_lower_bound_stale_future_drop pts=%.3f target=%.3f from=%.3f margin=%.3f",
+                               pts, seek_target_now, seek_from_now, stale_future_margin_sec);
                 } else {
                     seek_lower_bound_active_.store(false, std::memory_order_release);
                     seek_fast_catchup_frames_.store(0, std::memory_order_release);
@@ -1239,6 +1332,7 @@ void AndroidPlayer::renderLoop() {
                     sync_warmup_frames_.store(24, std::memory_order_release);
                     should_display = should_consume = true;
                     LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f", pts, seek_target_now);
+                    SYNCI("evt=seek_lower_bound_hit pts=%.3f target=%.3f", pts, seek_target_now);
                 }
             }
 
@@ -1251,6 +1345,7 @@ void AndroidPlayer::renderLoop() {
                     seek_lower_bound_active_.store(false, std::memory_order_release);
                     should_display = should_consume = true;
                     LOGW("[sync] seek recovery timeout fallback: pts=%.3f target=%.3f", pts, seek_target_now);
+                    SYNCW("evt=seek_recovery_timeout_fallback pts=%.3f target=%.3f", pts, seek_target_now);
                     in_seek_recovery = false;
                 } else {
                     should_consume = true;
@@ -1496,12 +1591,22 @@ void AndroidPlayer::renderLoop() {
                          kDiagInterval, pos,
                          total_render_ms / kDiagInterval, max_render_ms,
                          total_upload_ms / kDiagInterval, max_upload_ms);
+                    PERFI("evt=render_window_stats frames=%d pos=%.1f avg_render_ms=%" PRId64 " max_render_ms=%" PRId64
+                          " avg_upload_ms=%" PRId64 " max_upload_ms=%" PRId64,
+                          kDiagInterval, pos,
+                          total_render_ms / kDiagInterval, max_render_ms,
+                          total_upload_ms / kDiagInterval, max_upload_ms);
                     total_render_ms = total_upload_ms = max_render_ms = max_upload_ms = 0;
                 }
                 if (render_ms > 33)
                     LOGW("[perf] slow frame %" PRId64 "ms %dx%d surf=%dx%d",
                          render_ms, frame_data.width, frame_data.height,
                          surface_width_, surface_height_);
+                if (render_ms > 33) {
+                    PERFW("evt=slow_frame render_ms=%" PRId64 " video_w=%d video_h=%d surface_w=%d surface_h=%d rate=%.2f delay=%.3f",
+                          render_ms, frame_data.width, frame_data.height,
+                          surface_width_, surface_height_, playback_rate, delay);
+                }
             }
 
             if (should_consume) {
@@ -1560,6 +1665,8 @@ void AndroidPlayer::renderLoop() {
             bool high_rate = playback_rate >= 1.75;
             bool likely_4k = gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160;
             bool ultra_high_rate_4k = likely_4k && playback_rate >= 2.5;
+            bool in_loading = is_loading_.load(std::memory_order_acquire);
+            bool in_sync_warmup = sync_warmup_frames_.load(std::memory_order_acquire) > 0;
             int64_t rebuffer_trigger_ms = high_rate ? 180 : 260;
             if (likely_4k) rebuffer_trigger_ms = std::max<int64_t>(160, rebuffer_trigger_ms - 20);
             int64_t rebuffer_fallback_ms = high_rate ? 850 : 700;
@@ -1567,6 +1674,8 @@ void AndroidPlayer::renderLoop() {
             if (!ultra_high_rate_4k &&
                 !seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 high_rate && in_empty_streak &&
+                !in_loading &&
+                !in_sync_warmup &&
                 core_playing &&
                 !audio_rebuffer_pending_.load(std::memory_order_acquire)) {
                 int64_t empty_ms = now - empty_start_ms;
@@ -1577,6 +1686,10 @@ void AndroidPlayer::renderLoop() {
                         audio_rebuffer_deadline_ms_ = now + rebuffer_fallback_ms;
                         LOGW("[sync] video starvation -> pause audio: empty_ms=%" PRId64 " trig=%" PRId64 " fallback=%" PRId64 " rate=%.2f last=%dx%d",
                              empty_ms, rebuffer_trigger_ms, rebuffer_fallback_ms, playback_rate, gl_last_video_w_, gl_last_video_h_);
+                        SYNCW("evt=video_starvation_pause_audio empty_ms=%" PRId64 " trigger_ms=%" PRId64
+                              " fallback_ms=%" PRId64 " rate=%.2f last_video_w=%d last_video_h=%d",
+                              empty_ms, rebuffer_trigger_ms, rebuffer_fallback_ms,
+                              playback_rate, gl_last_video_w_, gl_last_video_h_);
                     }
                 }
             }
@@ -1664,6 +1777,8 @@ bool AndroidPlayer::ensurePBOs(int y_w, int y_h, int uv_w, int uv_h) {
     gl_pbo_uv_sz_ = uv_sz;
     gl_pbo_idx_   = 0;
     LOGI("[PBO] Allocated 6 PBOs: Y=%d bytes UV=%d bytes", y_sz, uv_sz);
+    PBOI("evt=pbo_allocate y_bytes=%d uv_bytes=%d y_w=%d y_h=%d uv_w=%d uv_h=%d",
+         y_sz, uv_sz, y_w, y_h, uv_w, uv_h);
     return true;
 }
 
@@ -1741,6 +1856,8 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     // For smaller resolutions the overhead of PBO setup isn't worth it.
     const bool use_pbo = (width >= 1920) &&
                          ensurePBOs(y_tex_w, height, uv_w, uv_h);
+    PBOD("evt=upload_path use_pbo=%d video_w=%d video_h=%d y_stride=%d u_stride=%d v_stride=%d",
+         use_pbo ? 1 : 0, width, height, y_tex_w, uv_w, v_tex_w);
 
     if (use_pbo) {
         int wi = gl_pbo_idx_;          // write index (0 or 1)
@@ -1829,6 +1946,8 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     if (upload_ms > 10) {
         LOGW("[DIAG] Slow upload: %" PRId64 "ms | %dx%d Y_stride=%d pbo=%d",
              upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
+        PBOW("evt=slow_upload upload_ms=%" PRId64 " video_w=%d video_h=%d y_stride=%d use_pbo=%d",
+             upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
     }
 
     gl_last_video_w_ = width;
@@ -1912,7 +2031,9 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         return -1;
     }
 
-    // Cache last frame so we can redraw after a surface hot-swap
+    // Cache last frame for surface hot-swap redraw.
+    // 4K + high-rate playback is sensitive to extra memcpy bandwidth, so we
+    // throttle cache updates for large frames instead of copying every frame.
     {
         int y_stride  = y_linesize  > 0 ? y_linesize  : width;
         int uv_stride = u_linesize  > 0 ? u_linesize  : width / 2;
@@ -1921,19 +2042,39 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         int u_cache_sz  = uv_stride * (height / 2);
         int v_cache_sz  = vs_stride * (height / 2);
 
-        if (width != last_frame_width_ || height != last_frame_height_) {
-            last_frame_y_.resize(y_cache_sz);
-            last_frame_u_.resize(u_cache_sz);
-            last_frame_v_.resize(v_cache_sz);
+        auto now_cache_ms = []() -> int64_t {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+        int64_t now_ms = now_cache_ms();
+        bool size_changed_for_cache = (width != last_frame_width_ || height != last_frame_height_);
+        bool empty_cache = last_frame_y_.empty() || last_frame_u_.empty() || last_frame_v_.empty();
+        int64_t cache_interval_ms = 0;
+        if (width >= 3840 || height >= 2160) {
+            cache_interval_ms = 120;
+        } else if (width >= 2560 || height >= 1440) {
+            cache_interval_ms = 66;
         }
-        memcpy(last_frame_y_.data(), y_data, y_cache_sz);
-        memcpy(last_frame_u_.data(), u_data, u_cache_sz);
-        memcpy(last_frame_v_.data(), v_data, v_cache_sz);
-        last_frame_width_    = width;
-        last_frame_height_   = height;
-        last_frame_y_stride_ = y_linesize;
-        last_frame_u_stride_ = u_linesize;
-        last_frame_v_stride_ = v_linesize;
+        bool should_cache = size_changed_for_cache || empty_cache ||
+                            cache_interval_ms <= 0 ||
+                            (now_ms - last_frame_cache_ms_) >= cache_interval_ms;
+
+        if (should_cache) {
+            if (size_changed_for_cache) {
+                last_frame_y_.resize(y_cache_sz);
+                last_frame_u_.resize(u_cache_sz);
+                last_frame_v_.resize(v_cache_sz);
+            }
+            memcpy(last_frame_y_.data(), y_data, y_cache_sz);
+            memcpy(last_frame_u_.data(), u_data, u_cache_sz);
+            memcpy(last_frame_v_.data(), v_data, v_cache_sz);
+            last_frame_width_    = width;
+            last_frame_height_   = height;
+            last_frame_y_stride_ = y_linesize;
+            last_frame_u_stride_ = u_linesize;
+            last_frame_v_stride_ = v_linesize;
+            last_frame_cache_ms_ = now_ms;
+        }
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();

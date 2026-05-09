@@ -162,6 +162,7 @@ private:
     int last_frame_y_stride_{0};
     int last_frame_u_stride_{0};
     int last_frame_v_stride_{0};
+    int64_t last_frame_cache_ms_{0};
 
     // EGL / GL helpers (called only from render thread)
     bool initEGLContext();
@@ -229,6 +230,8 @@ private:
     double            last_sync_video_pts_{std::numeric_limits<double>::quiet_NaN()};
     // Seek 后短时间内用于“快速追赶”的目标位点（仅高倍速/高分辨率启用）。
     std::atomic<double> seek_target_sec_{-1.0};
+    // Seek 发起时的播放位置，用于识别 backward seek 并过滤未来陈旧帧。
+    std::atomic<double> seek_from_sec_{-1.0};
     std::atomic<int>    seek_fast_catchup_frames_{0};
     int64_t             seek_catchup_deadline_ms_{0};
     // Tencent-like seek lower-bound gate: drop frames older than seek target
