@@ -130,34 +130,25 @@ AndroidPlayer::~AndroidPlayer() {
         }
     }
 
-    // 4. Null out player_core_ under audio_mutex_ BEFORE destroying the audio
-    //    player object.  This guarantees that any audio callback which fires
-    //    during or after playerObject_->Destroy() will see player_core_==nullptr
-    //    and return silence instead of calling swr_convert on a freed context.
+    // 4. Acquire audio_mutex_ to wait for any in-flight audio callback to finish,
+    //    then mark audio as inactive and null out player_core_.
+    //    Because onAudioData holds audio_mutex_ for its entire body (including
+    //    swr_convert), taking this lock here guarantees no callback is running
+    //    when we proceed to destroy the core.
     PlayerCoreHandle* core_to_destroy = nullptr;
     {
         std::lock_guard<std::mutex> lock(audio_mutex_);
+        audio_active_ = false;   // redundant but explicit
         core_to_destroy = player_core_;
         player_core_ = nullptr;
     }
 
-    // 5. Now safe to destroy the audio engine (callbacks see player_core_==nullptr)
+    // 5. Destroy OpenSL ES engine.  Any callback that fires AFTER we release the
+    //    lock above will see audio_active_==false / player_core_==nullptr and
+    //    return silence without touching the core.
     destroyAudioOutput();
 
-    // 5b. Wait for any audio callback that was already past the null-check and is
-    //     currently executing inside player_core_get_audio_data / swr_convert to finish.
-    //     destroyAudioOutput() stops new callbacks from being scheduled, but the
-    //     OpenSL ES driver may have already dispatched one final callback before
-    //     the Destroy() call completed.  Spin-wait (max ~50ms) to be safe.
-    {
-        int spin = 0;
-        while (audio_cb_in_flight_.load(std::memory_order_acquire) > 0 && spin < 500) {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-            spin++;
-        }
-    }
-
-    // 6. Tear down player core (callbacks already neutralised above)
+    // 6. Tear down player core - safe because audio_mutex_ already serialised us.
     if (core_to_destroy) {
         player_core_set_playback_completed_callback(core_to_destroy, nullptr, nullptr);
         player_core_set_loading_callback(core_to_destroy, nullptr, nullptr);
@@ -227,20 +218,18 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     if (cur_state != 0) { // 0 == IDLE
         LOGI("[open] pre-stop core (state=%d) before open", cur_state);
 
-        // 1. Stop new audio callbacks from being scheduled, and pause OpenSL ES.
+        // 1. Stop OpenSL ES output to prevent new callbacks from being queued.
         audio_start_pending_.store(false, std::memory_order_release);
         if (playItf_) {
             (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
         }
 
-        // 2. Wait for any in-flight audio callback to finish before stopping the
-        //    core (which resets / frees the SwrContext used by swr_convert).
+        // 2. Acquire audio_mutex_ to wait for any currently-executing callback
+        //    (which holds this lock for its full body) to finish before we call
+        //    player_core_stop(), which resets/frees the SwrContext.
         {
-            int spin = 0;
-            while (audio_cb_in_flight_.load(std::memory_order_acquire) > 0 && spin < 500) {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-                spin++;
-            }
+            std::lock_guard<std::mutex> lock(audio_mutex_);
+            // Lock acquired means no callback is in swr_convert right now.
         }
 
         // 3. Now safe to stop/reset the player core.
@@ -477,18 +466,15 @@ void AndroidPlayer::stop() {
     audio_start_pending_.store(false, std::memory_order_release);
     has_pending_playback_completed_.store(false, std::memory_order_release);
 
-    // Stop OpenSL ES first to prevent new audio callbacks, then wait for
-    // any in-flight callback to exit before stopping the core (which resets
-    // the SwrContext that swr_convert uses).
+    // Stop OpenSL ES first to prevent new callbacks from being queued,
+    // then acquire audio_mutex_ to wait for any running callback to finish,
+    // then stop the core (which resets the SwrContext used by swr_convert).
     if (playItf_) {
         (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
     }
     {
-        int spin = 0;
-        while (audio_cb_in_flight_.load(std::memory_order_acquire) > 0 && spin < 200) {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-            spin++;
-        }
+        std::lock_guard<std::mutex> lock(audio_mutex_);
+        // Holding the lock means no callback body is executing right now.
     }
     player_core_stop(player_core_);
 }
@@ -1792,28 +1778,22 @@ void AndroidPlayer::audioCallback(SLAndroidSimpleBufferQueueItf bq, void* contex
 }
 
 void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
-    // Track in-flight callbacks so the destructor can wait for them to finish.
-    audio_cb_in_flight_.fetch_add(1, std::memory_order_acquire);
+    // Hold audio_mutex_ for the entire callback body.
+    // The destructor and openURL both acquire this lock BEFORE destroying/stopping
+    // the core, so swr_convert() inside player_core_get_audio_data() is guaranteed
+    // to finish before the SwrContext is freed.
+    std::unique_lock<std::mutex> lock(audio_mutex_);
 
-    // If player is being destroyed, output silence
     if (!audio_active_ || !player_core_ || audio_buffer_size_ == 0) {
         int sz = audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096;
         memset(audio_buffer_, 0, sz);
+        lock.unlock();
         (*bq)->Enqueue(bq, audio_buffer_, sz);
-        audio_cb_in_flight_.fetch_sub(1, std::memory_order_release);
-        return;
-    }
-    
-    std::lock_guard<std::mutex> lock(audio_mutex_);
-    // Re-check after acquiring mutex
-    if (!audio_active_ || !player_core_) {
-        memset(audio_buffer_, 0, audio_buffer_size_);
-        (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
-        audio_cb_in_flight_.fetch_sub(1, std::memory_order_release);
         return;
     }
 
-    // Drain the core audio queue into the output buffer
+    // Drain the core audio queue into the output buffer (swr_convert runs here,
+    // safely protected by audio_mutex_).
     int total_bytes_read = 0;
     while (total_bytes_read < audio_buffer_size_) {
         int bytes_read = player_core_get_audio_data(
@@ -1828,33 +1808,27 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     }
 
     audio_cb_count_++;
-    int& callback_count = audio_cb_count_;
-    int& underrun_count = audio_underrun_count_;
-    int& partial_count  = audio_partial_count_;
-
     if (total_bytes_read > 0) {
         if (total_bytes_read < audio_buffer_size_) {
-            partial_count++;
-            // Zero-pad the tail (partial underrun)
+            audio_partial_count_++;
             memset(audio_buffer_ + total_bytes_read, 0,
                    audio_buffer_size_ - total_bytes_read);
         }
     } else {
-        underrun_count++;
+        audio_underrun_count_++;
         memset(audio_buffer_, 0, audio_buffer_size_);
     }
 
-    // Print audio stats every 200 callbacks (~1s at 5ms/cb); only log anomalies
-    if (callback_count % 200 == 0) {
-        double pos = player_core_ ? player_core_get_position(player_core_) : 0.0;
-        if (underrun_count > 0 || partial_count > 0) {
+    if (audio_cb_count_ % 200 == 0) {
+        double pos = player_core_get_position(player_core_);
+        if (audio_underrun_count_ > 0 || audio_partial_count_ > 0) {
             LOGW("[audio] cb=%d pos=%.1fs underrun=%d partial=%d (last 200)",
-                 callback_count, pos, underrun_count, partial_count);
+                 audio_cb_count_, pos, audio_underrun_count_, audio_partial_count_);
         }
-        underrun_count = 0;
-        partial_count  = 0;
+        audio_underrun_count_ = 0;
+        audio_partial_count_  = 0;
     }
 
+    lock.unlock();
     (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
-    audio_cb_in_flight_.fetch_sub(1, std::memory_order_release);
 }
