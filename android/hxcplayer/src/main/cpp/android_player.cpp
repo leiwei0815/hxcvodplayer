@@ -491,11 +491,23 @@ void AndroidPlayer::setPlaybackRate(float rate) {
 
 void AndroidPlayer::setVolume(float volume) {
     if (!player_core_) return;
-    
+    float prev = current_volume_.exchange(volume, std::memory_order_relaxed);
     LOGD("Set volume: %f (core only)", volume);
     // Volume is applied inside the core; we do not use OpenSL ES VolumeItf
     // to avoid triggering Android AppOps CONTROL_AUDIO permission checks.
     player_core_set_volume(player_core_, volume);
+
+    // If volume is raised from 0 to non-zero while the player is running,
+    // ensure the OpenSL ES audio output is actually playing (it may have been
+    // skipped during the deferred-start path when the player was muted).
+    if (prev <= 0.0f && volume > 0.0f && playItf_ && audio_active_) {
+        SLuint32 state = 0;
+        if ((*playItf_)->GetPlayState(playItf_, &state) == SL_RESULT_SUCCESS &&
+            state != SL_PLAYSTATE_PLAYING) {
+            (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+            LOGI("[ctrl] audio resumed on volume un-mute");
+        }
+    }
 }
 
 void AndroidPlayer::setAspectRatioMode(int mode) {
@@ -1081,10 +1093,13 @@ void AndroidPlayer::renderLoop() {
             if (should_display) {
                 // If this is the first rendered frame and audio start was deferred,
                 // start audio now so picture and sound appear together.
+                // Skip if volume is 0 (muted player, e.g. small window in split-screen).
                 if (frame_count == 0 && audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
-                    if (playItf_) {
+                    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] audio started on first frame: result=%d", r);
+                    } else {
+                        LOGI("[sync] audio start skipped: volume=0 (muted)");
                     }
                 }
                 frame_count++;
@@ -1141,7 +1156,7 @@ void AndroidPlayer::renderLoop() {
             if (audio_start_pending_.load(std::memory_order_acquire) &&
                 now_ms() >= audio_start_deadline_ms_) {
                 if (audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
-                    if (playItf_) {
+                    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] audio deadline fallback: result=%d", r);
                     }
