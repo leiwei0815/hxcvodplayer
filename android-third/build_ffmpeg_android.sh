@@ -210,9 +210,13 @@ build_ffmpeg() {
     if [ -f "$BUILD_SUBDIR/ffbuild/config.mak" ]; then
         grep -E "^(CONFIG_(ANDROID|JNI|MEDIACODEC|MEDIANDK|H264_MEDIACODEC_DECODER|HEVC_MEDIACODEC_DECODER|AAC_MEDIACODEC_DECODER|MP3_MEDIACODEC_DECODER|MPEG4_MEDIACODEC_DECODER))=" "$BUILD_SUBDIR/ffbuild/config.mak" || true
     fi
-    if [ -f "$BUILD_SUBDIR/ffbuild/config.log" ]; then
+    local CFG_LOG="$BUILD_SUBDIR/ffbuild/config.log"
+    if [ ! -f "$CFG_LOG" ] && [ -f "$BUILD_SUBDIR/config.log" ]; then
+        CFG_LOG="$BUILD_SUBDIR/config.log"
+    fi
+    if [ -f "$CFG_LOG" ]; then
         echo "🔎 configure 检测日志（mediacodec/mediandk/jni）..."
-        grep -Ei "mediacodec|mediandk|jni|did not match anything|not found" "$BUILD_SUBDIR/ffbuild/config.log" | tail -n 200 || true
+        grep -Ei "mediacodec|mediandk|jni|did not match anything|not found|disabled .*mediacodec|requires" "$CFG_LOG" | tail -n 300 || true
     fi
 
     echo ""

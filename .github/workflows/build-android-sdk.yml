@@ -196,6 +196,23 @@ jobs:
             cat "$cfg_comp" "$cfg_main" | grep -E "^#define .*MEDIACODEC.* 1" | sort -u || true
             echo "=== $abi mediacodec-related macro states ==="
             grep -E "^#define (CONFIG_ANDROID|CONFIG_JNI|CONFIG_MEDIANDK|CONFIG_H264_MEDIACODEC_DECODER|CONFIG_HEVC_MEDIACODEC_DECODER|CONFIG_MPEG4_MEDIACODEC_DECODER|CONFIG_AAC_MEDIACODEC_DECODER|CONFIG_MP3_MEDIACODEC_DECODER|CONFIG_H264_MEDIACODEC_HWACCEL|CONFIG_HEVC_MEDIACODEC_HWACCEL|CONFIG_MEDIACODEC_HWACCEL|CONFIG_H264_MP4TOANNEXB_BSF|CONFIG_HEVC_MP4TOANNEXB_BSF|CONFIG_H264_PARSER|CONFIG_HEVC_PARSER) " "$cfg_comp" "$cfg_main" || true
+            cfg_mak="ffmpeg-build-android/build-${abi}/ffbuild/config.mak"
+            cfg_log_a="ffmpeg-build-android/build-${abi}/ffbuild/config.log"
+            cfg_log_b="ffmpeg-build-android/build-${abi}/config.log"
+            if [ -f "$cfg_mak" ]; then
+              echo "=== $abi ffbuild/config.mak (mediacodec keys) ==="
+              grep -E "^(CONFIG_(ANDROID|JNI|MEDIACODEC|MEDIANDK|H264_MEDIACODEC_DECODER|HEVC_MEDIACODEC_DECODER|AAC_MEDIACODEC_DECODER|MP3_MEDIACODEC_DECODER|MPEG4_MEDIACODEC_DECODER))=" "$cfg_mak" || true
+            fi
+            cfg_log=""
+            if [ -f "$cfg_log_a" ]; then
+              cfg_log="$cfg_log_a"
+            elif [ -f "$cfg_log_b" ]; then
+              cfg_log="$cfg_log_b"
+            fi
+            if [ -n "$cfg_log" ]; then
+              echo "=== $abi config.log (mediacodec diagnostics) ==="
+              grep -Ei "mediacodec|mediandk|jni|did not match anything|not found|disabled .*mediacodec|requires" "$cfg_log" | tail -n 300 || true
+            fi
 
             if grep -q "^#define CONFIG_MEDIACODEC 1" "$cfg_comp" "$cfg_main"; then
               echo "✅ CONFIG_MEDIACODEC=1"
