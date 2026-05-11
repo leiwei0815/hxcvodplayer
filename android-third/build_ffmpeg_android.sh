@@ -156,7 +156,7 @@ build_ffmpeg() {
     
     # 设置编译和链接标志（清除所有可能的环境变量干扰）
     EXTRA_CFLAGS="-fPIC -DANDROID -D__ANDROID_API__=$API_LEVEL -I$MBEDTLS_DIR/include"
-    EXTRA_LDFLAGS="-Wl,-z,relro -Wl,-z,now -L$MBEDTLS_DIR/lib -lmbedtls -lmbedx509 -lmbedcrypto"
+    EXTRA_LDFLAGS="-Wl,-z,relro -Wl,-z,now -L$MBEDTLS_DIR/lib -lmbedtls -lmbedx509 -lmbedcrypto -landroid -lmediandk"
     
     # 清除可能干扰编译的环境变量
     unset CFLAGS CXXFLAGS LDFLAGS CPPFLAGS PKG_CONFIG_PATH
@@ -204,6 +204,12 @@ build_ffmpeg() {
         --disable-zlib \
         --disable-lzma \
         $EXTRA_CONFIGURE_FLAGS
+
+    echo ""
+    echo "🔎 configure 结果快照（Android/MediaCodec 关键宏）..."
+    if [ -f "$BUILD_SUBDIR/ffbuild/config.mak" ]; then
+        grep -E "^(CONFIG_(ANDROID|JNI|MEDIACODEC|MEDIANDK|H264_MEDIACODEC_DECODER|HEVC_MEDIACODEC_DECODER|AAC_MEDIACODEC_DECODER|MP3_MEDIACODEC_DECODER|MPEG4_MEDIACODEC_DECODER))=" "$BUILD_SUBDIR/ffbuild/config.mak" || true
+    fi
 
     echo ""
     echo "🔎 校验 FFmpeg mediacodec 组件宏..."
