@@ -202,7 +202,6 @@ build_ffmpeg() {
         --enable-protocol=tls \
         --enable-protocol=hls \
         --disable-encoders \
-        --disable-decoders \
         --enable-decoder=h264 \
         --enable-decoder=hevc \
         --enable-decoder=h264_mediacodec \
