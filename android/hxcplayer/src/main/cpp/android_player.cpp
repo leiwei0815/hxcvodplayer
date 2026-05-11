@@ -1422,6 +1422,7 @@ void AndroidPlayer::renderLoop() {
             }
             bool high_rate_4k = (playback_rate >= 2.0f) && likely_4k;
             bool ultra_high_rate_4k = high_rate_4k && playback_rate >= 2.5f;
+            bool very_high_rate_4k = high_rate_4k && playback_rate >= 2.75f;
             bool mid_rate_4k = false; // rollback: avoid mid-rate (1.25~1.75x) aggressive sync policy
             SYNCI_RATE(120, "evt=sync_snapshot pts=%.3f clk=%.3f delay=%.3f rate=%.2f video_w=%d video_h=%d is_4k=%d is_high_rate_4k=%d is_ultra_high_rate_4k=%d",
                        pts, clock, delay, playback_rate, frame_data.width, frame_data.height,
@@ -1435,9 +1436,15 @@ void AndroidPlayer::renderLoop() {
             int64_t reanchor_lag_persistent_ms = 3000;
             int64_t reanchor_cooldown_ms = 6000;
             int reanchor_budget = 3;
-            if (ultra_high_rate_4k) {
-                reanchor_delay_threshold = -5.0;
-                reanchor_lag_persistent_ms = 2200;
+            if (very_high_rate_4k) {
+                // Tencent-like: at >=2.75x prioritize fast convergence over long-tail smoothness.
+                reanchor_delay_threshold = -2.6;
+                reanchor_lag_persistent_ms = 1200;
+                reanchor_cooldown_ms = 6500;
+                reanchor_budget = 3;
+            } else if (ultra_high_rate_4k) {
+                reanchor_delay_threshold = -3.6;
+                reanchor_lag_persistent_ms = 1600;
                 reanchor_cooldown_ms = 8000;
                 reanchor_budget = 2;
             } else if (high_rate_4k) {
@@ -1490,10 +1497,10 @@ void AndroidPlayer::renderLoop() {
             if (!in_seek_recovery && !seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 !audio_rebuffer_pending_.load(std::memory_order_acquire) &&
                 player_core_is_playing(player_core_) && high_rate_4k) {
-                double lag_pause_threshold = (playback_rate >= 2.0) ? -2.8 : -2.2;
-                int64_t lag_pause_trigger_ms = (playback_rate >= 2.5) ? 320 : ((playback_rate >= 2.0) ? 420 : 700);
-                int64_t lag_pause_fallback_ms = (playback_rate >= 2.0) ? 1400 : 1800;
-                int64_t lag_pause_min_hold_ms = (playback_rate >= 2.5) ? 900 : ((playback_rate >= 2.0) ? 800 : 600);
+                double lag_pause_threshold = very_high_rate_4k ? -2.2 : ((playback_rate >= 2.5) ? -2.5 : ((playback_rate >= 2.0) ? -2.8 : -2.2));
+                int64_t lag_pause_trigger_ms = very_high_rate_4k ? 220 : ((playback_rate >= 2.5) ? 320 : ((playback_rate >= 2.0) ? 420 : 700));
+                int64_t lag_pause_fallback_ms = very_high_rate_4k ? 1700 : ((playback_rate >= 2.0) ? 1400 : 1800);
+                int64_t lag_pause_min_hold_ms = very_high_rate_4k ? 1100 : ((playback_rate >= 2.5) ? 900 : ((playback_rate >= 2.0) ? 800 : 600));
                 if (delay <= lag_pause_threshold) {
                     if (severe_lag_audio_pause_start_ms_ == 0) severe_lag_audio_pause_start_ms_ = now;
                     int64_t severe_lag_ms = now - severe_lag_audio_pause_start_ms_;
@@ -1758,9 +1765,13 @@ void AndroidPlayer::renderLoop() {
                             if (ultra_high_rate_4k) {
                                 // At >=2.5x 4K, keep a stronger cadence floor so video
                                 // can continuously catch up with fast-moving audio clock.
-                                int min_step_by_rate = (playback_rate >= 2.75) ? 3 : 2;
+                                int min_step_by_rate = (playback_rate >= 2.75)
+                                                       ? ((delay <= -1.4) ? 4 : 3)
+                                                       : 2;
                                 if (delay <= -2.5) {
                                     cadence_step = 4; // drop 3, show 1
+                                } else if (delay <= -1.8 && playback_rate >= 2.75) {
+                                    cadence_step = 5; // drop 4, show 1
                                 } else if (delay <= -1.2) {
                                     cadence_step = 3; // drop 2, show 1
                                 } else if (delay <= -0.6) {
@@ -1849,7 +1860,7 @@ void AndroidPlayer::renderLoop() {
                 if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                     audio_rebuffer_pending_.load(std::memory_order_acquire)) {
                     if (now >= audio_rebuffer_min_resume_at_ms_) {
-                        bool recover_enough = delay >= ((playback_rate >= 2.0) ? -1.0 : -0.75);
+                        bool recover_enough = delay >= (very_high_rate_4k ? -0.55 : ((playback_rate >= 2.5) ? -0.75 : ((playback_rate >= 2.0) ? -1.0 : -0.75)));
                         bool resume_by_fallback = now >= audio_rebuffer_deadline_ms_;
                         if (!recover_enough && !resume_by_fallback) {
                             SYNCI_RATE(60, "evt=audio_rebuffer_resume_wait delay=%.3f rate=%.2f min_resume_in_ms=%" PRId64 " fallback_in_ms=%" PRId64,
@@ -2224,7 +2235,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
             gl_uv_swap_votes_ = 0;
             gl_uv_swap_probe_budget_ = 24;
         }
-        if (!gl_uv_swap_decided_ || gl_uv_swap_probe_budget_ > 0) {
+        if (!gl_uv_swap_decided_ && gl_uv_swap_probe_budget_ > 0) {
             int vote = estimate_uv_swap_vote(
                 static_cast<const uint8_t*>(y_data),
                 y_linesize > 0 ? y_linesize : width,
@@ -2250,6 +2261,13 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
                        gl_uv_swap_decided_ ? "decided" : "probing",
                        gl_uv_swap_selected_ ? 1 : 0,
                        gl_uv_swap_votes_, gl_uv_swap_probe_budget_, width, height);
+        } else if (!gl_uv_swap_decided_ && gl_uv_swap_probe_budget_ <= 0) {
+            // Probe budget exhausted: lock to default NV12 mapping (swap=0)
+            // to stop repeated probing logs/work on every frame.
+            gl_uv_swap_selected_ = false;
+            gl_uv_swap_decided_ = true;
+            SYNCI("evt=uv_order_probe_timeout fallback=nv12 swap=%d votes=%d w=%d h=%d",
+                  gl_uv_swap_selected_ ? 1 : 0, gl_uv_swap_votes_, width, height);
         }
         uv_swap = gl_uv_swap_selected_;
         LOGI_RATE(120, "[render] interleaved UV upload path w=%d h=%d uv_stride=%d uv_tex_w=%d",
