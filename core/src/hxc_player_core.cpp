@@ -14,7 +14,11 @@
 #include <thread>
 #include <sstream>
 #include <cstring>
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#endif
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
@@ -316,6 +320,23 @@ static const AVCodec* hxc_find_android_mediacodec_decoder(enum AVCodecID codec_i
         *selected_name = first_match->name ? first_match->name : "";
     }
     return first_match;
+}
+
+static std::string hxc_get_avcodec_loaded_path() {
+    Dl_info info;
+    std::memset(&info, 0, sizeof(info));
+    if (dladdr((void*)&avcodec_version, &info) != 0 && info.dli_fname) {
+        return std::string(info.dli_fname);
+    }
+    return "";
+}
+
+static bool hxc_avcodec_config_has_mediacodec() {
+    const char* cfg = avcodec_configuration();
+    if (!cfg) {
+        return false;
+    }
+    return std::strstr(cfg, "mediacodec") != nullptr;
 }
 #endif
 
@@ -2091,6 +2112,12 @@ int PlayerCore::stream_component_open(int stream_index) {
                                : "default_decoder");
             if (!android_mediacodec_decoder_candidates.empty()) {
                 decode_diag += std::string(" hw_candidates=") + android_mediacodec_decoder_candidates;
+            }
+            decode_diag += std::string(" ffmcfg=") +
+                           (hxc_avcodec_config_has_mediacodec() ? "1" : "0");
+            std::string avcodec_path = hxc_get_avcodec_loaded_path();
+            if (!avcodec_path.empty()) {
+                decode_diag += std::string(" avcodec_path=") + avcodec_path;
             }
             if (android_mediacodec_decoder_missing) {
                 decode_diag += " hint=mediacodec_decoder_not_found";
