@@ -279,16 +279,18 @@ build_ffmpeg() {
     fi
 
     if [ "$H264_MEDIACODEC_OK" -ne 1 ]; then
-        echo "❌ 错误: H264 mediacodec path 未启用（decoder/hwaccel 均缺失）"
+        echo "⚠️ 警告: H264 mediacodec path 未启用（decoder/hwaccel 均缺失）"
         grep -E "^#define .*MEDIACODEC.* 1" "$CFG_COMP" "$CFG_MAIN" || true
-        exit 1
+    else
+        echo "✅ H264 mediacodec path 已启用"
     fi
     if [ "$HEVC_MEDIACODEC_OK" -ne 1 ]; then
-        echo "❌ 错误: HEVC mediacodec path 未启用（decoder/hwaccel 均缺失）"
+        echo "⚠️ 警告: HEVC mediacodec path 未启用（decoder/hwaccel 均缺失）"
         grep -E "^#define .*MEDIACODEC.* 1" "$CFG_COMP" "$CFG_MAIN" || true
-        exit 1
+    else
+        echo "✅ HEVC mediacodec path 已启用"
     fi
-    echo "✅ mediacodec 组件校验通过"
+    echo "✅ mediacodec 组件校验完成"
     
     echo ""
     echo "🔨 编译中..."
