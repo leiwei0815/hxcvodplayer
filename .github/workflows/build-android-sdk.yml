@@ -28,7 +28,7 @@ env:
   NDK_VERSION: '26.3.11579264'
   ANDROID_API_LEVEL: '24'
   # 手动提升该值可强制失效第三方缓存（用于排查“脚本已改但产物未更新”）
-  THIRD_PARTY_CACHE_REV: '20260511-mediacodec-v3'
+  THIRD_PARTY_CACHE_REV: '20260511-mediacodec-v4'
 
 jobs:
   # ============================================================
@@ -202,17 +202,33 @@ jobs:
               exit 1
             fi
 
+            if grep -q "^#define CONFIG_JNI 1" "$cfg_comp" "$cfg_main"; then
+              echo "✅ CONFIG_JNI=1"
+            else
+              echo "❌ $abi 缺少 CONFIG_JNI=1（Android mediacodec 依赖 JNI）"
+              exit 1
+            fi
+
+            if grep -qE "^#define (CONFIG_MEDIACODEC_DECODER|CONFIG_MEDIACODEC_HWACCEL) 1" "$cfg_comp" "$cfg_main"; then
+              echo "✅ Generic mediacodec decoder/hwaccel path enabled"
+            else
+              echo "❌ $abi 缺少通用 mediacodec decoder/hwaccel 通路"
+              exit 1
+            fi
+
             # 对每个编解码标准，要求 decoder/hwaccel 至少一个通路开启，避免不同 FFmpeg 版本宏名差异导致误拦截。
             if grep -qE "^#define (CONFIG_MEDIACODEC_HWACCEL|CONFIG_H264_MEDIACODEC_DECODER|CONFIG_H264_MEDIACODEC_HWACCEL) 1" "$cfg_comp" "$cfg_main"; then
               echo "✅ H264 mediacodec path enabled"
             else
-              echo "⚠️ $abi H264 mediacodec path not enabled (generic/per-codec decoder+hwaccel missing)"
+              echo "❌ $abi H264 mediacodec path not enabled (generic/per-codec decoder+hwaccel missing)"
+              exit 1
             fi
 
             if grep -qE "^#define (CONFIG_MEDIACODEC_HWACCEL|CONFIG_HEVC_MEDIACODEC_DECODER|CONFIG_HEVC_MEDIACODEC_HWACCEL) 1" "$cfg_comp" "$cfg_main"; then
               echo "✅ HEVC mediacodec path enabled"
             else
-              echo "⚠️ $abi HEVC mediacodec path not enabled (generic/per-codec decoder+hwaccel missing)"
+              echo "❌ $abi HEVC mediacodec path not enabled (generic/per-codec decoder+hwaccel missing)"
+              exit 1
             fi
           done
           echo "✅ FFmpeg mediacodec 组件宏校验通过"

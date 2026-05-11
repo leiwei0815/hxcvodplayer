@@ -268,6 +268,17 @@ build_ffmpeg() {
         exit 1
     fi
 
+    if ! grep -q "^#define CONFIG_JNI 1" "$CFG_COMP" "$CFG_MAIN"; then
+        echo "❌ 错误: CONFIG_JNI 未启用（Android mediacodec 依赖 JNI）"
+        exit 1
+    fi
+
+    if ! grep -qE "^#define (CONFIG_MEDIACODEC_DECODER|CONFIG_MEDIACODEC_HWACCEL) 1" "$CFG_COMP" "$CFG_MAIN"; then
+        echo "❌ 错误: 通用 mediacodec decoder/hwaccel 通路未启用"
+        grep -E "^#define .*MEDIACODEC.* 1" "$CFG_COMP" "$CFG_MAIN" || true
+        exit 1
+    fi
+
     local H264_MEDIACODEC_OK=0
     local HEVC_MEDIACODEC_OK=0
     if grep -qE "^#define (CONFIG_MEDIACODEC_HWACCEL|CONFIG_H264_MEDIACODEC_DECODER|CONFIG_H264_MEDIACODEC_HWACCEL) 1" "$CFG_COMP" "$CFG_MAIN"; then
@@ -278,14 +289,16 @@ build_ffmpeg() {
     fi
 
     if [ "$H264_MEDIACODEC_OK" -ne 1 ]; then
-        echo "⚠️ 警告: H264 mediacodec path 未启用（decoder/hwaccel 均缺失）"
+        echo "❌ 错误: H264 mediacodec path 未启用（decoder/hwaccel 均缺失）"
         grep -E "^#define .*MEDIACODEC.* 1" "$CFG_COMP" "$CFG_MAIN" || true
+        exit 1
     else
         echo "✅ H264 mediacodec path 已启用"
     fi
     if [ "$HEVC_MEDIACODEC_OK" -ne 1 ]; then
-        echo "⚠️ 警告: HEVC mediacodec path 未启用（decoder/hwaccel 均缺失）"
+        echo "❌ 错误: HEVC mediacodec path 未启用（decoder/hwaccel 均缺失）"
         grep -E "^#define .*MEDIACODEC.* 1" "$CFG_COMP" "$CFG_MAIN" || true
+        exit 1
     else
         echo "✅ HEVC mediacodec path 已启用"
     fi
