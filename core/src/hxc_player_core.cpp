@@ -261,6 +261,62 @@ static const char* hxc_get_android_mediacodec_decoder_name(enum AVCodecID codec_
             return nullptr;
     }
 }
+
+static const AVCodec* hxc_find_android_mediacodec_decoder(enum AVCodecID codec_id,
+                                                           std::string* selected_name,
+                                                           std::string* candidate_names) {
+    if (selected_name) {
+        selected_name->clear();
+    }
+    if (candidate_names) {
+        candidate_names->clear();
+    }
+
+    // 先按常见命名尝试，命中时可保证选择稳定。
+    const char* preferred_name = hxc_get_android_mediacodec_decoder_name(codec_id);
+    if (preferred_name) {
+        const AVCodec* preferred = avcodec_find_decoder_by_name(preferred_name);
+        if (preferred) {
+            if (selected_name) {
+                *selected_name = preferred_name;
+            }
+            if (candidate_names) {
+                *candidate_names = preferred_name;
+            }
+            return preferred;
+        }
+    }
+
+    // 回退：扫描当前 libavcodec 中所有解码器，匹配 "*mediacodec*"。
+    const AVCodec* first_match = nullptr;
+    void* opaque = nullptr;
+    while (true) {
+        const AVCodec* c = av_codec_iterate(&opaque);
+        if (!c) {
+            break;
+        }
+        if (!av_codec_is_decoder(c) || c->id != codec_id || !c->name) {
+            continue;
+        }
+        if (!std::strstr(c->name, "mediacodec")) {
+            continue;
+        }
+        if (candidate_names) {
+            if (!candidate_names->empty()) {
+                candidate_names->append(",");
+            }
+            candidate_names->append(c->name);
+        }
+        if (!first_match) {
+            first_match = c;
+        }
+    }
+
+    if (first_match && selected_name) {
+        *selected_name = first_match->name ? first_match->name : "";
+    }
+    return first_match;
+}
 #endif
 
 }  // namespace
@@ -1977,19 +2033,18 @@ int PlayerCore::stream_component_open(int stream_index) {
 #if defined(__ANDROID__)
     bool use_android_mediacodec_decoder = false;
     bool android_mediacodec_decoder_missing = false;
-    bool android_mediacodec_name_unsupported = false;
+    std::string android_mediacodec_decoder_name;
+    std::string android_mediacodec_decoder_candidates;
     if (request_video_hw_decode) {
-        const char* hw_decoder_name = hxc_get_android_mediacodec_decoder_name(codecpar->codec_id);
-        if (hw_decoder_name) {
-            const AVCodec* hw_codec = avcodec_find_decoder_by_name(hw_decoder_name);
-            if (hw_codec) {
-                codec = hw_codec;
-                use_android_mediacodec_decoder = true;
-            } else {
-                android_mediacodec_decoder_missing = true;
-            }
+        const AVCodec* hw_codec = hxc_find_android_mediacodec_decoder(
+            codecpar->codec_id,
+            &android_mediacodec_decoder_name,
+            &android_mediacodec_decoder_candidates);
+        if (hw_codec) {
+            codec = hw_codec;
+            use_android_mediacodec_decoder = true;
         } else {
-            android_mediacodec_name_unsupported = true;
+            android_mediacodec_decoder_missing = true;
         }
     }
 #endif
@@ -2031,11 +2086,14 @@ int PlayerCore::stream_component_open(int stream_index) {
 #if defined(__ANDROID__)
         if (request_video_hw_decode) {
             decode_diag += std::string(" hw_decoder=") +
-                           (use_android_mediacodec_decoder ? "mediacodec_named" : "default_decoder");
+                           (use_android_mediacodec_decoder
+                               ? android_mediacodec_decoder_name
+                               : "default_decoder");
+            if (!android_mediacodec_decoder_candidates.empty()) {
+                decode_diag += std::string(" hw_candidates=") + android_mediacodec_decoder_candidates;
+            }
             if (android_mediacodec_decoder_missing) {
                 decode_diag += " hint=mediacodec_decoder_not_found";
-            } else if (android_mediacodec_name_unsupported) {
-                decode_diag += " hint=codec_no_mediacodec_mapping";
             }
         }
 #endif
