@@ -28,7 +28,7 @@ env:
   NDK_VERSION: '26.3.11579264'
   ANDROID_API_LEVEL: '24'
   # 手动提升该值可强制失效第三方缓存（用于排查“脚本已改但产物未更新”）
-  THIRD_PARTY_CACHE_REV: '20260511-mediacodec-v2'
+  THIRD_PARTY_CACHE_REV: '20260511-mediacodec-v3'
 
 jobs:
   # ============================================================
