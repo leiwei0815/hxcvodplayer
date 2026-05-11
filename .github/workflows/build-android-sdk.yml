@@ -139,6 +139,25 @@ jobs:
             fi
           done
 
+      - name: 校验 FFmpeg mediacodec 解码器是否可用
+        working-directory: android-third
+        run: |
+          set -e
+          echo "=== 校验 mediacodec 解码器符号 ==="
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            codec_so="ffmpeg-build-android/FFmpeg-Android/${abi}/lib/libavcodec.so"
+            if [ ! -f "$codec_so" ]; then
+              echo "❌ 缺失 $codec_so"
+              exit 1
+            fi
+            echo "--- $abi ---"
+            strings "$codec_so" | grep -E "h264_mediacodec|hevc_mediacodec" || {
+              echo "❌ $abi 缺少 mediacodec decoder 符号（h264_mediacodec/hevc_mediacodec）"
+              exit 1
+            }
+          done
+          echo "✅ mediacodec decoder 校验通过"
+
       # 上传第三方库产物，供下一个 Job 使用
       - name: 上传第三方库产物
         uses: actions/upload-artifact@v4
