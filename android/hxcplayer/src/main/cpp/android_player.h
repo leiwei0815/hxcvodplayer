@@ -157,6 +157,9 @@ private:
     std::vector<uint8_t> last_frame_y_;
     std::vector<uint8_t> last_frame_u_;
     std::vector<uint8_t> last_frame_v_;
+    // Temporary split buffers when decoder outputs interleaved UV (NV12/NV21).
+    std::vector<uint8_t> nv_uv_split_u_;
+    std::vector<uint8_t> nv_uv_split_v_;
     int last_frame_width_{0};
     int last_frame_height_{0};
     int last_frame_y_stride_{0};

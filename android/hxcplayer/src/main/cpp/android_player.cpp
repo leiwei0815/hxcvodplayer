@@ -2056,10 +2056,17 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     auto isLikelyValidPtr = [](const void* p) -> bool {
         return p && reinterpret_cast<uintptr_t>(p) > 4096;
     };
-    if (!isLikelyValidPtr(y_data) || !isLikelyValidPtr(u_data) || !isLikelyValidPtr(v_data) ||
-        width <= 1 || height <= 1 || y_linesize < 0 || u_linesize < 0 || v_linesize < 0) {
+    if (!isLikelyValidPtr(y_data) || width <= 1 || height <= 1 ||
+        y_linesize < 0 || u_linesize < 0 || v_linesize < 0) {
         LOGW("[render] drop invalid frame args y=%p u=%p v=%p w=%d h=%d yls=%d uls=%d vls=%d",
              y_data, u_data, v_data, width, height, y_linesize, u_linesize, v_linesize);
+        return -1;
+    }
+    bool has_u = isLikelyValidPtr(u_data);
+    bool has_v = isLikelyValidPtr(v_data);
+    if (!has_u) {
+        LOGW("[render] drop frame: missing U plane y=%p u=%p v=%p w=%d h=%d",
+             y_data, u_data, v_data, width, height);
         return -1;
     }
     if (!gl_program_ || egl_surface_ == EGL_NO_SURFACE) return -1;
@@ -2076,9 +2083,47 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
 
     int y_tex_w  = y_linesize > 0 ? y_linesize : width;
     int uv_default_w = (width + 1) / 2;
+    int uv_h     = (height + 1) / 2;
+
+    // Some hardware decode paths provide Y + interleaved UV only (NV12/NV21),
+    // where frame->data[2] is null. Split UV on CPU to keep the existing 3-plane
+    // shader path stable and avoid black-screen after hard-decode switch.
+    if (!has_v) {
+        int uv_interleaved_stride = u_linesize > 0 ? u_linesize : width;
+        int uv_plane_w = uv_default_w;
+        if (uv_interleaved_stride < uv_plane_w * 2) {
+            LOGW("[render] drop frame: invalid interleaved UV stride=%d need>=%d w=%d h=%d",
+                 uv_interleaved_stride, uv_plane_w * 2, width, height);
+            return -1;
+        }
+        size_t uv_plane_size = static_cast<size_t>(uv_plane_w) * static_cast<size_t>(uv_h);
+        if (nv_uv_split_u_.size() != uv_plane_size || nv_uv_split_v_.size() != uv_plane_size) {
+            nv_uv_split_u_.assign(uv_plane_size, 0);
+            nv_uv_split_v_.assign(uv_plane_size, 0);
+        }
+        const uint8_t* uv_src = static_cast<const uint8_t*>(u_data);
+        // Assume NV12 layout (UVUV...). If some devices output NV21 (VUVU...),
+        // colors may shift; this path still avoids black-screen and crash.
+        for (int r = 0; r < uv_h; ++r) {
+            const uint8_t* row = uv_src + r * uv_interleaved_stride;
+            uint8_t* u_row = nv_uv_split_u_.data() + r * uv_plane_w;
+            uint8_t* v_row = nv_uv_split_v_.data() + r * uv_plane_w;
+            for (int c = 0; c < uv_plane_w; ++c) {
+                u_row[c] = row[c * 2];
+                v_row[c] = row[c * 2 + 1];
+            }
+        }
+        u_data = nv_uv_split_u_.data();
+        v_data = nv_uv_split_v_.data();
+        u_linesize = uv_plane_w;
+        v_linesize = uv_plane_w;
+        has_v = true;
+        LOGI("[render] split interleaved UV to planar buffers w=%d h=%d uv_stride=%d",
+             width, height, uv_interleaved_stride);
+    }
+
     int uv_w     = u_linesize > 0 ? u_linesize : uv_default_w;
     int v_tex_w  = v_linesize > 0 ? v_linesize : uv_default_w;
-    int uv_h     = (height + 1) / 2;
     int64_t y_sz64  = static_cast<int64_t>(y_tex_w) * height;
     int64_t uv_sz64 = static_cast<int64_t>(uv_w) * uv_h;
     int64_t v_sz64  = static_cast<int64_t>(v_tex_w) * uv_h;
