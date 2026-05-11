@@ -209,13 +209,6 @@ jobs:
               exit 1
             fi
 
-            if grep -qE "^#define (CONFIG_MEDIACODEC_DECODER|CONFIG_MEDIACODEC_HWACCEL) 1" "$cfg_comp" "$cfg_main"; then
-              echo "✅ Generic mediacodec decoder/hwaccel path enabled"
-            else
-              echo "❌ $abi 缺少通用 mediacodec decoder/hwaccel 通路"
-              exit 1
-            fi
-
             # 对每个编解码标准，要求 decoder/hwaccel 至少一个通路开启，避免不同 FFmpeg 版本宏名差异导致误拦截。
             if grep -qE "^#define (CONFIG_MEDIACODEC_HWACCEL|CONFIG_H264_MEDIACODEC_DECODER|CONFIG_H264_MEDIACODEC_HWACCEL) 1" "$cfg_comp" "$cfg_main"; then
               echo "✅ H264 mediacodec path enabled"

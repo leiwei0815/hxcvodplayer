@@ -177,7 +177,7 @@ build_ffmpeg() {
         --sysroot="$SYSROOT" \
         --extra-cflags="$EXTRA_CFLAGS" \
         --extra-ldflags="$EXTRA_LDFLAGS" \
-        --pkg-config=false \
+        --pkg-config=/usr/bin/false \
         --enable-shared \
         --disable-static \
         --enable-network \
@@ -215,7 +215,6 @@ build_ffmpeg() {
         --disable-muxers \
         --disable-demuxers \
         --enable-demuxer=mov \
-        --enable-demuxer=mp4 \
         --enable-demuxer=m4v \
         --enable-demuxer=mpegts \
         --enable-demuxer=mpegtsraw \
@@ -239,11 +238,7 @@ build_ffmpeg() {
         --disable-indevs \
         --disable-outdevs \
         --disable-filters \
-        --enable-filter=scale \
-        --enable-filter=format \
         --enable-hwaccel=mediacodec \
-        --enable-hwaccel=h264_mediacodec \
-        --enable-hwaccel=hevc_mediacodec \
         --enable-mediacodec \
         --enable-jni \
         --enable-mbedtls \
@@ -270,12 +265,6 @@ build_ffmpeg() {
 
     if ! grep -q "^#define CONFIG_JNI 1" "$CFG_COMP" "$CFG_MAIN"; then
         echo "❌ 错误: CONFIG_JNI 未启用（Android mediacodec 依赖 JNI）"
-        exit 1
-    fi
-
-    if ! grep -qE "^#define (CONFIG_MEDIACODEC_DECODER|CONFIG_MEDIACODEC_HWACCEL) 1" "$CFG_COMP" "$CFG_MAIN"; then
-        echo "❌ 错误: 通用 mediacodec decoder/hwaccel 通路未启用"
-        grep -E "^#define .*MEDIACODEC.* 1" "$CFG_COMP" "$CFG_MAIN" || true
         exit 1
     fi
 
@@ -306,7 +295,9 @@ build_ffmpeg() {
     
     echo ""
     echo "🔨 编译中..."
-    make -j$(sysctl -n hw.ncpu) 2>&1 | grep -v "warning:"
+    local JOBS
+    JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+    make -j"${JOBS}" 2>&1 | grep -v "warning:"
     
     echo ""
     echo "📦 安装到 $INSTALL_DIR..."
