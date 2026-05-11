@@ -22,6 +22,7 @@ extern "C" {
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/pixdesc.h>
 #include <libavformat/avformat.h>
 }
 
@@ -337,6 +338,55 @@ static bool hxc_avcodec_config_has_mediacodec() {
         return false;
     }
     return std::strstr(cfg, "mediacodec") != nullptr;
+}
+
+static std::string hxc_collect_hw_config_summary(const AVCodec* codec,
+                                                 enum AVHWDeviceType target_device_type) {
+    if (!codec) {
+        return "";
+    }
+    std::ostringstream oss;
+    bool has_any = false;
+    for (int i = 0;; ++i) {
+        const AVCodecHWConfig* cfg = avcodec_get_hw_config(codec, i);
+        if (!cfg) {
+            break;
+        }
+        if (has_any) {
+            oss << ",";
+        }
+        has_any = true;
+        const char* dev_name = av_hwdevice_get_type_name(cfg->device_type);
+        oss << (dev_name ? dev_name : "unknown")
+            << ":" << cfg->methods
+            << ":pf=" << av_get_pix_fmt_name(cfg->pix_fmt);
+        if (cfg->device_type == target_device_type) {
+            oss << "*";
+        }
+    }
+    return has_any ? oss.str() : "none";
+}
+
+static std::string hxc_collect_decoder_registry_summary(enum AVCodecID codec_id,
+                                                        enum AVHWDeviceType target_device_type) {
+    std::ostringstream oss;
+    bool has_any = false;
+    void* opaque = nullptr;
+    while (true) {
+        const AVCodec* c = av_codec_iterate(&opaque);
+        if (!c) {
+            break;
+        }
+        if (!av_codec_is_decoder(c) || c->id != codec_id || !c->name) {
+            continue;
+        }
+        if (has_any) {
+            oss << ";";
+        }
+        has_any = true;
+        oss << c->name << "[hw=" << hxc_collect_hw_config_summary(c, target_device_type) << "]";
+    }
+    return has_any ? oss.str() : "none";
 }
 #endif
 
@@ -2054,9 +2104,15 @@ int PlayerCore::stream_component_open(int stream_index) {
 #if defined(__ANDROID__)
     bool use_android_mediacodec_decoder = false;
     bool android_mediacodec_decoder_missing = false;
+    std::string android_hw_precheck = "na";
     std::string android_mediacodec_decoder_name;
     std::string android_mediacodec_decoder_candidates;
+    std::string android_codec_registry_summary;
+    enum AVHWDeviceType android_device_type = AV_HWDEVICE_TYPE_NONE;
     if (request_video_hw_decode) {
+        android_device_type = hxc_platform_hw_device_type();
+        android_codec_registry_summary = hxc_collect_decoder_registry_summary(
+            codecpar->codec_id, android_device_type);
         const AVCodec* hw_codec = hxc_find_android_mediacodec_decoder(
             codecpar->codec_id,
             &android_mediacodec_decoder_name,
@@ -2064,8 +2120,10 @@ int PlayerCore::stream_component_open(int stream_index) {
         if (hw_codec) {
             codec = hw_codec;
             use_android_mediacodec_decoder = true;
+            android_hw_precheck = "mediacodec_decoder_selected";
         } else {
             android_mediacodec_decoder_missing = true;
+            android_hw_precheck = "mediacodec_decoder_not_found";
         }
     }
 #endif
@@ -2110,8 +2168,12 @@ int PlayerCore::stream_component_open(int stream_index) {
                            (use_android_mediacodec_decoder
                                ? android_mediacodec_decoder_name
                                : "default_decoder");
+            decode_diag += std::string(" precheck=") + android_hw_precheck;
             if (!android_mediacodec_decoder_candidates.empty()) {
                 decode_diag += std::string(" hw_candidates=") + android_mediacodec_decoder_candidates;
+            }
+            if (!android_codec_registry_summary.empty()) {
+                decode_diag += std::string(" hw_registry=") + android_codec_registry_summary;
             }
             decode_diag += std::string(" ffmcfg=") +
                            (hxc_avcodec_config_has_mediacodec() ? "1" : "0");
@@ -2134,15 +2196,28 @@ int PlayerCore::stream_component_open(int stream_index) {
 #endif
         {
         enum AVHWDeviceType device_type = hxc_platform_hw_device_type();
+#if defined(__ANDROID__)
+        if (android_hw_precheck == "mediacodec_decoder_selected") {
+            android_hw_precheck = "mediacodec_decoder_selected_but_fallback_path";
+        } else if (device_type == AV_HWDEVICE_TYPE_NONE) {
+            android_hw_precheck = "platform_hw_device_none";
+        }
+#endif
         if (device_type == AV_HWDEVICE_TYPE_NONE) {
             decode_diag += " reason=platform_hw_device_none";
         } else if (!hxc_codec_supports_hw_device(codec, device_type)) {
             decode_diag += " reason=codec_not_support_hw_device";
+#if defined(__ANDROID__)
+            android_hw_precheck = "codec_not_support_hw_device";
+#endif
         }
         hw_decode_enabled = hxc_try_enable_hw_decode(codec_ctx, codec);
         if (!hw_decode_enabled &&
             decode_diag.find("reason=") == std::string::npos) {
             decode_diag += " reason=hw_device_create_or_ref_failed";
+#if defined(__ANDROID__)
+            android_hw_precheck = "hw_device_create_or_ref_failed";
+#endif
         }
         }
         LOG_INFO("视频解码模式：请求硬解，启用结果=", hw_decode_enabled ? 1 : 0);
