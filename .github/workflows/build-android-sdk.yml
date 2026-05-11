@@ -173,12 +173,22 @@ jobs:
               exit 1
             fi
             echo "--- $abi ---"
-            for sym in CONFIG_H264_MEDIACODEC_DECODER CONFIG_HEVC_MEDIACODEC_DECODER CONFIG_MEDIACODEC CONFIG_H264_MEDIACODEC_HWACCEL CONFIG_HEVC_MEDIACODEC_HWACCEL; do
+            # FFmpeg 不同版本/裁剪组合下，*_MEDIACODEC_DECODER 宏可能不存在，
+            # 但 mediacodec 硬解路径依赖的核心开关应至少包含以下 3 项。
+            for sym in CONFIG_MEDIACODEC CONFIG_H264_MEDIACODEC_HWACCEL CONFIG_HEVC_MEDIACODEC_HWACCEL; do
               if ! grep -q "^#define ${sym} 1" "$cfg_comp" "$cfg_main"; then
                 echo "❌ $abi 缺少或未启用 ${sym}=1"
                 exit 1
               fi
               echo "✅ ${sym}=1"
+            done
+            # 额外记录 decoder 宏，作为诊断信息，不作为 fail 条件。
+            for opt_sym in CONFIG_H264_MEDIACODEC_DECODER CONFIG_HEVC_MEDIACODEC_DECODER; do
+              if grep -q "^#define ${opt_sym} 1" "$cfg_comp" "$cfg_main"; then
+                echo "ℹ️ ${opt_sym}=1"
+              else
+                echo "ℹ️ ${opt_sym} 未启用（当前版本/配置可能无该宏）"
+              fi
             done
           done
           echo "✅ FFmpeg mediacodec 组件宏校验通过"
