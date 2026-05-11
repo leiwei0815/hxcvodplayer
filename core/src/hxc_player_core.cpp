@@ -14,6 +14,8 @@
 #include <thread>
 #include <sstream>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #if defined(__ANDROID__)
 #include <dlfcn.h>
 #endif
@@ -338,6 +340,30 @@ static bool hxc_avcodec_config_has_mediacodec() {
         return false;
     }
     return std::strstr(cfg, "mediacodec") != nullptr;
+}
+
+static std::string hxc_calc_file_fingerprint(const std::string& path) {
+    if (path.empty()) {
+        return "";
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return "";
+    }
+    // Lightweight FNV-1a 64-bit fingerprint for runtime artifact matching.
+    uint64_t hash = 1469598103934665603ULL;
+    const uint64_t prime = 1099511628211ULL;
+    char buf[8192];
+    while (in.read(buf, sizeof(buf)) || in.gcount() > 0) {
+        std::streamsize n = in.gcount();
+        for (std::streamsize i = 0; i < n; ++i) {
+            hash ^= static_cast<unsigned char>(buf[i]);
+            hash *= prime;
+        }
+    }
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return oss.str();
 }
 
 static std::string hxc_collect_hw_config_summary(const AVCodec* codec,
@@ -2180,6 +2206,10 @@ int PlayerCore::stream_component_open(int stream_index) {
             std::string avcodec_path = hxc_get_avcodec_loaded_path();
             if (!avcodec_path.empty()) {
                 decode_diag += std::string(" avcodec_path=") + avcodec_path;
+                std::string avcodec_fp = hxc_calc_file_fingerprint(avcodec_path);
+                if (!avcodec_fp.empty()) {
+                    decode_diag += std::string(" avcodec_fp=") + avcodec_fp;
+                }
             }
             if (android_mediacodec_decoder_missing) {
                 decode_diag += " hint=mediacodec_decoder_not_found";

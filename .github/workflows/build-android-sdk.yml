@@ -160,6 +160,22 @@ jobs:
           done
           echo "✅ mediacodec decoder 校验通过"
 
+      - name: 输出 FFmpeg libavcodec 指纹（用于对账运行时加载库）
+        working-directory: android-third
+        run: |
+          set -e
+          echo "=== libavcodec fingerprints ==="
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            codec_so="ffmpeg-build-android/FFmpeg-Android/${abi}/lib/libavcodec.so"
+            if [ ! -f "$codec_so" ]; then
+              echo "❌ 缺失 $codec_so"
+              exit 1
+            fi
+            fp=$(sha256sum "$codec_so" | awk '{print $1}')
+            size=$(wc -c < "$codec_so")
+            echo "$abi sha256=$fp size=$size path=$codec_so"
+          done
+
       - name: 校验 FFmpeg mediacodec 组件宏（避免符号假阳性）
         working-directory: android-third
         run: |
