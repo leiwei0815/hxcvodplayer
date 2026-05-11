@@ -135,6 +135,75 @@ inline float normalize_playback_rate(float rate) {
     }
     return rate;
 }
+
+inline float clamp01(float x) {
+    if (x < 0.0f) return 0.0f;
+    if (x > 1.0f) return 1.0f;
+    return x;
+}
+
+inline float rgb_clip_penalty(float y, float u, float v) {
+    float r = y + 1.402f * v;
+    float g = y - 0.344f * u - 0.714f * v;
+    float b = y + 1.772f * u;
+    float penalty = 0.0f;
+    penalty += std::fabs(r - clamp01(r));
+    penalty += std::fabs(g - clamp01(g));
+    penalty += std::fabs(b - clamp01(b));
+    return penalty;
+}
+
+// Returns:
+//   +1 => prefer NV21 (VU, swap UV)
+//   -1 => prefer NV12 (UV, no swap)
+//    0 => inconclusive
+int estimate_uv_swap_vote(const uint8_t* y_data,
+                          int y_stride,
+                          const uint8_t* uv_data,
+                          int uv_stride,
+                          int width,
+                          int height) {
+    if (!y_data || !uv_data || y_stride <= 0 || uv_stride <= 1 || width <= 2 || height <= 2) {
+        return 0;
+    }
+    const int uv_w = width / 2;
+    const int uv_h = height / 2;
+    if (uv_w <= 2 || uv_h <= 2 || uv_stride < uv_w * 2) {
+        return 0;
+    }
+
+    const int sample_rows = std::min(uv_h, 8);
+    const int sample_cols = std::min(uv_w, 12);
+    float score_nv12 = 0.0f;
+    float score_nv21 = 0.0f;
+    int samples = 0;
+
+    for (int sr = 0; sr < sample_rows; ++sr) {
+        int r = (sr * uv_h) / sample_rows;
+        const uint8_t* uv_row = uv_data + r * uv_stride;
+        int y_row = std::min(height - 1, r * 2);
+        const uint8_t* y_row_ptr = y_data + y_row * y_stride;
+        for (int sc = 0; sc < sample_cols; ++sc) {
+            int c = (sc * uv_w) / sample_cols;
+            int uv_idx = c * 2;
+            int y_col = std::min(width - 1, c * 2);
+            float y = static_cast<float>(y_row_ptr[y_col]) / 255.0f;
+            float u0 = static_cast<float>(uv_row[uv_idx]) / 255.0f - 0.5f;
+            float v0 = static_cast<float>(uv_row[uv_idx + 1]) / 255.0f - 0.5f;
+            score_nv12 += rgb_clip_penalty(y, u0, v0);
+            score_nv21 += rgb_clip_penalty(y, v0, u0);
+            samples++;
+        }
+    }
+
+    if (samples <= 0) return 0;
+    float avg_nv12 = score_nv12 / samples;
+    float avg_nv21 = score_nv21 / samples;
+    float diff = avg_nv12 - avg_nv21;
+    const float eps = 0.015f;
+    if (std::fabs(diff) <= eps) return 0;
+    return (diff > 0.0f) ? +1 : -1;
+}
 }  // namespace
 
 AndroidPlayer::AndroidPlayer()
@@ -158,11 +227,20 @@ AndroidPlayer::AndroidPlayer()
     , gl_uniform_y_(-1)
     , gl_uniform_u_(-1)
     , gl_uniform_v_(-1)
+    , gl_uniform_uv_interleaved_(-1)
+    , gl_uniform_uv_swap_(-1)
     , gl_attrib_pos_(-1)
     , gl_attrib_tex_(-1)
     , gl_attrib_tex_uv_(-1)
     , gl_last_video_w_(0)
     , gl_last_video_h_(0)
+    , gl_last_uv_interleaved_(false)
+    , gl_last_uv_swap_(false)
+    , gl_last_uv_tex_w_(0)
+    , gl_uv_swap_decided_(false)
+    , gl_uv_swap_selected_(false)
+    , gl_uv_swap_votes_(0)
+    , gl_uv_swap_probe_budget_(24)
     , gl_pbo_y_{}
     , gl_pbo_y_sz_(0)
     , gl_pbo_uv_sz_(0)
@@ -914,11 +992,26 @@ static const char* kFragmentShader =
     "uniform sampler2D u_tex_y;\n"
     "uniform sampler2D u_tex_u;\n"
     "uniform sampler2D u_tex_v;\n"
+    "uniform int u_uv_interleaved;\n"
+    "uniform int u_uv_swap;\n"
     "out vec4 fragColor;\n"
     "void main() {\n"
     "    float y = texture(u_tex_y, v_texcoord).r;\n"
-    "    float u = texture(u_tex_u, v_texcoord_uv).r - 0.5;\n"
-    "    float v = texture(u_tex_v, v_texcoord_uv).r - 0.5;\n"
+    "    float u;\n"
+    "    float v;\n"
+    "    if (u_uv_interleaved == 1) {\n"
+    "        vec2 uv = texture(u_tex_u, v_texcoord_uv).rg;\n"
+    "        if (u_uv_swap == 1) {\n"
+    "            u = uv.g - 0.5;\n"
+    "            v = uv.r - 0.5;\n"
+    "        } else {\n"
+    "            u = uv.r - 0.5;\n"
+    "            v = uv.g - 0.5;\n"
+    "        }\n"
+    "    } else {\n"
+    "        u = texture(u_tex_u, v_texcoord_uv).r - 0.5;\n"
+    "        v = texture(u_tex_v, v_texcoord_uv).r - 0.5;\n"
+    "    }\n"
     "    float r = y + 1.402  * v;\n"
     "    float g = y - 0.344  * u - 0.714 * v;\n"
     "    float b = y + 1.772  * u;\n"
@@ -1091,6 +1184,8 @@ bool AndroidPlayer::initGLProgram() {
     gl_uniform_y_  = glGetUniformLocation(gl_program_, "u_tex_y");
     gl_uniform_u_  = glGetUniformLocation(gl_program_, "u_tex_u");
     gl_uniform_v_  = glGetUniformLocation(gl_program_, "u_tex_v");
+    gl_uniform_uv_interleaved_ = glGetUniformLocation(gl_program_, "u_uv_interleaved");
+    gl_uniform_uv_swap_ = glGetUniformLocation(gl_program_, "u_uv_swap");
     gl_attrib_pos_    = glGetAttribLocation(gl_program_, "a_position");
     gl_attrib_tex_    = glGetAttribLocation(gl_program_, "a_texcoord");
     gl_attrib_tex_uv_ = glGetAttribLocation(gl_program_, "a_texcoord_uv");
@@ -1130,15 +1225,26 @@ void AndroidPlayer::destroyGLProgram() {
     gl_attrib_tex_uv_ = -1;
     gl_last_video_w_  = 0;
     gl_last_video_h_  = 0;
+    gl_last_uv_interleaved_ = false;
+    gl_last_uv_swap_ = false;
+    gl_last_uv_tex_w_ = 0;
+    gl_uv_swap_decided_ = false;
+    gl_uv_swap_selected_ = false;
+    gl_uv_swap_votes_ = 0;
+    gl_uv_swap_probe_budget_ = 24;
 }
 
 void AndroidPlayer::redrawLastFrame() {
     if (last_frame_width_ <= 0 || last_frame_height_ <= 0 ||
-        last_frame_y_.empty() || last_frame_u_.empty() || last_frame_v_.empty()) {
+        last_frame_y_.empty() || last_frame_u_.empty()) {
+        return;
+    }
+    if (last_frame_v_stride_ > 0 && last_frame_v_.empty()) {
         return;
     }
     if (!gl_program_ || egl_surface_ == EGL_NO_SURFACE) return;
-    renderFrame(last_frame_y_.data(), last_frame_u_.data(), last_frame_v_.data(),
+    void* cache_v = (last_frame_v_stride_ > 0 && !last_frame_v_.empty()) ? last_frame_v_.data() : nullptr;
+    renderFrame(last_frame_y_.data(), last_frame_u_.data(), cache_v,
                 last_frame_y_stride_, last_frame_u_stride_, last_frame_v_stride_,
                 last_frame_width_, last_frame_height_);
     LOGI("redrawLastFrame: %dx%d", last_frame_width_, last_frame_height_);
@@ -1650,13 +1756,19 @@ void AndroidPlayer::renderLoop() {
                             consecutive_drop_count_++;
                             int cadence_step = 4;
                             if (ultra_high_rate_4k) {
+                                // At >=2.5x 4K, keep a stronger cadence floor so video
+                                // can continuously catch up with fast-moving audio clock.
+                                int min_step_by_rate = (playback_rate >= 2.75) ? 3 : 2;
                                 if (delay <= -2.5) {
-                                    cadence_step = 3; // drop 2, show 1
+                                    cadence_step = 4; // drop 3, show 1
                                 } else if (delay <= -1.2) {
+                                    cadence_step = 3; // drop 2, show 1
+                                } else if (delay <= -0.6) {
                                     cadence_step = 2; // drop 1, show 1
                                 } else {
                                     cadence_step = 1; // near-sync: keep smoothness
                                 }
+                                cadence_step = std::max(cadence_step, min_step_by_rate);
                             } else {
                                 cadence_step = (delay <= -2.0) ? 4 : 3;
                             }
@@ -1975,9 +2087,9 @@ void AndroidPlayer::renderLoop() {
 
 // Ensure PBOs exist and match the current frame dimensions.
 // Called on the render thread (EGL context is current).
-bool AndroidPlayer::ensurePBOs(int y_w, int y_h, int uv_w, int uv_h) {
+bool AndroidPlayer::ensurePBOs(int y_w, int y_h, int uv_w, int uv_h, int uv_bpp) {
     int y_sz  = y_w  * y_h;
-    int uv_sz = uv_w * uv_h;
+    int uv_sz = uv_w * uv_h * uv_bpp;
 
     bool need_recreate = (gl_pbo_y_sz_  != y_sz  ||
                           gl_pbo_uv_sz_ != uv_sz ||
@@ -1990,7 +2102,7 @@ bool AndroidPlayer::ensurePBOs(int y_w, int y_h, int uv_w, int uv_h) {
     gl_pbo_y_sz_  = 0;
     gl_pbo_uv_sz_ = 0;
 
-    glGenBuffers(6, gl_pbo_y_);  // [0,1]=Y  [2,3]=U  [4,5]=V
+    glGenBuffers(6, gl_pbo_y_);  // [0,1]=Y  [2,3]=U/UV  [4,5]=V(planar only)
 
     auto alloc = [&](GLuint id, int sz) {
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, id);
@@ -2005,8 +2117,8 @@ bool AndroidPlayer::ensurePBOs(int y_w, int y_h, int uv_w, int uv_h) {
     gl_pbo_uv_sz_ = uv_sz;
     gl_pbo_idx_   = 0;
     LOGI("[PBO] Allocated 6 PBOs: Y=%d bytes UV=%d bytes", y_sz, uv_sz);
-    PBOI("evt=pbo_allocate y_bytes=%d uv_bytes=%d y_w=%d y_h=%d uv_w=%d uv_h=%d",
-         y_sz, uv_sz, y_w, y_h, uv_w, uv_h);
+    PBOI("evt=pbo_allocate y_bytes=%d uv_bytes=%d y_w=%d y_h=%d uv_w=%d uv_h=%d uv_bpp=%d",
+         y_sz, uv_sz, y_w, y_h, uv_w, uv_h, uv_bpp);
     return true;
 }
 
@@ -2084,64 +2196,97 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     int y_tex_w  = y_linesize > 0 ? y_linesize : width;
     int uv_default_w = (width + 1) / 2;
     int uv_h     = (height + 1) / 2;
+    bool uv_interleaved = !has_v;
+    bool uv_swap = gl_uv_swap_selected_;
+    int uv_tex_w = 0;
+    int v_tex_w  = 0;
+    int uv_upload_bpp = uv_interleaved ? 2 : 1;
+    int uv_upload_stride = 0;
+    const void* uv_upload_data = u_data;
 
-    // Some hardware decode paths provide Y + interleaved UV only (NV12/NV21),
-    // where frame->data[2] is null. Split UV on CPU to keep the existing 3-plane
-    // shader path stable and avoid black-screen after hard-decode switch.
-    if (!has_v) {
-        int uv_interleaved_stride = u_linesize > 0 ? u_linesize : width;
-        int uv_plane_w = uv_default_w;
-        if (uv_interleaved_stride < uv_plane_w * 2) {
-            LOGW("[render] drop frame: invalid interleaved UV stride=%d need>=%d w=%d h=%d",
-                 uv_interleaved_stride, uv_plane_w * 2, width, height);
+    if (uv_interleaved) {
+        uv_upload_stride = u_linesize > 0 ? u_linesize : width;
+        if (uv_upload_stride <= 0 || (uv_upload_stride % 2) != 0) {
+            LOGW("[render] drop frame: invalid interleaved UV stride=%d w=%d h=%d",
+                 uv_upload_stride, width, height);
             return -1;
         }
-        size_t uv_plane_size = static_cast<size_t>(uv_plane_w) * static_cast<size_t>(uv_h);
-        if (nv_uv_split_u_.size() != uv_plane_size || nv_uv_split_v_.size() != uv_plane_size) {
-            nv_uv_split_u_.assign(uv_plane_size, 0);
-            nv_uv_split_v_.assign(uv_plane_size, 0);
+        int uv_plane_w = uv_default_w;
+        if (uv_upload_stride < uv_plane_w * 2) {
+            LOGW("[render] drop frame: interleaved UV stride too small stride=%d need>=%d w=%d h=%d",
+                 uv_upload_stride, uv_plane_w * 2, width, height);
+            return -1;
         }
-        const uint8_t* uv_src = static_cast<const uint8_t*>(u_data);
-        // Assume NV12 layout (UVUV...). If some devices output NV21 (VUVU...),
-        // colors may shift; this path still avoids black-screen and crash.
-        for (int r = 0; r < uv_h; ++r) {
-            const uint8_t* row = uv_src + r * uv_interleaved_stride;
-            uint8_t* u_row = nv_uv_split_u_.data() + r * uv_plane_w;
-            uint8_t* v_row = nv_uv_split_v_.data() + r * uv_plane_w;
-            for (int c = 0; c < uv_plane_w; ++c) {
-                u_row[c] = row[c * 2];
-                v_row[c] = row[c * 2 + 1];
+        uv_tex_w = uv_upload_stride / 2; // RG texel width
+        if (width != gl_last_video_w_ || height != gl_last_video_h_) {
+            // New stream size/layout: reopen UV order probe window.
+            gl_uv_swap_decided_ = false;
+            gl_uv_swap_votes_ = 0;
+            gl_uv_swap_probe_budget_ = 24;
+        }
+        if (!gl_uv_swap_decided_ || gl_uv_swap_probe_budget_ > 0) {
+            int vote = estimate_uv_swap_vote(
+                static_cast<const uint8_t*>(y_data),
+                y_linesize > 0 ? y_linesize : width,
+                static_cast<const uint8_t*>(u_data),
+                uv_upload_stride,
+                width,
+                height);
+            if (vote != 0) {
+                gl_uv_swap_votes_ += vote;
+                if (gl_uv_swap_votes_ > 24) gl_uv_swap_votes_ = 24;
+                if (gl_uv_swap_votes_ < -24) gl_uv_swap_votes_ = -24;
             }
+            if (!gl_uv_swap_decided_ && std::abs(gl_uv_swap_votes_) >= 6) {
+                gl_uv_swap_selected_ = (gl_uv_swap_votes_ > 0);
+                gl_uv_swap_decided_ = true;
+                SYNCI("evt=uv_order_probe_decided decided=1 swap=%d votes=%d w=%d h=%d",
+                      gl_uv_swap_selected_ ? 1 : 0, gl_uv_swap_votes_, width, height);
+            }
+            if (gl_uv_swap_probe_budget_ > 0) {
+                gl_uv_swap_probe_budget_--;
+            }
+            SYNCI_RATE(180, "evt=uv_order_probe status=%s swap=%d votes=%d budget=%d w=%d h=%d",
+                       gl_uv_swap_decided_ ? "decided" : "probing",
+                       gl_uv_swap_selected_ ? 1 : 0,
+                       gl_uv_swap_votes_, gl_uv_swap_probe_budget_, width, height);
         }
-        u_data = nv_uv_split_u_.data();
-        v_data = nv_uv_split_v_.data();
-        u_linesize = uv_plane_w;
-        v_linesize = uv_plane_w;
-        has_v = true;
-        LOGI("[render] split interleaved UV to planar buffers w=%d h=%d uv_stride=%d",
-             width, height, uv_interleaved_stride);
+        uv_swap = gl_uv_swap_selected_;
+        LOGI_RATE(120, "[render] interleaved UV upload path w=%d h=%d uv_stride=%d uv_tex_w=%d",
+                  width, height, uv_upload_stride, uv_tex_w);
+    } else {
+        uv_tex_w = u_linesize > 0 ? u_linesize : uv_default_w;
+        v_tex_w  = v_linesize > 0 ? v_linesize : uv_default_w;
+        uv_upload_stride = uv_tex_w;
+        gl_uv_swap_decided_ = false;
+        gl_uv_swap_selected_ = false;
+        gl_uv_swap_votes_ = 0;
+        gl_uv_swap_probe_budget_ = 24;
+        uv_swap = false;
     }
 
-    int uv_w     = u_linesize > 0 ? u_linesize : uv_default_w;
-    int v_tex_w  = v_linesize > 0 ? v_linesize : uv_default_w;
     int64_t y_sz64  = static_cast<int64_t>(y_tex_w) * height;
-    int64_t uv_sz64 = static_cast<int64_t>(uv_w) * uv_h;
-    int64_t v_sz64  = static_cast<int64_t>(v_tex_w) * uv_h;
-    if (y_tex_w <= 0 || uv_w <= 0 || v_tex_w <= 0 || uv_h <= 0 ||
-        y_sz64 <= 0 || uv_sz64 <= 0 || v_sz64 <= 0 ||
-        y_sz64 > INT_MAX || uv_sz64 > INT_MAX || v_sz64 > INT_MAX) {
-        LOGW("[render] drop invalid frame size w=%d h=%d ytw=%d uw=%d vw=%d uh=%d",
-             width, height, y_tex_w, uv_w, v_tex_w, uv_h);
+    int64_t uv_sz64 = static_cast<int64_t>(uv_tex_w) * uv_h * uv_upload_bpp;
+    int64_t v_sz64  = uv_interleaved ? 0 : static_cast<int64_t>(v_tex_w) * uv_h;
+    if (y_tex_w <= 0 || uv_tex_w <= 0 || uv_h <= 0 ||
+        y_sz64 <= 0 || uv_sz64 <= 0 ||
+        (!uv_interleaved && (v_tex_w <= 0 || v_sz64 <= 0)) ||
+        y_sz64 > INT_MAX || uv_sz64 > INT_MAX || (!uv_interleaved && v_sz64 > INT_MAX)) {
+        LOGW("[render] drop invalid frame size w=%d h=%d ytw=%d uvw=%d vw=%d uh=%d uv_interleaved=%d",
+             width, height, y_tex_w, uv_tex_w, v_tex_w, uv_h, uv_interleaved ? 1 : 0);
         return -1;
     }
     int y_sz = static_cast<int>(y_sz64);
-    int uv_sz = static_cast<int>(uv_sz64);
-    int v_sz = static_cast<int>(v_sz64);
+    int uv_upload_sz = static_cast<int>(uv_sz64);
+    int v_sz = uv_interleaved ? 0 : static_cast<int>(v_sz64);
 
     bool size_changed = (width != gl_last_video_w_ || height != gl_last_video_h_);
+    bool uv_layout_changed = (uv_interleaved != gl_last_uv_interleaved_) ||
+                             (uv_swap != gl_last_uv_swap_) ||
+                             (uv_tex_w != gl_last_uv_tex_w_);
     if (size_changed) {
         LOGI("[DIAG] Video size: %dx%d -> %dx%d | Y_stride=%d UV_stride=%d",
-             gl_last_video_w_, gl_last_video_h_, width, height, y_tex_w, uv_w);
+             gl_last_video_w_, gl_last_video_h_, width, height, y_tex_w, uv_upload_stride);
     }
 
     // --- Texture upload ---
@@ -2150,9 +2295,9 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     // Use PBO double-buffering for 4K (>= 1920x1080) to overlap CPU copy with GPU draw.
     // For smaller resolutions the overhead of PBO setup isn't worth it.
     const bool use_pbo = (width >= 1920) &&
-                         ensurePBOs(y_tex_w, height, uv_w, uv_h);
-    PBOD("evt=upload_path use_pbo=%d video_w=%d video_h=%d y_stride=%d u_stride=%d v_stride=%d",
-         use_pbo ? 1 : 0, width, height, y_tex_w, uv_w, v_tex_w);
+                         ensurePBOs(y_tex_w, height, uv_tex_w, uv_h, uv_upload_bpp);
+    PBOD("evt=upload_path use_pbo=%d video_w=%d video_h=%d y_stride=%d uv_stride=%d v_stride=%d uv_interleaved=%d",
+         use_pbo ? 1 : 0, width, height, y_tex_w, uv_upload_stride, v_tex_w, uv_interleaved ? 1 : 0);
 
     if (use_pbo) {
         int wi = gl_pbo_idx_;          // write index (0 or 1)
@@ -2167,12 +2312,17 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
                          0, GL_LUMINANCE, GL_UNSIGNED_BYTE, y_data);
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, gl_tex_u_);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_w, uv_h,
-                         0, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
-            glActiveTexture(GL_TEXTURE2);
-            glBindTexture(GL_TEXTURE_2D, gl_tex_v_);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v_tex_w, uv_h,
-                         0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+            if (uv_interleaved) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, uv_tex_w, uv_h,
+                             0, GL_RG, GL_UNSIGNED_BYTE, uv_upload_data);
+            } else {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_tex_w, uv_h,
+                             0, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+                glActiveTexture(GL_TEXTURE2);
+                glBindTexture(GL_TEXTURE_2D, gl_tex_v_);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v_tex_w, uv_h,
+                             0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+            }
             // Pre-fill write PBOs for next frame
             auto fill_pbo = [](GLuint id, const void* src, int sz) {
                 if (!src || sz <= 0) {
@@ -2191,22 +2341,34 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
                 glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
             };
             fill_pbo(gl_pbo_y_[wi],   y_data, y_sz);
-            fill_pbo(gl_pbo_y_[2+wi], u_data, uv_sz);
-            fill_pbo(gl_pbo_y_[4+wi], v_data, v_sz);
+            fill_pbo(gl_pbo_y_[2+wi], uv_upload_data, uv_upload_sz);
+            if (!uv_interleaved) {
+                fill_pbo(gl_pbo_y_[4+wi], v_data, v_sz);
+            }
             gl_pbo_first_frame_ = false;
         } else {
             uploadPlanePBO(GL_TEXTURE0, gl_tex_y_,
                            gl_pbo_y_[wi],   gl_pbo_y_[ri],
                            GL_LUMINANCE, GL_LUMINANCE,
                            y_tex_w, height, y_data, y_sz, size_changed);
-            uploadPlanePBO(GL_TEXTURE1, gl_tex_u_,
-                           gl_pbo_y_[2+wi], gl_pbo_y_[2+ri],
-                           GL_LUMINANCE, GL_LUMINANCE,
-                           uv_w, uv_h, u_data, uv_sz, size_changed);
-            uploadPlanePBO(GL_TEXTURE2, gl_tex_v_,
-                           gl_pbo_y_[4+wi], gl_pbo_y_[4+ri],
-                           GL_LUMINANCE, GL_LUMINANCE,
-                           v_tex_w, uv_h, v_data, v_sz, size_changed);
+            if (uv_interleaved) {
+                uploadPlanePBO(GL_TEXTURE1, gl_tex_u_,
+                               gl_pbo_y_[2+wi], gl_pbo_y_[2+ri],
+                               GL_RG8, GL_RG,
+                               uv_tex_w, uv_h, uv_upload_data, uv_upload_sz,
+                               size_changed || uv_layout_changed);
+            } else {
+                uploadPlanePBO(GL_TEXTURE1, gl_tex_u_,
+                               gl_pbo_y_[2+wi], gl_pbo_y_[2+ri],
+                               GL_LUMINANCE, GL_LUMINANCE,
+                               uv_tex_w, uv_h, u_data, uv_upload_sz,
+                               size_changed || uv_layout_changed);
+                uploadPlanePBO(GL_TEXTURE2, gl_tex_v_,
+                               gl_pbo_y_[4+wi], gl_pbo_y_[4+ri],
+                               GL_LUMINANCE, GL_LUMINANCE,
+                               v_tex_w, uv_h, v_data, v_sz,
+                               size_changed || uv_layout_changed);
+            }
         }
         gl_pbo_idx_ = 1 - gl_pbo_idx_; // ping-pong
     } else {
@@ -2222,21 +2384,33 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
         }
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, gl_tex_u_);
-        if (size_changed) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_w, uv_h,
-                         0, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+        if (size_changed || uv_layout_changed) {
+            if (uv_interleaved) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, uv_tex_w, uv_h,
+                             0, GL_RG, GL_UNSIGNED_BYTE, uv_upload_data);
+            } else {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, uv_tex_w, uv_h,
+                             0, GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+            }
         } else {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_w, uv_h,
-                            GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+            if (uv_interleaved) {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_tex_w, uv_h,
+                                GL_RG, GL_UNSIGNED_BYTE, uv_upload_data);
+            } else {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, uv_tex_w, uv_h,
+                                GL_LUMINANCE, GL_UNSIGNED_BYTE, u_data);
+            }
         }
-        glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_2D, gl_tex_v_);
-        if (size_changed) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v_tex_w, uv_h,
-                         0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
-        } else {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, v_tex_w, uv_h,
-                            GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+        if (!uv_interleaved) {
+            glActiveTexture(GL_TEXTURE2);
+            glBindTexture(GL_TEXTURE_2D, gl_tex_v_);
+            if (size_changed) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, v_tex_w, uv_h,
+                             0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+            } else {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, v_tex_w, uv_h,
+                                GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
+            }
         }
     }
 
@@ -2255,11 +2429,14 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
 
     gl_last_video_w_ = width;
     gl_last_video_h_ = height;
+    gl_last_uv_interleaved_ = uv_interleaved;
+    gl_last_uv_swap_ = uv_swap;
+    gl_last_uv_tex_w_ = uv_tex_w;
 
     // --- Compute vertex / texcoord layout ---
     float y_u_scale  = (float)width      / (float)y_tex_w;
     float y_v_scale  = 1.0f;
-    float uv_u_scale = (float)(width / 2) / (float)(uv_w > 0 ? uv_w : width / 2);
+    float uv_u_scale = (float)(width / 2) / (float)(uv_tex_w > 0 ? uv_tex_w : width / 2);
 
     float vx0 = -1.0f, vx1 = 1.0f, vy0 = -1.0f, vy1 = 1.0f;
     float tx0 = 0.0f,  tx1 = y_u_scale,  ty0 = 0.0f, ty1 = y_v_scale;
@@ -2310,6 +2487,12 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     glUniform1i(gl_uniform_y_, 0);
     glUniform1i(gl_uniform_u_, 1);
     glUniform1i(gl_uniform_v_, 2);
+    if (gl_uniform_uv_interleaved_ >= 0) {
+        glUniform1i(gl_uniform_uv_interleaved_, uv_interleaved ? 1 : 0);
+    }
+    if (gl_uniform_uv_swap_ >= 0) {
+        glUniform1i(gl_uniform_uv_swap_, uv_swap ? 1 : 0);
+    }
 
     if (gl_attrib_pos_ < 0 || gl_attrib_tex_ < 0 || gl_attrib_tex_uv_ < 0) return -1;
 
@@ -2340,12 +2523,12 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     {
         int y_stride  = y_linesize > 0 ? y_linesize : width;
         int uv_stride = u_linesize > 0 ? u_linesize : (width + 1) / 2;
-        int vs_stride = v_linesize > 0 ? v_linesize : (width + 1) / 2;
+        int vs_stride = uv_interleaved ? 0 : (v_linesize > 0 ? v_linesize : (width + 1) / 2);
         int y_cache_h = height;
         int uv_cache_h = (height + 1) / 2;
         int y_cache_sz  = y_stride  * y_cache_h;
         int u_cache_sz  = uv_stride * uv_cache_h;
-        int v_cache_sz  = vs_stride * uv_cache_h;
+        int v_cache_sz  = uv_interleaved ? 0 : (vs_stride * uv_cache_h);
 
         auto now_cache_ms = []() -> int64_t {
             return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2373,7 +2556,12 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
                 last_frame_u_.resize(u_cache_sz);
                 last_frame_v_.resize(v_cache_sz);
             }
-            if (isLikelyValidPtr(y_data) && isLikelyValidPtr(u_data) && isLikelyValidPtr(v_data)) {
+            if (uv_interleaved) {
+                if (isLikelyValidPtr(y_data) && isLikelyValidPtr(u_data)) {
+                    memcpy(last_frame_y_.data(), y_data, y_cache_sz);
+                    memcpy(last_frame_u_.data(), u_data, u_cache_sz);
+                }
+            } else if (isLikelyValidPtr(y_data) && isLikelyValidPtr(u_data) && isLikelyValidPtr(v_data)) {
                 memcpy(last_frame_y_.data(), y_data, y_cache_sz);
                 memcpy(last_frame_u_.data(), u_data, u_cache_sz);
                 memcpy(last_frame_v_.data(), v_data, v_cache_sz);
