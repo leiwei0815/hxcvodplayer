@@ -166,8 +166,7 @@ jobs:
           set -e
           echo "=== libavcodec fingerprints ==="
           fnv64() {
-            python3 -c "import sys;h=1469598103934665603;p=1099511628211;d=open(sys.argv[1],'rb').read(); \
-[0 for b in d if (h:=((h^b)*p & 0xFFFFFFFFFFFFFFFF)) or True];print(f'{h:016x}')" "$1"
+            python3 -c "import sys; h=1469598103934665603; p=1099511628211; f=open(sys.argv[1],'rb'); data=f.read(); [0 for b in data if (h:=((h ^ b) * p & 0xFFFFFFFFFFFFFFFF)) or True]; print(f'{h:016x}')" "$1"
           }
           for abi in arm64-v8a armeabi-v7a x86_64; do
             codec_so="ffmpeg-build-android/FFmpeg-Android/${abi}/lib/libavcodec.so"
