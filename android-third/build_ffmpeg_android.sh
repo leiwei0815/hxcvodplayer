@@ -189,9 +189,7 @@ build_ffmpeg() {
         --disable-txtpages \
         --disable-debug \
         --enable-optimizations \
-        --enable-small \
         --disable-avdevice \
-        --disable-avfilter \
         --disable-protocols \
         --enable-protocol=file \
         --enable-protocol=http \
@@ -235,7 +233,6 @@ build_ffmpeg() {
         --enable-bsf=aac_adtstoasc \
         --disable-indevs \
         --disable-outdevs \
-        --disable-filters \
         --enable-hwaccel=mediacodec \
         --enable-mediacodec \
         --enable-jni \
