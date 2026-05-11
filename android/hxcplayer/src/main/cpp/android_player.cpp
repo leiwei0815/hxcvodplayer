@@ -2019,6 +2019,9 @@ static void uploadPlanePBO(GLenum tex_unit, GLuint tex_id,
                             int tex_w, int tex_h,
                             const void* src, int sz,
                             bool size_changed) {
+    if (!src || sz <= 0 || tex_w <= 0 || tex_h <= 0) {
+        return;
+    }
     // Step A: bind pbo_read and kick async upload to texture
     glActiveTexture(tex_unit);
     glBindTexture(GL_TEXTURE_2D, tex_id);
@@ -2036,7 +2039,7 @@ static void uploadPlanePBO(GLenum tex_unit, GLuint tex_id,
     glBufferData(GL_PIXEL_UNPACK_BUFFER, sz, nullptr, GL_STREAM_DRAW); // orphan
     void* dst = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, sz,
                                   GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-    if (dst) {
+    if (dst && reinterpret_cast<uintptr_t>(dst) > 4096) {
         memcpy(dst, src, sz);
         glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
     } else {
@@ -2050,7 +2053,15 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
                                int y_linesize, int u_linesize, int v_linesize,
                                int width, int height,
                                int64_t* out_upload_ms, int64_t* out_max_upload_ms) {
-    if (!y_data || width <= 0 || height <= 0) return -1;
+    auto isLikelyValidPtr = [](const void* p) -> bool {
+        return p && reinterpret_cast<uintptr_t>(p) > 4096;
+    };
+    if (!isLikelyValidPtr(y_data) || !isLikelyValidPtr(u_data) || !isLikelyValidPtr(v_data) ||
+        width <= 1 || height <= 1 || y_linesize < 0 || u_linesize < 0 || v_linesize < 0) {
+        LOGW("[render] drop invalid frame args y=%p u=%p v=%p w=%d h=%d yls=%d uls=%d vls=%d",
+             y_data, u_data, v_data, width, height, y_linesize, u_linesize, v_linesize);
+        return -1;
+    }
     if (!gl_program_ || egl_surface_ == EGL_NO_SURFACE) return -1;
 
     int surface_w, surface_h;
@@ -2063,13 +2074,24 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    int y_tex_w  = y_linesize  > 0 ? y_linesize  : width;
-    int uv_w     = u_linesize  > 0 ? u_linesize  : width  / 2;
-    int v_tex_w  = v_linesize  > 0 ? v_linesize  : width  / 2;
-    int uv_h     = height / 2;
-    int y_sz     = y_tex_w * height;
-    int uv_sz    = uv_w    * uv_h;
-    int v_sz     = v_tex_w * uv_h;
+    int y_tex_w  = y_linesize > 0 ? y_linesize : width;
+    int uv_default_w = (width + 1) / 2;
+    int uv_w     = u_linesize > 0 ? u_linesize : uv_default_w;
+    int v_tex_w  = v_linesize > 0 ? v_linesize : uv_default_w;
+    int uv_h     = (height + 1) / 2;
+    int64_t y_sz64  = static_cast<int64_t>(y_tex_w) * height;
+    int64_t uv_sz64 = static_cast<int64_t>(uv_w) * uv_h;
+    int64_t v_sz64  = static_cast<int64_t>(v_tex_w) * uv_h;
+    if (y_tex_w <= 0 || uv_w <= 0 || v_tex_w <= 0 || uv_h <= 0 ||
+        y_sz64 <= 0 || uv_sz64 <= 0 || v_sz64 <= 0 ||
+        y_sz64 > INT_MAX || uv_sz64 > INT_MAX || v_sz64 > INT_MAX) {
+        LOGW("[render] drop invalid frame size w=%d h=%d ytw=%d uw=%d vw=%d uh=%d",
+             width, height, y_tex_w, uv_w, v_tex_w, uv_h);
+        return -1;
+    }
+    int y_sz = static_cast<int>(y_sz64);
+    int uv_sz = static_cast<int>(uv_sz64);
+    int v_sz = static_cast<int>(v_sz64);
 
     bool size_changed = (width != gl_last_video_w_ || height != gl_last_video_h_);
     if (size_changed) {
@@ -2108,11 +2130,19 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
                          0, GL_LUMINANCE, GL_UNSIGNED_BYTE, v_data);
             // Pre-fill write PBOs for next frame
             auto fill_pbo = [](GLuint id, const void* src, int sz) {
+                if (!src || sz <= 0) {
+                    return;
+                }
                 glBindBuffer(GL_PIXEL_UNPACK_BUFFER, id);
                 glBufferData(GL_PIXEL_UNPACK_BUFFER, sz, nullptr, GL_STREAM_DRAW);
                 void* dst = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, sz,
                                               GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-                if (dst) { memcpy(dst, src, sz); glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER); }
+                if (dst && reinterpret_cast<uintptr_t>(dst) > 4096) {
+                    memcpy(dst, src, sz);
+                    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+                } else {
+                    glBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, sz, src);
+                }
                 glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
             };
             fill_pbo(gl_pbo_y_[wi],   y_data, y_sz);
@@ -2263,12 +2293,14 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     // 4K + high-rate playback is sensitive to extra memcpy bandwidth, so we
     // throttle cache updates for large frames instead of copying every frame.
     {
-        int y_stride  = y_linesize  > 0 ? y_linesize  : width;
-        int uv_stride = u_linesize  > 0 ? u_linesize  : width / 2;
-        int vs_stride = v_linesize  > 0 ? v_linesize  : width / 2;
-        int y_cache_sz  = y_stride  * height;
-        int u_cache_sz  = uv_stride * (height / 2);
-        int v_cache_sz  = vs_stride * (height / 2);
+        int y_stride  = y_linesize > 0 ? y_linesize : width;
+        int uv_stride = u_linesize > 0 ? u_linesize : (width + 1) / 2;
+        int vs_stride = v_linesize > 0 ? v_linesize : (width + 1) / 2;
+        int y_cache_h = height;
+        int uv_cache_h = (height + 1) / 2;
+        int y_cache_sz  = y_stride  * y_cache_h;
+        int u_cache_sz  = uv_stride * uv_cache_h;
+        int v_cache_sz  = vs_stride * uv_cache_h;
 
         auto now_cache_ms = []() -> int64_t {
             return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2288,14 +2320,19 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
                             (now_ms - last_frame_cache_ms_) >= cache_interval_ms;
 
         if (should_cache) {
-            if (size_changed_for_cache) {
+            if (size_changed_for_cache ||
+                static_cast<int>(last_frame_y_.size()) != y_cache_sz ||
+                static_cast<int>(last_frame_u_.size()) != u_cache_sz ||
+                static_cast<int>(last_frame_v_.size()) != v_cache_sz) {
                 last_frame_y_.resize(y_cache_sz);
                 last_frame_u_.resize(u_cache_sz);
                 last_frame_v_.resize(v_cache_sz);
             }
-            memcpy(last_frame_y_.data(), y_data, y_cache_sz);
-            memcpy(last_frame_u_.data(), u_data, u_cache_sz);
-            memcpy(last_frame_v_.data(), v_data, v_cache_sz);
+            if (isLikelyValidPtr(y_data) && isLikelyValidPtr(u_data) && isLikelyValidPtr(v_data)) {
+                memcpy(last_frame_y_.data(), y_data, y_cache_sz);
+                memcpy(last_frame_u_.data(), u_data, u_cache_sz);
+                memcpy(last_frame_v_.data(), v_data, v_cache_sz);
+            }
             last_frame_width_    = width;
             last_frame_height_   = height;
             last_frame_y_stride_ = y_linesize;
