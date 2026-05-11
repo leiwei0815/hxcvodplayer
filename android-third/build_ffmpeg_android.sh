@@ -242,7 +242,6 @@ build_ffmpeg() {
         --disable-filters \
         --enable-filter=scale \
         --enable-filter=format \
-        --disable-hwaccels \
         --enable-hwaccel=h264_mediacodec \
         --enable-hwaccel=hevc_mediacodec \
         --enable-mediacodec \
@@ -254,6 +253,41 @@ build_ffmpeg() {
         --disable-zlib \
         --disable-lzma \
         $EXTRA_CONFIGURE_FLAGS
+
+    echo ""
+    echo "🔎 校验 FFmpeg mediacodec 组件宏..."
+    local CFG_COMP="$BUILD_SUBDIR/config_components.h"
+    local CFG_MAIN="$BUILD_SUBDIR/config.h"
+    if [ ! -f "$CFG_COMP" ] || [ ! -f "$CFG_MAIN" ]; then
+        echo "❌ 错误: 缺少配置文件: $CFG_COMP 或 $CFG_MAIN"
+        exit 1
+    fi
+
+    if ! grep -q "^#define CONFIG_MEDIACODEC 1" "$CFG_COMP" "$CFG_MAIN"; then
+        echo "❌ 错误: CONFIG_MEDIACODEC 未启用"
+        exit 1
+    fi
+
+    local H264_MEDIACODEC_OK=0
+    local HEVC_MEDIACODEC_OK=0
+    if grep -qE "^#define (CONFIG_H264_MEDIACODEC_DECODER|CONFIG_H264_MEDIACODEC_HWACCEL) 1" "$CFG_COMP" "$CFG_MAIN"; then
+        H264_MEDIACODEC_OK=1
+    fi
+    if grep -qE "^#define (CONFIG_HEVC_MEDIACODEC_DECODER|CONFIG_HEVC_MEDIACODEC_HWACCEL) 1" "$CFG_COMP" "$CFG_MAIN"; then
+        HEVC_MEDIACODEC_OK=1
+    fi
+
+    if [ "$H264_MEDIACODEC_OK" -ne 1 ]; then
+        echo "❌ 错误: H264 mediacodec path 未启用（decoder/hwaccel 均缺失）"
+        grep -E "^#define .*MEDIACODEC.* 1" "$CFG_COMP" "$CFG_MAIN" || true
+        exit 1
+    fi
+    if [ "$HEVC_MEDIACODEC_OK" -ne 1 ]; then
+        echo "❌ 错误: HEVC mediacodec path 未启用（decoder/hwaccel 均缺失）"
+        grep -E "^#define .*MEDIACODEC.* 1" "$CFG_COMP" "$CFG_MAIN" || true
+        exit 1
+    fi
+    echo "✅ mediacodec 组件校验通过"
     
     echo ""
     echo "🔨 编译中..."
