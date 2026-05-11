@@ -242,6 +242,7 @@ build_ffmpeg() {
         --disable-filters \
         --enable-filter=scale \
         --enable-filter=format \
+        --enable-hwaccel=mediacodec \
         --enable-hwaccel=h264_mediacodec \
         --enable-hwaccel=hevc_mediacodec \
         --enable-mediacodec \
@@ -270,10 +271,10 @@ build_ffmpeg() {
 
     local H264_MEDIACODEC_OK=0
     local HEVC_MEDIACODEC_OK=0
-    if grep -qE "^#define (CONFIG_H264_MEDIACODEC_DECODER|CONFIG_H264_MEDIACODEC_HWACCEL) 1" "$CFG_COMP" "$CFG_MAIN"; then
+    if grep -qE "^#define (CONFIG_MEDIACODEC_HWACCEL|CONFIG_H264_MEDIACODEC_DECODER|CONFIG_H264_MEDIACODEC_HWACCEL) 1" "$CFG_COMP" "$CFG_MAIN"; then
         H264_MEDIACODEC_OK=1
     fi
-    if grep -qE "^#define (CONFIG_HEVC_MEDIACODEC_DECODER|CONFIG_HEVC_MEDIACODEC_HWACCEL) 1" "$CFG_COMP" "$CFG_MAIN"; then
+    if grep -qE "^#define (CONFIG_MEDIACODEC_HWACCEL|CONFIG_HEVC_MEDIACODEC_DECODER|CONFIG_HEVC_MEDIACODEC_HWACCEL) 1" "$CFG_COMP" "$CFG_MAIN"; then
         HEVC_MEDIACODEC_OK=1
     fi
 

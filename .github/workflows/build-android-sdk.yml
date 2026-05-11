@@ -183,17 +183,17 @@ jobs:
             fi
 
             # 对每个编解码标准，要求 decoder/hwaccel 至少一个通路开启，避免不同 FFmpeg 版本宏名差异导致误拦截。
-            if grep -qE "^#define (CONFIG_H264_MEDIACODEC_DECODER|CONFIG_H264_MEDIACODEC_HWACCEL) 1" "$cfg_comp" "$cfg_main"; then
+            if grep -qE "^#define (CONFIG_MEDIACODEC_HWACCEL|CONFIG_H264_MEDIACODEC_DECODER|CONFIG_H264_MEDIACODEC_HWACCEL) 1" "$cfg_comp" "$cfg_main"; then
               echo "✅ H264 mediacodec path enabled"
             else
-              echo "❌ $abi H264 mediacodec path not enabled (decoder/hwaccel both missing)"
+              echo "❌ $abi H264 mediacodec path not enabled (generic/per-codec decoder+hwaccel missing)"
               exit 1
             fi
 
-            if grep -qE "^#define (CONFIG_HEVC_MEDIACODEC_DECODER|CONFIG_HEVC_MEDIACODEC_HWACCEL) 1" "$cfg_comp" "$cfg_main"; then
+            if grep -qE "^#define (CONFIG_MEDIACODEC_HWACCEL|CONFIG_HEVC_MEDIACODEC_DECODER|CONFIG_HEVC_MEDIACODEC_HWACCEL) 1" "$cfg_comp" "$cfg_main"; then
               echo "✅ HEVC mediacodec path enabled"
             else
-              echo "❌ $abi HEVC mediacodec path not enabled (decoder/hwaccel both missing)"
+              echo "❌ $abi HEVC mediacodec path not enabled (generic/per-codec decoder+hwaccel missing)"
               exit 1
             fi
           done
