@@ -139,14 +139,24 @@ private:
     GLint  gl_uniform_y_;
     GLint  gl_uniform_u_;
     GLint  gl_uniform_v_;
+    GLint  gl_uniform_uv_interleaved_;
+    GLint  gl_uniform_uv_swap_;
     GLint  gl_attrib_pos_;
     GLint  gl_attrib_tex_;
     GLint  gl_attrib_tex_uv_;
     int    gl_last_video_w_;
     int    gl_last_video_h_;
+    bool   gl_last_uv_interleaved_;
+    bool   gl_last_uv_swap_;
+    int    gl_last_uv_tex_w_;
+    // Auto-detect NV12/NV21 (UV vs VU) for interleaved chroma path.
+    bool   gl_uv_swap_decided_{false};
+    bool   gl_uv_swap_selected_{false};
+    int    gl_uv_swap_votes_{0};
+    int    gl_uv_swap_probe_budget_{24};
 
     // PBO double-buffer for async 4K texture upload (>=1920 wide)
-    // Slots: [0,1]=Y  [2,3]=U  [4,5]=V
+    // Slots: [0,1]=Y  [2,3]=U/UV  [4,5]=V(only planar path)
     GLuint gl_pbo_y_[6];
     int    gl_pbo_y_sz_;
     int    gl_pbo_uv_sz_;
@@ -157,9 +167,6 @@ private:
     std::vector<uint8_t> last_frame_y_;
     std::vector<uint8_t> last_frame_u_;
     std::vector<uint8_t> last_frame_v_;
-    // Temporary split buffers when decoder outputs interleaved UV (NV12/NV21).
-    std::vector<uint8_t> nv_uv_split_u_;
-    std::vector<uint8_t> nv_uv_split_v_;
     int last_frame_width_{0};
     int last_frame_height_{0};
     int last_frame_y_stride_{0};
@@ -175,7 +182,7 @@ private:
     bool initGLProgram();
     void destroyGLProgram();
     void redrawLastFrame();
-    bool ensurePBOs(int y_w, int y_h, int uv_w, int uv_h);
+    bool ensurePBOs(int y_w, int y_h, int uv_w, int uv_h, int uv_bpp = 1);
 
     // -----------------------------------------------------------------------
     // Render thread
