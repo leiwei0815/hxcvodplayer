@@ -225,6 +225,14 @@ build_ffmpeg() {
         --enable-demuxer=aac \
         --enable-demuxer=mp3 \
         --enable-demuxer=wav \
+        --enable-parser=h264 \
+        --enable-parser=hevc \
+        --enable-parser=mpeg4video \
+        --enable-parser=aac \
+        --enable-parser=mpegaudio \
+        --enable-bsf=h264_mp4toannexb \
+        --enable-bsf=hevc_mp4toannexb \
+        --enable-bsf=aac_adtstoasc \
         --disable-indevs \
         --disable-outdevs \
         --disable-filters \

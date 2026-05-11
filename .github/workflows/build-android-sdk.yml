@@ -28,7 +28,7 @@ env:
   NDK_VERSION: '26.3.11579264'
   ANDROID_API_LEVEL: '24'
   # 手动提升该值可强制失效第三方缓存（用于排查“脚本已改但产物未更新”）
-  THIRD_PARTY_CACHE_REV: '20260511-mediacodec-v5'
+  THIRD_PARTY_CACHE_REV: '20260511-mediacodec-v6'
 
 jobs:
   # ============================================================
@@ -194,6 +194,8 @@ jobs:
             fi
             echo "--- $abi ---"
             cat "$cfg_comp" "$cfg_main" | grep -E "^#define .*MEDIACODEC.* 1" | sort -u || true
+            echo "=== $abi mediacodec-related macro states ==="
+            grep -E "^#define (CONFIG_H264_MEDIACODEC_DECODER|CONFIG_HEVC_MEDIACODEC_DECODER|CONFIG_H264_MEDIACODEC_HWACCEL|CONFIG_HEVC_MEDIACODEC_HWACCEL|CONFIG_MEDIACODEC_HWACCEL|CONFIG_H264_MP4TOANNEXB_BSF|CONFIG_HEVC_MP4TOANNEXB_BSF|CONFIG_H264_PARSER|CONFIG_HEVC_PARSER) " "$cfg_comp" "$cfg_main" || true
 
             if grep -q "^#define CONFIG_MEDIACODEC 1" "$cfg_comp" "$cfg_main"; then
               echo "✅ CONFIG_MEDIACODEC=1"
