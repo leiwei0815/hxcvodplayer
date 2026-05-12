@@ -761,16 +761,17 @@ void AndroidPlayer::seekTo(double position) {
     seek_from_sec_.store(seek_from, std::memory_order_release);
     seek_target_sec_.store(position, std::memory_order_release);
     // 约 1 秒左右的渲染 tick 追赶窗口，避免 seek 后先看到大量旧帧。
-    seek_fast_catchup_frames_.store(72, std::memory_order_release);
+    seek_fast_catchup_frames_.store(96, std::memory_order_release);
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    seek_catchup_deadline_ms_ = now + 650;
+    seek_catchup_deadline_ms_ = now + 900;
     seek_lower_bound_active_.store(true, std::memory_order_release);
-    seek_lower_bound_deadline_ms_ = now + 5000;
+    // Avoid long black/frozen waits after large forward seeks on 4K.
+    seek_lower_bound_deadline_ms_ = now + 2200;
     seek_recovery_active_.store(true, std::memory_order_release);
-    seek_recovery_deadline_ms_ = now + 6500;
+    seek_recovery_deadline_ms_ = now + 4200;
     seek_audio_wait_video_.store(true, std::memory_order_release);
-    seek_audio_wait_deadline_ms_ = now + 6000;
+    seek_audio_wait_deadline_ms_ = now + 3800;
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
@@ -1575,7 +1576,18 @@ void AndroidPlayer::renderLoop() {
                 double seek_from_now = seek_from_sec_.load(std::memory_order_acquire);
                 bool is_backward_seek = seek_from_now >= 0.0 &&
                                         (seek_from_now - seek_target_now) > 0.5;
+                double seek_span_sec = (seek_target_now >= 0.0 && seek_from_now >= 0.0)
+                                       ? (seek_target_now - seek_from_now) : 0.0;
+                bool large_forward_seek = !is_backward_seek && seek_span_sec > 25.0;
                 double stale_future_margin_sec = ultra_high_rate_4k ? 6.0 : 3.5;
+                if (large_forward_seek) {
+                    // Tencent/Exo-like seek UX: on large forward jumps, prioritize
+                    // "show something close quickly" over strict exact-target hit.
+                    seek_epsilon_sec = std::max(seek_epsilon_sec, 1.20);
+                    if (seek_span_sec > 120.0) {
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, 1.80);
+                    }
+                }
                 // If seek recovery is slow, relax lower-bound gradually instead of
                 // exiting gate and resuming audio too early.
                 bool lower_bound_deadline_elapsed = now >= seek_lower_bound_deadline_ms_;
@@ -1587,6 +1599,9 @@ void AndroidPlayer::renderLoop() {
                     if (sw_decode_4k && playback_rate >= 2.0) {
                         // After deadline, prioritize quick visual recovery over exact seek hit.
                         seek_epsilon_sec = std::max(seek_epsilon_sec, 1.80);
+                    }
+                    if (large_forward_seek) {
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, 1.60);
                     }
                 }
                 if (pts + seek_epsilon_sec < seek_target_now) {
