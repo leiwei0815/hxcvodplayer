@@ -1856,14 +1856,18 @@ void AndroidPlayer::renderLoop() {
                         backward_hit_min_delay = likely_4k ? -1.6 : -1.2;
                     }
                     if (likely_4k && very_large_seek) {
-                        // Large backward 4K seek: avoid over-holding near target.
-                        backward_hit_min_delay = std::min(backward_hit_min_delay, -2.0);
+                        // For very large 4K backward seeks, avoid strict hold gate.
+                        // Audio resume gate already protects A/V sync before unmute.
+                        backward_hit_min_delay = std::min(backward_hit_min_delay, -4.5);
                     }
                     // Avoid prolonged "loading freeze" on backward seeks.
                     // Gradually relax hold window as elapsed grows, and cap max hold time.
-                    int64_t backward_hold_max_ms = likely_4k ? 4200 : 2600;
+                    int64_t backward_hold_max_ms = likely_4k ? 1800 : 1400;
                     if (large_seek_any_direction) {
-                        backward_hold_max_ms += likely_4k ? 800 : 500;
+                        backward_hold_max_ms += likely_4k ? 400 : 300;
+                    }
+                    if (very_large_seek) {
+                        backward_hold_max_ms += likely_4k ? 300 : 200;
                     }
                     if (seek_elapsed_ms >= 1200) {
                         backward_hit_min_delay += likely_4k ? 0.20 : 0.28;
@@ -1874,7 +1878,9 @@ void AndroidPlayer::renderLoop() {
                     if (seek_elapsed_ms >= 2800) {
                         backward_hit_min_delay += likely_4k ? 0.20 : 0.22;
                     }
-                    if (delay < backward_hit_min_delay && seek_elapsed_ms < backward_hold_max_ms) {
+                    if (delay < backward_hit_min_delay &&
+                        seek_elapsed_ms < backward_hold_max_ms &&
+                        seek_lower_bound_drop_count_ < 90) {
                         should_consume = true;
                         seek_lower_bound_drop_count_++;
                         SYNCW_RATE(20, "evt=seek_lower_bound_hit_hold_backward delay=%.3f min=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
