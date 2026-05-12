@@ -450,6 +450,8 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         seek_recovery_deadline_ms_ = 0;
         seek_audio_wait_video_.store(false, std::memory_order_release);
         seek_audio_wait_deadline_ms_ = 0;
+        seek_started_at_ms_ = 0;
+        seek_lower_bound_drop_count_ = 0;
         consecutive_drop_count_ = 0;
         severe_lag_start_ms_ = 0;
         last_soft_reanchor_ms_ = 0;
@@ -675,6 +677,8 @@ void AndroidPlayer::play() {
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
+    seek_started_at_ms_ = 0;
+    seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
@@ -707,6 +711,8 @@ void AndroidPlayer::pause() {
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
+    seek_started_at_ms_ = 0;
+    seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
@@ -733,6 +739,8 @@ void AndroidPlayer::stop() {
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
+    seek_started_at_ms_ = 0;
+    seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
@@ -755,23 +763,27 @@ void AndroidPlayer::seekTo(double position) {
     if (!player_core_) return;
 
     double seek_from = player_core_get_position(player_core_);
+    double seek_span = std::fabs(position - seek_from);
+    bool very_large_seek = seek_span > 180.0;
     LOGI("[ctrl] seekTo: %.3fs (current pos=%.3f state=%d)", position, seek_from, player_core_get_state(player_core_));
     seek_just_happened_.store(true, std::memory_order_release);
     sync_warmup_frames_.store(40, std::memory_order_release); // wider warmup after seek
     seek_from_sec_.store(seek_from, std::memory_order_release);
     seek_target_sec_.store(position, std::memory_order_release);
     // 约 1 秒左右的渲染 tick 追赶窗口，避免 seek 后先看到大量旧帧。
-    seek_fast_catchup_frames_.store(96, std::memory_order_release);
+    seek_fast_catchup_frames_.store(very_large_seek ? 128 : 96, std::memory_order_release);
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    seek_catchup_deadline_ms_ = now + 900;
+    seek_started_at_ms_ = now;
+    seek_lower_bound_drop_count_ = 0;
+    seek_catchup_deadline_ms_ = now + (very_large_seek ? 1200 : 900);
     seek_lower_bound_active_.store(true, std::memory_order_release);
     // Avoid long black/frozen waits after large forward seeks on 4K.
-    seek_lower_bound_deadline_ms_ = now + 2200;
+    seek_lower_bound_deadline_ms_ = now + (very_large_seek ? 1700 : 2200);
     seek_recovery_active_.store(true, std::memory_order_release);
-    seek_recovery_deadline_ms_ = now + 4200;
+    seek_recovery_deadline_ms_ = now + (very_large_seek ? 3600 : 4200);
     seek_audio_wait_video_.store(true, std::memory_order_release);
-    seek_audio_wait_deadline_ms_ = now + 3800;
+    seek_audio_wait_deadline_ms_ = now + (very_large_seek ? 3400 : 3800);
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
@@ -1576,9 +1588,13 @@ void AndroidPlayer::renderLoop() {
                 double seek_from_now = seek_from_sec_.load(std::memory_order_acquire);
                 bool is_backward_seek = seek_from_now >= 0.0 &&
                                         (seek_from_now - seek_target_now) > 0.5;
+                int64_t seek_elapsed_ms = seek_started_at_ms_ > 0 ? (now - seek_started_at_ms_) : 0;
                 double seek_span_sec = (seek_target_now >= 0.0 && seek_from_now >= 0.0)
                                        ? (seek_target_now - seek_from_now) : 0.0;
+                double seek_span_abs_sec = std::fabs(seek_span_sec);
                 bool large_forward_seek = !is_backward_seek && seek_span_sec > 25.0;
+                bool large_seek_any_direction = seek_span_abs_sec > 25.0;
+                bool very_large_seek = seek_span_abs_sec > 180.0;
                 double stale_future_margin_sec = ultra_high_rate_4k ? 6.0 : 3.5;
                 if (large_forward_seek) {
                     // Tencent/Exo-like seek UX: on large forward jumps, prioritize
@@ -1604,22 +1620,48 @@ void AndroidPlayer::renderLoop() {
                         seek_epsilon_sec = std::max(seek_epsilon_sec, 1.60);
                     }
                 }
+                // Mature players tend to gradually relax seek gate when a large seek
+                // cannot immediately land near target keyframe. This avoids prolonged
+                // frozen frames and prioritizes visible recovery.
+                if (seek_elapsed_ms >= 1200) {
+                    seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 0.90 : (large_seek_any_direction ? 1.80 : 0.60));
+                }
+                if (seek_elapsed_ms >= 2200) {
+                    if (is_backward_seek) {
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.60 : 1.80);
+                    } else {
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 8.00 : (large_seek_any_direction ? 3.60 : 1.20));
+                    }
+                }
+                if (seek_elapsed_ms >= 3200) {
+                    if (is_backward_seek) {
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 3.60 : 2.40);
+                    } else {
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 10.50 : (large_seek_any_direction ? 5.00 : 2.00));
+                    }
+                }
+                bool lower_bound_force_relax = seek_lower_bound_drop_count_ >= (very_large_seek ? 180 : 120);
+                if (lower_bound_force_relax) {
+                    seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 3.40 : (very_large_seek ? 9.50 : 4.20));
+                }
                 if (pts + seek_epsilon_sec < seek_target_now) {
                     should_consume = true;
+                    seek_lower_bound_drop_count_++;
                     LOGW_RATE(20, "[sync] seek lower-bound drop: pts=%.3f target=%.3f",
                               pts, seek_target_now);
-                    SYNCW_RATE(20, "evt=seek_lower_bound_drop pts=%.3f target=%.3f",
-                               pts, seek_target_now);
+                    SYNCW_RATE(20, "evt=seek_lower_bound_drop pts=%.3f target=%.3f elapsed_ms=%" PRId64 " drop_count=%d eps=%.3f",
+                               pts, seek_target_now, seek_elapsed_ms, seek_lower_bound_drop_count_, seek_epsilon_sec);
                 } else if (is_backward_seek &&
                            !lower_bound_deadline_elapsed &&
                            pts > seek_target_now + stale_future_margin_sec) {
                     // Backward seek: before lower-bound deadline, do not accept
                     // far-future stale frames as the first target hit.
                     should_consume = true;
+                    seek_lower_bound_drop_count_++;
                     LOGW_RATE(20, "[sync] seek lower-bound stale-future drop: pts=%.3f target=%.3f from=%.3f margin=%.3f",
                               pts, seek_target_now, seek_from_now, stale_future_margin_sec);
-                    SYNCW_RATE(20, "evt=seek_lower_bound_stale_future_drop pts=%.3f target=%.3f from=%.3f margin=%.3f",
-                               pts, seek_target_now, seek_from_now, stale_future_margin_sec);
+                    SYNCW_RATE(20, "evt=seek_lower_bound_stale_future_drop pts=%.3f target=%.3f from=%.3f margin=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
+                               pts, seek_target_now, seek_from_now, stale_future_margin_sec, seek_elapsed_ms, seek_lower_bound_drop_count_);
                 } else {
                     seek_lower_bound_active_.store(false, std::memory_order_release);
                     seek_fast_catchup_frames_.store(0, std::memory_order_release);
@@ -1627,14 +1669,16 @@ void AndroidPlayer::renderLoop() {
                     seek_recovery_active_.store(false, std::memory_order_release);
                     seek_recovery_deadline_ms_ = 0;
                     in_seek_recovery = false;
+                    seek_started_at_ms_ = 0;
+                    seek_lower_bound_drop_count_ = 0;
                     sync_warmup_frames_.store(24, std::memory_order_release);
                     int64_t bypass_ms = is_backward_seek ? 5200 : 3200;
                     post_seek_ahead_bypass_until_ms = now + bypass_ms;
                     should_display = should_consume = true;
-                    LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64,
-                         pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms);
-                    SYNCI("evt=seek_lower_bound_hit pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64,
-                          pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms);
+                    LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64 " elapsed_ms=%" PRId64,
+                         pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms, seek_elapsed_ms);
+                    SYNCI("evt=seek_lower_bound_hit pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64 " elapsed_ms=%" PRId64,
+                          pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms, seek_elapsed_ms);
                 }
             }
 
@@ -1645,6 +1689,8 @@ void AndroidPlayer::renderLoop() {
                     seek_recovery_active_.store(false, std::memory_order_release);
                     seek_recovery_deadline_ms_ = 0;
                     seek_lower_bound_active_.store(false, std::memory_order_release);
+                    seek_started_at_ms_ = 0;
+                    seek_lower_bound_drop_count_ = 0;
                     should_display = should_consume = true;
                     LOGW("[sync] seek recovery timeout fallback: pts=%.3f target=%.3f", pts, seek_target_now);
                     SYNCW("evt=seek_recovery_timeout_fallback pts=%.3f target=%.3f", pts, seek_target_now);
