@@ -786,7 +786,8 @@ void AndroidPlayer::seekTo(double position) {
     seek_recovery_active_.store(true, std::memory_order_release);
     seek_recovery_deadline_ms_ = now + (very_large_seek ? 3600 : 4200);
     seek_audio_wait_video_.store(true, std::memory_order_release);
-    seek_audio_wait_deadline_ms_ = now + (very_large_seek ? 3400 : 3800);
+    // 稳定性优先：seek 后给音画对齐更多缓冲时间，避免刚恢复就出现明显不同步。
+    seek_audio_wait_deadline_ms_ = now + (very_large_seek ? 4200 : 4600);
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
@@ -1715,6 +1716,51 @@ void AndroidPlayer::renderLoop() {
                     seek_lower_bound_drop_count_++;
                     SYNCW_RATE(20, "evt=seek_lower_bound_delay_guard pts=%.3f target=%.3f delay=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
                                pts, seek_target_now, delay, seek_elapsed_ms, seek_lower_bound_drop_count_);
+                } else if (!is_backward_seek) {
+                    // 稳定性优先：前向 seek 命中前要求 delay 不得过度落后，
+                    // 否则即便命中 lower-bound，也会出现“先播放但音画不同步数秒”。
+                    double forward_hit_min_delay = likely_4k ? -1.2 : -0.9;
+                    if (playback_rate >= 2.0) {
+                        forward_hit_min_delay = likely_4k ? -1.6 : -1.2;
+                    }
+                    if (delay < forward_hit_min_delay && seek_elapsed_ms < 7000) {
+                        should_consume = true;
+                        seek_lower_bound_drop_count_++;
+                        SYNCW_RATE(20, "evt=seek_lower_bound_hit_hold delay=%.3f min=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
+                                   delay, forward_hit_min_delay, seek_elapsed_ms, seek_lower_bound_drop_count_);
+                    } else {
+                        seek_lower_bound_active_.store(false, std::memory_order_release);
+                        seek_fast_catchup_frames_.store(0, std::memory_order_release);
+                        seek_catchup_deadline_ms_ = 0;
+                        seek_recovery_active_.store(false, std::memory_order_release);
+                        seek_recovery_deadline_ms_ = 0;
+                        in_seek_recovery = false;
+                        seek_started_at_ms_ = 0;
+                        seek_lower_bound_drop_count_ = 0;
+                        sync_warmup_frames_.store(24, std::memory_order_release);
+                        // Seek 恢复后允许短暂 bypass ahead-hold，但窗口过长会放大音画分离体感。
+                        // 在高倍速下保留一定缓冲，常速下尽量缩短恢复时间。
+                        int64_t bypass_ms = is_backward_seek ? 2200 : 1400;
+                        if (playback_rate >= 2.0) {
+                            bypass_ms += 800;
+                        }
+                        post_seek_ahead_bypass_until_ms = now + bypass_ms;
+                        if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
+                            // 命中 lower-bound 后仍保留一小段“同步等待窗口”，
+                            // 避免 deadline 过早触发导致刚出画面就开声而不同步。
+                            int64_t post_hit_sync_wait_ms = is_backward_seek ? 1800 : 1200;
+                            if (playback_rate >= 2.0) {
+                                post_hit_sync_wait_ms += 400;
+                            }
+                            seek_audio_wait_deadline_ms_ = std::max<int64_t>(
+                                seek_audio_wait_deadline_ms_, now + post_hit_sync_wait_ms);
+                        }
+                        should_display = should_consume = true;
+                        LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64 " elapsed_ms=%" PRId64,
+                             pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms, seek_elapsed_ms);
+                        SYNCI("evt=seek_lower_bound_hit pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64 " elapsed_ms=%" PRId64,
+                              pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms, seek_elapsed_ms);
+                    }
                 } else {
                     seek_lower_bound_active_.store(false, std::memory_order_release);
                     seek_fast_catchup_frames_.store(0, std::memory_order_release);
@@ -1732,6 +1778,16 @@ void AndroidPlayer::renderLoop() {
                         bypass_ms += 800;
                     }
                     post_seek_ahead_bypass_until_ms = now + bypass_ms;
+                    if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
+                        // 命中 lower-bound 后仍保留一小段“同步等待窗口”，
+                        // 避免 deadline 过早触发导致刚出画面就开声而不同步。
+                        int64_t post_hit_sync_wait_ms = is_backward_seek ? 1800 : 1200;
+                        if (playback_rate >= 2.0) {
+                            post_hit_sync_wait_ms += 400;
+                        }
+                        seek_audio_wait_deadline_ms_ = std::max<int64_t>(
+                            seek_audio_wait_deadline_ms_, now + post_hit_sync_wait_ms);
+                    }
                     should_display = should_consume = true;
                     LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64 " elapsed_ms=%" PRId64,
                          pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms, seek_elapsed_ms);
@@ -2009,17 +2065,32 @@ void AndroidPlayer::renderLoop() {
                     bool seek_resume_sync_ready = std::fabs(delay) <= seek_resume_sync_threshold;
                     bool seek_resume_deadline = seek_audio_wait_deadline_ms_ > 0 &&
                                                 now >= seek_audio_wait_deadline_ms_;
-                    if (seek_resume_sync_ready || seek_resume_deadline) {
+                    double seek_resume_deadline_guard = likely_4k ? 1.20 : 0.90;
+                    if (playback_rate >= 2.0) {
+                        seek_resume_deadline_guard = likely_4k ? 1.50 : 1.10;
+                    }
+                    bool seek_resume_deadline_safe = seek_resume_deadline &&
+                                                     std::fabs(delay) <= seek_resume_deadline_guard;
+                    bool seek_resume_force_timeout = seek_started_at_ms_ > 0 &&
+                                                     (now - seek_started_at_ms_) >= 8000;
+                    if (seek_resume_sync_ready || seek_resume_deadline_safe || seek_resume_force_timeout) {
                         if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
                             if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                                 LOGI("[sync] seek first-frame resume audio: result=%d", r);
                             }
-                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f by_deadline=%d rate=%.2f",
-                                  delay, seek_resume_sync_threshold, seek_resume_deadline ? 1 : 0, playback_rate);
+                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f by_deadline=%d deadline_guard=%.3f force_timeout=%d rate=%.2f",
+                                  delay, seek_resume_sync_threshold, seek_resume_deadline ? 1 : 0,
+                                  seek_resume_deadline_guard, seek_resume_force_timeout ? 1 : 0, playback_rate);
                         }
                         seek_audio_wait_deadline_ms_ = 0;
                     } else {
+                        if (seek_resume_deadline) {
+                            // deadline 到点但仍明显不同步时，短延一档再等，稳定性优先。
+                            seek_audio_wait_deadline_ms_ = now + 800;
+                            SYNCI_RATE(20, "evt=seek_audio_resume_deadline_extend delay=%.3f guard=%.3f extend_ms=%d rate=%.2f",
+                                       delay, seek_resume_deadline_guard, 800, playback_rate);
+                        }
                         SYNCI_RATE(30, "evt=seek_audio_resume_wait delay=%.3f threshold=%.3f deadline_left_ms=%" PRId64 " rate=%.2f",
                                    delay, seek_resume_sync_threshold,
                                    (int64_t)std::max<int64_t>(0, seek_audio_wait_deadline_ms_ - now),
