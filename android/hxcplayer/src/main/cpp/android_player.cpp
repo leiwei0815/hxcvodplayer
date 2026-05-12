@@ -23,7 +23,7 @@
 //   2 = INFO + WARN + ERROR
 //   3 = DEBUG + INFO + WARN + ERROR
 #ifndef HXC_PLAYER_RUNTIME_LOG_LEVEL
-#define HXC_PLAYER_RUNTIME_LOG_LEVEL 2
+#define HXC_PLAYER_RUNTIME_LOG_LEVEL 1
 #endif
 
 #if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 3
@@ -89,6 +89,7 @@
 #define PERFI(...)      TAGI(LOG_TAG_PERF, __VA_ARGS__)
 #define PERFW(...)      TAGW(LOG_TAG_PERF, __VA_ARGS__)
 #define PERFI_RATE(...) TAGI_RATE(LOG_TAG_PERF, __VA_ARGS__)
+#define PERFW_RATE(...) TAGW_RATE(LOG_TAG_PERF, __VA_ARGS__)
 #define SYNCI(...)      TAGI(LOG_TAG_SYNC, __VA_ARGS__)
 #define SYNCW(...)      TAGW(LOG_TAG_SYNC, __VA_ARGS__)
 #define SYNCI_RATE(...) TAGI_RATE(LOG_TAG_SYNC, __VA_ARGS__)
@@ -97,6 +98,8 @@
 #define PBOD(...)       TAGD(LOG_TAG_PBO, __VA_ARGS__)
 #define PBOI(...)       TAGI(LOG_TAG_PBO, __VA_ARGS__)
 #define PBOW(...)       TAGW(LOG_TAG_PBO, __VA_ARGS__)
+#define PBOI_RATE(...)  TAGI_RATE(LOG_TAG_PBO, __VA_ARGS__)
+#define PBOW_RATE(...)  TAGW_RATE(LOG_TAG_PBO, __VA_ARGS__)
 
 // Rate-limited logging: prints at most once every N calls.
 // Usage: LOGI_RATE(100, "msg %d", val);
@@ -2083,13 +2086,13 @@ void AndroidPlayer::renderLoop() {
                     total_render_ms = total_upload_ms = max_render_ms = max_upload_ms = 0;
                 }
                 if (render_ms > 33)
-                    LOGW("[perf] slow frame %" PRId64 "ms %dx%d surf=%dx%d",
-                         render_ms, frame_data.width, frame_data.height,
-                         surface_width_, surface_height_);
+                    LOGW_RATE(20, "[perf] slow frame %" PRId64 "ms %dx%d surf=%dx%d",
+                              render_ms, frame_data.width, frame_data.height,
+                              surface_width_, surface_height_);
                 if (render_ms > 33) {
-                    PERFW("evt=slow_frame render_ms=%" PRId64 " video_w=%d video_h=%d surface_w=%d surface_h=%d rate=%.2f delay=%.3f",
-                          render_ms, frame_data.width, frame_data.height,
-                          surface_width_, surface_height_, playback_rate, delay);
+                    PERFW_RATE(20, "evt=slow_frame render_ms=%" PRId64 " video_w=%d video_h=%d surface_w=%d surface_h=%d rate=%.2f delay=%.3f",
+                               render_ms, frame_data.width, frame_data.height,
+                               surface_width_, surface_height_, playback_rate, delay);
                 }
             }
 
@@ -2576,10 +2579,11 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     if (out_max_upload_ms && upload_ms > *out_max_upload_ms)
         *out_max_upload_ms = upload_ms;
     if (upload_ms > 10) {
-        LOGW("[DIAG] Slow upload: %" PRId64 "ms | %dx%d Y_stride=%d pbo=%d",
-             upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
-        PBOW("evt=slow_upload upload_ms=%" PRId64 " video_w=%d video_h=%d y_stride=%d use_pbo=%d",
-             upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
+        // 4K 下慢上传可能连续出现，按固定采样率输出，避免告警刷屏影响性能。
+        LOGW_RATE(30, "[DIAG] Slow upload: %" PRId64 "ms | %dx%d Y_stride=%d pbo=%d",
+                  upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
+        PBOW_RATE(30, "evt=slow_upload upload_ms=%" PRId64 " video_w=%d video_h=%d y_stride=%d use_pbo=%d",
+                  upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
     }
 
     gl_last_video_w_ = width;
