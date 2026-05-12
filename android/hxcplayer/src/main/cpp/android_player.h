@@ -236,6 +236,8 @@ private:
     int64_t           audio_rebuffer_deadline_ms_{0};
     int64_t           audio_rebuffer_paused_at_ms_{0};
     int64_t           audio_rebuffer_min_resume_at_ms_{0};
+    // Seek 期间临时输出静音，避免 OpenSL 队列残留旧音频导致“画面已跳转但声音还在旧位置”。
+    std::atomic<bool> audio_seek_pending_{false};
     // AV sync helpers (mirroring iOS HXCPlayerControl logic)
     double            audio_output_latency_sec_{0.0}; // estimated hw output queue delay
     std::atomic<int>  sync_warmup_frames_{0};         // relaxed sync window after open/seek

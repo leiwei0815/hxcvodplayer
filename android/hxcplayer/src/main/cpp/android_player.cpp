@@ -454,6 +454,7 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         seek_recovery_active_.store(false, std::memory_order_release);
         seek_recovery_deadline_ms_ = 0;
         seek_audio_wait_video_.store(false, std::memory_order_release);
+        audio_seek_pending_.store(false, std::memory_order_release);
         seek_audio_wait_deadline_ms_ = 0;
         seek_started_at_ms_ = 0;
         seek_lower_bound_drop_count_ = 0;
@@ -698,6 +699,7 @@ void AndroidPlayer::play() {
     seek_recovery_active_.store(false, std::memory_order_release);
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
+    audio_seek_pending_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
@@ -732,6 +734,7 @@ void AndroidPlayer::pause() {
     seek_recovery_active_.store(false, std::memory_order_release);
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
+    audio_seek_pending_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
@@ -760,6 +763,7 @@ void AndroidPlayer::stop() {
     seek_recovery_active_.store(false, std::memory_order_release);
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
+    audio_seek_pending_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
@@ -809,6 +813,7 @@ void AndroidPlayer::seekTo(double position) {
     seek_recovery_active_.store(true, std::memory_order_release);
     seek_recovery_deadline_ms_ = now + (very_large_seek ? 3600 : 4200);
     seek_audio_wait_video_.store(true, std::memory_order_release);
+    audio_seek_pending_.store(true, std::memory_order_release);
     // 兼顾“出画速度”和“首帧同步”：保留同步窗口，但避免超长等待造成卡死体感。
     int64_t seek_audio_wait_ms = very_large_seek ? 2600 : 3000;
     if (seek_span > 120.0) {
@@ -822,9 +827,15 @@ void AndroidPlayer::seekTo(double position) {
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
     audio_rebuffer_min_resume_at_ms_ = 0;
-    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+    if (playItf_) {
+        std::lock_guard<std::mutex> audio_lock(audio_mutex_);
         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
-        LOGI("[sync] seek pause audio waiting first target frame: result=%d", r);
+        if (bufferQueueItf_) {
+            SLresult clear_r = (*bufferQueueItf_)->Clear(bufferQueueItf_);
+            LOGI("[sync] seek pause audio waiting first target frame: pause=%d clear=%d", r, clear_r);
+        } else {
+            LOGI("[sync] seek pause audio waiting first target frame: pause=%d clear=skip(no_bq)", r);
+        }
     }
     consecutive_drop_count_ = 0;
     severe_lag_start_ms_ = 0;
@@ -2210,19 +2221,24 @@ void AndroidPlayer::renderLoop() {
                     bool seek_resume_slow_path_ready = lower_bound_cleared &&
                                                        post_seek_wait_ms >= 2200 &&
                                                        std::fabs(delay) <= (likely_4k ? 1.00 : 0.85);
+                    bool seek_resume_fast_path_ready = lower_bound_cleared &&
+                                                       post_seek_wait_ms >= 900 &&
+                                                       std::fabs(delay) <= (likely_4k ? 0.65 : 0.50);
                     bool seek_resume_force_timeout = seek_started_at_ms_ > 0 &&
                                                      (now - seek_started_at_ms_) >= 8000;
                     if (frame_reached_target &&
                         (seek_resume_sync_stable || seek_resume_deadline_safe ||
-                         seek_resume_slow_path_ready || seek_resume_force_timeout)) {
+                         seek_resume_slow_path_ready || seek_resume_fast_path_ready ||
+                         seek_resume_force_timeout)) {
                         if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
+                            audio_seek_pending_.store(false, std::memory_order_release);
                             if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                                 LOGI("[sync] seek first-frame resume audio: result=%d", r);
                             }
-                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f stable=%d/%d by_deadline=%d deadline_guard=%.3f force_timeout=%d rate=%.2f",
+                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f stable=%d/%d by_deadline=%d fast_path=%d deadline_guard=%.3f force_timeout=%d rate=%.2f",
                                   delay, seek_resume_sync_threshold, seek_resume_stable_frames, seek_resume_need_stable_frames,
-                                  seek_resume_deadline ? 1 : 0, seek_resume_deadline_guard,
+                                  seek_resume_deadline ? 1 : 0, seek_resume_fast_path_ready ? 1 : 0, seek_resume_deadline_guard,
                                   seek_resume_force_timeout ? 1 : 0, playback_rate);
                         }
                         seek_resume_stable_frames = 0;
@@ -2389,6 +2405,7 @@ void AndroidPlayer::renderLoop() {
                 !seek_lower_bound_active_.load(std::memory_order_acquire) &&
                 now >= seek_audio_wait_deadline_ms_) {
                 if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
+                    audio_seek_pending_.store(false, std::memory_order_release);
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] seek wait-video fallback resume audio: result=%d", r);
@@ -3267,6 +3284,12 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         int sz = audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096;
         memset(audio_buffer_, 0, sz);
         (*bq)->Enqueue(bq, audio_buffer_, sz);
+        return;
+    }
+
+    if (audio_seek_pending_.load(std::memory_order_acquire)) {
+        memset(audio_buffer_, 0, audio_buffer_size_);
+        (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
         return;
     }
 
