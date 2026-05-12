@@ -1705,10 +1705,16 @@ void AndroidPlayer::renderLoop() {
                 }
                 if (seek_elapsed_ms >= 1200) {
                     seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 0.70 : (large_seek_any_direction ? 0.45 : 0.30));
+                    if (is_backward_seek && likely_4k && very_large_seek) {
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, 2.20);
+                    }
                 }
                 if (seek_elapsed_ms >= 2200) {
                     if (is_backward_seek) {
                         seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 1.30 : 0.95);
+                        if (likely_4k && very_large_seek) {
+                            seek_epsilon_sec = std::max(seek_epsilon_sec, 3.00);
+                        }
                     } else {
                         double forward_relax_eps = very_large_seek ? 0.85 : (large_seek_any_direction ? 0.62 : 0.45);
                         if (playback_rate >= 2.0) {
@@ -1720,6 +1726,9 @@ void AndroidPlayer::renderLoop() {
                 if (seek_elapsed_ms >= 3200) {
                     if (is_backward_seek) {
                         seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 1.60 : 1.20);
+                        if (likely_4k && very_large_seek) {
+                            seek_epsilon_sec = std::max(seek_epsilon_sec, 3.60);
+                        }
                     } else {
                         double forward_relax_eps = very_large_seek ? 1.00 : (large_seek_any_direction ? 0.78 : 0.55);
                         if (playback_rate >= 2.0) {
@@ -1794,6 +1803,10 @@ void AndroidPlayer::renderLoop() {
                     }
                     if (playback_rate >= 2.0) {
                         backward_hit_min_delay = likely_4k ? -1.6 : -1.2;
+                    }
+                    if (likely_4k && very_large_seek) {
+                        // Large backward 4K seek: avoid over-holding near target.
+                        backward_hit_min_delay = std::min(backward_hit_min_delay, -2.0);
                     }
                     if (delay < backward_hit_min_delay && seek_elapsed_ms < 7000) {
                         should_consume = true;
@@ -2291,7 +2304,7 @@ void AndroidPlayer::renderLoop() {
                 // In catch-up mode (high rate / far behind), don't sleep so seek recovery
                 // can drain stale frames quickly.
                 if (!should_display &&
-                    (delay < -0.20 || playback_rate >= 1.75)) {
+                    (delay < -0.20 || delay > 1.20 || playback_rate >= 1.75)) {
                     wait_ms = 0;
                 } else {
                     wait_ms = 8;
