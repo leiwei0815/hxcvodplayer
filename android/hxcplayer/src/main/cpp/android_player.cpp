@@ -1628,10 +1628,13 @@ void AndroidPlayer::renderLoop() {
                     seek_recovery_deadline_ms_ = 0;
                     in_seek_recovery = false;
                     sync_warmup_frames_.store(24, std::memory_order_release);
-                    post_seek_ahead_bypass_until_ms = now + 5000;
+                    int64_t bypass_ms = is_backward_seek ? 5200 : 3200;
+                    post_seek_ahead_bypass_until_ms = now + bypass_ms;
                     should_display = should_consume = true;
-                    LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f", pts, seek_target_now);
-                    SYNCI("evt=seek_lower_bound_hit pts=%.3f target=%.3f", pts, seek_target_now);
+                    LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64,
+                         pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms);
+                    SYNCI("evt=seek_lower_bound_hit pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64,
+                          pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms);
                 }
             }
 
@@ -1849,10 +1852,10 @@ void AndroidPlayer::renderLoop() {
                 } else if (delay <= kMaxAhead) {
                     should_display = should_consume = true;
                 } else if (!in_seek_recovery &&
-                           high_rate_4k &&
                            post_seek_ahead_bypass_until_ms > now) {
-                    // Seek just recovered, but clock may temporarily roll back.
-                    // Bypass "ahead hold" briefly so users don't see frozen picture.
+                    // Seek just recovered, but clock may temporarily roll back or lag.
+                    // Bypass "ahead hold" briefly so users don't see frozen picture
+                    // (not only for high-rate; 1.0x backward seek can also hit this).
                     should_display = should_consume = true;
                     SYNCI_RATE(30, "evt=post_seek_ahead_bypass pts=%.3f clk=%.3f delay=%.3f rate=%.2f bypass_left_ms=%" PRId64,
                                pts, clock, delay, playback_rate,
