@@ -21,7 +21,6 @@
 
 // Forward declarations
 struct PlayerCoreHandle;
-namespace hxcplayer { class ICustomDataSource; }
 
 /**
  * Android player – EGL/GLES2 video + OpenSL ES audio.
@@ -84,7 +83,8 @@ public:
     void   setPlaybackRate(float rate);
     void   setVolume(float volume);
     void   setAspectRatioMode(int mode);   // 0=FIT, 1=FILL
-    void   setDecodeMode(int mode);        // 0=software, 1=hardware
+    // 0=software, 1=hardware. Runtime switch only affects subsequent open* calls.
+    void   setDecodeMode(int mode);
     int    getDecodeMode() const;
 
     // --- State queries ---
@@ -259,6 +259,8 @@ private:
     // Seek recovery diagnostics and adaptive lower-bound relaxation.
     int64_t             seek_started_at_ms_{0};
     int                 seek_lower_bound_drop_count_{0};
+    // Seek 之后由渲染线程清空 last-frame 缓存，避免重绘旧画面。
+    std::atomic<bool>   clear_last_frame_cache_pending_{false};
     // High-rate cadence: avoid long "all-drop then force old frame" behavior.
     int                 consecutive_drop_count_{0};
     // Severe-lag detector for soft re-anchor (prevents endless drop loops).
