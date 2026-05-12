@@ -310,6 +310,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var networkLoadingSinceMs: Long = 0L
     private var networkTotalStallMs: Long = 0L
     private var networkReconnectCount: Int = 0
+    // Guard against external pause storms (e.g. dual-view sync loops) that can
+    // immediately cancel a user-triggered play.
+    private var pauseGuardUntilMs: Long = 0L
+    private var lastPauseRequestMs: Long = 0L
     private var lastOpenUrl: String? = null
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
@@ -337,6 +341,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     // 设置回调
     fun setCallback(callback: PlayerCallback) {
         this.callback = callback
+        dispatchCurrentStateSnapshot(callback)
     }
 
     /**
@@ -371,6 +376,32 @@ class HXCPlayerControl @JvmOverloads constructor(
     private fun currentHandle(): Long {
         synchronized(lifecycleLock) {
             return nativeHandle
+        }
+    }
+
+    /**
+     * When UI page (re)binds callback (e.g. entering from floating window),
+     * immediately push current player snapshot so UI buttons don't rely on stale state.
+     */
+    private fun dispatchCurrentStateSnapshot(target: PlayerCallback) {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        val state = getState()
+        val position = getPosition()
+        val duration = getDuration()
+        val loading = isLoading()
+        val now = SystemClock.elapsedRealtime()
+        lastPlayerState = state
+        lastLoadingState = loading
+        loadingCandidateState = loading
+        loadingCandidateSinceMs = now
+        mainHandler.post {
+            if (isReleased || this.callback !== target) return@post
+            target.onPlayerStateChanged(state)
+            if (duration > 0) {
+                target.onPlayerPositionUpdated(position, duration)
+            }
+            target.onPlayerLoadingChanged(loading)
         }
     }
 
@@ -833,13 +864,29 @@ class HXCPlayerControl @JvmOverloads constructor(
             return
         }
         nativePlay(handle)
+        // Give playback state a short settle window to avoid "tap play then
+        // instantly paused by looped external pause dispatch".
+        pauseGuardUntilMs = SystemClock.elapsedRealtime() + 900L
     }
 
     // 暂停
     fun pause() {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
+        val now = SystemClock.elapsedRealtime()
+        if (now < pauseGuardUntilMs) {
+            Log.w(TAG, "pause suppressed by play-guard remainMs=${pauseGuardUntilMs - now}")
+            return
+        }
+        val state = getState()
+        // Throttle repeated pause spam when already not playing.
+        if (state == PlayerState.PAUSED || state == PlayerState.STOPPED || state == PlayerState.IDLE) {
+            if (now - lastPauseRequestMs < 600L) {
+                return
+            }
+        }
         nativePause(handle)
+        lastPauseRequestMs = now
     }
 
     // 停止
