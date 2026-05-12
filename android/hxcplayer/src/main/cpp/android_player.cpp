@@ -1932,6 +1932,16 @@ void AndroidPlayer::renderLoop() {
                     SYNCI_RATE(30, "evt=post_seek_ahead_bypass pts=%.3f clk=%.3f delay=%.3f rate=%.2f bypass_left_ms=%" PRId64,
                                pts, clock, delay, playback_rate,
                                (int64_t)std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now));
+                } else if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
+                           audio_rebuffer_pending_.load(std::memory_order_acquire) &&
+                           now >= audio_rebuffer_min_resume_at_ms_) {
+                    // Deadlock guard: when audio was paused for starvation, clock can
+                    // stop advancing. If we keep "ahead hold" here, video never gets
+                    // presented again and audio never reaches resume path.
+                    // Force one display+consume to re-enter normal recovery.
+                    should_display = should_consume = true;
+                    SYNCI_RATE(30, "evt=audio_rebuffer_break_ahead_hold pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
+                               pts, clock, delay, playback_rate);
                 }
                 // else: video > 2s ahead of audio -- hold frame (don't consume)
             }

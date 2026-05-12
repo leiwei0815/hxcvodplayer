@@ -189,12 +189,54 @@ build_ffmpeg() {
         --disable-txtpages \
         --disable-debug \
         --enable-optimizations \
+        --enable-small \
         --disable-avdevice \
+        --disable-avfilter \
+        --disable-protocols \
+        --enable-protocol=file \
+        --enable-protocol=http \
+        --enable-protocol=https \
+        --enable-protocol=crypto \
+        --enable-protocol=httpproxy \
+        --enable-protocol=tcp \
+        --enable-protocol=tls \
+        --enable-protocol=pipe \
+        --disable-demuxers \
+        --enable-demuxer=mov \
+        --enable-demuxer=mpegts \
+        --enable-demuxer=hls \
+        --enable-demuxer=avi \
+        --enable-demuxer=matroska \
+        --enable-demuxer=flv \
+        --enable-demuxer=aac \
+        --enable-demuxer=mp3 \
+        --enable-demuxer=wav \
+        --disable-parsers \
+        --enable-parser=h264 \
+        --enable-parser=hevc \
+        --enable-parser=mpeg4video \
+        --enable-parser=aac \
+        --enable-parser=mpegaudio \
+        --disable-bsfs \
+        --enable-bsf=h264_mp4toannexb \
+        --enable-bsf=hevc_mp4toannexb \
+        --enable-bsf=aac_adtstoasc \
+        --disable-decoders \
+        --enable-decoder=h264 \
+        --enable-decoder=hevc \
+        --enable-decoder=mpeg4 \
+        --enable-decoder=aac \
+        --enable-decoder=mp3 \
+        --enable-decoder=pcm_s16le \
+        --disable-encoders \
+        --disable-muxers \
+        --disable-filters \
+        --disable-hwaccels \
+        --enable-hwaccel=mediacodec \
         --enable-decoder=h264_mediacodec \
         --enable-decoder=hevc_mediacodec \
         --disable-indevs \
         --disable-outdevs \
-        --enable-hwaccel=mediacodec \
         --enable-mediacodec \
         --enable-jni \
         --enable-mbedtls \
