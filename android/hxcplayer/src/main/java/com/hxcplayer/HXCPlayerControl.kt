@@ -299,7 +299,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var loadingCandidateSinceMs: Long = 0L
     private val openExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val loadingShowDebounceMs = 300L
+    private val loadingShowDebounceMs = 450L
     private val loadingHideDebounceMs = 150L
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
@@ -382,10 +382,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     private fun dispatchCurrentStateSnapshot(target: PlayerCallback) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        val state = getState()
+        val loading = isLoading()
+        val state = coerceStateWithLoading(getState(), loading)
         val position = getPosition()
         val duration = getDuration()
-        val loading = isLoading()
         val now = SystemClock.elapsedRealtime()
         lastPlayerState = state
         lastLoadingState = loading
@@ -1018,6 +1018,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         return mapPlayerState(coreStateRaw)
     }
 
+    private fun coerceStateWithLoading(state: PlayerState, loading: Boolean): PlayerState {
+        // Seek recovery can keep loading=true while native briefly reports PLAYING.
+        // Coerce to LOADING to avoid UI hiding spinner too early and causing flicker.
+        return if (loading && state == PlayerState.PLAYING) PlayerState.LOADING else state
+    }
+
     /**
      * 当前视频是否处于硬解状态（硬解失败回退软解后返回 false）。
      */
@@ -1043,7 +1049,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val pipelineStateRaw = nativeGetPipelineState(handle)
                 val playWhenReady = nativeGetPlayWhenReady(handle)
                 val isPlaying = nativeIsPlaying(handle)
-                val state = resolveUnifiedState(coreStateRaw, pipelineStateRaw, playWhenReady, isPlaying)
+                val loading = isLoading()
+                val state = coerceStateWithLoading(
+                    resolveUnifiedState(coreStateRaw, pipelineStateRaw, playWhenReady, isPlaying),
+                    loading
+                )
 
                 if (lastPlayerState != state) {
                     lastPlayerState = state
@@ -1055,7 +1065,6 @@ class HXCPlayerControl @JvmOverloads constructor(
                     callback?.onPlayerPositionUpdated(position, duration)
                 }
 
-                val loading = isLoading()
                 val now = SystemClock.elapsedRealtime()
                 if (loadingCandidateState == null || loadingCandidateState != loading) {
                     loadingCandidateState = loading

@@ -1635,19 +1635,31 @@ void AndroidPlayer::renderLoop() {
                     if (is_backward_seek) {
                         seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.20 : 1.60);
                     } else {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 8.00 : (large_seek_any_direction ? 3.60 : 1.20));
+                        double forward_relax_eps = very_large_seek ? 8.00 : (large_seek_any_direction ? 3.60 : 1.20);
+                        if (playback_rate >= 2.0) {
+                            forward_relax_eps = very_large_seek ? 2.80 : (large_seek_any_direction ? 2.40 : 1.20);
+                        }
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, forward_relax_eps);
                     }
                 }
                 if (seek_elapsed_ms >= 3200) {
                     if (is_backward_seek) {
                         seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.80 : 2.20);
                     } else {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 10.50 : (large_seek_any_direction ? 5.00 : 2.00));
+                        double forward_relax_eps = very_large_seek ? 10.50 : (large_seek_any_direction ? 5.00 : 2.00);
+                        if (playback_rate >= 2.0) {
+                            forward_relax_eps = very_large_seek ? 3.80 : (large_seek_any_direction ? 3.00 : 2.00);
+                        }
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, forward_relax_eps);
                     }
                 }
                 bool lower_bound_force_relax = seek_lower_bound_drop_count_ >= (very_large_seek ? 180 : 120);
                 if (lower_bound_force_relax) {
-                    seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 2.60 : (very_large_seek ? 9.50 : 4.20));
+                    double forced_eps = is_backward_seek ? 2.60 : (very_large_seek ? 9.50 : 4.20);
+                    if (!is_backward_seek && playback_rate >= 2.0) {
+                        forced_eps = very_large_seek ? 3.40 : 2.80;
+                    }
+                    seek_epsilon_sec = std::max(seek_epsilon_sec, forced_eps);
                 }
                 if (pts + seek_epsilon_sec < seek_target_now) {
                     should_consume = true;
@@ -1667,6 +1679,15 @@ void AndroidPlayer::renderLoop() {
                               pts, seek_target_now, seek_from_now, stale_future_margin_sec);
                     SYNCW_RATE(20, "evt=seek_lower_bound_stale_future_drop pts=%.3f target=%.3f from=%.3f margin=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
                                pts, seek_target_now, seek_from_now, stale_future_margin_sec, seek_elapsed_ms, seek_lower_bound_drop_count_);
+                } else if (!is_backward_seek &&
+                           delay < -3.2 &&
+                           seek_elapsed_ms < 5200) {
+                    // Avoid exiting seek gate too early when frame still trails
+                    // audio clock by a lot; otherwise users see "loading gone but frozen".
+                    should_consume = true;
+                    seek_lower_bound_drop_count_++;
+                    SYNCW_RATE(20, "evt=seek_lower_bound_delay_guard pts=%.3f target=%.3f delay=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
+                               pts, seek_target_now, delay, seek_elapsed_ms, seek_lower_bound_drop_count_);
                 } else {
                     seek_lower_bound_active_.store(false, std::memory_order_release);
                     seek_fast_catchup_frames_.store(0, std::memory_order_release);
