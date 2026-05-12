@@ -259,12 +259,6 @@ private:
     // Seek recovery diagnostics and adaptive lower-bound relaxation.
     int64_t             seek_started_at_ms_{0};
     int                 seek_lower_bound_drop_count_{0};
-    // Post-seek resync watchdog: if delay stays too large after seek recovery,
-    // trigger one bounded re-seek (soft reset style) to re-acquire A/V sync.
-    int64_t             seek_last_request_ms_{0};
-    int64_t             seek_last_reseek_ms_{0};
-    int64_t             seek_reseek_trigger_start_ms_{0};
-    int                 seek_reseek_count_{0};
     // High-rate cadence: avoid long "all-drop then force old frame" behavior.
     int                 consecutive_drop_count_{0};
     // Severe-lag detector for soft re-anchor (prevents endless drop loops).
