@@ -1859,7 +1859,22 @@ void AndroidPlayer::renderLoop() {
                         // Large backward 4K seek: avoid over-holding near target.
                         backward_hit_min_delay = std::min(backward_hit_min_delay, -2.0);
                     }
-                    if (delay < backward_hit_min_delay && seek_elapsed_ms < 7000) {
+                    // Avoid prolonged "loading freeze" on backward seeks.
+                    // Gradually relax hold window as elapsed grows, and cap max hold time.
+                    int64_t backward_hold_max_ms = likely_4k ? 4200 : 2600;
+                    if (large_seek_any_direction) {
+                        backward_hold_max_ms += likely_4k ? 800 : 500;
+                    }
+                    if (seek_elapsed_ms >= 1200) {
+                        backward_hit_min_delay += likely_4k ? 0.20 : 0.28;
+                    }
+                    if (seek_elapsed_ms >= 2000) {
+                        backward_hit_min_delay += likely_4k ? 0.25 : 0.35;
+                    }
+                    if (seek_elapsed_ms >= 2800) {
+                        backward_hit_min_delay += likely_4k ? 0.20 : 0.22;
+                    }
+                    if (delay < backward_hit_min_delay && seek_elapsed_ms < backward_hold_max_ms) {
                         should_consume = true;
                         seek_lower_bound_drop_count_++;
                         SYNCW_RATE(20, "evt=seek_lower_bound_hit_hold_backward delay=%.3f min=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
