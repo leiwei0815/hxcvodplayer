@@ -256,6 +256,9 @@ private:
     // During seek, wait for first target video frame before resuming audio.
     std::atomic<bool>   seek_audio_wait_video_{false};
     int64_t             seek_audio_wait_deadline_ms_{0};
+    // Seek recovery diagnostics and adaptive lower-bound relaxation.
+    int64_t             seek_started_at_ms_{0};
+    int                 seek_lower_bound_drop_count_{0};
     // High-rate cadence: avoid long "all-drop then force old frame" behavior.
     int                 consecutive_drop_count_{0};
     // Severe-lag detector for soft re-anchor (prevents endless drop loops).
