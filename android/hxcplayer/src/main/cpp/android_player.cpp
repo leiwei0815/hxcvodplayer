@@ -777,6 +777,8 @@ void AndroidPlayer::seekTo(double position) {
     seek_fast_catchup_frames_.store(very_large_seek ? 128 : 96, std::memory_order_release);
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+    double playback_rate = player_core_get_playback_rate(player_core_);
+    if (playback_rate <= 0.0) playback_rate = 1.0;
     seek_started_at_ms_ = now;
     seek_lower_bound_drop_count_ = 0;
     seek_catchup_deadline_ms_ = now + (very_large_seek ? 1200 : 900);
@@ -786,8 +788,15 @@ void AndroidPlayer::seekTo(double position) {
     seek_recovery_active_.store(true, std::memory_order_release);
     seek_recovery_deadline_ms_ = now + (very_large_seek ? 3600 : 4200);
     seek_audio_wait_video_.store(true, std::memory_order_release);
-    // 稳定性优先：seek 后给音画对齐更多缓冲时间，避免刚恢复就出现明显不同步。
-    seek_audio_wait_deadline_ms_ = now + (very_large_seek ? 4200 : 4600);
+    // 兼顾“出画速度”和“首帧同步”：保留同步窗口，但避免超长等待造成卡死体感。
+    int64_t seek_audio_wait_ms = very_large_seek ? 2600 : 3000;
+    if (seek_span > 120.0) {
+        seek_audio_wait_ms += 300;
+    }
+    if (playback_rate >= 2.0) {
+        seek_audio_wait_ms += 400;
+    }
+    seek_audio_wait_deadline_ms_ = now + seek_audio_wait_ms;
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
@@ -1630,7 +1639,11 @@ void AndroidPlayer::renderLoop() {
                 bool large_forward_seek = !is_backward_seek && seek_span_sec > 25.0;
                 bool large_seek_any_direction = seek_span_abs_sec > 25.0;
                 bool very_large_seek = seek_span_abs_sec > 180.0;
-                double stale_future_margin_sec = ultra_high_rate_4k ? 6.0 : 3.5;
+                double stale_future_margin_sec = ultra_high_rate_4k ? 4.0 : 2.2;
+                double forward_future_block_margin_sec = ultra_high_rate_4k ? 1.10 : 0.70;
+                if (large_seek_any_direction) {
+                    forward_future_block_margin_sec += 0.20;
+                }
                 auto mark_seek_lower_bound_hit = [&]() {
                     seek_lower_bound_active_.store(false, std::memory_order_release);
                     seek_fast_catchup_frames_.store(0, std::memory_order_release);
@@ -1643,9 +1656,9 @@ void AndroidPlayer::renderLoop() {
                     sync_warmup_frames_.store(24, std::memory_order_release);
                     // Seek 恢复后允许短暂 bypass ahead-hold，但窗口过长会放大音画分离体感。
                     // 在高倍速下保留一定缓冲，常速下尽量缩短恢复时间。
-                    int64_t bypass_ms = is_backward_seek ? 2200 : 1400;
+                    int64_t bypass_ms = is_backward_seek ? 1300 : 900;
                     if (playback_rate >= 2.0) {
-                        bypass_ms += 800;
+                        bypass_ms += 400;
                     }
                     post_seek_ahead_bypass_until_ms = now + bypass_ms;
                     post_seek_bypass_skip_count = 0;
@@ -1666,11 +1679,11 @@ void AndroidPlayer::renderLoop() {
                           pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms, seek_elapsed_ms);
                 };
                 if (large_forward_seek) {
-                    // Tencent/Exo-like seek UX: on large forward jumps, prioritize
-                    // "show something close quickly" over strict exact-target hit.
-                    seek_epsilon_sec = std::max(seek_epsilon_sec, 1.20);
+                    // Keep seek hit tight even for large forward jumps.
+                    // Over-relaxing epsilon causes "jump forward by seconds".
+                    seek_epsilon_sec = std::max(seek_epsilon_sec, 0.18);
                     if (seek_span_sec > 120.0) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, 1.80);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, 0.28);
                     }
                 }
                 // If seek recovery is slow, relax lower-bound gradually instead of
@@ -1682,48 +1695,57 @@ void AndroidPlayer::renderLoop() {
                         seek_epsilon_sec = 0.350;
                     }
                     if (sw_decode_4k && playback_rate >= 2.0) {
-                        // After deadline, prioritize quick visual recovery over exact seek hit.
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, 1.80);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, 0.55);
                     }
                     if (large_forward_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, 1.60);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, 0.48);
                     }
                 }
-                // Mature players tend to gradually relax seek gate when a large seek
-                // cannot immediately land near target keyframe. This avoids prolonged
-                // frozen frames and prioritizes visible recovery.
                 if (seek_elapsed_ms >= 1200) {
-                    seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 0.90 : (large_seek_any_direction ? 1.80 : 0.60));
+                    seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 0.70 : (large_seek_any_direction ? 0.45 : 0.30));
                 }
                 if (seek_elapsed_ms >= 2200) {
                     if (is_backward_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.20 : 1.60);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 1.30 : 0.95);
                     } else {
-                        double forward_relax_eps = very_large_seek ? 8.00 : (large_seek_any_direction ? 3.60 : 1.20);
+                        double forward_relax_eps = very_large_seek ? 0.85 : (large_seek_any_direction ? 0.62 : 0.45);
                         if (playback_rate >= 2.0) {
-                            forward_relax_eps = very_large_seek ? 2.80 : (large_seek_any_direction ? 2.40 : 1.20);
+                            forward_relax_eps = very_large_seek ? 0.72 : (large_seek_any_direction ? 0.58 : 0.42);
                         }
                         seek_epsilon_sec = std::max(seek_epsilon_sec, forward_relax_eps);
                     }
                 }
                 if (seek_elapsed_ms >= 3200) {
                     if (is_backward_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.80 : 2.20);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 1.60 : 1.20);
                     } else {
-                        double forward_relax_eps = very_large_seek ? 10.50 : (large_seek_any_direction ? 5.00 : 2.00);
+                        double forward_relax_eps = very_large_seek ? 1.00 : (large_seek_any_direction ? 0.78 : 0.55);
                         if (playback_rate >= 2.0) {
-                            forward_relax_eps = very_large_seek ? 3.80 : (large_seek_any_direction ? 3.00 : 2.00);
+                            forward_relax_eps = very_large_seek ? 0.85 : (large_seek_any_direction ? 0.72 : 0.50);
                         }
                         seek_epsilon_sec = std::max(seek_epsilon_sec, forward_relax_eps);
                     }
                 }
                 bool lower_bound_force_relax = seek_lower_bound_drop_count_ >= (very_large_seek ? 180 : 120);
                 if (lower_bound_force_relax) {
-                    double forced_eps = is_backward_seek ? 2.60 : (very_large_seek ? 9.50 : 4.20);
+                    double forced_eps = is_backward_seek ? 1.50 : (very_large_seek ? 1.00 : 0.72);
                     if (!is_backward_seek && playback_rate >= 2.0) {
-                        forced_eps = very_large_seek ? 3.40 : 2.80;
+                        forced_eps = very_large_seek ? 0.86 : 0.66;
                     }
                     seek_epsilon_sec = std::max(seek_epsilon_sec, forced_eps);
+                }
+                if (!is_backward_seek) {
+                    double forward_eps_cap = 0.75;
+                    if (large_seek_any_direction) {
+                        forward_eps_cap = 0.95;
+                    }
+                    if (very_large_seek) {
+                        forward_eps_cap = 1.10;
+                    }
+                    if (playback_rate >= 2.0) {
+                        forward_eps_cap += 0.12;
+                    }
+                    seek_epsilon_sec = std::min(seek_epsilon_sec, forward_eps_cap);
                 }
                 if (pts + seek_epsilon_sec < seek_target_now) {
                     should_consume = true;
@@ -1743,6 +1765,15 @@ void AndroidPlayer::renderLoop() {
                               pts, seek_target_now, seek_from_now, stale_future_margin_sec);
                     SYNCW_RATE(20, "evt=seek_lower_bound_stale_future_drop pts=%.3f target=%.3f from=%.3f margin=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
                                pts, seek_target_now, seek_from_now, stale_future_margin_sec, seek_elapsed_ms, seek_lower_bound_drop_count_);
+                } else if (!is_backward_seek &&
+                           !lower_bound_deadline_elapsed &&
+                           pts > seek_target_now + forward_future_block_margin_sec) {
+                    // Forward seek: do not accept far-future frame as first hit.
+                    // This prevents "seek lands but immediately jumps several seconds ahead".
+                    should_consume = true;
+                    seek_lower_bound_drop_count_++;
+                    SYNCW_RATE(20, "evt=seek_lower_bound_forward_future_drop pts=%.3f target=%.3f margin=%.3f elapsed_ms=%" PRId64 " drop_count=%d eps=%.3f",
+                               pts, seek_target_now, forward_future_block_margin_sec, seek_elapsed_ms, seek_lower_bound_drop_count_, seek_epsilon_sec);
                 } else if (!is_backward_seek &&
                            delay < -3.2 &&
                            seek_elapsed_ms < 5200) {
@@ -2016,10 +2047,17 @@ void AndroidPlayer::renderLoop() {
                            post_seek_ahead_bypass_until_ms > now) {
                     double max_bypass_ahead_sec = high_rate_4k ? 2.6 : 1.8;
                     if (delay > max_bypass_ahead_sec) {
-                        // Ahead 过大时不再强制 bypass，避免 seek 后出现数秒明显音画不同步。
-                        // 但要继续 consume 追赶时钟，避免“看起来像卡死”。
+                        // Ahead 过大时继续追赶时钟，但避免 pure-drop 导致“画面卡住”体感。
+                        // 在可控的 ahead 区间按 cadence 出帧，优先保证可见进度。
                         should_consume = true;
                         post_seek_bypass_skip_count++;
+                        double cadence_display_limit = max_bypass_ahead_sec + (likely_4k ? 1.0 : 0.8);
+                        if (delay <= cadence_display_limit &&
+                            (post_seek_bypass_skip_count % 3 == 0)) {
+                            should_display = true;
+                            SYNCI_RATE(20, "evt=post_seek_ahead_bypass_cadence_display delay=%.3f max_ahead=%.3f skip_count=%d rate=%.2f",
+                                       delay, max_bypass_ahead_sec, post_seek_bypass_skip_count, playback_rate);
+                        }
                         int64_t bypass_left_ms = std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now);
                         if (post_seek_bypass_skip_count >= 3 && bypass_left_ms > 260) {
                             int64_t shrink_ms = (post_seek_bypass_skip_count >= 8) ? 360 : 220;
@@ -2080,6 +2118,17 @@ void AndroidPlayer::renderLoop() {
                     if (playback_rate >= 2.0) {
                         seek_resume_need_stable_frames += 2;
                     }
+                    bool lower_bound_cleared = !seek_lower_bound_active_.load(std::memory_order_acquire);
+                    int64_t post_seek_wait_ms = seek_started_at_ms_ > 0 ? (now - seek_started_at_ms_) : 0;
+                    if (lower_bound_cleared && post_seek_wait_ms >= 1400) {
+                        seek_resume_sync_threshold = std::max(seek_resume_sync_threshold, likely_4k ? 0.75 : 0.60);
+                        seek_resume_need_stable_frames = std::min(seek_resume_need_stable_frames, likely_4k ? 5 : 4);
+                    }
+                    if (lower_bound_cleared && post_seek_wait_ms >= 2200) {
+                        seek_resume_sync_threshold = std::max(seek_resume_sync_threshold, likely_4k ? 0.95 : 0.80);
+                        seek_resume_need_stable_frames = std::min(seek_resume_need_stable_frames, 3);
+                    }
+                    seek_resume_sync_ready = std::fabs(delay) <= seek_resume_sync_threshold;
                     if (seek_resume_sync_ready) {
                         seek_resume_stable_frames = std::min(seek_resume_stable_frames + 1,
                                                              seek_resume_need_stable_frames + 3);
@@ -2097,9 +2146,13 @@ void AndroidPlayer::renderLoop() {
                     }
                     bool seek_resume_deadline_safe = seek_resume_deadline &&
                                                      std::fabs(delay) <= seek_resume_deadline_guard;
+                    bool seek_resume_slow_path_ready = lower_bound_cleared &&
+                                                       post_seek_wait_ms >= 2200 &&
+                                                       std::fabs(delay) <= (likely_4k ? 1.00 : 0.85);
                     bool seek_resume_force_timeout = seek_started_at_ms_ > 0 &&
                                                      (now - seek_started_at_ms_) >= 8000;
-                    if (seek_resume_sync_stable || seek_resume_deadline_safe || seek_resume_force_timeout) {
+                    if (seek_resume_sync_stable || seek_resume_deadline_safe ||
+                        seek_resume_slow_path_ready || seek_resume_force_timeout) {
                         if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
                             if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);

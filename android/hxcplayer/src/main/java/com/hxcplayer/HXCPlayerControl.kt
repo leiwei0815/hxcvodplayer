@@ -301,6 +301,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val loadingShowDebounceMs = 450L
     private val loadingHideDebounceMs = 150L
+    // 首开时 loading=false 可能早于首帧真正上屏，增加一个轻量保护窗口避免黑闪。
+    private val openLoadingHideMinDelayMs = 280L
+    private var openLoadingHideProtectUntilMs: Long = 0L
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
     private var autoReopenOnRecoverableErrorEnabled: Boolean = false
@@ -399,6 +402,10 @@ class HXCPlayerControl @JvmOverloads constructor(
             }
             target.onPlayerLoadingChanged(loading)
         }
+    }
+
+    private fun armOpenLoadingHideGuard() {
+        openLoadingHideProtectUntilMs = SystemClock.elapsedRealtime() + openLoadingHideMinDelayMs
     }
 
     // ========== iOS 对齐属性（property 风格 setter/getter）==========
@@ -520,7 +527,10 @@ class HXCPlayerControl @JvmOverloads constructor(
             }
         }
         if (!result) {
+            openLoadingHideProtectUntilMs = 0L
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "打开失败: mode=${model.mode}, url=${model.url}")
+        } else {
+            armOpenLoadingHideGuard()
         }
         return result
     }
@@ -736,7 +746,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         val result = nativeOpenURLWithStartPosition(handle, url, startPosition)
 
         if (!result) {
+            openLoadingHideProtectUntilMs = 0L
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
+        } else {
+            armOpenLoadingHideGuard()
         }
         return result
     }
@@ -771,9 +784,12 @@ class HXCPlayerControl @JvmOverloads constructor(
                 // 始终用带起始位置的接口
                 val result = nativeOpenURLWithStartPosition(handle, url, startPosition)
 
-                if (!result && !isReleased) {
-                    mainHandler.post {
+                mainHandler.post {
+                    if (!result && !isReleased) {
+                        openLoadingHideProtectUntilMs = 0L
                         dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
+                    } else if (result && !isReleased) {
+                        armOpenLoadingHideGuard()
                     }
                 }
             }
@@ -1070,9 +1086,15 @@ class HXCPlayerControl @JvmOverloads constructor(
                     loadingCandidateState = loading
                     loadingCandidateSinceMs = now
                 } else {
-                    val debounceMs = if (loading) loadingShowDebounceMs else loadingHideDebounceMs
+                    var debounceMs = if (loading) loadingShowDebounceMs else loadingHideDebounceMs
+                    if (!loading && now < openLoadingHideProtectUntilMs) {
+                        debounceMs = maxOf(debounceMs, openLoadingHideProtectUntilMs - now)
+                    }
                     if (lastLoadingState != loading && (now - loadingCandidateSinceMs) >= debounceMs) {
                         lastLoadingState = loading
+                        if (!loading) {
+                            openLoadingHideProtectUntilMs = 0L
+                        }
                         mainHandler.post {
                             callback?.onPlayerLoadingChanged(loading)
                             if (loading) {
