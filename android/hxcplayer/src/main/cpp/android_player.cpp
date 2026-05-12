@@ -1773,15 +1773,16 @@ void AndroidPlayer::renderLoop() {
                 } else if (!is_backward_seek) {
                     // 稳定性优先：前向 seek 命中前要求 delay 不得过度落后，
                     // 否则即便命中 lower-bound，也会出现“先播放但音画不同步数秒”。
-                    double forward_hit_min_delay = likely_4k ? -1.0 : -0.8;
+                    double forward_hit_min_delay = likely_4k ? -1.3 : -1.0;
                     if (large_seek_any_direction) {
-                        forward_hit_min_delay -= likely_4k ? 0.15 : 0.10;
+                        forward_hit_min_delay -= likely_4k ? 0.25 : 0.15;
                     }
                     if (playback_rate >= 2.0) {
-                        forward_hit_min_delay = likely_4k ? -1.4 : -1.0;
+                        // 体验优先：高倍速不再过度等待 lower-bound，避免 loading 后长时间“假播放卡住”。
+                        forward_hit_min_delay = likely_4k ? -2.2 : -1.6;
                     }
                     if (playback_rate >= 2.5) {
-                        forward_hit_min_delay = likely_4k ? -1.6 : -1.2;
+                        forward_hit_min_delay = likely_4k ? -2.6 : -1.9;
                     }
                     if (delay < forward_hit_min_delay && seek_elapsed_ms < 7000) {
                         should_consume = true;
@@ -2016,6 +2017,8 @@ void AndroidPlayer::renderLoop() {
                     double max_bypass_ahead_sec = high_rate_4k ? 2.6 : 1.8;
                     if (delay > max_bypass_ahead_sec) {
                         // Ahead 过大时不再强制 bypass，避免 seek 后出现数秒明显音画不同步。
+                        // 但要继续 consume 追赶时钟，避免“看起来像卡死”。
+                        should_consume = true;
                         post_seek_bypass_skip_count++;
                         int64_t bypass_left_ms = std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now);
                         if (post_seek_bypass_skip_count >= 3 && bypass_left_ms > 260) {
