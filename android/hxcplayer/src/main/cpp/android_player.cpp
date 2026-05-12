@@ -1317,6 +1317,15 @@ void AndroidPlayer::renderLoop() {
     // (audio clock catches up from an older anchor), producing large positive delay
     // and a short "hold/freeze". Keep a brief bypass window to avoid that freeze.
     int64_t post_seek_ahead_bypass_until_ms = 0;
+    // Sync-stall watchdog: if pts/clock stay almost unchanged for too long while
+    // playback is active, force one consume+display to break potential deadlock.
+    double stall_watchdog_last_pts = std::numeric_limits<double>::quiet_NaN();
+    double stall_watchdog_last_clk = std::numeric_limits<double>::quiet_NaN();
+    int64_t stall_watchdog_since_ms = 0;
+    int64_t stall_watchdog_last_break_ms = 0;
+    const int64_t kSyncStallWatchdogMs = 1200;
+    const int64_t kSyncStallWatchdogCooldownMs = 450;
+    const double kSyncStallWatchdogEps = 0.002;
 
     int64_t total_render_ms = 0, total_upload_ms = 0;
     int64_t max_render_ms   = 0, max_upload_ms   = 0;
@@ -1411,9 +1420,24 @@ void AndroidPlayer::renderLoop() {
             int64_t now = now_ms();
             double playback_rate = player_core_get_playback_rate(player_core_);
             if (playback_rate <= 0.0) playback_rate = 1.0;
+            bool core_playing_now = player_core_is_playing(player_core_);
             float requested_rate = requested_playback_rate_.load(std::memory_order_relaxed);
             if (requested_rate <= 0.0f) requested_rate = (float)playback_rate;
             requested_rate = normalize_playback_rate(requested_rate);
+
+            bool snapshot_stalled = false;
+            if (!std::isnan(stall_watchdog_last_pts) && !std::isnan(stall_watchdog_last_clk)) {
+                snapshot_stalled =
+                    std::fabs(pts - stall_watchdog_last_pts) <= kSyncStallWatchdogEps &&
+                    std::fabs(clock - stall_watchdog_last_clk) <= kSyncStallWatchdogEps;
+            }
+            if (snapshot_stalled) {
+                if (stall_watchdog_since_ms == 0) stall_watchdog_since_ms = now;
+            } else {
+                stall_watchdog_since_ms = now;
+            }
+            stall_watchdog_last_pts = pts;
+            stall_watchdog_last_clk = clock;
 
             bool should_display = false;
             bool should_consume = false;
@@ -1942,6 +1966,19 @@ void AndroidPlayer::renderLoop() {
                     should_display = should_consume = true;
                     SYNCI_RATE(30, "evt=audio_rebuffer_break_ahead_hold pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
                                pts, clock, delay, playback_rate);
+                } else if (!in_seek_recovery &&
+                           core_playing_now &&
+                           likely_4k &&
+                           snapshot_stalled &&
+                           stall_watchdog_since_ms > 0 &&
+                           (now - stall_watchdog_since_ms) >= kSyncStallWatchdogMs &&
+                           (now - stall_watchdog_last_break_ms) >= kSyncStallWatchdogCooldownMs) {
+                    // If clocks are stuck while "playing", force progress once to
+                    // avoid a long pseudo-playing freeze in high-load scenarios.
+                    should_display = should_consume = true;
+                    stall_watchdog_last_break_ms = now;
+                    SYNCI_RATE(20, "evt=sync_stall_watchdog_break pts=%.3f clk=%.3f delay=%.3f stalled_ms=%" PRId64 " rate=%.2f",
+                               pts, clock, delay, (int64_t)(now - stall_watchdog_since_ms), playback_rate);
                 }
                 // else: video > 2s ahead of audio -- hold frame (don't consume)
             }
