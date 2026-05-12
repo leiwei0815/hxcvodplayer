@@ -301,9 +301,13 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val loadingShowDebounceMs = 450L
     private val loadingHideDebounceMs = 150L
-    // 首开时 loading=false 可能早于首帧真正上屏，增加一个轻量保护窗口避免黑闪。
-    private val openLoadingHideMinDelayMs = 280L
+    // 首开时 loading=false 可能早于首帧真正上屏，增加保护窗口避免黑闪。
+    private val openLoadingHideMinDelayMs = 700L
+    private val openLoadingHideHardMaxDelayMs = 1800L
+    private val openLoadingHideMinPosDeltaSec = 0.06
     private var openLoadingHideProtectUntilMs: Long = 0L
+    private var openLoadingHideHardDeadlineMs: Long = 0L
+    private var openLoadingGuardStartPosSec: Double = -1.0
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
     private var autoReopenOnRecoverableErrorEnabled: Boolean = false
@@ -405,7 +409,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     private fun armOpenLoadingHideGuard() {
-        openLoadingHideProtectUntilMs = SystemClock.elapsedRealtime() + openLoadingHideMinDelayMs
+        val now = SystemClock.elapsedRealtime()
+        openLoadingHideProtectUntilMs = now + openLoadingHideMinDelayMs
+        openLoadingHideHardDeadlineMs = now + openLoadingHideHardMaxDelayMs
+        openLoadingGuardStartPosSec = getPosition()
     }
 
     // ========== iOS 对齐属性（property 风格 setter/getter）==========
@@ -528,6 +535,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         if (!result) {
             openLoadingHideProtectUntilMs = 0L
+            openLoadingHideHardDeadlineMs = 0L
+            openLoadingGuardStartPosSec = -1.0
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "打开失败: mode=${model.mode}, url=${model.url}")
         } else {
             armOpenLoadingHideGuard()
@@ -747,6 +756,8 @@ class HXCPlayerControl @JvmOverloads constructor(
 
         if (!result) {
             openLoadingHideProtectUntilMs = 0L
+            openLoadingHideHardDeadlineMs = 0L
+            openLoadingGuardStartPosSec = -1.0
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
         } else {
             armOpenLoadingHideGuard()
@@ -787,6 +798,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                 mainHandler.post {
                     if (!result && !isReleased) {
                         openLoadingHideProtectUntilMs = 0L
+                        openLoadingHideHardDeadlineMs = 0L
+                        openLoadingGuardStartPosSec = -1.0
                         dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
                     } else if (result && !isReleased) {
                         armOpenLoadingHideGuard()
@@ -1087,13 +1100,26 @@ class HXCPlayerControl @JvmOverloads constructor(
                     loadingCandidateSinceMs = now
                 } else {
                     var debounceMs = if (loading) loadingShowDebounceMs else loadingHideDebounceMs
-                    if (!loading && now < openLoadingHideProtectUntilMs) {
-                        debounceMs = maxOf(debounceMs, openLoadingHideProtectUntilMs - now)
+                    if (!loading && openLoadingHideProtectUntilMs > 0L) {
+                        val posAdvanced = openLoadingGuardStartPosSec < 0.0 ||
+                                (position - openLoadingGuardStartPosSec) >= openLoadingHideMinPosDeltaSec
+                        val inMinDelay = now < openLoadingHideProtectUntilMs
+                        val inHardGuard = !posAdvanced && now < openLoadingHideHardDeadlineMs
+                        if (inMinDelay || inHardGuard) {
+                            val guardLeft = if (inMinDelay) {
+                                openLoadingHideProtectUntilMs - now
+                            } else {
+                                120L
+                            }
+                            debounceMs = maxOf(debounceMs, guardLeft)
+                        }
                     }
                     if (lastLoadingState != loading && (now - loadingCandidateSinceMs) >= debounceMs) {
                         lastLoadingState = loading
                         if (!loading) {
                             openLoadingHideProtectUntilMs = 0L
+                            openLoadingHideHardDeadlineMs = 0L
+                            openLoadingGuardStartPosSec = -1.0
                         }
                         mainHandler.post {
                             callback?.onPlayerLoadingChanged(loading)

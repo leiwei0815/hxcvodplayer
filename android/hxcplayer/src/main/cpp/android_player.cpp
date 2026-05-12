@@ -1332,6 +1332,10 @@ void AndroidPlayer::renderLoop() {
     int64_t post_seek_ahead_bypass_until_ms = 0;
     int post_seek_bypass_skip_count = 0;
     int seek_resume_stable_frames = 0;
+    // After lower-bound hit, forbid long ahead-hold for a short window.
+    // Some streams (especially long-GOP 4K) may temporarily report huge positive
+    // delay and otherwise freeze on one frame for seconds.
+    int64_t post_seek_no_hold_until_ms = 0;
     // Sync-stall watchdog: if pts/clock stay almost unchanged for too long while
     // playback is active, force one consume+display to break potential deadlock.
     double stall_watchdog_last_pts = std::numeric_limits<double>::quiet_NaN();
@@ -1662,6 +1666,11 @@ void AndroidPlayer::renderLoop() {
                     }
                     post_seek_ahead_bypass_until_ms = now + bypass_ms;
                     post_seek_bypass_skip_count = 0;
+                    int64_t no_hold_ms = is_backward_seek ? 1800 : 2200;
+                    if (likely_4k) {
+                        no_hold_ms += 900;
+                    }
+                    post_seek_no_hold_until_ms = now + no_hold_ms;
                     if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
                         // 命中 lower-bound 后仍保留一小段“同步等待窗口”，
                         // 避免 deadline 过早触发导致刚出画面就开声而不同步。
@@ -2043,6 +2052,26 @@ void AndroidPlayer::renderLoop() {
                     }
                 } else if (delay <= kMaxAhead) {
                     should_display = should_consume = true;
+                    if (post_seek_no_hold_until_ms > 0) {
+                        post_seek_no_hold_until_ms = 0;
+                    }
+                } else if (!in_seek_recovery &&
+                           post_seek_no_hold_until_ms > now) {
+                    // Seek just hit lower-bound, but clock may still be unstable.
+                    // Do not hard-hold a single frame here; keep draining and
+                    // periodically display to avoid "loading ended but frozen".
+                    should_consume = true;
+                    post_seek_bypass_skip_count++;
+                    double no_hold_display_limit = high_rate_4k ? 4.4 : 3.2;
+                    if ((post_seek_bypass_skip_count % 3) == 0 ||
+                        delay <= no_hold_display_limit) {
+                        should_display = true;
+                    }
+                    SYNCI_RATE(25, "evt=post_seek_no_hold_consume delay=%.3f left_ms=%" PRId64 " skip_count=%d rate=%.2f",
+                               delay,
+                               (int64_t)std::max<int64_t>(0, post_seek_no_hold_until_ms - now),
+                               post_seek_bypass_skip_count,
+                               playback_rate);
                 } else if (!in_seek_recovery &&
                            post_seek_ahead_bypass_until_ms > now) {
                     double max_bypass_ahead_sec = high_rate_4k ? 2.6 : 1.8;
