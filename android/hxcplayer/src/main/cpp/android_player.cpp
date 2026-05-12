@@ -908,7 +908,12 @@ void AndroidPlayer::setPlayWhenReady(bool play_when_ready) {
 }
 
 bool AndroidPlayer::isLoading() const {
-    return is_loading_.load(std::memory_order_acquire);
+    bool core_loading = is_loading_.load(std::memory_order_acquire);
+    bool seek_loading =
+        seek_audio_wait_video_.load(std::memory_order_acquire) ||
+        seek_recovery_active_.load(std::memory_order_acquire) ||
+        seek_lower_bound_active_.load(std::memory_order_acquire);
+    return core_loading || seek_loading;
 }
 
 bool AndroidPlayer::isHardwareDecodingActive() const {
@@ -1628,21 +1633,21 @@ void AndroidPlayer::renderLoop() {
                 }
                 if (seek_elapsed_ms >= 2200) {
                     if (is_backward_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.60 : 1.80);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.20 : 1.60);
                     } else {
                         seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 8.00 : (large_seek_any_direction ? 3.60 : 1.20));
                     }
                 }
                 if (seek_elapsed_ms >= 3200) {
                     if (is_backward_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 3.60 : 2.40);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.80 : 2.20);
                     } else {
                         seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 10.50 : (large_seek_any_direction ? 5.00 : 2.00));
                     }
                 }
                 bool lower_bound_force_relax = seek_lower_bound_drop_count_ >= (very_large_seek ? 180 : 120);
                 if (lower_bound_force_relax) {
-                    seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 3.40 : (very_large_seek ? 9.50 : 4.20));
+                    seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 2.60 : (very_large_seek ? 9.50 : 4.20));
                 }
                 if (pts + seek_epsilon_sec < seek_target_now) {
                     should_consume = true;
