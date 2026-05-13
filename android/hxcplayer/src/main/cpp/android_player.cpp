@@ -1858,7 +1858,21 @@ void AndroidPlayer::renderLoop() {
                     }
                     seek_epsilon_sec = std::min(seek_epsilon_sec, forward_eps_cap);
                 }
-                if (pts + seek_epsilon_sec < seek_target_now) {
+                int64_t seek_force_hit_max_ms = likely_4k ? 2200 : 1700;
+                if (large_seek_any_direction) {
+                    seek_force_hit_max_ms += likely_4k ? 700 : 500;
+                }
+                if (very_large_seek) {
+                    seek_force_hit_max_ms += likely_4k ? 400 : 300;
+                }
+                bool force_hit_by_timeout = seek_elapsed_ms >= seek_force_hit_max_ms;
+                if (force_hit_by_timeout) {
+                    // Availability first: cap lower-bound waiting time to avoid
+                    // multi-second frozen-loading behavior after seek.
+                    SYNCI_RATE(10, "evt=seek_lower_bound_force_hit_timeout pts=%.3f target=%.3f elapsed_ms=%" PRId64 " eps=%.3f",
+                               pts, seek_target_now, seek_elapsed_ms, seek_epsilon_sec);
+                    mark_seek_lower_bound_hit();
+                } else if (pts + seek_epsilon_sec < seek_target_now) {
                     should_consume = true;
                     seek_lower_bound_drop_count_++;
                     LOGW_RATE(20, "[sync] seek lower-bound drop: pts=%.3f target=%.3f",
@@ -2326,10 +2340,17 @@ void AndroidPlayer::renderLoop() {
                                                        delay >= fast_path_min_delay;
                     bool seek_resume_force_timeout = seek_started_at_ms_ > 0 &&
                                                      (now - seek_started_at_ms_) >= 8000;
-                    if (frame_reached_target &&
-                        (seek_resume_sync_stable || seek_resume_deadline_safe ||
-                         seek_resume_slow_path_ready || seek_resume_fast_path_ready ||
-                         seek_resume_force_timeout)) {
+                    bool seek_resume_deadline_fallback_ready =
+                        seek_resume_deadline &&
+                        post_seek_wait_ms >= (likely_4k ? 1700 : 1300) &&
+                        std::fabs(delay) <= (likely_4k ? 2.20 : 1.70);
+                    bool seek_resume_ready =
+                        (frame_reached_target &&
+                         (seek_resume_sync_stable || seek_resume_deadline_safe ||
+                          seek_resume_slow_path_ready || seek_resume_fast_path_ready)) ||
+                        seek_resume_deadline_fallback_ready ||
+                        seek_resume_force_timeout;
+                    if (seek_resume_ready) {
                         if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
                             if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
@@ -2370,9 +2391,10 @@ void AndroidPlayer::renderLoop() {
                                     audio_resume_bypass_no_shrink_until_ms = now + 2000;
                                 }
                             }
-                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f stable=%d/%d by_deadline=%d fast_path=%d deadline_guard=%.3f force_timeout=%d rate=%.2f bypass_extended_ms=%" PRId64,
+                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f stable=%d/%d by_deadline=%d fast_path=%d deadline_fallback=%d deadline_guard=%.3f force_timeout=%d rate=%.2f bypass_extended_ms=%" PRId64,
                                   delay, seek_resume_sync_threshold, seek_resume_stable_frames, seek_resume_need_stable_frames,
-                                  seek_resume_deadline ? 1 : 0, seek_resume_fast_path_ready ? 1 : 0, seek_resume_deadline_guard,
+                                  seek_resume_deadline ? 1 : 0, seek_resume_fast_path_ready ? 1 : 0,
+                                  seek_resume_deadline_fallback_ready ? 1 : 0, seek_resume_deadline_guard,
                                   seek_resume_force_timeout ? 1 : 0, playback_rate,
                                   (int64_t)std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now));
                         }
