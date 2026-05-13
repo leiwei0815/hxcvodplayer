@@ -1497,27 +1497,35 @@ void AndroidPlayer::renderLoop() {
                 if (seek_target_now >= 0.0) {
                     clock = seek_target_now;
                 }
-                // 重置 wall-clock 锚点，等待音频恢复后重建
-                post_seek_wall_anchor_ms_ = 0;
+                // 注意：不在此处重置锚点。seek_audio_resume_gate 会在同帧内
+                // exchange(false) 并主动建立锚点，下一帧进入 else 分支立即生效。
                 post_seek_last_clock_ = clock;
             } else {
                 // ── 阶段2：音频恢复后，检测 audio_clock 停滞并用 wall-clock 兜底 ──
-                // 问题：4K 视频音频队列偶发空洞（OpenSL ES underrun），audio_clock 冻结；
-                // 视频帧继续被 consume，delay 超过 kMaxAhead=2s，触发 ahead-hold 互锁。
-                // 解法：建立 wall-clock 锚点，audio_clock 停滞时用挂钟估算 clock，
-                //       保证 delay 正确反映音视频差距，不因时钟停了而触发互锁。
+                // 根本原因：4K/1920 视频 seek 后音频队列出现空洞（OpenSL underrun），
+                // audio_clock 冻结不动。视频帧继续消费，delay 超过 kMaxAhead=2s，
+                // 触发 ahead-hold，audio 也无法拉取新数据，形成互锁。
+                // 解法：seek_audio_resume_gate 主动建立 wall-clock 锚点；此后若
+                // audio_clock 停滞，用 "anchor_pts + elapsed * rate" 估算 clock，
+                // 保证 delay 不因时钟停滞而虚高，不触发 ahead-hold 互锁。
                 const double kClockStallThreshold = 0.005; // 5ms 内认为时钟停滞
-                const double kWallClockMaxDrift    = 3.0;  // 最多信任 wall-clock 3s
                 bool clock_advanced = std::fabs(clock - post_seek_last_clock_) > kClockStallThreshold;
+                bool player_paused = !player_core_is_playing(player_core_);
                 if (clock_advanced) {
-                    // audio_clock 正常推进，更新锚点
+                    // audio_clock 正常推进，更新锚点（用最新值，精度更高）
                     post_seek_wall_anchor_ms_    = now;
                     post_seek_clock_anchor_pts_  = clock;
                     post_seek_last_clock_        = clock;
+                } else if (player_paused && post_seek_wall_anchor_ms_ > 0) {
+                    // 播放器已暂停：wall-clock 继续流逝但 audio_clock 不动是正常的。
+                    // 不做 wall-clock 兜底，但更新锚点时间基准，避免恢复后 elapsed 虚高。
+                    post_seek_wall_anchor_ms_ = now;
                 } else if (post_seek_wall_anchor_ms_ > 0) {
-                    // audio_clock 停滞，用 wall-clock 估算
+                    // audio_clock 停滞（underrun），用 wall-clock 估算
+                    // 无上限：确保无论停滞多久都能兜底。
+                    // 当 audio_clock 恢复推进后，clock_advanced=true 会重建锚点。
                     double wall_elapsed = (now - post_seek_wall_anchor_ms_) / 1000.0;
-                    if (wall_elapsed > 0.0 && wall_elapsed <= kWallClockMaxDrift) {
+                    if (wall_elapsed > 0.0) {
                         double wall_clock = post_seek_clock_anchor_pts_ + wall_elapsed * playback_rate;
                         // 只在 wall_clock > audio_clock 时才替换（避免时钟回跳）
                         if (wall_clock > clock) {
@@ -2438,6 +2446,10 @@ void AndroidPlayer::renderLoop() {
                     } else {
                         LOGI("[sync] audio start skipped: volume=0 (muted)");
                     }
+                    // 建立 wall-clock 锚点，防止首帧音频恢复后 clock 停滞触发互锁
+                    { double rc = player_core_get_position(player_core_);
+                      if (audio_output_latency_sec_ > 0.0) rc = std::max(0.0, rc - audio_output_latency_sec_);
+                      post_seek_wall_anchor_ms_ = now_ms(); post_seek_clock_anchor_pts_ = rc; post_seek_last_clock_ = rc; }
                 }
                 frame_count++;
                 last_sync_video_pts_ = pts; // track for dynamic frame-interval estimation
@@ -2513,6 +2525,10 @@ void AndroidPlayer::renderLoop() {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                                 LOGI("[sync] seek audio force-resume (drop loop): result=%d delay=%.3f", r, delay);
                             }
+                            // 建立 wall-clock 锚点，防止音频恢复后 clock 停滞触发互锁
+                            { double rc = player_core_get_position(player_core_);
+                              if (audio_output_latency_sec_ > 0.0) rc = std::max(0.0, rc - audio_output_latency_sec_);
+                              post_seek_wall_anchor_ms_ = now; post_seek_clock_anchor_pts_ = rc; post_seek_last_clock_ = rc; }
                             SYNCI("evt=seek_audio_force_resume_drop_loop delay=%.3f elapsed_ms=%" PRId64 " rate=%.2f",
                                   delay, seek_started_at_ms_ > 0 ? (now - seek_started_at_ms_) : 0LL, playback_rate);
                             seek_audio_wait_deadline_ms_ = 0;
@@ -2557,6 +2573,10 @@ void AndroidPlayer::renderLoop() {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] seek wait-video fallback resume audio: result=%d", r);
                     }
+                    // 建立 wall-clock 锚点，防止音频恢复后 clock 停滞触发互锁
+                    { double rc = player_core_get_position(player_core_);
+                      if (audio_output_latency_sec_ > 0.0) rc = std::max(0.0, rc - audio_output_latency_sec_);
+                      post_seek_wall_anchor_ms_ = now; post_seek_clock_anchor_pts_ = rc; post_seek_last_clock_ = rc; }
                     seek_audio_wait_deadline_ms_ = 0;
                     seek_started_at_ms_ = 0;
                     seek_resume_stable_frames = 0;
