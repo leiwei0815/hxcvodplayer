@@ -689,11 +689,12 @@ void AndroidPlayer::play() {
     if (playItf_) {
         // Defer audio start until the first video frame is rendered to prevent
         // audible sound before any picture (especially noticeable in dual-player).
-        // A 500ms deadline ensures audio is not muted forever if video decoding stalls.
+        // Stability-first: allow a longer wait so playback starts with closer A/V sync.
+        // Keep a deadline fallback to avoid permanent mute if decoding/network stalls.
         audio_start_pending_.store(true, std::memory_order_release);
         audio_start_deadline_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count() + 500;
-        LOGI("[ctrl] play: audio deferred until first video frame (deadline +500ms)");
+            std::chrono::steady_clock::now().time_since_epoch()).count() + 1200;
+        LOGI("[ctrl] play: audio deferred until first video frame (deadline +1200ms)");
     } else {
         LOGD("No audio interface (audio disabled)");
     }
@@ -1725,11 +1726,11 @@ void AndroidPlayer::renderLoop() {
                     seek_started_at_ms_ = 0;
                     seek_lower_bound_drop_count_ = 0;
                     sync_warmup_frames_.store(24, std::memory_order_release);
-                    int64_t bypass_ms = is_backward_seek ? 5200 : 3200;
+                    int64_t bypass_ms = is_backward_seek ? 700 : 450;
                     if (likely_4k) {
-                        // 4K seek after-gate bypass is intentionally shorter:
-                        // reduce long A/V drift tails while preserving anti-freeze behavior.
-                        bypass_ms = is_backward_seek ? 3200 : 2200;
+                        // 4K keeps a slightly longer anti-freeze window, but still
+                        // much shorter than before to avoid multi-second A/V drift tails.
+                        bypass_ms = is_backward_seek ? 1800 : 1200;
                     }
                     post_seek_ahead_bypass_until_ms = now + bypass_ms;
                     should_display = should_consume = true;
@@ -1799,12 +1800,13 @@ void AndroidPlayer::renderLoop() {
                 // keep dropping frames to catch up first; otherwise the viewer
                 // sees a flash of old content before the picture snaps to the
                 // correct position.
-                if (delay < -1.0) {
+                double first_frame_force_threshold = likely_4k ? -0.65 : -0.45;
+                if (delay < first_frame_force_threshold) {
                     // Still too far behind -- drop silently and keep catching up.
                     should_consume = true;
-                    LOGI_RATE(30, "[sync] %s catching up: pts=%.3f clk=%.3f delay=%.3f",
+                    LOGI_RATE(30, "[sync] %s catching up: pts=%.3f clk=%.3f delay=%.3f thr=%.3f",
                               frame_count == 0 ? "first frame" : "post-seek frame",
-                              pts, clock, delay);
+                              pts, clock, delay, first_frame_force_threshold);
                 } else {
                     LOGI("[sync] %s forced: pts=%.3f clk=%.3f delay=%.3f",
                          frame_count == 0 ? "first frame" : "post-seek frame",
@@ -1956,7 +1958,8 @@ void AndroidPlayer::renderLoop() {
                 } else if (delay <= kMaxAhead) {
                     should_display = should_consume = true;
                 } else if (!in_seek_recovery &&
-                           post_seek_ahead_bypass_until_ms > now) {
+                           post_seek_ahead_bypass_until_ms > now &&
+                           delay <= (likely_4k ? 1.4 : 0.8)) {
                     // Seek just recovered, but clock may temporarily roll back or lag.
                     // Bypass "ahead hold" briefly so users don't see frozen picture
                     // (not only for high-rate; 1.0x backward seek can also hit this).
@@ -1964,6 +1967,14 @@ void AndroidPlayer::renderLoop() {
                     SYNCI_RATE(30, "evt=post_seek_ahead_bypass pts=%.3f clk=%.3f delay=%.3f rate=%.2f bypass_left_ms=%" PRId64,
                                pts, clock, delay, playback_rate,
                                (int64_t)std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now));
+                } else if (!in_seek_recovery &&
+                           post_seek_ahead_bypass_until_ms > now &&
+                           delay > (likely_4k ? 1.4 : 0.8)) {
+                    // Video has already become too far ahead; stop bypass immediately
+                    // and return to normal sync path for faster A/V re-alignment.
+                    post_seek_ahead_bypass_until_ms = 0;
+                    SYNCI_RATE(30, "evt=post_seek_ahead_bypass_skip delay=%.3f max_ahead=%.3f is_4k=%d",
+                               delay, (likely_4k ? 1.4 : 0.8), likely_4k ? 1 : 0);
                 } else if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                            audio_rebuffer_pending_.load(std::memory_order_acquire) &&
                            now >= audio_rebuffer_min_resume_at_ms_) {
