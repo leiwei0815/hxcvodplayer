@@ -51,6 +51,7 @@
 #define LOG_TAG_SYNC   "HXCSDK_SYNC"
 #define LOG_TAG_DECODE "HXCSDK_DECODE"
 #define LOG_TAG_PBO    "HXCSDK_PBO"
+#define LOG_TAG_SEEK_WATCH "HXCSDK_SEEK_WATCH"
 
 #if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 3
 #define TAGD(TAG, ...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
@@ -98,6 +99,7 @@
 #define PBOD(...)       TAGD(LOG_TAG_PBO, __VA_ARGS__)
 #define PBOI(...)       TAGI(LOG_TAG_PBO, __VA_ARGS__)
 #define PBOW(...)       TAGW(LOG_TAG_PBO, __VA_ARGS__)
+#define SEEKW(...)      TAGW(LOG_TAG_SEEK_WATCH, __VA_ARGS__)
 #define PBOI_RATE(...)  TAGI_RATE(LOG_TAG_PBO, __VA_ARGS__)
 #define PBOW_RATE(...)  TAGW_RATE(LOG_TAG_PBO, __VA_ARGS__)
 
@@ -2247,6 +2249,44 @@ void AndroidPlayer::renderLoop() {
             // if video queue stays empty for a while, pause OpenSL audio so user
             // doesn't hear a long "audio-only" segment and then permanent A/V drift.
             int64_t now = now_ms();
+            // Seek watchdog in empty-frame path:
+            // seek recovery timeout fallback previously only ran in the "frame available"
+            // branch. If decoder keeps returning no frames, the player can stay in
+            // LOADING forever. Add an empty-queue timeout to break the deadlock.
+            bool seek_lower_active = seek_lower_bound_active_.load(std::memory_order_acquire);
+            bool seek_recovery_active = seek_recovery_active_.load(std::memory_order_acquire);
+            bool seek_wait_video = seek_audio_wait_video_.load(std::memory_order_acquire);
+            if ((seek_lower_active || seek_recovery_active || seek_wait_video) && seek_started_at_ms_ > 0) {
+                int64_t seek_elapsed_ms = now - seek_started_at_ms_;
+                double seek_target_now = seek_target_sec_.load(std::memory_order_acquire);
+                double seek_from_now = seek_from_sec_.load(std::memory_order_acquire);
+                bool is_backward_seek = seek_from_now >= 0.0 && seek_target_now >= 0.0 &&
+                                        (seek_from_now - seek_target_now) > 0.5;
+                int64_t seek_empty_timeout_ms = is_backward_seek ? 7000 : 5500;
+                if (seek_elapsed_ms >= seek_empty_timeout_ms) {
+                    seek_lower_bound_active_.store(false, std::memory_order_release);
+                    seek_lower_bound_deadline_ms_ = 0;
+                    seek_recovery_active_.store(false, std::memory_order_release);
+                    seek_recovery_deadline_ms_ = 0;
+                    seek_fast_catchup_frames_.store(0, std::memory_order_release);
+                    seek_catchup_deadline_ms_ = 0;
+                    seek_audio_wait_video_.store(false, std::memory_order_release);
+                    seek_audio_wait_deadline_ms_ = 0;
+                    seek_started_at_ms_ = 0;
+                    seek_lower_bound_drop_count_ = 0;
+                    seek_resume_stable_hits_.store(0, std::memory_order_release);
+                    sync_warmup_frames_.store(20, std::memory_order_release);
+                    bool core_playing_now = player_core_is_playing(player_core_);
+                    if (core_playing_now && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                        LOGW("[sync] seek empty fallback resume audio: result=%d", r);
+                    }
+                    SEEKW("seek_empty_timeout_fallback elapsed_ms=%" PRId64 " backward=%d target=%.3f from=%.3f",
+                          seek_elapsed_ms, is_backward_seek ? 1 : 0, seek_target_now, seek_from_now);
+                    SYNCW("evt=seek_empty_timeout_fallback elapsed_ms=%" PRId64 " backward=%d target=%.3f from=%.3f",
+                          seek_elapsed_ms, is_backward_seek ? 1 : 0, seek_target_now, seek_from_now);
+                }
+            }
             if (seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 !seek_recovery_active_.load(std::memory_order_acquire) &&
                 !seek_lower_bound_active_.load(std::memory_order_acquire) &&
