@@ -3143,10 +3143,16 @@ void AndroidPlayer::ensureAudioOutputForCurrentStream() {
 
 void AndroidPlayer::audioCallback(SLAndroidSimpleBufferQueueItf bq, void* context) {
     auto* player = static_cast<AndroidPlayer*>(context);
+    if (!player || !bq) {
+        return;
+    }
     player->onAudioData(bq);
 }
 
 void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
+    if (!bq) {
+        return;
+    }
     // Hold audio_mutex_ for the entire callback body.
     // The destructor and openURL both acquire this lock BEFORE destroying/stopping
     // the core, so swr_convert() inside player_core_get_audio_data() is guaranteed
@@ -3159,7 +3165,10 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     if (!audio_active_ || !player_core_ || audio_buffer_size_ == 0) {
         int sz = audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096;
         memset(audio_buffer_, 0, sz);
-        (*bq)->Enqueue(bq, audio_buffer_, sz);
+        SLresult enqueue_ret = (*bq)->Enqueue(bq, audio_buffer_, sz);
+        if (enqueue_ret != SL_RESULT_SUCCESS) {
+            LOGW_RATE(50, "[audio] enqueue silent buffer failed: ret=%d size=%d", enqueue_ret, sz);
+        }
         return;
     }
 
@@ -3200,5 +3209,8 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         audio_partial_count_  = 0;
     }
 
-    (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
+    SLresult enqueue_ret = (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
+    if (enqueue_ret != SL_RESULT_SUCCESS) {
+        LOGW_RATE(50, "[audio] enqueue output buffer failed: ret=%d size=%d", enqueue_ret, audio_buffer_size_);
+    }
 }
