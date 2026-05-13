@@ -301,6 +301,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val loadingShowDebounceMs = 450L
     private val loadingHideDebounceMs = 150L
+    // Seek 场景优先保证“先隐藏 loading 再恢复播放”，避免拖慢体感。
+    private val seekLoadingHideDebounceMs = 0L
+    private val seekLoadingReshowSuppressMs = 900L
+    private val seekDetectMinJumpSec = 1.0
     // 首开时 loading=false 可能早于首帧真正上屏，增加保护窗口避免黑闪。
     private val openLoadingHideMinDelayMs = 700L
     private val openLoadingHideHardMaxDelayMs = 1800L
@@ -308,6 +312,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var openLoadingHideProtectUntilMs: Long = 0L
     private var openLoadingHideHardDeadlineMs: Long = 0L
     private var openLoadingGuardStartPosSec: Double = -1.0
+    private var loadingSessionLikelySeek: Boolean = false
+    private var suppressLoadingShowUntilMs: Long = 0L
+    private var lastPositionForLoadingHeuristicSec: Double = Double.NaN
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
     private var autoReopenOnRecoverableErrorEnabled: Boolean = false
@@ -1096,10 +1103,21 @@ class HXCPlayerControl @JvmOverloads constructor(
 
                 val now = SystemClock.elapsedRealtime()
                 if (loadingCandidateState == null || loadingCandidateState != loading) {
+                    if (loading) {
+                        val likelySeekByJump = !lastPositionForLoadingHeuristicSec.isNaN() &&
+                            abs(position - lastPositionForLoadingHeuristicSec) >= seekDetectMinJumpSec
+                        loadingSessionLikelySeek = likelySeekByJump
+                    }
                     loadingCandidateState = loading
                     loadingCandidateSinceMs = now
                 } else {
                     var debounceMs = if (loading) loadingShowDebounceMs else loadingHideDebounceMs
+                    if (loading && now < suppressLoadingShowUntilMs) {
+                        debounceMs = maxOf(debounceMs, suppressLoadingShowUntilMs - now)
+                    }
+                    if (!loading && loadingSessionLikelySeek) {
+                        debounceMs = seekLoadingHideDebounceMs
+                    }
                     if (!loading && openLoadingHideProtectUntilMs > 0L) {
                         val posAdvanced = openLoadingGuardStartPosSec < 0.0 ||
                                 (position - openLoadingGuardStartPosSec) >= openLoadingHideMinPosDeltaSec
@@ -1120,6 +1138,10 @@ class HXCPlayerControl @JvmOverloads constructor(
                             openLoadingHideProtectUntilMs = 0L
                             openLoadingHideHardDeadlineMs = 0L
                             openLoadingGuardStartPosSec = -1.0
+                            if (loadingSessionLikelySeek) {
+                                suppressLoadingShowUntilMs = now + seekLoadingReshowSuppressMs
+                            }
+                            loadingSessionLikelySeek = false
                         }
                         mainHandler.post {
                             callback?.onPlayerLoadingChanged(loading)
@@ -1140,6 +1162,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                         }
                     }
                 }
+                lastPositionForLoadingHeuristicSec = position
 
                 // 透传播放中错误（由 core 错误回调写入，Java 侧轮询消费）
                 val outCode = IntArray(1)
@@ -1199,6 +1222,9 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastLoadingState = null
         loadingCandidateState = null
         loadingCandidateSinceMs = 0L
+        loadingSessionLikelySeek = false
+        suppressLoadingShowUntilMs = 0L
+        lastPositionForLoadingHeuristicSec = Double.NaN
         networkLoadingSinceMs = 0L
         networkTotalStallMs = 0L
         networkReconnectCount = 0
