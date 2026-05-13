@@ -230,6 +230,9 @@ private:
     // (avoids audible sound before any picture on dual-player scenarios).
     std::atomic<bool> audio_start_pending_{false};
     int64_t           audio_start_deadline_ms_{0}; // wall-clock deadline for the deferred start
+    // Open-first-frame guards: keep loading/audio gate until first frame really renders.
+    std::atomic<bool> first_frame_rendered_{false};
+    int64_t           first_frame_wait_started_ms_{0};
     // High-rate rebuffer: when video starvation lasts too long, temporarily
     // pause OpenSL audio to avoid "audio keeps moving but video frozen".
     std::atomic<bool> audio_rebuffer_pending_{false};

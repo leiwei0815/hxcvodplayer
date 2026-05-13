@@ -457,6 +457,8 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         seek_started_at_ms_ = 0;
         seek_lower_bound_drop_count_ = 0;
         consecutive_drop_count_ = 0;
+        first_frame_rendered_.store(false, std::memory_order_release);
+        first_frame_wait_started_ms_ = 0;
         severe_lag_start_ms_ = 0;
         last_soft_reanchor_ms_ = 0;
         soft_reanchor_count_ = 0;
@@ -689,14 +691,26 @@ void AndroidPlayer::play() {
     severe_lag_audio_pause_start_ms_ = 0;
 
     if (playItf_) {
-        // Defer audio start until the first video frame is rendered to prevent
-        // audible sound before any picture (especially noticeable in dual-player).
-        // Stability-first: allow a longer wait so playback starts with closer A/V sync.
-        // Keep a deadline fallback to avoid permanent mute if decoding/network stalls.
-        audio_start_pending_.store(true, std::memory_order_release);
-        audio_start_deadline_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count() + 1200;
-        LOGI("[ctrl] play: audio deferred until first video frame (deadline +1200ms)");
+        // For initial open: defer audio until first frame rendered to avoid
+        // "loading hidden but black screen". For resumed playback (already rendered),
+        // start audio immediately.
+        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (!first_frame_rendered_.load(std::memory_order_acquire)) {
+            audio_start_pending_.store(true, std::memory_order_release);
+            first_frame_wait_started_ms_ = now;
+            // Keep deadline as a hard safety valve, but render loop will not use it
+            // in early open phase until first-frame hard timeout is reached.
+            audio_start_deadline_ms_ = now + 2600;
+            LOGI("[ctrl] play: audio deferred until first video frame (deadline +2600ms)");
+        } else {
+            audio_start_pending_.store(false, std::memory_order_release);
+            first_frame_wait_started_ms_ = 0;
+            if (current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                LOGI("[ctrl] play: audio immediate resume (already rendered), result=%d", r);
+            }
+        }
     } else {
         LOGD("No audio interface (audio disabled)");
     }
@@ -721,6 +735,7 @@ void AndroidPlayer::pause() {
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
+    first_frame_wait_started_ms_ = 0;
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
     player_core_pause(player_core_);
@@ -750,6 +765,8 @@ void AndroidPlayer::stop() {
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
+    first_frame_wait_started_ms_ = 0;
+    first_frame_rendered_.store(false, std::memory_order_release);
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
     has_pending_playback_completed_.store(false, std::memory_order_release);
@@ -922,7 +939,11 @@ bool AndroidPlayer::isLoading() const {
         seek_audio_wait_video_.load(std::memory_order_acquire) ||
         seek_recovery_active_.load(std::memory_order_acquire) ||
         seek_lower_bound_active_.load(std::memory_order_acquire);
-    return core_loading || seek_loading;
+    bool waiting_open_first_frame =
+        !first_frame_rendered_.load(std::memory_order_acquire) &&
+        player_core_ &&
+        player_core_get_play_when_ready(player_core_) != 0;
+    return core_loading || seek_loading || waiting_open_first_frame;
 }
 
 bool AndroidPlayer::isHardwareDecodingActive() const {
@@ -1806,13 +1827,28 @@ void AndroidPlayer::renderLoop() {
                 // sees a flash of old content before the picture snaps to the
                 // correct position.
                 double first_frame_force_threshold = likely_4k ? -0.65 : -0.45;
-                if (delay < first_frame_force_threshold) {
+                bool is_open_first_frame = (frame_count == 0);
+                int64_t first_wait_ms = (is_open_first_frame && first_frame_wait_started_ms_ > 0)
+                                        ? (now - first_frame_wait_started_ms_) : 0;
+                int64_t first_frame_max_wait_ms = likely_4k ? 3200 : 1800;
+                bool first_frame_wait_timeout = is_open_first_frame &&
+                                                first_wait_ms >= first_frame_max_wait_ms;
+                if (delay < first_frame_force_threshold && !first_frame_wait_timeout) {
                     // Still too far behind -- drop silently and keep catching up.
                     should_consume = true;
                     LOGI_RATE(30, "[sync] %s catching up: pts=%.3f clk=%.3f delay=%.3f thr=%.3f",
                               frame_count == 0 ? "first frame" : "post-seek frame",
                               pts, clock, delay, first_frame_force_threshold);
                 } else {
+                    if (first_frame_wait_timeout) {
+                        // Open-first-frame hard timeout: prefer visible recovery over
+                        // extended black screen, then re-anchor to current video PTS.
+                        if (player_core_ && std::isfinite(pts) && pts >= 0.0) {
+                            player_core_anchor_clock(player_core_, pts);
+                        }
+                        LOGI("[sync] first frame force by timeout: pts=%.3f clk=%.3f delay=%.3f wait_ms=%" PRId64 " max_wait_ms=%" PRId64,
+                             pts, clock, delay, first_wait_ms, first_frame_max_wait_ms);
+                    }
                     LOGI("[sync] %s forced: pts=%.3f clk=%.3f delay=%.3f",
                          frame_count == 0 ? "first frame" : "post-seek frame",
                          pts, clock, delay);
@@ -2008,6 +2044,7 @@ void AndroidPlayer::renderLoop() {
             }
 
             if (should_display) {
+                bool is_displaying_first_frame = (frame_count == 0);
                 consecutive_drop_count_ = 0;
                 if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
                     // Stability-first triple gate:
@@ -2136,6 +2173,10 @@ void AndroidPlayer::renderLoop() {
                     }
                     continue;
                 }
+                if (is_displaying_first_frame) {
+                    first_frame_rendered_.store(true, std::memory_order_release);
+                    first_frame_wait_started_ms_ = 0;
+                }
 
                 if (frame_count % kDiagInterval == 0) {
                     double pos = player_core_ ? player_core_get_position(player_core_) : 0.0;
@@ -2189,10 +2230,16 @@ void AndroidPlayer::renderLoop() {
             if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 audio_start_pending_.load(std::memory_order_acquire) &&
                 now_ms() >= audio_start_deadline_ms_) {
-                if (audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
+                int64_t now_fallback = now_ms();
+                bool open_first_hard_timeout = first_frame_wait_started_ms_ > 0 &&
+                                               (now_fallback - first_frame_wait_started_ms_) >= 5000;
+                // Avoid audio running ahead in open-first-frame phase; only allow
+                // fallback after a much longer timeout.
+                if (open_first_hard_timeout && audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
-                        LOGI("[sync] audio deadline fallback: result=%d", r);
+                        LOGI("[sync] audio deadline fallback (open hard-timeout): result=%d wait_ms=%" PRId64,
+                             r, (int64_t)(now_fallback - first_frame_wait_started_ms_));
                     }
                 }
             }
