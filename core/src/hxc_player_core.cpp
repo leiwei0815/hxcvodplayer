@@ -73,6 +73,9 @@ static int hxc_calc_retry_delay_ms(int retry_count, int base_delay_ms, int max_d
 static constexpr double kSeekAnchorBackwardToleranceMinSec = 0.2;
 static constexpr double kSeekAnchorBackwardToleranceMaxSec = 0.5;
 static constexpr double kSeekAnchorForwardToleranceSec = 5.0;
+// 音频 seek 锚点窗口（稳定优先）：仅用于判断 "seek 是否完成"，
+// 不是普通播放阶段的 A/V 同步阈值。窗口偏小可减少 seek 后前跳。
+static constexpr double kSeekAudioAnchorForwardToleranceSec = 0.45;
 
 static double hxc_calc_seek_backward_tolerance_sec(const MediaInfo& media_info) {
     // 自适应容差：3 * frame interval，并限制在 [0.2s, 0.5s]。
@@ -2787,14 +2790,18 @@ void PlayerCore::audio_thread() {
         double pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : 
                      frame->pts * av_q2d(format_ctx_->streams[audio_stream_]->time_base);
 
-        // seek 追帧策略（关键修复，对齐 iOS 行为）：
+        // seek 追帧策略（稳定优先）：
         // - 不在这里丢帧！audio_callback_impl 消费时对 pts < target 的帧输出静音。
-        // - 只要拿到第一个有效音频帧，立即清除 seeking_ 标志，让 video_thread 停止追帧，
-        //   渲染线程能尽快拿到视频帧出图。
+        // - 不再使用 "任意有效音频帧" 作为 seek 完成锚点，避免过早清除 seeking_
+        //   导致视频提前放行（用户体感为 seek 后前跳几秒）。
+        // - 仅当音频进入目标窗口（target +/- tolerance）才结束 seeking。
         if (seeking_.load(std::memory_order_acquire) && !isnan(pts)) {
             double target = seek_target_pos_.load(std::memory_order_acquire);
-            // 任何 pts > 0 的音频帧都可以作为 seek 完成锚点（callback 会跳过早于 target 的帧）
-            if (pts >= 0.0) {
+            const double backward_tolerance_sec = hxc_calc_seek_backward_tolerance_sec(media_info_);
+            bool in_seek_window = target <= 0.0 ||
+                                  (pts >= (target - backward_tolerance_sec) &&
+                                   pts <= (target + kSeekAudioAnchorForwardToleranceSec));
+            if (in_seek_window) {
                 seeking_.store(false, std::memory_order_release);
                 set_seek_loading(false);
                 // seek 结束后给 video_thread 40 帧的 warmup 窗口（对齐 iOS syncWarmupFramesRemaining）

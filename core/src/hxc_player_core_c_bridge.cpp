@@ -22,6 +22,12 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 }
 
+namespace {
+// C bridge 侧 seek 音频追帧窗口：跳过明显早于目标位置的旧音频帧，
+// 让输出层更快收敛到目标点，减少 seek 后短时间错位。
+static constexpr double kBridgeSeekAudioBackwardToleranceSec = 0.35;
+}
+
 // PlayerCoreHandle 结构，包含音频处理所需的状态
 struct PlayerCoreHandle {
     hxcplayer::PlayerCore* core;
@@ -682,6 +688,17 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             return 0;
         }
         double pts = af->pts;  // ⚠️ 保存 PTS，用于后续时钟更新
+
+        // Seek 后桥接层继续做一次目标前音频过滤（与 core 内部策略互补）：
+        // 若当前音频帧明显早于目标位置，则直接丢弃并继续取下一帧。
+        // 这样可减少 seek 后先播一段旧音频导致的视频看起来“快进/前跳”。
+        if (std::isfinite(pts) && pts >= 0.0) {
+            double seek_target = handle->core->get_seek_target_pos();
+            if (seek_target > 0.0 && pts < (seek_target - kBridgeSeekAudioBackwardToleranceSec)) {
+                audioQueue->next();
+                continue;
+            }
+        }
 
         // 保存当前帧的时钟基准（注意：以输出缓冲起点作为媒体时间基准）。
         handle->audio_current_pts = pts;

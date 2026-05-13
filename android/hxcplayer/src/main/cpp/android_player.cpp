@@ -453,6 +453,7 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         seek_recovery_deadline_ms_ = 0;
         seek_audio_wait_video_.store(false, std::memory_order_release);
         seek_audio_wait_deadline_ms_ = 0;
+        seek_resume_stable_hits_.store(0, std::memory_order_release);
         seek_started_at_ms_ = 0;
         seek_lower_bound_drop_count_ = 0;
         consecutive_drop_count_ = 0;
@@ -680,6 +681,7 @@ void AndroidPlayer::play() {
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
+    seek_resume_stable_hits_.store(0, std::memory_order_release);
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
@@ -715,6 +717,7 @@ void AndroidPlayer::pause() {
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
+    seek_resume_stable_hits_.store(0, std::memory_order_release);
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
@@ -743,6 +746,7 @@ void AndroidPlayer::stop() {
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
+    seek_resume_stable_hits_.store(0, std::memory_order_release);
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
@@ -788,6 +792,7 @@ void AndroidPlayer::seekTo(double position) {
     seek_recovery_deadline_ms_ = now + (very_large_seek ? 3600 : 4200);
     seek_audio_wait_video_.store(true, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = now + (very_large_seek ? 3400 : 3800);
+    seek_resume_stable_hits_.store(0, std::memory_order_release);
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
@@ -2005,14 +2010,42 @@ void AndroidPlayer::renderLoop() {
             if (should_display) {
                 consecutive_drop_count_ = 0;
                 if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
-                    // Stability-first gate:
-                    // after seek, only resume audio when video is reasonably close to clock,
-                    // or when wait deadline is reached (fallback to avoid deadlock/mute).
-                    double seek_resume_delay_threshold = likely_4k ? -0.45 : -0.75;
-                    bool seek_resume_sync_ready = std::isnan(delay) || std::isinf(delay) || delay >= seek_resume_delay_threshold;
+                    // Stability-first triple gate:
+                    // 1) 视频已到 seek 目标窗口
+                    // 2) A/V 差值进入可接受区间（不允许视频过度领先）
+                    // 3) 连续 N 帧稳定命中
+                    // 同时保留 deadline 兜底，避免异常设备/流导致长时间无声卡住。
+                    double seek_target_now = seek_target_sec_.load(std::memory_order_acquire);
+                    double seek_target_back_tol = likely_4k ? 0.35 : 0.25;
+                    bool seek_target_ready = (seek_target_now < 0.0) ||
+                                             std::isnan(pts) || std::isinf(pts) ||
+                                             (pts + seek_target_back_tol >= seek_target_now);
+
+                    double seek_resume_delay_threshold = likely_4k ? -0.40 : -0.65;
+                    double seek_resume_max_ahead = likely_4k ? 0.45 : 0.30;
+                    bool seek_resume_sync_ready = std::isnan(delay) || std::isinf(delay) ||
+                                                  (delay >= seek_resume_delay_threshold &&
+                                                   delay <= seek_resume_max_ahead);
+                    int stable_need = likely_4k ? 3 : 2;
+                    int stable_hits = seek_resume_stable_hits_.load(std::memory_order_acquire);
+                    if (seek_target_ready && seek_resume_sync_ready) {
+                        stable_hits = seek_resume_stable_hits_.fetch_add(1, std::memory_order_acq_rel) + 1;
+                    } else {
+                        seek_resume_stable_hits_.store(0, std::memory_order_release);
+                        stable_hits = 0;
+                    }
+
+                    bool seek_resume_by_stable_gate = seek_target_ready &&
+                                                      seek_resume_sync_ready &&
+                                                      stable_hits >= stable_need;
                     bool seek_resume_by_deadline = seek_audio_wait_deadline_ms_ > 0 && now >= seek_audio_wait_deadline_ms_;
-                    if (seek_resume_sync_ready || seek_resume_by_deadline) {
+                    if (seek_resume_by_stable_gate || seek_resume_by_deadline) {
                         if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
+                            seek_resume_stable_hits_.store(0, std::memory_order_release);
+                            if (player_core_ && std::isfinite(pts) && pts >= 0.0) {
+                                // Seek 恢复时做一次主时钟重锚，减少恢复初期延迟抖动。
+                                player_core_anchor_clock(player_core_, pts);
+                            }
                             if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                                 LOGI("[sync] seek first-frame resume audio: result=%d", r);
@@ -2020,8 +2053,10 @@ void AndroidPlayer::renderLoop() {
                             seek_audio_wait_deadline_ms_ = 0;
                         }
                     } else {
-                        SYNCI_RATE(30, "evt=seek_audio_resume_wait delay=%.3f threshold=%.3f deadline_left_ms=%" PRId64 " is_4k=%d",
-                                   delay, seek_resume_delay_threshold,
+                        SYNCI_RATE(30, "evt=seek_audio_resume_wait delay=%.3f low=%.3f high=%.3f target=%.3f target_ready=%d stable=%d/%d deadline_left_ms=%" PRId64 " is_4k=%d",
+                                   delay, seek_resume_delay_threshold, seek_resume_max_ahead,
+                                   seek_target_now, seek_target_ready ? 1 : 0,
+                                   stable_hits, stable_need,
                                    (int64_t)std::max<int64_t>(0, seek_audio_wait_deadline_ms_ - now),
                                    likely_4k ? 1 : 0);
                     }
@@ -2170,6 +2205,7 @@ void AndroidPlayer::renderLoop() {
                 !seek_lower_bound_active_.load(std::memory_order_acquire) &&
                 now >= seek_audio_wait_deadline_ms_) {
                 if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
+                    seek_resume_stable_hits_.store(0, std::memory_order_release);
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] seek wait-video fallback resume audio: result=%d", r);
@@ -2485,8 +2521,38 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     // For smaller resolutions the overhead of PBO setup isn't worth it.
     const bool use_pbo = (width >= 1920) &&
                          ensurePBOs(y_tex_w, height, uv_tex_w, uv_h, uv_upload_bpp);
-    PBOD("evt=upload_path use_pbo=%d video_w=%d video_h=%d y_stride=%d uv_stride=%d v_stride=%d uv_interleaved=%d",
-         use_pbo ? 1 : 0, width, height, y_tex_w, uv_upload_stride, v_tex_w, uv_interleaved ? 1 : 0);
+    // Reduce duplicate hot-path logs: keep critical upload-path info on change,
+    // and keep a sparse heartbeat for long sessions.
+    static int s_last_use_pbo = -1;
+    static int s_last_video_w = -1;
+    static int s_last_video_h = -1;
+    static int s_last_y_stride = -1;
+    static int s_last_uv_stride = -1;
+    static int s_last_v_stride = -1;
+    static int s_last_uv_interleaved = -1;
+    int use_pbo_i = use_pbo ? 1 : 0;
+    int uv_interleaved_i = uv_interleaved ? 1 : 0;
+    bool upload_path_changed = (s_last_use_pbo != use_pbo_i) ||
+                               (s_last_video_w != width) ||
+                               (s_last_video_h != height) ||
+                               (s_last_y_stride != y_tex_w) ||
+                               (s_last_uv_stride != uv_upload_stride) ||
+                               (s_last_v_stride != v_tex_w) ||
+                               (s_last_uv_interleaved != uv_interleaved_i);
+    if (upload_path_changed) {
+        PBOI("evt=upload_path_change use_pbo=%d video_w=%d video_h=%d y_stride=%d uv_stride=%d v_stride=%d uv_interleaved=%d",
+             use_pbo_i, width, height, y_tex_w, uv_upload_stride, v_tex_w, uv_interleaved_i);
+        s_last_use_pbo = use_pbo_i;
+        s_last_video_w = width;
+        s_last_video_h = height;
+        s_last_y_stride = y_tex_w;
+        s_last_uv_stride = uv_upload_stride;
+        s_last_v_stride = v_tex_w;
+        s_last_uv_interleaved = uv_interleaved_i;
+    } else {
+        PBOI_RATE(300, "evt=upload_path_heartbeat use_pbo=%d video_w=%d video_h=%d y_stride=%d uv_stride=%d v_stride=%d uv_interleaved=%d",
+                  use_pbo_i, width, height, y_tex_w, uv_upload_stride, v_tex_w, uv_interleaved_i);
+    }
 
     if (use_pbo) {
         int wi = gl_pbo_idx_;          // write index (0 or 1)

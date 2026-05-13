@@ -256,6 +256,9 @@ private:
     // During seek, wait for first target video frame before resuming audio.
     std::atomic<bool>   seek_audio_wait_video_{false};
     int64_t             seek_audio_wait_deadline_ms_{0};
+    // Triple-gate counter: require consecutive "target+sync ready" frames
+    // before resuming audio after seek.
+    std::atomic<int>    seek_resume_stable_hits_{0};
     // Seek recovery diagnostics and adaptive lower-bound relaxation.
     int64_t             seek_started_at_ms_{0};
     int                 seek_lower_bound_drop_count_{0};
