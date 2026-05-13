@@ -6,7 +6,14 @@
 #include "hxc_player_core_c_bridge.h"
 
 #define LOG_TAG "HXCPlayerJNI"
+#ifndef HXC_PLAYER_JNI_DEBUG_LOG
+#define HXC_PLAYER_JNI_DEBUG_LOG 0
+#endif
+#if HXC_PLAYER_JNI_DEBUG_LOG
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#else
+#define LOGD(...) ((void)0)
+#endif
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)

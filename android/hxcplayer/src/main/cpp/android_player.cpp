@@ -23,7 +23,7 @@
 //   2 = INFO + WARN + ERROR
 //   3 = DEBUG + INFO + WARN + ERROR
 #ifndef HXC_PLAYER_RUNTIME_LOG_LEVEL
-#define HXC_PLAYER_RUNTIME_LOG_LEVEL 3
+#define HXC_PLAYER_RUNTIME_LOG_LEVEL 2
 #endif
 
 #if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 3
@@ -400,6 +400,10 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     int cur_state = player_core_get_state(player_core_);
     if (cur_state != 0) { // 0 == IDLE
         LOGI("[open] pre-stop core (state=%d) before open", cur_state);
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        suppress_transient_loading_false_.store(true, std::memory_order_release);
+        suppress_transient_loading_false_until_ms_.store(now_ms + 1200, std::memory_order_release);
 
         // 1. Stop OpenSL ES output to prevent new callbacks from being queued.
         audio_start_pending_.store(false, std::memory_order_release);
@@ -958,6 +962,18 @@ void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
     if (!player) {
         return;
     }
+    if (player->suppress_transient_loading_false_.load(std::memory_order_acquire)) {
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t suppress_until = player->suppress_transient_loading_false_until_ms_.load(std::memory_order_acquire);
+        if (is_loading || now_ms > suppress_until) {
+            player->suppress_transient_loading_false_.store(false, std::memory_order_release);
+            player->suppress_transient_loading_false_until_ms_.store(0, std::memory_order_release);
+        } else {
+            LOGI_RATE(60, "[state] ignore transient loading=false during open switch");
+            return;
+        }
+    }
     player->is_loading_.store(is_loading, std::memory_order_release);
     LOGI("[state] loading=%s pos=%.3f", is_loading ? "true" : "false",
          player->player_core_ ? player_core_get_position(player->player_core_) : 0.0);
@@ -1361,7 +1377,7 @@ void AndroidPlayer::renderLoop() {
 
     int64_t total_render_ms = 0, total_upload_ms = 0;
     int64_t max_render_ms   = 0, max_upload_ms   = 0;
-    const int kDiagInterval = 60;
+    const int kDiagInterval = 180;
 
     const double kSyncThreshold = 0.050; // 50 ms: drop if video is behind
     const double kMaxAhead      = 2.000; // 2 s:  hold if video is too far ahead
@@ -3061,16 +3077,26 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     audio_sample_rate_ = sample_rate;
     audio_channels_    = channels;
 
-    // Target ~5ms per callback (bytes = rate * ch * 2 bytes/sample * 0.005s)
-    audio_buffer_size_ = (sample_rate * channels * 2 * 5) / 1000;
+    // Adaptive buffer sizing:
+    // - default ~12ms to reduce callback underrun on busy devices
+    // - enlarge for high-rate or 4K decode pipelines
+    int target_buffer_ms = 12;
+    float req_rate = requested_playback_rate_.load(std::memory_order_relaxed);
+    bool high_bandwidth_pcm = sample_rate >= 44100 && channels >= 2;
+    if (req_rate >= 2.5f) {
+        target_buffer_ms = 22;
+    } else if (req_rate >= 2.0f || high_bandwidth_pcm) {
+        target_buffer_ms = 18;
+    }
+    audio_buffer_size_ = (sample_rate * channels * 2 * target_buffer_ms) / 1000;
     audio_buffer_size_ = (audio_buffer_size_ + 3) & ~3;  // 4-byte align
 
     if (audio_buffer_size_ > MAX_AUDIO_BUFFER_SIZE) {
         audio_buffer_size_ = MAX_AUDIO_BUFFER_SIZE;
         LOGW("Audio buffer size capped to %d bytes", MAX_AUDIO_BUFFER_SIZE);
     }
-    if (audio_buffer_size_ < 960) {
-        audio_buffer_size_ = 960; // floor at ~10ms @ 48kHz stereo
+    if (audio_buffer_size_ < 1536) {
+        audio_buffer_size_ = 1536;
     }
 
     LOGI("Audio buffer: %d bytes (%.1f ms)",

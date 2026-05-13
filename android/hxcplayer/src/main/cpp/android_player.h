@@ -281,6 +281,9 @@ private:
     // Event forwarding (core callbacks -> JNI poll)
     // -----------------------------------------------------------------------
     std::atomic<bool> is_loading_{false};
+    // Ignore stale "loading=false" callbacks briefly during pre-stop/open switch.
+    std::atomic<bool> suppress_transient_loading_false_{false};
+    std::atomic<int64_t> suppress_transient_loading_false_until_ms_{0};
     static void loadingStateCallback(bool is_loading, void* user_data);
 
     std::mutex        error_mutex_;
