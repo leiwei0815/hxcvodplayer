@@ -23,7 +23,7 @@
 //   2 = INFO + WARN + ERROR
 //   3 = DEBUG + INFO + WARN + ERROR
 #ifndef HXC_PLAYER_RUNTIME_LOG_LEVEL
-#define HXC_PLAYER_RUNTIME_LOG_LEVEL 1
+#define HXC_PLAYER_RUNTIME_LOG_LEVEL 3
 #endif
 
 #if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 3
@@ -1708,7 +1708,7 @@ void AndroidPlayer::renderLoop() {
                                pts, seek_target_now, seek_from_now, stale_future_margin_sec, seek_elapsed_ms, seek_lower_bound_drop_count_);
                 } else if (!is_backward_seek &&
                            delay < -3.2 &&
-                           seek_elapsed_ms < 5200) {
+                           seek_elapsed_ms < (likely_4k ? 2600 : 5200)) {
                     // Avoid exiting seek gate too early when frame still trails
                     // audio clock by a lot; otherwise users see "loading gone but frozen".
                     should_consume = true;
@@ -1726,6 +1726,11 @@ void AndroidPlayer::renderLoop() {
                     seek_lower_bound_drop_count_ = 0;
                     sync_warmup_frames_.store(24, std::memory_order_release);
                     int64_t bypass_ms = is_backward_seek ? 5200 : 3200;
+                    if (likely_4k) {
+                        // 4K seek after-gate bypass is intentionally shorter:
+                        // reduce long A/V drift tails while preserving anti-freeze behavior.
+                        bypass_ms = is_backward_seek ? 3200 : 2200;
+                    }
                     post_seek_ahead_bypass_until_ms = now + bypass_ms;
                     should_display = should_consume = true;
                     LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64 " elapsed_ms=%" PRId64,
@@ -1988,12 +1993,27 @@ void AndroidPlayer::renderLoop() {
 
             if (should_display) {
                 consecutive_drop_count_ = 0;
-                if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
-                    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
-                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
-                        LOGI("[sync] seek first-frame resume audio: result=%d", r);
+                if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
+                    // Stability-first gate:
+                    // after seek, only resume audio when video is reasonably close to clock,
+                    // or when wait deadline is reached (fallback to avoid deadlock/mute).
+                    double seek_resume_delay_threshold = likely_4k ? -0.45 : -0.75;
+                    bool seek_resume_sync_ready = std::isnan(delay) || std::isinf(delay) || delay >= seek_resume_delay_threshold;
+                    bool seek_resume_by_deadline = seek_audio_wait_deadline_ms_ > 0 && now >= seek_audio_wait_deadline_ms_;
+                    if (seek_resume_sync_ready || seek_resume_by_deadline) {
+                        if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
+                            if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                                SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                                LOGI("[sync] seek first-frame resume audio: result=%d", r);
+                            }
+                            seek_audio_wait_deadline_ms_ = 0;
+                        }
+                    } else {
+                        SYNCI_RATE(30, "evt=seek_audio_resume_wait delay=%.3f threshold=%.3f deadline_left_ms=%" PRId64 " is_4k=%d",
+                                   delay, seek_resume_delay_threshold,
+                                   (int64_t)std::max<int64_t>(0, seek_audio_wait_deadline_ms_ - now),
+                                   likely_4k ? 1 : 0);
                     }
-                    seek_audio_wait_deadline_ms_ = 0;
                 }
                 // If we previously paused audio due to prolonged video starvation,
                 // resume audio as soon as video starts presenting again.
