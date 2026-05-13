@@ -1682,6 +1682,22 @@ double PlayerCore::get_duration() const {
     return 0.0;
 }
 
+void PlayerCore::anchor_clock(double pts) {
+    // 将 master clock 重锚到 pts，消除 seek 期间音频暂停导致的时钟漂移。
+    // 同时更新 audio_current_pts_/drift_ 使后续音频回调立即感知新基准。
+    // serial 传 0：seek 后重新对齐，与 seek 阶段 set_clock(target_pos, 0) 保持一致。
+    if (audio_stream_ >= 0) {
+        audio_clock_.set_clock(pts, 0);
+    }
+    if (video_stream_ >= 0) {
+        video_clock_.set_clock(pts, 0);
+    }
+    external_clock_.set_clock(pts, 0);
+    audio_current_pts_ = pts;
+    audio_current_pts_drift_ = pts - av_gettime_relative() / 1000000.0;
+    LOG_INFO("anchor_clock: pts=", pts);
+}
+
 void PlayerCore::set_volume(int volume) {
     volume_ = std::max(0, std::min(100, volume));
 }

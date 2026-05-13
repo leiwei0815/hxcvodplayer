@@ -167,6 +167,9 @@ public:
     const MediaInfo& get_media_info() const { return media_info_; }
     double get_position() const;    // 当前播放位置（秒）
     double get_duration() const;    // 总时长（秒）
+    // seek 后由平台层在首帧显示时调用：将 master clock 重锚到指定 pts，
+    // 使 delay = 0，消除 clock 因音频暂停期间自动流逝带来的累积偏差。
+    void anchor_clock(double pts);  // 重锚时钟（秒）
     bool is_video_hardware_decoding() const { return video_hw_decode_active_.load(std::memory_order_acquire); }
     std::string get_video_decode_diagnostic() const;
     

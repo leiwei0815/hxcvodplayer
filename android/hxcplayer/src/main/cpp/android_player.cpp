@@ -1479,6 +1479,17 @@ void AndroidPlayer::renderLoop() {
                 clock -= audio_output_latency_sec_;
                 if (clock < 0.0) clock = 0.0;
             }
+            // seek_audio_wait_video_ 期间音频被 Android 层暂停，但 Core 的 audio_clock
+            // 仍按真实时间流逝（paused=false），导致 clock 越来越大、delay 越来越负，
+            // 所有恢复门控条件永远无法满足（冻结根因）。
+            // 修复：等待期间改用 seek_target_sec_ 作为时钟基准，使 delay 仅反映
+            // 视频帧与目标 seek 位置的差距，不受等待时长影响。
+            if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
+                double seek_target_now = seek_target_sec_.load(std::memory_order_acquire);
+                if (seek_target_now >= 0.0) {
+                    clock = seek_target_now;
+                }
+            }
             double delay = pts - clock;
             int64_t now = now_ms();
             double playback_rate = player_core_get_playback_rate(player_core_);
@@ -2215,9 +2226,16 @@ void AndroidPlayer::renderLoop() {
                         seek_resume_need_stable_frames = std::min(seek_resume_need_stable_frames, 3);
                     }
                     seek_resume_sync_ready = std::fabs(delay) <= seek_resume_sync_threshold;
+                    // Don't count stable frames when video is persistently behind audio:
+                    // resuming audio in that state would make the gap worse, not better.
+                    double sync_stable_min_delay = likely_4k ? -0.40 : -0.30;
+                    if (lower_bound_cleared && post_seek_wait_ms >= 2200) {
+                        sync_stable_min_delay = likely_4k ? -0.70 : -0.55;
+                    }
+                    bool sync_stable_direction_ok = delay >= sync_stable_min_delay;
                     if (!frame_reached_target) {
                         seek_resume_stable_frames = 0;
-                    } else if (seek_resume_sync_ready) {
+                    } else if (seek_resume_sync_ready && sync_stable_direction_ok) {
                         seek_resume_stable_frames = std::min(seek_resume_stable_frames + 1,
                                                              seek_resume_need_stable_frames + 3);
                     } else {
@@ -2234,12 +2252,25 @@ void AndroidPlayer::renderLoop() {
                     }
                     bool seek_resume_deadline_safe = seek_resume_deadline &&
                                                      std::fabs(delay) <= seek_resume_deadline_guard;
+                    // slow/fast path require delay >= min_negative to ensure video
+                    // is not persistently behind audio; if video still lags, resuming
+                    // audio now would widen the gap and cause a frozen-picture stall.
+                    double fast_path_min_delay = likely_4k ? -0.35 : -0.25;
+                    double slow_path_min_delay = likely_4k ? -0.60 : -0.45;
+                    // After lower-bound hit, if a lot of time has passed, be more lenient
+                    // so we don't block indefinitely (8K/high-load corner cases).
+                    if (lower_bound_cleared && post_seek_wait_ms >= 3000) {
+                        fast_path_min_delay = likely_4k ? -0.75 : -0.60;
+                        slow_path_min_delay = likely_4k ? -1.10 : -0.90;
+                    }
                     bool seek_resume_slow_path_ready = lower_bound_cleared &&
                                                        post_seek_wait_ms >= 2200 &&
-                                                       std::fabs(delay) <= (likely_4k ? 1.00 : 0.85);
+                                                       std::fabs(delay) <= (likely_4k ? 1.00 : 0.85) &&
+                                                       delay >= slow_path_min_delay;
                     bool seek_resume_fast_path_ready = lower_bound_cleared &&
                                                        post_seek_wait_ms >= 900 &&
-                                                       std::fabs(delay) <= (likely_4k ? 0.65 : 0.50);
+                                                       std::fabs(delay) <= (likely_4k ? 0.65 : 0.50) &&
+                                                       delay >= fast_path_min_delay;
                     bool seek_resume_force_timeout = seek_started_at_ms_ > 0 &&
                                                      (now - seek_started_at_ms_) >= 8000;
                     if (frame_reached_target &&
@@ -2247,14 +2278,19 @@ void AndroidPlayer::renderLoop() {
                          seek_resume_slow_path_ready || seek_resume_fast_path_ready ||
                          seek_resume_force_timeout)) {
                         if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
+                            // 重锚 master clock 到当前视频帧 pts，消除 seek 期间音频暂停
+                            // 导致 audio_clock 自动流逝的累积偏差（腾讯播放器 ptsShift=0 等效操作）。
+                            if (player_core_) {
+                                player_core_anchor_clock(player_core_, pts);
+                            }
                             if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
-                                LOGI("[sync] seek first-frame resume audio: result=%d", r);
+                                LOGI("[sync] seek first-frame resume audio: result=%d anchor_pts=%.3f", r, pts);
                             }
-                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f stable=%d/%d by_deadline=%d fast_path=%d deadline_guard=%.3f force_timeout=%d rate=%.2f",
+                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f stable=%d/%d by_deadline=%d fast_path=%d deadline_guard=%.3f force_timeout=%d rate=%.2f anchor_pts=%.3f",
                                   delay, seek_resume_sync_threshold, seek_resume_stable_frames, seek_resume_need_stable_frames,
                                   seek_resume_deadline ? 1 : 0, seek_resume_fast_path_ready ? 1 : 0, seek_resume_deadline_guard,
-                                  seek_resume_force_timeout ? 1 : 0, playback_rate);
+                                  seek_resume_force_timeout ? 1 : 0, playback_rate, pts);
                         }
                         seek_resume_stable_frames = 0;
                         seek_audio_wait_deadline_ms_ = 0;
@@ -2387,6 +2423,27 @@ void AndroidPlayer::renderLoop() {
                     wait_ms = 0;
                 } else {
                     wait_ms = 8;
+                }
+                // Safety: if frames are continuously dropped (should_display=false) while
+                // seek_audio_wait_video_ is still set, the should_display branch never runs
+                // and the audio resume gate is never checked. Detect this via force_timeout
+                // so audio doesn't stay muted indefinitely even under persistent video lag.
+                if (!should_display && seek_audio_wait_video_.load(std::memory_order_acquire)) {
+                    bool force_timeout = seek_started_at_ms_ > 0 &&
+                                        (now - seek_started_at_ms_) >= 8000;
+                    if (force_timeout) {
+                        if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
+                            if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                                SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                                LOGI("[sync] seek audio force-resume (drop loop): result=%d delay=%.3f", r, delay);
+                            }
+                            SYNCI("evt=seek_audio_force_resume_drop_loop delay=%.3f elapsed_ms=%" PRId64 " rate=%.2f",
+                                  delay, seek_started_at_ms_ > 0 ? (now - seek_started_at_ms_) : 0LL, playback_rate);
+                            seek_audio_wait_deadline_ms_ = 0;
+                            seek_started_at_ms_ = 0;
+                            seek_resume_stable_frames = 0;
+                        }
+                    }
                 }
             } else {
                 // Video ahead of clock: sleep proportional to how far ahead,

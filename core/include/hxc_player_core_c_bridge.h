@@ -293,6 +293,9 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
 double player_core_get_seek_target(PlayerCoreHandle* handle);
 // 返回 seek 结束后 warmup 剩余帧数（>0 表示 seek 刚结束，平台层应放宽 A/V sync 阈值）
 int    player_core_get_post_seek_warmup(PlayerCoreHandle* handle);
+// seek 后由平台层在首帧显示时调用：将 master clock 重锚到 pts，
+// 使 delay ≈ 0，消除 clock 因音频暂停期间自动流逝带来的累积偏差。
+void   player_core_anchor_clock(PlayerCoreHandle* handle, double pts);
 
 // 媒体信息
 int player_core_get_audio_sample_rate(PlayerCoreHandle* handle);

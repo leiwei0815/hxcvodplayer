@@ -576,6 +576,12 @@ int player_core_get_post_seek_warmup(PlayerCoreHandle* handle) {
     return handle->core->get_post_seek_warmup_frames();
 }
 
+void player_core_anchor_clock(PlayerCoreHandle* handle, double pts) {
+    if (handle && handle->core) {
+        handle->core->anchor_clock(pts);
+    }
+}
+
 int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, int buffer_size) {
     if (!handle || !handle->core || !buffer || buffer_size <= 0) {
         return 0;
