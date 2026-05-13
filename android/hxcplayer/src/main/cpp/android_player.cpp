@@ -2019,7 +2019,7 @@ void AndroidPlayer::renderLoop() {
                     should_display = should_consume = true;
                 } else if (!in_seek_recovery &&
                            post_seek_ahead_bypass_until_ms > now &&
-                           delay <= (likely_4k ? 1.4 : 0.8)) {
+                           delay <= (likely_4k ? 2.6 : 1.4)) {
                     // Seek just recovered, but clock may temporarily roll back or lag.
                     // Bypass "ahead hold" briefly so users don't see frozen picture
                     // (not only for high-rate; 1.0x backward seek can also hit this).
@@ -2029,12 +2029,12 @@ void AndroidPlayer::renderLoop() {
                                (int64_t)std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now));
                 } else if (!in_seek_recovery &&
                            post_seek_ahead_bypass_until_ms > now &&
-                           delay > (likely_4k ? 1.4 : 0.8)) {
+                           delay > (likely_4k ? 2.6 : 1.4)) {
                     // Video has already become too far ahead; stop bypass immediately
                     // and return to normal sync path for faster A/V re-alignment.
                     post_seek_ahead_bypass_until_ms = 0;
                     SYNCI_RATE(30, "evt=post_seek_ahead_bypass_skip delay=%.3f max_ahead=%.3f is_4k=%d",
-                               delay, (likely_4k ? 1.4 : 0.8), likely_4k ? 1 : 0);
+                               delay, (likely_4k ? 2.6 : 1.4), likely_4k ? 1 : 0);
                 } else if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                            audio_rebuffer_pending_.load(std::memory_order_acquire) &&
                            now >= audio_rebuffer_min_resume_at_ms_) {
@@ -2047,7 +2047,6 @@ void AndroidPlayer::renderLoop() {
                                pts, clock, delay, playback_rate);
                 } else if (!in_seek_recovery &&
                            core_playing_now &&
-                           likely_4k &&
                            snapshot_stalled &&
                            stall_watchdog_since_ms > 0 &&
                            (now - stall_watchdog_since_ms) >= kSyncStallWatchdogMs &&
@@ -2292,8 +2291,26 @@ void AndroidPlayer::renderLoop() {
                     seek_started_at_ms_ = 0;
                     seek_lower_bound_drop_count_ = 0;
                     seek_resume_stable_hits_.store(0, std::memory_order_release);
-                    sync_warmup_frames_.store(20, std::memory_order_release);
+                    sync_warmup_frames_.store(28, std::memory_order_release);
+                    int64_t timeout_bypass_ms = likely_4k ? 3200 : 1800;
+                    post_seek_ahead_bypass_until_ms = now + timeout_bypass_ms;
+                    // Reset stall-watchdog baseline so timeout recovery starts from a clean edge.
+                    stall_watchdog_since_ms = 0;
+                    stall_watchdog_last_break_ms = now;
+                    if (player_core_ && std::isfinite(seek_target_now) && seek_target_now >= 0.0) {
+                        // Timeout fallback 后优先重锚到目标附近，避免后续长期落入 ahead-hold 死区。
+                        player_core_anchor_clock(player_core_, seek_target_now);
+                    }
+                    if (player_core_) {
+                        player_core_set_play_when_ready(player_core_, 1);
+                    }
                     bool core_playing_now = player_core_is_playing(player_core_);
+                    if (!core_playing_now && player_core_) {
+                        player_core_play(player_core_);
+                        core_playing_now = player_core_is_playing(player_core_);
+                        SEEKW("seek_empty_timeout_fallback force_core_play playing=%d",
+                              core_playing_now ? 1 : 0);
+                    }
                     if (core_playing_now && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGW("[sync] seek empty fallback resume audio: result=%d", r);
