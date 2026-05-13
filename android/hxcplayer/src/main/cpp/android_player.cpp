@@ -2327,6 +2327,24 @@ void AndroidPlayer::renderLoop() {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                                 LOGI("[sync] seek first-frame resume audio: result=%d pts=%.3f delay=%.3f", r, pts, delay);
                             }
+                            // 音频恢复时主动建立 wall-clock 锚点。
+                            // 背景：4K 视频 seek 后音频队列可能出现持续空洞（OpenSL underrun），
+                            // audio_clock 长时间不推进。renderLoop 中的锚点建立依赖
+                            // "clock_advanced > 5ms"，若 clock 一直停滞则锚点永远不建立，
+                            // wall-clock 兜底也就不会触发，delay 超过 kMaxAhead 触发互锁。
+                            // 修复：在音频恢复这一刻，用当前 audio_clock（即 seek_target 附近）
+                            // 建立初始锚点，确保后续 clock 停滞时 wall-clock 兜底立即可用。
+                            {
+                                double resume_clock = player_core_get_position(player_core_);
+                                if (audio_output_latency_sec_ > 0.0) {
+                                    resume_clock -= audio_output_latency_sec_;
+                                    if (resume_clock < 0.0) resume_clock = 0.0;
+                                }
+                                post_seek_wall_anchor_ms_   = now;
+                                post_seek_clock_anchor_pts_ = resume_clock;
+                                post_seek_last_clock_       = resume_clock;
+                                LOGI("[sync] wall_clock_anchor_set pts=%.3f clk=%.3f at_ms=%" PRId64, pts, resume_clock, now);
+                            }
                             // 恢复音频时重新延长 ahead-bypass 窗口。
                             // seek_lower_bound_hit 时设置的 bypass 窗口（900~1300ms）往往在音频
                             // 恢复之前或刚恢复后就过期；此时 audio_clock 刚开始推进，视频可能
