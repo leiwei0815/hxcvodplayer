@@ -1788,7 +1788,8 @@ void AndroidPlayer::renderLoop() {
             }
 
             // --- First/post-seek fast-path ---
-            bool is_first_or_seek = (frame_count == 0) ||
+            bool open_first_frame_pending = !first_frame_rendered_.load(std::memory_order_acquire);
+            bool is_first_or_seek = open_first_frame_pending ||
                                      seek_just_happened_.exchange(false, std::memory_order_acq_rel);
             int seek_catchup_left = seek_fast_catchup_frames_.load(std::memory_order_acquire);
             double seek_target = seek_target_sec_.load(std::memory_order_acquire);
@@ -1829,7 +1830,7 @@ void AndroidPlayer::renderLoop() {
                 // sees a flash of old content before the picture snaps to the
                 // correct position.
                 double first_frame_force_threshold = likely_4k ? -0.65 : -0.45;
-                bool is_open_first_frame = (frame_count == 0);
+                bool is_open_first_frame = open_first_frame_pending;
                 int64_t first_wait_ms = (is_open_first_frame && first_frame_wait_started_ms_ > 0)
                                         ? (now - first_frame_wait_started_ms_) : 0;
                 int64_t first_frame_max_wait_ms = likely_4k ? 3200 : 1800;
@@ -1839,7 +1840,7 @@ void AndroidPlayer::renderLoop() {
                     // Still too far behind -- drop silently and keep catching up.
                     should_consume = true;
                     LOGI_RATE(30, "[sync] %s catching up: pts=%.3f clk=%.3f delay=%.3f thr=%.3f",
-                              frame_count == 0 ? "first frame" : "post-seek frame",
+                              is_open_first_frame ? "first frame" : "post-seek frame",
                               pts, clock, delay, first_frame_force_threshold);
                 } else {
                     if (first_frame_wait_timeout) {
@@ -1852,7 +1853,7 @@ void AndroidPlayer::renderLoop() {
                              pts, clock, delay, first_wait_ms, first_frame_max_wait_ms);
                     }
                     LOGI("[sync] %s forced: pts=%.3f clk=%.3f delay=%.3f",
-                         frame_count == 0 ? "first frame" : "post-seek frame",
+                         is_open_first_frame ? "first frame" : "post-seek frame",
                          pts, clock, delay);
                     should_display = should_consume = true;
                 }
@@ -2046,7 +2047,7 @@ void AndroidPlayer::renderLoop() {
             }
 
             if (should_display) {
-                bool is_displaying_first_frame = (frame_count == 0);
+                bool is_displaying_first_frame = open_first_frame_pending;
                 consecutive_drop_count_ = 0;
                 if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
                     // Stability-first triple gate:
@@ -2143,7 +2144,7 @@ void AndroidPlayer::renderLoop() {
                 // If this is the first rendered frame and audio start was deferred,
                 // start audio now so picture and sound appear together.
                 // Skip if volume is 0 (muted player, e.g. small window in split-screen).
-                if (frame_count == 0 && audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
+                if (is_displaying_first_frame && audio_start_pending_.exchange(false, std::memory_order_acq_rel)) {
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] audio started on first frame: result=%d", r);
