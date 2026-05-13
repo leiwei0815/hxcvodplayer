@@ -2276,6 +2276,7 @@ void AndroidPlayer::renderLoop() {
                 int64_t seek_elapsed_ms = now - seek_started_at_ms_;
                 double seek_target_now = seek_target_sec_.load(std::memory_order_acquire);
                 double seek_from_now = seek_from_sec_.load(std::memory_order_acquire);
+                bool likely_4k_empty = gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160;
                 bool is_backward_seek = seek_from_now >= 0.0 && seek_target_now >= 0.0 &&
                                         (seek_from_now - seek_target_now) > 0.5;
                 int64_t seek_empty_timeout_ms = is_backward_seek ? 7000 : 5500;
@@ -2292,7 +2293,7 @@ void AndroidPlayer::renderLoop() {
                     seek_lower_bound_drop_count_ = 0;
                     seek_resume_stable_hits_.store(0, std::memory_order_release);
                     sync_warmup_frames_.store(28, std::memory_order_release);
-                    int64_t timeout_bypass_ms = likely_4k ? 3200 : 1800;
+                    int64_t timeout_bypass_ms = likely_4k_empty ? 3200 : 1800;
                     post_seek_ahead_bypass_until_ms = now + timeout_bypass_ms;
                     // Reset stall-watchdog baseline so timeout recovery starts from a clean edge.
                     stall_watchdog_since_ms = 0;
