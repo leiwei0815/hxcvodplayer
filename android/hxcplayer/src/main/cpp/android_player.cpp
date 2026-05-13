@@ -1,4 +1,4 @@
-#include "android_player.h"
+﻿#include "android_player.h"
 #include "hxc_player_core_c_bridge.h"
 #include <android/log.h>
 #include <android/native_window.h>
@@ -810,12 +810,12 @@ void AndroidPlayer::seekTo(double position) {
     seek_recovery_deadline_ms_ = now + (very_large_seek ? 3600 : 4200);
     seek_audio_wait_video_.store(true, std::memory_order_release);
     // 兼顾“出画速度”和“首帧同步”：保留同步窗口，但避免超长等待造成卡死体感。
-    int64_t seek_audio_wait_ms = very_large_seek ? 2600 : 3000;
+    int64_t seek_audio_wait_ms = very_large_seek ? 2200 : 1800;
     if (seek_span > 120.0) {
-        seek_audio_wait_ms += 300;
+        seek_audio_wait_ms += 200;
     }
     if (playback_rate >= 2.0) {
-        seek_audio_wait_ms += 400;
+        seek_audio_wait_ms += 300;
     }
     seek_audio_wait_deadline_ms_ = now + seek_audio_wait_ms;
     audio_rebuffer_pending_.store(false, std::memory_order_release);
@@ -1728,9 +1728,9 @@ void AndroidPlayer::renderLoop() {
                     if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
                         // 命中 lower-bound 后仍保留一小段“同步等待窗口”，
                         // 避免 deadline 过早触发导致刚出画面就开声而不同步。
-                        int64_t post_hit_sync_wait_ms = is_backward_seek ? 1800 : 1200;
+                        int64_t post_hit_sync_wait_ms = is_backward_seek ? 1200 : 800;
                         if (playback_rate >= 2.0) {
-                            post_hit_sync_wait_ms += 400;
+                            post_hit_sync_wait_ms += 300;
                         }
                         seek_audio_wait_deadline_ms_ = std::max<int64_t>(
                             seek_audio_wait_deadline_ms_, now + post_hit_sync_wait_ms);
@@ -2144,29 +2144,14 @@ void AndroidPlayer::renderLoop() {
                            post_seek_ahead_bypass_until_ms > now) {
                     double max_bypass_ahead_sec = high_rate_4k ? 2.6 : 1.8;
                     if (delay > max_bypass_ahead_sec) {
-                        // Ahead 过大时继续追赶时钟，但避免 pure-drop 导致“画面卡住”体感。
-                        // 在可控的 ahead 区间按 cadence 出帧，优先保证可见进度。
+                        // Seek 恢复期 audio_clock 滞后，视频超前较多时：
+                        // 纯 consume（丢帧）让视频快速追赶，wait_ms=0 连续处理。
+                        // 原 cadence+shrink 方案反而妨碍追赶且容易在 shrink 后
+                        // 触发 ahead-hold 互锁，故简化为纯丢帧快追路径。
                         should_consume = true;
-                        post_seek_bypass_skip_count++;
-                        double cadence_display_limit = max_bypass_ahead_sec + (likely_4k ? 1.0 : 0.8);
-                        if (delay <= cadence_display_limit &&
-                            (post_seek_bypass_skip_count % 3 == 0)) {
-                            should_display = true;
-                            SYNCI_RATE(20, "evt=post_seek_ahead_bypass_cadence_display delay=%.3f max_ahead=%.3f skip_count=%d rate=%.2f",
-                                       delay, max_bypass_ahead_sec, post_seek_bypass_skip_count, playback_rate);
-                        }
-                        int64_t bypass_left_ms = std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now);
-                        bool bypass_shrink_protected = (audio_resume_bypass_no_shrink_until_ms > now);
-                        if (!bypass_shrink_protected &&
-                            post_seek_bypass_skip_count >= 3 && bypass_left_ms > 260) {
-                            int64_t shrink_ms = (post_seek_bypass_skip_count >= 8) ? 360 : 220;
-                            int64_t shortened_left_ms = std::max<int64_t>(220, bypass_left_ms - shrink_ms);
-                            post_seek_ahead_bypass_until_ms = now + shortened_left_ms;
-                            SYNCI_RATE(20, "evt=post_seek_ahead_bypass_shrink delay=%.3f left_ms=%" PRId64 " new_left_ms=%" PRId64 " skip_count=%d rate=%.2f",
-                                       delay, bypass_left_ms, shortened_left_ms, post_seek_bypass_skip_count, playback_rate);
-                        }
-                        SYNCI_RATE(30, "evt=post_seek_ahead_bypass_skip delay=%.3f max_ahead=%.3f rate=%.2f",
-                                   delay, max_bypass_ahead_sec, playback_rate);
+                        SYNCI_RATE(30, "evt=post_seek_ahead_bypass_drop pts=%.3f clk=%.3f delay=%.3f max_ahead=%.3f rate=%.2f bypass_left_ms=%" PRId64,
+                                   pts, clock, delay, max_bypass_ahead_sec, playback_rate,
+                                   (int64_t)std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now));
                     } else {
                     // Seek just recovered, but clock may temporarily roll back or lag.
                     // Bypass "ahead hold" briefly so users don't see frozen picture
