@@ -23,7 +23,7 @@
 //   2 = INFO + WARN + ERROR
 //   3 = DEBUG + INFO + WARN + ERROR
 #ifndef HXC_PLAYER_RUNTIME_LOG_LEVEL
-#define HXC_PLAYER_RUNTIME_LOG_LEVEL 2
+#define HXC_PLAYER_RUNTIME_LOG_LEVEL 1
 #endif
 
 #if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 3
@@ -364,8 +364,6 @@ void AndroidPlayer::setSurface(ANativeWindow* window) {
             }
             LOGI("[surface] setSurface: queued window=%p size=%dx%d", window, surface_width_, surface_height_);
         } else {
-            surface_width_ = 0;
-            surface_height_ = 0;
             LOGI("[surface] setSurface: queued clear (null)");
         }
     }
@@ -587,23 +585,6 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
                                           int key_mode,
                                           const char* key_material_b64,
                                           const char* key_iv_hex) {
-    static std::atomic<bool> secure_param_warned{false};
-    bool has_extra_secure_args =
-        (auth_token && *auth_token) ||
-        (video_id && *video_id) ||
-        (device_id && *device_id) ||
-        (secret_id && *secret_id) ||
-        (nonce && *nonce) ||
-        (play_session_id && *play_session_id) ||
-        session_expire_at_ms > 0 ||
-        key_mode != 0 ||
-        (key_material_b64 && *key_material_b64) ||
-        (key_iv_hex && *key_iv_hex);
-    if (has_extra_secure_args &&
-        !secure_param_warned.exchange(true, std::memory_order_acq_rel)) {
-        LOGW("[secure] openWithSecureSession currently applies secure_headers only; "
-             "other secure args are accepted for API compatibility but not yet forwarded to core");
-    }
     (void)auth_token;
     (void)video_id;
     (void)device_id;
@@ -708,11 +689,11 @@ void AndroidPlayer::play() {
     if (playItf_) {
         // Defer audio start until the first video frame is rendered to prevent
         // audible sound before any picture (especially noticeable in dual-player).
-        // A slightly longer deadline reduces "loading hides then black frame" on first play.
+        // A 500ms deadline ensures audio is not muted forever if video decoding stalls.
         audio_start_pending_.store(true, std::memory_order_release);
         audio_start_deadline_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count() + 1200;
-        LOGI("[ctrl] play: audio deferred until first video frame (deadline +1200ms)");
+            std::chrono::steady_clock::now().time_since_epoch()).count() + 500;
+        LOGI("[ctrl] play: audio deferred until first video frame (deadline +500ms)");
     } else {
         LOGD("No audio interface (audio disabled)");
     }
@@ -796,12 +777,8 @@ void AndroidPlayer::seekTo(double position) {
     seek_fast_catchup_frames_.store(very_large_seek ? 128 : 96, std::memory_order_release);
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    double playback_rate = player_core_get_playback_rate(player_core_);
-    if (playback_rate <= 0.0) playback_rate = 1.0;
     seek_started_at_ms_ = now;
     seek_lower_bound_drop_count_ = 0;
-    // Clear stale redraw cache on render thread before presenting post-seek frames.
-    clear_last_frame_cache_pending_.store(true, std::memory_order_release);
     seek_catchup_deadline_ms_ = now + (very_large_seek ? 1200 : 900);
     seek_lower_bound_active_.store(true, std::memory_order_release);
     // Avoid long black/frozen waits after large forward seeks on 4K.
@@ -809,37 +786,19 @@ void AndroidPlayer::seekTo(double position) {
     seek_recovery_active_.store(true, std::memory_order_release);
     seek_recovery_deadline_ms_ = now + (very_large_seek ? 3600 : 4200);
     seek_audio_wait_video_.store(true, std::memory_order_release);
-    // 兼顾“出画速度”和“首帧同步”：保留同步窗口，但避免超长等待造成卡死体感。
-    int64_t seek_audio_wait_ms = very_large_seek ? 2200 : 1800;
-    if (seek_span > 120.0) {
-        seek_audio_wait_ms += 200;
-    }
-    if (playback_rate >= 2.0) {
-        seek_audio_wait_ms += 300;
-    }
-    seek_audio_wait_deadline_ms_ = now + seek_audio_wait_ms;
+    seek_audio_wait_deadline_ms_ = now + (very_large_seek ? 3400 : 3800);
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
     audio_rebuffer_min_resume_at_ms_ = 0;
-    if (playItf_) {
-        std::lock_guard<std::mutex> audio_lock(audio_mutex_);
+    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
-        if (bufferQueueItf_) {
-            SLresult clear_r = (*bufferQueueItf_)->Clear(bufferQueueItf_);
-            LOGI("[sync] seek pause audio waiting first target frame: pause=%d clear=%d", r, clear_r);
-        } else {
-            LOGI("[sync] seek pause audio waiting first target frame: pause=%d clear=skip(no_bq)", r);
-        }
+        LOGI("[sync] seek pause audio waiting first target frame: result=%d", r);
     }
     consecutive_drop_count_ = 0;
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
     last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
-    // 重置 wall-clock 锚点，seek 期间由渲染线程在 seek_audio_wait_video_ 分支重建
-    post_seek_wall_anchor_ms_   = 0;
-    post_seek_clock_anchor_pts_ = 0.0;
-    post_seek_last_clock_       = 0.0;
     player_core_seek(player_core_, position);
     render_cv_.notify_one();
 }
@@ -906,12 +865,6 @@ void AndroidPlayer::setDecodeMode(int mode) {
     decode_mode_ = (mode == 1) ? 1 : 0;
     DECODEI("evt=set_decode_mode decode_mode=%s", decode_mode_ == 1 ? "hardware" : "software");
     if (player_core_) {
-        int core_state = player_core_get_state(player_core_);
-        if (core_state != 0) {
-            LOGW("[decode] decode mode changed while state=%d; new mode applies on next open", core_state);
-        }
-    }
-    if (player_core_) {
         player_core_set_decode_mode(player_core_,
                                     decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                       : PLAYER_DECODE_MODE_SOFTWARE);
@@ -963,9 +916,7 @@ bool AndroidPlayer::isLoading() const {
         seek_audio_wait_video_.load(std::memory_order_acquire) ||
         seek_recovery_active_.load(std::memory_order_acquire) ||
         seek_lower_bound_active_.load(std::memory_order_acquire);
-    // Avoid hiding loading before the first post-play frame is ready.
-    bool first_frame_loading = audio_start_pending_.load(std::memory_order_acquire);
-    return core_loading || seek_loading || first_frame_loading;
+    return core_loading || seek_loading;
 }
 
 bool AndroidPlayer::isHardwareDecodingActive() const {
@@ -1369,12 +1320,6 @@ void AndroidPlayer::renderLoop() {
     // (audio clock catches up from an older anchor), producing large positive delay
     // and a short "hold/freeze". Keep a brief bypass window to avoid that freeze.
     int64_t post_seek_ahead_bypass_until_ms = 0;
-    int post_seek_bypass_skip_count = 0;
-    int seek_resume_stable_frames = 0;
-    // 音频恢复时重新延长 bypass 窗口，在此期间禁止 shrink，防止过早触发 ahead-hold 互锁。
-    int64_t audio_resume_bypass_no_shrink_until_ms = 0;
-    // 当 audio_clock 停滞导致 ahead-hold 互锁时，进入快速追赶模式（持续 consume）。
-    bool ahead_stall_catchup_active = false;
     // Sync-stall watchdog: if pts/clock stay almost unchanged for too long while
     // playback is active, force one consume+display to break potential deadlock.
     double stall_watchdog_last_pts = std::numeric_limits<double>::quiet_NaN();
@@ -1451,19 +1396,6 @@ void AndroidPlayer::renderLoop() {
 
         if (!surface_ready || !player_core_) continue;
 
-        if (clear_last_frame_cache_pending_.exchange(false, std::memory_order_acq_rel)) {
-            last_frame_y_.clear();
-            last_frame_u_.clear();
-            last_frame_v_.clear();
-            last_frame_width_ = 0;
-            last_frame_height_ = 0;
-            last_frame_y_stride_ = 0;
-            last_frame_u_stride_ = 0;
-            last_frame_v_stride_ = 0;
-            last_frame_cache_ms_ = 0;
-            LOGI("[sync] clear last-frame cache after seek");
-        }
-
         // --- Fetch next decoded video frame ---
         VideoFrameDataC frame_data;
         int get_result = player_core_get_video_frame(player_core_, &frame_data);
@@ -1487,56 +1419,10 @@ void AndroidPlayer::renderLoop() {
                 clock -= audio_output_latency_sec_;
                 if (clock < 0.0) clock = 0.0;
             }
+            double delay = pts - clock;
             int64_t now = now_ms();
             double playback_rate = player_core_get_playback_rate(player_core_);
             if (playback_rate <= 0.0) playback_rate = 1.0;
-            // ── 阶段1：seek_audio_wait_video_ 期间用 seek_target 作基准 ──────────
-            // 音频被 Android 暂停但 audio_clock 仍按真实时间流逝，导致 delay 无限变负。
-            if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
-                double seek_target_now = seek_target_sec_.load(std::memory_order_acquire);
-                if (seek_target_now >= 0.0) {
-                    clock = seek_target_now;
-                }
-                // 注意：不在此处重置锚点。seek_audio_resume_gate 会在同帧内
-                // exchange(false) 并主动建立锚点，下一帧进入 else 分支立即生效。
-                post_seek_last_clock_ = clock;
-            } else {
-                // ── 阶段2：音频恢复后，检测 audio_clock 停滞并用 wall-clock 兜底 ──
-                // 根本原因：4K/1920 视频 seek 后音频队列出现空洞（OpenSL underrun），
-                // audio_clock 冻结不动。视频帧继续消费，delay 超过 kMaxAhead=2s，
-                // 触发 ahead-hold，audio 也无法拉取新数据，形成互锁。
-                // 解法：seek_audio_resume_gate 主动建立 wall-clock 锚点；此后若
-                // audio_clock 停滞，用 "anchor_pts + elapsed * rate" 估算 clock，
-                // 保证 delay 不因时钟停滞而虚高，不触发 ahead-hold 互锁。
-                const double kClockStallThreshold = 0.005; // 5ms 内认为时钟停滞
-                bool clock_advanced = std::fabs(clock - post_seek_last_clock_) > kClockStallThreshold;
-                bool player_paused = !player_core_is_playing(player_core_);
-                if (clock_advanced) {
-                    // audio_clock 正常推进，更新锚点（用最新值，精度更高）
-                    post_seek_wall_anchor_ms_    = now;
-                    post_seek_clock_anchor_pts_  = clock;
-                    post_seek_last_clock_        = clock;
-                } else if (player_paused && post_seek_wall_anchor_ms_ > 0) {
-                    // 播放器已暂停：wall-clock 继续流逝但 audio_clock 不动是正常的。
-                    // 不做 wall-clock 兜底，但更新锚点时间基准，避免恢复后 elapsed 虚高。
-                    post_seek_wall_anchor_ms_ = now;
-                } else if (post_seek_wall_anchor_ms_ > 0) {
-                    // audio_clock 停滞（underrun），用 wall-clock 估算
-                    // 无上限：确保无论停滞多久都能兜底。
-                    // 当 audio_clock 恢复推进后，clock_advanced=true 会重建锚点。
-                    double wall_elapsed = (now - post_seek_wall_anchor_ms_) / 1000.0;
-                    if (wall_elapsed > 0.0) {
-                        double wall_clock = post_seek_clock_anchor_pts_ + wall_elapsed * playback_rate;
-                        // 只在 wall_clock > audio_clock 时才替换（避免时钟回跳）
-                        if (wall_clock > clock) {
-                            SYNCI_RATE(60, "evt=wall_clock_fallback audio_clk=%.3f wall_clk=%.3f elapsed=%.3f anchor=%.3f",
-                                       clock, wall_clock, wall_elapsed, post_seek_clock_anchor_pts_);
-                            clock = wall_clock;
-                        }
-                    }
-                }
-            }
-            double delay = pts - clock;
             bool core_playing_now = player_core_is_playing(player_core_);
             float requested_rate = requested_playback_rate_.load(std::memory_order_relaxed);
             if (requested_rate <= 0.0f) requested_rate = (float)playback_rate;
@@ -1741,51 +1627,13 @@ void AndroidPlayer::renderLoop() {
                 bool large_forward_seek = !is_backward_seek && seek_span_sec > 25.0;
                 bool large_seek_any_direction = seek_span_abs_sec > 25.0;
                 bool very_large_seek = seek_span_abs_sec > 180.0;
-                double stale_future_margin_sec = ultra_high_rate_4k ? 4.0 : 2.2;
-                double forward_future_block_margin_sec = ultra_high_rate_4k ? 1.10 : 0.70;
-                if (large_seek_any_direction) {
-                    forward_future_block_margin_sec += 0.20;
-                }
-                auto mark_seek_lower_bound_hit = [&]() {
-                    seek_lower_bound_active_.store(false, std::memory_order_release);
-                    seek_fast_catchup_frames_.store(0, std::memory_order_release);
-                    seek_catchup_deadline_ms_ = 0;
-                    seek_recovery_active_.store(false, std::memory_order_release);
-                    seek_recovery_deadline_ms_ = 0;
-                    in_seek_recovery = false;
-                    seek_lower_bound_drop_count_ = 0;
-                    seek_resume_stable_frames = 0;
-                    sync_warmup_frames_.store(24, std::memory_order_release);
-                    // Seek 恢复后允许短暂 bypass ahead-hold，但窗口过长会放大音画分离体感。
-                    // 在高倍速下保留一定缓冲，常速下尽量缩短恢复时间。
-                    int64_t bypass_ms = is_backward_seek ? 1300 : 900;
-                    if (playback_rate >= 2.0) {
-                        bypass_ms += 400;
-                    }
-                    post_seek_ahead_bypass_until_ms = now + bypass_ms;
-                    post_seek_bypass_skip_count = 0;
-                    if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
-                        // 命中 lower-bound 后仍保留一小段“同步等待窗口”，
-                        // 避免 deadline 过早触发导致刚出画面就开声而不同步。
-                        int64_t post_hit_sync_wait_ms = is_backward_seek ? 1200 : 800;
-                        if (playback_rate >= 2.0) {
-                            post_hit_sync_wait_ms += 300;
-                        }
-                        seek_audio_wait_deadline_ms_ = std::max<int64_t>(
-                            seek_audio_wait_deadline_ms_, now + post_hit_sync_wait_ms);
-                    }
-                    should_display = should_consume = true;
-                    LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64 " elapsed_ms=%" PRId64,
-                         pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms, seek_elapsed_ms);
-                    SYNCI("evt=seek_lower_bound_hit pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64 " elapsed_ms=%" PRId64,
-                          pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms, seek_elapsed_ms);
-                };
+                double stale_future_margin_sec = ultra_high_rate_4k ? 6.0 : 3.5;
                 if (large_forward_seek) {
-                    // Keep seek hit tight even for large forward jumps.
-                    // Over-relaxing epsilon causes "jump forward by seconds".
-                    seek_epsilon_sec = std::max(seek_epsilon_sec, 0.18);
+                    // Tencent/Exo-like seek UX: on large forward jumps, prioritize
+                    // "show something close quickly" over strict exact-target hit.
+                    seek_epsilon_sec = std::max(seek_epsilon_sec, 1.20);
                     if (seek_span_sec > 120.0) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, 0.28);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, 1.80);
                     }
                 }
                 // If seek recovery is slow, relax lower-bound gradually instead of
@@ -1797,82 +1645,50 @@ void AndroidPlayer::renderLoop() {
                         seek_epsilon_sec = 0.350;
                     }
                     if (sw_decode_4k && playback_rate >= 2.0) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, 0.55);
+                        // After deadline, prioritize quick visual recovery over exact seek hit.
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, 1.80);
                     }
                     if (large_forward_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, 0.48);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, 1.60);
                     }
                 }
+                // Mature players tend to gradually relax seek gate when a large seek
+                // cannot immediately land near target keyframe. This avoids prolonged
+                // frozen frames and prioritizes visible recovery.
                 if (seek_elapsed_ms >= 1200) {
-                    seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 0.70 : (large_seek_any_direction ? 0.45 : 0.30));
-                    if (is_backward_seek && likely_4k && very_large_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, 2.20);
-                    }
+                    seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 0.90 : (large_seek_any_direction ? 1.80 : 0.60));
                 }
                 if (seek_elapsed_ms >= 2200) {
                     if (is_backward_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 1.30 : 0.95);
-                        if (likely_4k && very_large_seek) {
-                            seek_epsilon_sec = std::max(seek_epsilon_sec, 3.00);
-                        }
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.20 : 1.60);
                     } else {
-                        double forward_relax_eps = very_large_seek ? 0.85 : (large_seek_any_direction ? 0.62 : 0.45);
+                        double forward_relax_eps = very_large_seek ? 8.00 : (large_seek_any_direction ? 3.60 : 1.20);
                         if (playback_rate >= 2.0) {
-                            forward_relax_eps = very_large_seek ? 0.72 : (large_seek_any_direction ? 0.58 : 0.42);
+                            forward_relax_eps = very_large_seek ? 2.80 : (large_seek_any_direction ? 2.40 : 1.20);
                         }
                         seek_epsilon_sec = std::max(seek_epsilon_sec, forward_relax_eps);
                     }
                 }
                 if (seek_elapsed_ms >= 3200) {
                     if (is_backward_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 1.60 : 1.20);
-                        if (likely_4k && very_large_seek) {
-                            seek_epsilon_sec = std::max(seek_epsilon_sec, 3.60);
-                        }
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.80 : 2.20);
                     } else {
-                        double forward_relax_eps = very_large_seek ? 1.00 : (large_seek_any_direction ? 0.78 : 0.55);
+                        double forward_relax_eps = very_large_seek ? 10.50 : (large_seek_any_direction ? 5.00 : 2.00);
                         if (playback_rate >= 2.0) {
-                            forward_relax_eps = very_large_seek ? 0.85 : (large_seek_any_direction ? 0.72 : 0.50);
+                            forward_relax_eps = very_large_seek ? 3.80 : (large_seek_any_direction ? 3.00 : 2.00);
                         }
                         seek_epsilon_sec = std::max(seek_epsilon_sec, forward_relax_eps);
                     }
                 }
                 bool lower_bound_force_relax = seek_lower_bound_drop_count_ >= (very_large_seek ? 180 : 120);
                 if (lower_bound_force_relax) {
-                    double forced_eps = is_backward_seek ? 1.50 : (very_large_seek ? 1.00 : 0.72);
+                    double forced_eps = is_backward_seek ? 2.60 : (very_large_seek ? 9.50 : 4.20);
                     if (!is_backward_seek && playback_rate >= 2.0) {
-                        forced_eps = very_large_seek ? 0.86 : 0.66;
+                        forced_eps = very_large_seek ? 3.40 : 2.80;
                     }
                     seek_epsilon_sec = std::max(seek_epsilon_sec, forced_eps);
                 }
-                if (!is_backward_seek) {
-                    double forward_eps_cap = 0.75;
-                    if (large_seek_any_direction) {
-                        forward_eps_cap = 0.95;
-                    }
-                    if (very_large_seek) {
-                        forward_eps_cap = 1.10;
-                    }
-                    if (playback_rate >= 2.0) {
-                        forward_eps_cap += 0.12;
-                    }
-                    seek_epsilon_sec = std::min(seek_epsilon_sec, forward_eps_cap);
-                }
-                int64_t seek_force_hit_max_ms = likely_4k ? 2200 : 1700;
-                if (large_seek_any_direction) {
-                    seek_force_hit_max_ms += likely_4k ? 700 : 500;
-                }
-                if (very_large_seek) {
-                    seek_force_hit_max_ms += likely_4k ? 400 : 300;
-                }
-                bool force_hit_by_timeout = seek_elapsed_ms >= seek_force_hit_max_ms;
-                if (force_hit_by_timeout) {
-                    // Availability first: cap lower-bound waiting time to avoid
-                    // multi-second frozen-loading behavior after seek.
-                    SYNCI_RATE(10, "evt=seek_lower_bound_force_hit_timeout pts=%.3f target=%.3f elapsed_ms=%" PRId64 " eps=%.3f",
-                               pts, seek_target_now, seek_elapsed_ms, seek_epsilon_sec);
-                    mark_seek_lower_bound_hit();
-                } else if (pts + seek_epsilon_sec < seek_target_now) {
+                if (pts + seek_epsilon_sec < seek_target_now) {
                     should_consume = true;
                     seek_lower_bound_drop_count_++;
                     LOGW_RATE(20, "[sync] seek lower-bound drop: pts=%.3f target=%.3f",
@@ -1891,15 +1707,6 @@ void AndroidPlayer::renderLoop() {
                     SYNCW_RATE(20, "evt=seek_lower_bound_stale_future_drop pts=%.3f target=%.3f from=%.3f margin=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
                                pts, seek_target_now, seek_from_now, stale_future_margin_sec, seek_elapsed_ms, seek_lower_bound_drop_count_);
                 } else if (!is_backward_seek &&
-                           !lower_bound_deadline_elapsed &&
-                           pts > seek_target_now + forward_future_block_margin_sec) {
-                    // Forward seek: do not accept far-future frame as first hit.
-                    // This prevents "seek lands but immediately jumps several seconds ahead".
-                    should_consume = true;
-                    seek_lower_bound_drop_count_++;
-                    SYNCW_RATE(20, "evt=seek_lower_bound_forward_future_drop pts=%.3f target=%.3f margin=%.3f elapsed_ms=%" PRId64 " drop_count=%d eps=%.3f",
-                               pts, seek_target_now, forward_future_block_margin_sec, seek_elapsed_ms, seek_lower_bound_drop_count_, seek_epsilon_sec);
-                } else if (!is_backward_seek &&
                            delay < -3.2 &&
                            seek_elapsed_ms < 5200) {
                     // Avoid exiting seek gate too early when frame still trails
@@ -1908,73 +1715,23 @@ void AndroidPlayer::renderLoop() {
                     seek_lower_bound_drop_count_++;
                     SYNCW_RATE(20, "evt=seek_lower_bound_delay_guard pts=%.3f target=%.3f delay=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
                                pts, seek_target_now, delay, seek_elapsed_ms, seek_lower_bound_drop_count_);
-                } else if (is_backward_seek) {
-                    // backward seek 在 4K 下也可能“命中过早”，随后出现几秒前冲卡顿。
-                    // 增加 delay 门槛，保证命中时音画已经进入可恢复区间。
-                    double backward_hit_min_delay = likely_4k ? -1.2 : -0.9;
-                    if (large_seek_any_direction) {
-                        backward_hit_min_delay -= likely_4k ? 0.20 : 0.10;
-                    }
-                    if (playback_rate >= 2.0) {
-                        backward_hit_min_delay = likely_4k ? -1.6 : -1.2;
-                    }
-                    if (likely_4k && very_large_seek) {
-                        // For very large 4K backward seeks, avoid strict hold gate.
-                        // Audio resume gate already protects A/V sync before unmute.
-                        backward_hit_min_delay = std::min(backward_hit_min_delay, -4.5);
-                    }
-                    // Avoid prolonged "loading freeze" on backward seeks.
-                    // Gradually relax hold window as elapsed grows, and cap max hold time.
-                    int64_t backward_hold_max_ms = likely_4k ? 1800 : 1400;
-                    if (large_seek_any_direction) {
-                        backward_hold_max_ms += likely_4k ? 400 : 300;
-                    }
-                    if (very_large_seek) {
-                        backward_hold_max_ms += likely_4k ? 300 : 200;
-                    }
-                    if (seek_elapsed_ms >= 1200) {
-                        backward_hit_min_delay += likely_4k ? 0.20 : 0.28;
-                    }
-                    if (seek_elapsed_ms >= 2000) {
-                        backward_hit_min_delay += likely_4k ? 0.25 : 0.35;
-                    }
-                    if (seek_elapsed_ms >= 2800) {
-                        backward_hit_min_delay += likely_4k ? 0.20 : 0.22;
-                    }
-                    if (delay < backward_hit_min_delay &&
-                        seek_elapsed_ms < backward_hold_max_ms &&
-                        seek_lower_bound_drop_count_ < 90) {
-                        should_consume = true;
-                        seek_lower_bound_drop_count_++;
-                        SYNCW_RATE(20, "evt=seek_lower_bound_hit_hold_backward delay=%.3f min=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
-                                   delay, backward_hit_min_delay, seek_elapsed_ms, seek_lower_bound_drop_count_);
-                    } else {
-                        mark_seek_lower_bound_hit();
-                    }
-                } else if (!is_backward_seek) {
-                    // 稳定性优先：前向 seek 命中前要求 delay 不得过度落后，
-                    // 否则即便命中 lower-bound，也会出现“先播放但音画不同步数秒”。
-                    double forward_hit_min_delay = likely_4k ? -1.3 : -1.0;
-                    if (large_seek_any_direction) {
-                        forward_hit_min_delay -= likely_4k ? 0.25 : 0.15;
-                    }
-                    if (playback_rate >= 2.0) {
-                        // 体验优先：高倍速不再过度等待 lower-bound，避免 loading 后长时间“假播放卡住”。
-                        forward_hit_min_delay = likely_4k ? -2.2 : -1.6;
-                    }
-                    if (playback_rate >= 2.5) {
-                        forward_hit_min_delay = likely_4k ? -2.6 : -1.9;
-                    }
-                    if (delay < forward_hit_min_delay && seek_elapsed_ms < 7000) {
-                        should_consume = true;
-                        seek_lower_bound_drop_count_++;
-                        SYNCW_RATE(20, "evt=seek_lower_bound_hit_hold delay=%.3f min=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
-                                   delay, forward_hit_min_delay, seek_elapsed_ms, seek_lower_bound_drop_count_);
-                    } else {
-                        mark_seek_lower_bound_hit();
-                    }
                 } else {
-                    mark_seek_lower_bound_hit();
+                    seek_lower_bound_active_.store(false, std::memory_order_release);
+                    seek_fast_catchup_frames_.store(0, std::memory_order_release);
+                    seek_catchup_deadline_ms_ = 0;
+                    seek_recovery_active_.store(false, std::memory_order_release);
+                    seek_recovery_deadline_ms_ = 0;
+                    in_seek_recovery = false;
+                    seek_started_at_ms_ = 0;
+                    seek_lower_bound_drop_count_ = 0;
+                    sync_warmup_frames_.store(24, std::memory_order_release);
+                    int64_t bypass_ms = is_backward_seek ? 5200 : 3200;
+                    post_seek_ahead_bypass_until_ms = now + bypass_ms;
+                    should_display = should_consume = true;
+                    LOGI("[sync] seek lower-bound hit: pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64 " elapsed_ms=%" PRId64,
+                         pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms, seek_elapsed_ms);
+                    SYNCI("evt=seek_lower_bound_hit pts=%.3f target=%.3f delay=%.3f backward=%d bypass_ms=%" PRId64 " elapsed_ms=%" PRId64,
+                          pts, seek_target_now, delay, is_backward_seek ? 1 : 0, bypass_ms, seek_elapsed_ms);
                 }
             }
 
@@ -2195,26 +1952,13 @@ void AndroidPlayer::renderLoop() {
                     should_display = should_consume = true;
                 } else if (!in_seek_recovery &&
                            post_seek_ahead_bypass_until_ms > now) {
-                    double max_bypass_ahead_sec = high_rate_4k ? 2.6 : 1.8;
-                    if (delay > max_bypass_ahead_sec) {
-                        // Seek 恢复期 audio_clock 滞后，视频超前较多时：
-                        // 纯 consume（丢帧）让视频快速追赶，wait_ms=0 连续处理。
-                        // 原 cadence+shrink 方案反而妨碍追赶且容易在 shrink 后
-                        // 触发 ahead-hold 互锁，故简化为纯丢帧快追路径。
-                        should_consume = true;
-                        SYNCI_RATE(30, "evt=post_seek_ahead_bypass_drop pts=%.3f clk=%.3f delay=%.3f max_ahead=%.3f rate=%.2f bypass_left_ms=%" PRId64,
-                                   pts, clock, delay, max_bypass_ahead_sec, playback_rate,
-                                   (int64_t)std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now));
-                    } else {
                     // Seek just recovered, but clock may temporarily roll back or lag.
                     // Bypass "ahead hold" briefly so users don't see frozen picture
                     // (not only for high-rate; 1.0x backward seek can also hit this).
-                    post_seek_bypass_skip_count = 0;
                     should_display = should_consume = true;
                     SYNCI_RATE(30, "evt=post_seek_ahead_bypass pts=%.3f clk=%.3f delay=%.3f rate=%.2f bypass_left_ms=%" PRId64,
                                pts, clock, delay, playback_rate,
                                (int64_t)std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now));
-                    }
                 } else if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                            audio_rebuffer_pending_.load(std::memory_order_acquire) &&
                            now >= audio_rebuffer_min_resume_at_ms_) {
@@ -2227,196 +1971,29 @@ void AndroidPlayer::renderLoop() {
                                pts, clock, delay, playback_rate);
                 } else if (!in_seek_recovery &&
                            core_playing_now &&
+                           likely_4k &&
                            snapshot_stalled &&
                            stall_watchdog_since_ms > 0 &&
                            (now - stall_watchdog_since_ms) >= kSyncStallWatchdogMs &&
                            (now - stall_watchdog_last_break_ms) >= kSyncStallWatchdogCooldownMs) {
-                    // audio_clock + video_pts 均停滞（audio queue 空或 codec 慢）：
-                    // 视频超前音频 >2s 且两者都不动时（互锁），持续 consume 帧追赶，
-                    // 每 kSyncStallWatchdogCooldownMs 展示 1 帧，保持可见进度。
-                    // 注：不再限制 likely_4k，普通分辨率也可能在 seek 后出现此互锁。
-                    bool stall_gap_large = delay > (kMaxAhead + 0.5);
-                    should_consume = true;
-                    if (!stall_gap_large) {
-                        should_display = true; // gap 接近临界时顺便展示
-                    }
-                    if (stall_gap_large) {
-                        // 开启快速追赶模式：持续 consume 直到 delay < kMaxAhead
-                        ahead_stall_catchup_active = true;
-                    }
+                    // If clocks are stuck while "playing", force progress once to
+                    // avoid a long pseudo-playing freeze in high-load scenarios.
+                    should_display = should_consume = true;
                     stall_watchdog_last_break_ms = now;
-                    SYNCI_RATE(20, "evt=sync_stall_watchdog_drop pts=%.3f clk=%.3f delay=%.3f stalled_ms=%" PRId64 " rate=%.2f gap_large=%d catchup=%d",
-                               pts, clock, delay, (int64_t)(now - stall_watchdog_since_ms), playback_rate,
-                               stall_gap_large ? 1 : 0, ahead_stall_catchup_active ? 1 : 0);
+                    SYNCI_RATE(20, "evt=sync_stall_watchdog_break pts=%.3f clk=%.3f delay=%.3f stalled_ms=%" PRId64 " rate=%.2f",
+                               pts, clock, delay, (int64_t)(now - stall_watchdog_since_ms), playback_rate);
                 }
                 // else: video > 2s ahead of audio -- hold frame (don't consume)
-                // 兜底：若处于 ahead-stall 快速追赶模式，强制 consume（丢帧）直到 delay 收敛。
-                else if (ahead_stall_catchup_active) {
-                    should_consume = true;
-                    SYNCI_RATE(30, "evt=ahead_stall_catchup_drop pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
-                               pts, clock, delay, playback_rate);
-                }
-            }
-
-            // 追赶模式退出检查：delay 已收敛到正常范围
-            if (ahead_stall_catchup_active && delay <= kMaxAhead) {
-                ahead_stall_catchup_active = false;
-                SYNCI("evt=ahead_stall_catchup_done pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
-                      pts, clock, delay, playback_rate);
             }
 
             if (should_display) {
                 consecutive_drop_count_ = 0;
-                if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
-                    // seek 后允许 loading 多保持一小段时间，优先等待音画接近同步再恢复音频，
-                    // 避免用户感知到“先出画面再跟音频对齐”的明显不同步。
-                    double seek_target_now = seek_target_sec_.load(std::memory_order_acquire);
-                    double seek_target_reach_margin = likely_4k ? 0.18 : 0.12;
-                    bool frame_reached_target = seek_target_now < 0.0 ||
-                                                pts >= (seek_target_now - seek_target_reach_margin);
-                    double seek_resume_sync_threshold =
-                        (playback_rate >= 2.5) ? 0.90 :
-                        ((playback_rate >= 2.0) ? 0.70 : 0.45);
-                    bool seek_resume_sync_ready = std::fabs(delay) <= seek_resume_sync_threshold;
-                    int seek_resume_need_stable_frames = likely_4k ? 8 : 6;
-                    if (playback_rate >= 2.0) {
-                        seek_resume_need_stable_frames += 2;
+                if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
+                    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                        SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
+                        LOGI("[sync] seek first-frame resume audio: result=%d", r);
                     }
-                    bool lower_bound_cleared = !seek_lower_bound_active_.load(std::memory_order_acquire);
-                    int64_t post_seek_wait_ms = seek_started_at_ms_ > 0 ? (now - seek_started_at_ms_) : 0;
-                    if (lower_bound_cleared && post_seek_wait_ms >= 1400) {
-                        seek_resume_sync_threshold = std::max(seek_resume_sync_threshold, likely_4k ? 0.75 : 0.60);
-                        seek_resume_need_stable_frames = std::min(seek_resume_need_stable_frames, likely_4k ? 5 : 4);
-                    }
-                    if (lower_bound_cleared && post_seek_wait_ms >= 2200) {
-                        seek_resume_sync_threshold = std::max(seek_resume_sync_threshold, likely_4k ? 0.95 : 0.80);
-                        seek_resume_need_stable_frames = std::min(seek_resume_need_stable_frames, 3);
-                    }
-                    seek_resume_sync_ready = std::fabs(delay) <= seek_resume_sync_threshold;
-                    // Don't count stable frames when video is persistently behind audio:
-                    // resuming audio in that state would make the gap worse, not better.
-                    double sync_stable_min_delay = likely_4k ? -0.40 : -0.30;
-                    if (lower_bound_cleared && post_seek_wait_ms >= 2200) {
-                        sync_stable_min_delay = likely_4k ? -0.70 : -0.55;
-                    }
-                    bool sync_stable_direction_ok = delay >= sync_stable_min_delay;
-                    if (!frame_reached_target) {
-                        seek_resume_stable_frames = 0;
-                    } else if (seek_resume_sync_ready && sync_stable_direction_ok) {
-                        seek_resume_stable_frames = std::min(seek_resume_stable_frames + 1,
-                                                             seek_resume_need_stable_frames + 3);
-                    } else {
-                        seek_resume_stable_frames = 0;
-                    }
-                    bool seek_resume_sync_stable =
-                        seek_resume_sync_ready &&
-                        seek_resume_stable_frames >= seek_resume_need_stable_frames;
-                    bool seek_resume_deadline = seek_audio_wait_deadline_ms_ > 0 &&
-                                                now >= seek_audio_wait_deadline_ms_;
-                    double seek_resume_deadline_guard = likely_4k ? 1.20 : 0.90;
-                    if (playback_rate >= 2.0) {
-                        seek_resume_deadline_guard = likely_4k ? 1.50 : 1.10;
-                    }
-                    bool seek_resume_deadline_safe = seek_resume_deadline &&
-                                                     std::fabs(delay) <= seek_resume_deadline_guard;
-                    // slow/fast path require delay >= min_negative to ensure video
-                    // is not persistently behind audio; if video still lags, resuming
-                    // audio now would widen the gap and cause a frozen-picture stall.
-                    double fast_path_min_delay = likely_4k ? -0.35 : -0.25;
-                    double slow_path_min_delay = likely_4k ? -0.60 : -0.45;
-                    // After lower-bound hit, if a lot of time has passed, be more lenient
-                    // so we don't block indefinitely (8K/high-load corner cases).
-                    if (lower_bound_cleared && post_seek_wait_ms >= 3000) {
-                        fast_path_min_delay = likely_4k ? -0.75 : -0.60;
-                        slow_path_min_delay = likely_4k ? -1.10 : -0.90;
-                    }
-                    bool seek_resume_slow_path_ready = lower_bound_cleared &&
-                                                       post_seek_wait_ms >= 2200 &&
-                                                       std::fabs(delay) <= (likely_4k ? 1.00 : 0.85) &&
-                                                       delay >= slow_path_min_delay;
-                    bool seek_resume_fast_path_ready = lower_bound_cleared &&
-                                                       post_seek_wait_ms >= 900 &&
-                                                       std::fabs(delay) <= (likely_4k ? 0.65 : 0.50) &&
-                                                       delay >= fast_path_min_delay;
-                    bool seek_resume_force_timeout = seek_started_at_ms_ > 0 &&
-                                                     (now - seek_started_at_ms_) >= 8000;
-                    bool seek_resume_deadline_fallback_ready =
-                        seek_resume_deadline &&
-                        post_seek_wait_ms >= (likely_4k ? 1700 : 1300) &&
-                        std::fabs(delay) <= (likely_4k ? 2.20 : 1.70);
-                    bool seek_resume_ready =
-                        (frame_reached_target &&
-                         (seek_resume_sync_stable || seek_resume_deadline_safe ||
-                          seek_resume_slow_path_ready || seek_resume_fast_path_ready)) ||
-                        seek_resume_deadline_fallback_ready ||
-                        seek_resume_force_timeout;
-                    if (seek_resume_ready) {
-                        if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
-                            if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
-                                SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
-                                LOGI("[sync] seek first-frame resume audio: result=%d pts=%.3f delay=%.3f", r, pts, delay);
-                            }
-                            // 音频恢复时主动建立 wall-clock 锚点。
-                            // 背景：4K 视频 seek 后音频队列可能出现持续空洞（OpenSL underrun），
-                            // audio_clock 长时间不推进。renderLoop 中的锚点建立依赖
-                            // "clock_advanced > 5ms"，若 clock 一直停滞则锚点永远不建立，
-                            // wall-clock 兜底也就不会触发，delay 超过 kMaxAhead 触发互锁。
-                            // 修复：在音频恢复这一刻，用当前 audio_clock（即 seek_target 附近）
-                            // 建立初始锚点，确保后续 clock 停滞时 wall-clock 兜底立即可用。
-                            {
-                                double resume_clock = player_core_get_position(player_core_);
-                                if (audio_output_latency_sec_ > 0.0) {
-                                    resume_clock -= audio_output_latency_sec_;
-                                    if (resume_clock < 0.0) resume_clock = 0.0;
-                                }
-                                post_seek_wall_anchor_ms_   = now;
-                                post_seek_clock_anchor_pts_ = resume_clock;
-                                post_seek_last_clock_       = resume_clock;
-                                LOGI("[sync] wall_clock_anchor_set pts=%.3f clk=%.3f at_ms=%" PRId64, pts, resume_clock, now);
-                            }
-                            // 恢复音频时重新延长 ahead-bypass 窗口。
-                            // seek_lower_bound_hit 时设置的 bypass 窗口（900~1300ms）往往在音频
-                            // 恢复之前或刚恢复后就过期；此时 audio_clock 刚开始推进，视频可能
-                            // 已超前 1~2s（尤其是 4K lower_bound 阶段大量 drop），导致 delay>2s
-                            // 触发 ahead-hold，audio 也停止拉取，形成互锁卡住画面。
-                            // 重设 bypass 窗口保证音频有足够时间（~3s）推进时钟追上视频。
-                            {
-                                int64_t audio_resume_bypass_ms = likely_4k ? 3500 : 2500;
-                                if (playback_rate >= 2.0) audio_resume_bypass_ms += 500;
-                                int64_t new_bypass_until = now + audio_resume_bypass_ms;
-                                if (new_bypass_until > post_seek_ahead_bypass_until_ms) {
-                                    post_seek_ahead_bypass_until_ms = new_bypass_until;
-                                    post_seek_bypass_skip_count = 0;
-                                    // 禁止 bypass-shrink 至少 2s，保证 bypass 窗口不被过早压缩
-                                    audio_resume_bypass_no_shrink_until_ms = now + 2000;
-                                }
-                            }
-                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f stable=%d/%d by_deadline=%d fast_path=%d deadline_fallback=%d deadline_guard=%.3f force_timeout=%d rate=%.2f bypass_extended_ms=%" PRId64,
-                                  delay, seek_resume_sync_threshold, seek_resume_stable_frames, seek_resume_need_stable_frames,
-                                  seek_resume_deadline ? 1 : 0, seek_resume_fast_path_ready ? 1 : 0,
-                                  seek_resume_deadline_fallback_ready ? 1 : 0, seek_resume_deadline_guard,
-                                  seek_resume_force_timeout ? 1 : 0, playback_rate,
-                                  (int64_t)std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now));
-                        }
-                        seek_resume_stable_frames = 0;
-                        seek_audio_wait_deadline_ms_ = 0;
-                        seek_started_at_ms_ = 0;
-                    } else {
-                        if (seek_resume_deadline) {
-                            // deadline 到点但仍明显不同步时，短延一档再等，稳定性优先。
-                            seek_audio_wait_deadline_ms_ = now + 800;
-                            SYNCI_RATE(20, "evt=seek_audio_resume_deadline_extend delay=%.3f guard=%.3f extend_ms=%d rate=%.2f",
-                                       delay, seek_resume_deadline_guard, 800, playback_rate);
-                        }
-                        SYNCI_RATE(30, "evt=seek_audio_resume_wait delay=%.3f threshold=%.3f stable=%d/%d reached_target=%d deadline_left_ms=%" PRId64 " rate=%.2f",
-                                   delay, seek_resume_sync_threshold,
-                                   seek_resume_stable_frames, seek_resume_need_stable_frames,
-                                   frame_reached_target ? 1 : 0,
-                                   (int64_t)std::max<int64_t>(0, seek_audio_wait_deadline_ms_ - now),
-                                   playback_rate);
-                    }
-                } else {
-                    seek_resume_stable_frames = 0;
+                    seek_audio_wait_deadline_ms_ = 0;
                 }
                 // If we previously paused audio due to prolonged video starvation,
                 // resume audio as soon as video starts presenting again.
@@ -2468,10 +2045,6 @@ void AndroidPlayer::renderLoop() {
                     } else {
                         LOGI("[sync] audio start skipped: volume=0 (muted)");
                     }
-                    // 建立 wall-clock 锚点，防止首帧音频恢复后 clock 停滞触发互锁
-                    { double rc = player_core_get_position(player_core_);
-                      if (audio_output_latency_sec_ > 0.0) rc = std::max(0.0, rc - audio_output_latency_sec_);
-                      post_seek_wall_anchor_ms_ = now_ms(); post_seek_clock_anchor_pts_ = rc; post_seek_last_clock_ = rc; }
                 }
                 frame_count++;
                 last_sync_video_pts_ = pts; // track for dynamic frame-interval estimation
@@ -2513,13 +2086,13 @@ void AndroidPlayer::renderLoop() {
                     total_render_ms = total_upload_ms = max_render_ms = max_upload_ms = 0;
                 }
                 if (render_ms > 33)
-                    LOGW("[perf] slow frame %" PRId64 "ms %dx%d surf=%dx%d",
-                         render_ms, frame_data.width, frame_data.height,
-                         surface_width_, surface_height_);
+                    LOGW_RATE(20, "[perf] slow frame %" PRId64 "ms %dx%d surf=%dx%d",
+                              render_ms, frame_data.width, frame_data.height,
+                              surface_width_, surface_height_);
                 if (render_ms > 33) {
-                    PERFW("evt=slow_frame render_ms=%" PRId64 " video_w=%d video_h=%d surface_w=%d surface_h=%d rate=%.2f delay=%.3f",
-                          render_ms, frame_data.width, frame_data.height,
-                          surface_width_, surface_height_, playback_rate, delay);
+                    PERFW_RATE(20, "evt=slow_frame render_ms=%" PRId64 " video_w=%d video_h=%d surface_w=%d surface_h=%d rate=%.2f delay=%.3f",
+                               render_ms, frame_data.width, frame_data.height,
+                               surface_width_, surface_height_, playback_rate, delay);
                 }
             }
 
@@ -2529,35 +2102,10 @@ void AndroidPlayer::renderLoop() {
                 // In catch-up mode (high rate / far behind), don't sleep so seek recovery
                 // can drain stale frames quickly.
                 if (!should_display &&
-                    (delay < -0.20 || delay > 1.20 || playback_rate >= 1.75)) {
+                    (delay < -0.20 || playback_rate >= 1.75)) {
                     wait_ms = 0;
                 } else {
                     wait_ms = 8;
-                }
-                // Safety: if frames are continuously dropped (should_display=false) while
-                // seek_audio_wait_video_ is still set, the should_display branch never runs
-                // and the audio resume gate is never checked. Detect this via force_timeout
-                // so audio doesn't stay muted indefinitely even under persistent video lag.
-                if (!should_display && seek_audio_wait_video_.load(std::memory_order_acquire)) {
-                    bool force_timeout = seek_started_at_ms_ > 0 &&
-                                        (now - seek_started_at_ms_) >= 8000;
-                    if (force_timeout) {
-                        if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
-                            if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
-                                SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
-                                LOGI("[sync] seek audio force-resume (drop loop): result=%d delay=%.3f", r, delay);
-                            }
-                            // 建立 wall-clock 锚点，防止音频恢复后 clock 停滞触发互锁
-                            { double rc = player_core_get_position(player_core_);
-                              if (audio_output_latency_sec_ > 0.0) rc = std::max(0.0, rc - audio_output_latency_sec_);
-                              post_seek_wall_anchor_ms_ = now; post_seek_clock_anchor_pts_ = rc; post_seek_last_clock_ = rc; }
-                            SYNCI("evt=seek_audio_force_resume_drop_loop delay=%.3f elapsed_ms=%" PRId64 " rate=%.2f",
-                                  delay, seek_started_at_ms_ > 0 ? (now - seek_started_at_ms_) : 0LL, playback_rate);
-                            seek_audio_wait_deadline_ms_ = 0;
-                            seek_started_at_ms_ = 0;
-                            seek_resume_stable_frames = 0;
-                        }
-                    }
                 }
             } else {
                 // Video ahead of clock: sleep proportional to how far ahead,
@@ -2595,13 +2143,7 @@ void AndroidPlayer::renderLoop() {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] seek wait-video fallback resume audio: result=%d", r);
                     }
-                    // 建立 wall-clock 锚点，防止音频恢复后 clock 停滞触发互锁
-                    { double rc = player_core_get_position(player_core_);
-                      if (audio_output_latency_sec_ > 0.0) rc = std::max(0.0, rc - audio_output_latency_sec_);
-                      post_seek_wall_anchor_ms_ = now; post_seek_clock_anchor_pts_ = rc; post_seek_last_clock_ = rc; }
                     seek_audio_wait_deadline_ms_ = 0;
-                    seek_started_at_ms_ = 0;
-                    seek_resume_stable_frames = 0;
                 }
             }
             double playback_rate = player_core_get_playback_rate(player_core_);
@@ -3037,10 +2579,11 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
     if (out_max_upload_ms && upload_ms > *out_max_upload_ms)
         *out_max_upload_ms = upload_ms;
     if (upload_ms > 10) {
-        LOGW("[DIAG] Slow upload: %" PRId64 "ms | %dx%d Y_stride=%d pbo=%d",
-             upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
-        PBOW("evt=slow_upload upload_ms=%" PRId64 " video_w=%d video_h=%d y_stride=%d use_pbo=%d",
-             upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
+        // 4K 下慢上传可能连续出现，按固定采样率输出，避免告警刷屏影响性能。
+        LOGW_RATE(30, "[DIAG] Slow upload: %" PRId64 "ms | %dx%d Y_stride=%d pbo=%d",
+                  upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
+        PBOW_RATE(30, "evt=slow_upload upload_ms=%" PRId64 " video_w=%d video_h=%d y_stride=%d use_pbo=%d",
+                  upload_ms, width, height, y_tex_w, use_pbo ? 1 : 0);
     }
 
     gl_last_video_w_ = width;
