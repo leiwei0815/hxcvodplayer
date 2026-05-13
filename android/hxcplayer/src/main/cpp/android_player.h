@@ -261,6 +261,12 @@ private:
     int                 seek_lower_bound_drop_count_{0};
     // Seek 之后由渲染线程清空 last-frame 缓存，避免重绘旧画面。
     std::atomic<bool>   clear_last_frame_cache_pending_{false};
+    // Wall-clock 锚点：seek 恢复音频后，若 audio_clock 停滞（队列空/underrun），
+    // 用 "anchor_pts + (now - anchor_wall_ms) * rate" 估算 clock，避免 ahead-hold 互锁。
+    // audio_clock 有实际更新时（差值 > 阈值）切回真实 clock，锚点失效。
+    int64_t             post_seek_wall_anchor_ms_{0};   // 锚点建立时的 wall-clock (ms)
+    double              post_seek_clock_anchor_pts_{0.0}; // 锚点建立时的 audio clock 值
+    double              post_seek_last_clock_{0.0};     // 上次观测到的 audio clock，用于检测更新
     // High-rate cadence: avoid long "all-drop then force old frame" behavior.
     int                 consecutive_drop_count_{0};
     // Severe-lag detector for soft re-anchor (prevents endless drop loops).

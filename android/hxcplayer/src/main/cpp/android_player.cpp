@@ -1,4 +1,4 @@
-﻿#include "android_player.h"
+#include "android_player.h"
 #include "hxc_player_core_c_bridge.h"
 #include <android/log.h>
 #include <android/native_window.h>
@@ -836,6 +836,10 @@ void AndroidPlayer::seekTo(double position) {
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
     last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
+    // 重置 wall-clock 锚点，seek 期间由渲染线程在 seek_audio_wait_video_ 分支重建
+    post_seek_wall_anchor_ms_   = 0;
+    post_seek_clock_anchor_pts_ = 0.0;
+    post_seek_last_clock_       = 0.0;
     player_core_seek(player_core_, position);
     render_cv_.notify_one();
 }
@@ -1483,21 +1487,48 @@ void AndroidPlayer::renderLoop() {
                 clock -= audio_output_latency_sec_;
                 if (clock < 0.0) clock = 0.0;
             }
-            // seek_audio_wait_video_ 期间音频被 Android 层暂停，但 Core 的 audio_clock
-            // 仍按真实时间流逝（paused=false），导致 clock 越来越大、delay 越来越负，
-            // 所有恢复门控条件永远无法满足（冻结根因）。
-            // 修复：等待期间改用 seek_target_sec_ 作为时钟基准，使 delay 仅反映
-            // 视频帧与目标 seek 位置的差距，不受等待时长影响。
+            int64_t now = now_ms();
+            double playback_rate = player_core_get_playback_rate(player_core_);
+            if (playback_rate <= 0.0) playback_rate = 1.0;
+            // ── 阶段1：seek_audio_wait_video_ 期间用 seek_target 作基准 ──────────
+            // 音频被 Android 暂停但 audio_clock 仍按真实时间流逝，导致 delay 无限变负。
             if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
                 double seek_target_now = seek_target_sec_.load(std::memory_order_acquire);
                 if (seek_target_now >= 0.0) {
                     clock = seek_target_now;
                 }
+                // 重置 wall-clock 锚点，等待音频恢复后重建
+                post_seek_wall_anchor_ms_ = 0;
+                post_seek_last_clock_ = clock;
+            } else {
+                // ── 阶段2：音频恢复后，检测 audio_clock 停滞并用 wall-clock 兜底 ──
+                // 问题：4K 视频音频队列偶发空洞（OpenSL ES underrun），audio_clock 冻结；
+                // 视频帧继续被 consume，delay 超过 kMaxAhead=2s，触发 ahead-hold 互锁。
+                // 解法：建立 wall-clock 锚点，audio_clock 停滞时用挂钟估算 clock，
+                //       保证 delay 正确反映音视频差距，不因时钟停了而触发互锁。
+                const double kClockStallThreshold = 0.005; // 5ms 内认为时钟停滞
+                const double kWallClockMaxDrift    = 3.0;  // 最多信任 wall-clock 3s
+                bool clock_advanced = std::fabs(clock - post_seek_last_clock_) > kClockStallThreshold;
+                if (clock_advanced) {
+                    // audio_clock 正常推进，更新锚点
+                    post_seek_wall_anchor_ms_    = now;
+                    post_seek_clock_anchor_pts_  = clock;
+                    post_seek_last_clock_        = clock;
+                } else if (post_seek_wall_anchor_ms_ > 0) {
+                    // audio_clock 停滞，用 wall-clock 估算
+                    double wall_elapsed = (now - post_seek_wall_anchor_ms_) / 1000.0;
+                    if (wall_elapsed > 0.0 && wall_elapsed <= kWallClockMaxDrift) {
+                        double wall_clock = post_seek_clock_anchor_pts_ + wall_elapsed * playback_rate;
+                        // 只在 wall_clock > audio_clock 时才替换（避免时钟回跳）
+                        if (wall_clock > clock) {
+                            SYNCI_RATE(60, "evt=wall_clock_fallback audio_clk=%.3f wall_clk=%.3f elapsed=%.3f anchor=%.3f",
+                                       clock, wall_clock, wall_elapsed, post_seek_clock_anchor_pts_);
+                            clock = wall_clock;
+                        }
+                    }
+                }
             }
             double delay = pts - clock;
-            int64_t now = now_ms();
-            double playback_rate = player_core_get_playback_rate(player_core_);
-            if (playback_rate <= 0.0) playback_rate = 1.0;
             bool core_playing_now = player_core_is_playing(player_core_);
             float requested_rate = requested_playback_rate_.load(std::memory_order_relaxed);
             if (requested_rate <= 0.0f) requested_rate = (float)playback_rate;
