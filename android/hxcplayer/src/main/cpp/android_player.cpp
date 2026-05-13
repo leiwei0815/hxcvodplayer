@@ -393,6 +393,13 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     }
 
     LOGI("[open] openURL start_pos=%.3f url=%s", start_position, url ? url : "(null)");
+    // Start every open session from a clean loading baseline.
+    // If previous session ended in seek/replay edge paths, stale loading=true
+    // can leak into the next session and block upper-layer replay guards.
+    bool stale_loading = is_loading_.exchange(false, std::memory_order_acq_rel);
+    if (stale_loading) {
+        LOGI("[open] clear stale loading=true before open switch");
+    }
 
     // Always stop first so the core FSM is in a clean IDLE state before open.
     // This is critical for replay: when playback ends the core reaches a terminal

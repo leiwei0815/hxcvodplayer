@@ -522,6 +522,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastOpenUrl = model.url
         lastOpenStartPosition = maxOf(0.0, startPosition)
         lastOpenPlayModel = clonePlayModel(model)
+        // New open session should not inherit previous seek-loading heuristics.
+        loadingSessionLikelySeek = false
+        loadingCandidateState = null
+        loadingCandidateSinceMs = 0L
         if (!autoReopenInFlight) {
             autoReopenAttemptCount = 0
             networkTotalStallMs = 0L
@@ -752,6 +756,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastOpenUrl = url
         lastOpenStartPosition = startPosition
         lastOpenPlayModel = null
+        // New open session should not inherit previous seek-loading heuristics.
+        loadingSessionLikelySeek = false
+        loadingCandidateState = null
+        loadingCandidateSinceMs = 0L
         if (!autoReopenInFlight) {
             autoReopenAttemptCount = 0
             networkTotalStallMs = 0L
@@ -784,6 +792,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastOpenUrl = url
         lastOpenStartPosition = startPosition
         lastOpenPlayModel = null
+        // New open session should not inherit previous seek-loading heuristics.
+        loadingSessionLikelySeek = false
+        loadingCandidateState = null
+        loadingCandidateSinceMs = 0L
         if (!autoReopenInFlight) {
             autoReopenAttemptCount = 0
             networkTotalStallMs = 0L
@@ -1055,9 +1067,11 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     private fun coerceStateWithLoading(state: PlayerState, loading: Boolean): PlayerState {
-        // Seek recovery can keep loading=true while native briefly reports PLAYING.
-        // Coerce to LOADING to avoid UI hiding spinner too early and causing flicker.
-        return if (loading && state == PlayerState.PLAYING) PlayerState.LOADING else state
+        // Only coerce PLAYING->LOADING for seek-like sessions.
+        // If loading flag gets temporarily stale during replay/open switch,
+        // forcing LOADING here can block upper-layer "main is playing" gates.
+        val seekLikeLoading = loading && loadingSessionLikelySeek
+        return if (seekLikeLoading && state == PlayerState.PLAYING) PlayerState.LOADING else state
     }
 
     /**
