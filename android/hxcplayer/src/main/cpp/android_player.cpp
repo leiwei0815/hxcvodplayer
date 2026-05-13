@@ -1367,6 +1367,10 @@ void AndroidPlayer::renderLoop() {
     int64_t post_seek_ahead_bypass_until_ms = 0;
     int post_seek_bypass_skip_count = 0;
     int seek_resume_stable_frames = 0;
+    // 音频恢复时重新延长 bypass 窗口，在此期间禁止 shrink，防止过早触发 ahead-hold 互锁。
+    int64_t audio_resume_bypass_no_shrink_until_ms = 0;
+    // 当 audio_clock 停滞导致 ahead-hold 互锁时，进入快速追赶模式（持续 consume）。
+    bool ahead_stall_catchup_active = false;
     // Sync-stall watchdog: if pts/clock stay almost unchanged for too long while
     // playback is active, force one consume+display to break potential deadlock.
     double stall_watchdog_last_pts = std::numeric_limits<double>::quiet_NaN();
@@ -2152,7 +2156,9 @@ void AndroidPlayer::renderLoop() {
                                        delay, max_bypass_ahead_sec, post_seek_bypass_skip_count, playback_rate);
                         }
                         int64_t bypass_left_ms = std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now);
-                        if (post_seek_bypass_skip_count >= 3 && bypass_left_ms > 260) {
+                        bool bypass_shrink_protected = (audio_resume_bypass_no_shrink_until_ms > now);
+                        if (!bypass_shrink_protected &&
+                            post_seek_bypass_skip_count >= 3 && bypass_left_ms > 260) {
                             int64_t shrink_ms = (post_seek_bypass_skip_count >= 8) ? 360 : 220;
                             int64_t shortened_left_ms = std::max<int64_t>(220, bypass_left_ms - shrink_ms);
                             post_seek_ahead_bypass_until_ms = now + shortened_left_ms;
@@ -2183,19 +2189,42 @@ void AndroidPlayer::renderLoop() {
                                pts, clock, delay, playback_rate);
                 } else if (!in_seek_recovery &&
                            core_playing_now &&
-                           likely_4k &&
                            snapshot_stalled &&
                            stall_watchdog_since_ms > 0 &&
                            (now - stall_watchdog_since_ms) >= kSyncStallWatchdogMs &&
                            (now - stall_watchdog_last_break_ms) >= kSyncStallWatchdogCooldownMs) {
-                    // If clocks are stuck while "playing", force progress once to
-                    // avoid a long pseudo-playing freeze in high-load scenarios.
-                    should_display = should_consume = true;
+                    // audio_clock + video_pts 均停滞（audio queue 空或 codec 慢）：
+                    // 视频超前音频 >2s 且两者都不动时（互锁），持续 consume 帧追赶，
+                    // 每 kSyncStallWatchdogCooldownMs 展示 1 帧，保持可见进度。
+                    // 注：不再限制 likely_4k，普通分辨率也可能在 seek 后出现此互锁。
+                    bool stall_gap_large = delay > (kMaxAhead + 0.5);
+                    should_consume = true;
+                    if (!stall_gap_large) {
+                        should_display = true; // gap 接近临界时顺便展示
+                    }
+                    if (stall_gap_large) {
+                        // 开启快速追赶模式：持续 consume 直到 delay < kMaxAhead
+                        ahead_stall_catchup_active = true;
+                    }
                     stall_watchdog_last_break_ms = now;
-                    SYNCI_RATE(20, "evt=sync_stall_watchdog_break pts=%.3f clk=%.3f delay=%.3f stalled_ms=%" PRId64 " rate=%.2f",
-                               pts, clock, delay, (int64_t)(now - stall_watchdog_since_ms), playback_rate);
+                    SYNCI_RATE(20, "evt=sync_stall_watchdog_drop pts=%.3f clk=%.3f delay=%.3f stalled_ms=%" PRId64 " rate=%.2f gap_large=%d catchup=%d",
+                               pts, clock, delay, (int64_t)(now - stall_watchdog_since_ms), playback_rate,
+                               stall_gap_large ? 1 : 0, ahead_stall_catchup_active ? 1 : 0);
                 }
                 // else: video > 2s ahead of audio -- hold frame (don't consume)
+                // 兜底：若处于 ahead-stall 快速追赶模式，强制 consume（丢帧）直到 delay 收敛。
+                else if (ahead_stall_catchup_active) {
+                    should_consume = true;
+                    SYNCI_RATE(30, "evt=ahead_stall_catchup_drop pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
+                               pts, clock, delay, playback_rate);
+                }
+            }
+
+            // 追赶模式退出检查：delay 已收敛到正常范围
+            if (ahead_stall_catchup_active && delay <= kMaxAhead) {
+                ahead_stall_catchup_active = false;
+                SYNCI("evt=ahead_stall_catchup_done pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
+                      pts, clock, delay, playback_rate);
             }
 
             if (should_display) {
@@ -2278,19 +2307,32 @@ void AndroidPlayer::renderLoop() {
                          seek_resume_slow_path_ready || seek_resume_fast_path_ready ||
                          seek_resume_force_timeout)) {
                         if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
-                            // 重锚 master clock 到当前视频帧 pts，消除 seek 期间音频暂停
-                            // 导致 audio_clock 自动流逝的累积偏差（腾讯播放器 ptsShift=0 等效操作）。
-                            if (player_core_) {
-                                player_core_anchor_clock(player_core_, pts);
-                            }
                             if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
-                                LOGI("[sync] seek first-frame resume audio: result=%d anchor_pts=%.3f", r, pts);
+                                LOGI("[sync] seek first-frame resume audio: result=%d pts=%.3f delay=%.3f", r, pts, delay);
                             }
-                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f stable=%d/%d by_deadline=%d fast_path=%d deadline_guard=%.3f force_timeout=%d rate=%.2f anchor_pts=%.3f",
+                            // 恢复音频时重新延长 ahead-bypass 窗口。
+                            // seek_lower_bound_hit 时设置的 bypass 窗口（900~1300ms）往往在音频
+                            // 恢复之前或刚恢复后就过期；此时 audio_clock 刚开始推进，视频可能
+                            // 已超前 1~2s（尤其是 4K lower_bound 阶段大量 drop），导致 delay>2s
+                            // 触发 ahead-hold，audio 也停止拉取，形成互锁卡住画面。
+                            // 重设 bypass 窗口保证音频有足够时间（~3s）推进时钟追上视频。
+                            {
+                                int64_t audio_resume_bypass_ms = likely_4k ? 3500 : 2500;
+                                if (playback_rate >= 2.0) audio_resume_bypass_ms += 500;
+                                int64_t new_bypass_until = now + audio_resume_bypass_ms;
+                                if (new_bypass_until > post_seek_ahead_bypass_until_ms) {
+                                    post_seek_ahead_bypass_until_ms = new_bypass_until;
+                                    post_seek_bypass_skip_count = 0;
+                                    // 禁止 bypass-shrink 至少 2s，保证 bypass 窗口不被过早压缩
+                                    audio_resume_bypass_no_shrink_until_ms = now + 2000;
+                                }
+                            }
+                            SYNCI("evt=seek_audio_resume_gate delay=%.3f threshold=%.3f stable=%d/%d by_deadline=%d fast_path=%d deadline_guard=%.3f force_timeout=%d rate=%.2f bypass_extended_ms=%" PRId64,
                                   delay, seek_resume_sync_threshold, seek_resume_stable_frames, seek_resume_need_stable_frames,
                                   seek_resume_deadline ? 1 : 0, seek_resume_fast_path_ready ? 1 : 0, seek_resume_deadline_guard,
-                                  seek_resume_force_timeout ? 1 : 0, playback_rate, pts);
+                                  seek_resume_force_timeout ? 1 : 0, playback_rate,
+                                  (int64_t)std::max<int64_t>(0, post_seek_ahead_bypass_until_ms - now));
                         }
                         seek_resume_stable_frames = 0;
                         seek_audio_wait_deadline_ms_ = 0;
