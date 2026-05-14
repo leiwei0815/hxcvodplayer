@@ -2,7 +2,7 @@ name: Build Android SDK
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [ main, master, develop, mian-android, main-android ]
     tags:
       - 'v*'
   pull_request:
