@@ -97,10 +97,10 @@
 #define SYNCW_RATE(...) TAGW_RATE(LOG_TAG_SYNC, __VA_ARGS__)
 #define DECODEI(...)    TAGI(LOG_TAG_DECODE, __VA_ARGS__)
 #define PBOD(...)       TAGD(LOG_TAG_PBO, __VA_ARGS__)
-#define PBOI(...)       TAGI(LOG_TAG_PBO, __VA_ARGS__)
+#define PBOI(...)       ((void)0)
 #define PBOW(...)       TAGW(LOG_TAG_PBO, __VA_ARGS__)
 #define SEEKW(...)      TAGW(LOG_TAG_SEEK_WATCH, __VA_ARGS__)
-#define PBOI_RATE(...)  TAGI_RATE(LOG_TAG_PBO, __VA_ARGS__)
+#define PBOI_RATE(...)  ((void)0)
 #define PBOW_RATE(...)  TAGW_RATE(LOG_TAG_PBO, __VA_ARGS__)
 
 // Rate-limited logging: prints at most once every N calls.
