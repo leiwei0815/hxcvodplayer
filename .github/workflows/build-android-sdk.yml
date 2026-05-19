@@ -257,17 +257,7 @@ jobs:
           done
           echo "✅ FFmpeg mediacodec 组件宏校验通过"
 
-      # 上传第三方库产物，供下一个 Job 使用
-      - name: 上传第三方库产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-third-libs
-          path: |
-            android-third/ffmpeg-build-android/FFmpeg-Android
-            android-third/mbedtls-build-android/mbedTLS-Android
-            android-third/curl-build-android/curl-Android
-            android-third/soundtouch-build-android/SoundTouch-Android
-          retention-days: 2
+      # 第三方库通过 actions/cache 在 Job 间复用，避免占用 artifact 配额
 
   # ============================================================
   # Job 2: 编译 AAR
@@ -305,15 +295,24 @@ jobs:
           echo "ANDROID_NDK=$NDK_PATH" >> $GITHUB_ENV
           echo "NDK_PATH=$NDK_PATH" >> $GITHUB_ENV
 
-      # 下载第三方库产物
-      - name: 下载第三方库产物
-        uses: actions/download-artifact@v4
+      # 通过 cache 恢复第三方库产物（避免 upload/download artifact）
+      - name: 恢复 android-third 编译产物缓存
+        id: cache-third-party
+        uses: actions/cache@v4
         with:
-          name: android-third-libs
-          path: .
+          path: |
+            android-third/ffmpeg-build-android
+            android-third/mbedtls-build-android
+            android-third/curl-build-android
+            android-third/soundtouch-build-android
+          key: android-third-${{ env.NDK_VERSION }}-${{ env.THIRD_PARTY_CACHE_REV }}-${{ hashFiles('android-third/build_*.sh') }}
 
       - name: 验证第三方库
         run: |
+          if [ "${{ steps.cache-third-party.outputs.cache-hit }}" != "true" ]; then
+            echo "❌ 未命中第三方库缓存，请先确保 build-third-party Job 成功执行并写入缓存"
+            exit 1
+          fi
           echo "=== 检查第三方库 ==="
           find android-third -name "*.so" | head -30
           find android-third -name "*.a" | head -10
@@ -367,6 +366,7 @@ jobs:
 
       - name: 上传 AAR（Release）
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: hxcplayer-release-aar
           path: android/hxcplayer/build/outputs/aar/hxcplayer-release.aar
@@ -376,6 +376,7 @@ jobs:
       - name: 上传 AAR（Debug）
         if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'all' }}
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: hxcplayer-debug-aar
           path: android/hxcplayer/build/outputs/aar/hxcplayer-debug.aar
