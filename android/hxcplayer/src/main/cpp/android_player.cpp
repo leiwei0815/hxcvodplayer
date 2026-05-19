@@ -879,13 +879,10 @@ void AndroidPlayer::setVolume(float volume) {
     // Guard with core playing state to avoid resuming OpenSL while app is paused.
     if (prev <= 0.0f
         && volume > 0.0f
-        && playItf_
         && audio_active_
         && player_core_is_playing(player_core_)) {
-        SLuint32 state = 0;
-        if ((*playItf_)->GetPlayState(playItf_, &state) == SL_RESULT_SUCCESS &&
-            state != SL_PLAYSTATE_PLAYING) {
-            setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
+        SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
+        if (r == SL_RESULT_SUCCESS) {
             LOGI("[ctrl] audio resumed on volume un-mute");
         }
     }

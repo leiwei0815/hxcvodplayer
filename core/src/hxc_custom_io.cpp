@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <vector>
 #include <chrono>
+#include <limits>
 
 // 平台相关的 HTTP 实现
 #if defined(__APPLE__)
@@ -64,8 +65,13 @@ static inline uint8_t decrypt_first100_byte(uint8_t b) {
 static size_t curl_write_callback(void* contents, size_t size, size_t nmemb, void* userp) {
     size_t realsize = size * nmemb;
     std::vector<uint8_t>* buffer = static_cast<std::vector<uint8_t>*>(userp);
-    
+    if (!contents || !buffer || realsize == 0) {
+        return 0;
+    }
     size_t old_size = buffer->size();
+    if (old_size > (std::numeric_limits<size_t>::max() - realsize)) {
+        return 0;
+    }
     buffer->resize(old_size + realsize);
     std::memcpy(buffer->data() + old_size, contents, realsize);
     
