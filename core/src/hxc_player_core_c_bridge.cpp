@@ -44,6 +44,7 @@ struct PlayerCoreHandle {
     int audio_current_channels;         // 当前音频通道数
     std::atomic<uint64_t> audio_seek_serial; // seek 代数，用于丢弃 seek 前旧回调
     int audio_buf_serial;               // 当前桥接音频缓冲对应的 serial
+    std::mutex audio_data_mutex;        // 保护音频缓冲/重采样/SoundTouch并发访问
 
     // 音频重采样器
     hxcplayer::AudioResampler* resampler;
@@ -330,6 +331,7 @@ const char* player_core_get_video_decode_diagnostic(PlayerCoreHandle* handle) {
 
 void player_core_seek(PlayerCoreHandle* handle, double pos) {
     if (handle && handle->core) {
+        std::lock_guard<std::mutex> audio_lock(handle->audio_data_mutex);
         handle->audio_seek_serial.fetch_add(1, std::memory_order_acq_rel);
         // iOS/macOS/Android 通过 C bridge 拉取音频数据时，先清空桥接层音频残留，
         // 避免 seek 后短暂输出旧缓冲导致主时钟回跳。
@@ -358,6 +360,7 @@ void player_core_set_volume(PlayerCoreHandle* handle, float volume) {
 
 void player_core_set_playback_rate(PlayerCoreHandle* handle, float rate) {
     if (handle && handle->core) {
+        std::lock_guard<std::mutex> audio_lock(handle->audio_data_mutex);
         handle->core->set_playback_rate(rate);
         
 #ifdef HAS_SOUNDTOUCH
@@ -592,6 +595,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
     if (!handle || !handle->core || !buffer || buffer_size <= 0) {
         return 0;
     }
+    std::lock_guard<std::mutex> audio_lock(handle->audio_data_mutex);
 
     uint64_t call_seek_serial = handle->audio_seek_serial.load(std::memory_order_acquire);
     
@@ -674,6 +678,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         int channels = frame->ch_layout.nb_channels;
         int samples = frame->nb_samples;
         int sample_rate = frame->sample_rate;
+        AVSampleFormat sample_fmt = static_cast<AVSampleFormat>(frame->format);
 
         // 防御性检查：部分解码器在 flush/边界时可能给出 nb_samples>0 但 data[0] 为空指针或缓冲区大小为 0 的帧；
         // 此时直接丢弃，避免后续 memcpy / 重采样访问非法地址导致崩溃。
@@ -681,9 +686,13 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             nullptr,
             channels,
             samples,
-            (AVSampleFormat)frame->format,
+            sample_fmt,
             0);
-        if (samples <= 0 || !frame->data[0] || expected_src_size <= 0) {
+        if (channels <= 0 || channels > 8 ||
+            sample_rate <= 0 || sample_rate > 384000 ||
+            samples <= 0 || samples > 32768 ||
+            av_get_bytes_per_sample(sample_fmt) <= 0 ||
+            !frame->data[0] || expected_src_size <= 0) {
             audioQueue->next();
             return 0;
         }
@@ -716,19 +725,24 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             output_channels = channels;
         }
         handle->audio_current_channels = output_channels;
-        handle->resampler->configure(&frame->ch_layout,
-                                     (AVSampleFormat)frame->format,
-                                     sample_rate,
-                                     &dst_layout,
-                                     AV_SAMPLE_FMT_S16,
-                                     sample_rate);
+        int cfg_ret = handle->resampler->configure(&frame->ch_layout,
+                                                   sample_fmt,
+                                                   sample_rate,
+                                                   &dst_layout,
+                                                   AV_SAMPLE_FMT_S16,
+                                                   sample_rate);
+        if (cfg_ret < 0) {
+            audioQueue->next();
+            return 0;
+        }
 
         uint8_t* audio_data = nullptr;
         int audio_samples = samples;
 
         // 重采样（如果需要）
         if (handle->resampler->is_needed()) {
-            int ret = handle->resampler->resample(frame->data, samples, &audio_data, &audio_samples);
+            uint8_t** src_planes = frame->extended_data ? frame->extended_data : frame->data;
+            int ret = handle->resampler->resample(src_planes, samples, &audio_data, &audio_samples);
             if (ret < 0) {
                 audioQueue->next();
                 return 0;
@@ -737,7 +751,12 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             audio_data = frame->data[0];
         }
 
-        int raw_output_size = audio_samples * output_channels * sizeof(int16_t);
+        int64_t raw_output_size64 = (int64_t)audio_samples * output_channels * (int)sizeof(int16_t);
+        if (audio_samples <= 0 || !audio_data || raw_output_size64 <= 0 || raw_output_size64 > (8 * 1024 * 1024)) {
+            audioQueue->next();
+            return 0;
+        }
+        int raw_output_size = (int)raw_output_size64;
         
         // 确保临时缓冲区足够大
         if (!handle->audio_buf || handle->audio_buf_size < (unsigned int)raw_output_size * 2) {

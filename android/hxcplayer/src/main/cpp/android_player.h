@@ -216,6 +216,7 @@ private:
     bool initAudioOutput(int sample_rate, int channels);
     void destroyAudioOutput();
     void ensureAudioOutputForCurrentStream();
+    SLresult setOpenSLESPlayState(SLuint32 state, bool require_audible);
     static void audioCallback(SLAndroidSimpleBufferQueueItf bq, void* context);
     void onAudioData(SLAndroidSimpleBufferQueueItf bq);
 
