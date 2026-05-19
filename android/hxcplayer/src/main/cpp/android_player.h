@@ -52,6 +52,7 @@ public:
     bool openWithCustomFile(const char* path, size_t avio_buffer_size = 64 * 1024,
                             bool encrypted_file = false);
     bool openWithSecureSession(const char* url,
+                               double      start_position,
                                const char* auth_token,
                                const char* video_id,
                                const char* device_id          = nullptr,
@@ -64,6 +65,7 @@ public:
                                const char* key_material_b64   = nullptr,
                                const char* key_iv_hex         = nullptr);
     bool openWithSecureHLS(const char* url,
+                           double      start_position,
                            const char* auth_token,
                            const char* video_id,
                            const char* device_id          = nullptr,
@@ -239,6 +241,8 @@ private:
     int64_t           audio_rebuffer_deadline_ms_{0};
     int64_t           audio_rebuffer_paused_at_ms_{0};
     int64_t           audio_rebuffer_min_resume_at_ms_{0};
+    // Prevent high-rate starvation logic from rapidly re-triggering pause/resume oscillation.
+    int64_t           audio_rebuffer_cooldown_until_ms_{0};
     // AV sync helpers (mirroring iOS HXCPlayerControl logic)
     double            audio_output_latency_sec_{0.0}; // estimated hw output queue delay
     std::atomic<int>  sync_warmup_frames_{0};         // relaxed sync window after open/seek

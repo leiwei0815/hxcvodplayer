@@ -456,6 +456,7 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         audio_rebuffer_deadline_ms_ = 0;
         audio_rebuffer_paused_at_ms_ = 0;
         audio_rebuffer_min_resume_at_ms_ = 0;
+        audio_rebuffer_cooldown_until_ms_ = 0;
         seek_target_sec_.store(-1.0, std::memory_order_release);
         seek_from_sec_.store(-1.0, std::memory_order_release);
         seek_fast_catchup_frames_.store(0, std::memory_order_release);
@@ -590,6 +591,7 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
 }
 
 bool AndroidPlayer::openWithSecureSession(const char* url,
+                                          double start_position,
                                           const char* auth_token,
                                           const char* video_id,
                                           const char* device_id,
@@ -624,7 +626,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     PlayerDataSourceConfigC config{};
     PlayerDataSourceC source{};
     source.url = url;
-    source.start_position = 0.0;
+    source.start_position = start_position;
     source.mode = PLAYER_DATA_SOURCE_MODE_SECURE_HLS;
     source.encrypted_file = 0;
     source.secure_headers = secure_headers;
@@ -650,6 +652,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
 }
 
 bool AndroidPlayer::openWithSecureHLS(const char* url,
+                                      double start_position,
                                       const char* auth_token,
                                       const char* video_id,
                                       const char* device_id,
@@ -663,6 +666,7 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
                                       const char* key_iv_hex) {
     // Legacy alias: forward to openWithSecureSession
     return openWithSecureSession(url,
+                                 start_position,
                                  auth_token,
                                  video_id,
                                  device_id,
@@ -692,6 +696,7 @@ void AndroidPlayer::play() {
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
     audio_rebuffer_min_resume_at_ms_ = 0;
+    audio_rebuffer_cooldown_until_ms_ = 0;
     seek_recovery_active_.store(false, std::memory_order_release);
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
@@ -740,6 +745,7 @@ void AndroidPlayer::pause() {
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
     audio_rebuffer_min_resume_at_ms_ = 0;
+    audio_rebuffer_cooldown_until_ms_ = 0;
     seek_recovery_active_.store(false, std::memory_order_release);
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
@@ -770,6 +776,7 @@ void AndroidPlayer::stop() {
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
     audio_rebuffer_min_resume_at_ms_ = 0;
+    audio_rebuffer_cooldown_until_ms_ = 0;
     seek_recovery_active_.store(false, std::memory_order_release);
     seek_recovery_deadline_ms_ = 0;
     seek_audio_wait_video_.store(false, std::memory_order_release);
@@ -827,6 +834,7 @@ void AndroidPlayer::seekTo(double position) {
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
     audio_rebuffer_min_resume_at_ms_ = 0;
+    audio_rebuffer_cooldown_until_ms_ = 0;
     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PAUSED);
         LOGI("[sync] seek pause audio waiting first target frame: result=%d", r);
@@ -2138,6 +2146,11 @@ void AndroidPlayer::renderLoop() {
                         } else if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
                             audio_rebuffer_paused_at_ms_ = 0;
                             audio_rebuffer_min_resume_at_ms_ = 0;
+                            // Add a short cool-down after resume to avoid rapid pause/resume loops.
+                            int64_t cooldown_ms = (playback_rate >= 2.8 && !likely_4k) ? 1300 :
+                                                  ((playback_rate >= 2.5 && !likely_4k) ? 1000 :
+                                                   (high_rate ? 700 : 450));
+                            audio_rebuffer_cooldown_until_ms_ = now + cooldown_ms;
                             if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                                 LOGI("[sync] audio resumed after video rebuffer: result=%d", r);
@@ -2349,17 +2362,25 @@ void AndroidPlayer::renderLoop() {
             bool likely_4k = gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160;
             bool in_loading = is_loading_.load(std::memory_order_acquire);
             bool in_sync_warmup = sync_warmup_frames_.load(std::memory_order_acquire) > 0;
-            int64_t rebuffer_trigger_ms = high_rate ? 180 : 260;
+            int64_t rebuffer_trigger_ms = high_rate ? 220 : 260;
+            if (!likely_4k && playback_rate >= 2.5) {
+                rebuffer_trigger_ms = 260;
+            }
+            if (!likely_4k && playback_rate >= 2.8) {
+                rebuffer_trigger_ms = 320;
+            }
             if (likely_4k) rebuffer_trigger_ms = std::max<int64_t>(160, rebuffer_trigger_ms - 20);
             int64_t rebuffer_fallback_ms = high_rate ? 850 : 700;
             if (likely_4k) rebuffer_fallback_ms += 150;
             int64_t rebuffer_min_hold_ms = high_rate ? 650 : 450;
             if (likely_4k) rebuffer_min_hold_ms += 150;
+            bool rebuffer_cooldown_active = now < audio_rebuffer_cooldown_until_ms_;
             if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 high_rate && in_empty_streak &&
                 !in_loading &&
                 !in_sync_warmup &&
                 core_playing &&
+                !rebuffer_cooldown_active &&
                 !audio_rebuffer_pending_.load(std::memory_order_acquire)) {
                 int64_t empty_ms = now - empty_start_ms;
                 if (empty_ms >= rebuffer_trigger_ms && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
@@ -2386,6 +2407,10 @@ void AndroidPlayer::renderLoop() {
                 if (audio_rebuffer_pending_.exchange(false, std::memory_order_acq_rel)) {
                     audio_rebuffer_paused_at_ms_ = 0;
                     audio_rebuffer_min_resume_at_ms_ = 0;
+                    int64_t cooldown_ms = (playback_rate >= 2.8 && !likely_4k) ? 1300 :
+                                          ((playback_rate >= 2.5 && !likely_4k) ? 1000 :
+                                           (high_rate ? 700 : 450));
+                    audio_rebuffer_cooldown_until_ms_ = now + cooldown_ms;
                     if (core_playing && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
                         LOGI("[sync] audio rebuffer fallback resume: result=%d", r);

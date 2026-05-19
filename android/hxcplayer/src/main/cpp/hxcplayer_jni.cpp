@@ -23,6 +23,7 @@ extern "C" {
 static jboolean hxc_native_open_with_secure_session(JNIEnv *env,
                                                     jlong handle,
                                                     jstring url,
+                                                    jdouble start_position,
                                                     jstring auth_token,
                                                     jstring video_id,
                                                     jstring device_id,
@@ -48,7 +49,7 @@ static jboolean hxc_native_open_with_secure_session(JNIEnv *env,
     const char* c_key = key_material_b64 ? env->GetStringUTFChars(key_material_b64, nullptr) : nullptr;
     const char* c_iv = key_iv_hex ? env->GetStringUTFChars(key_iv_hex, nullptr) : nullptr;
 
-    bool result = player->openWithSecureSession(c_url, c_auth, c_vid, c_dev, c_secret, c_nonce, c_sid, c_hdr,
+    bool result = player->openWithSecureSession(c_url, (double)start_position, c_auth, c_vid, c_dev, c_secret, c_nonce, c_sid, c_hdr,
                                                 static_cast<int64_t>(session_expire_at_ms), key_mode, c_key, c_iv);
 
     env->ReleaseStringUTFChars(url, c_url);
@@ -438,10 +439,10 @@ Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomHTTP(
 
 JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithSecureSession(
-        JNIEnv *env, jobject thiz, jlong handle, jstring url, jstring auth_token, jstring video_id,
+        JNIEnv *env, jobject thiz, jlong handle, jstring url, jdouble start_position, jstring auth_token, jstring video_id,
         jstring device_id, jstring secret_id, jstring nonce, jstring play_session_id,
         jstring secure_headers, jlong session_expire_at_ms, jint key_mode, jstring key_material_b64, jstring key_iv_hex) {
-    return hxc_native_open_with_secure_session(env, handle, url, auth_token, video_id, device_id, secret_id, nonce,
+    return hxc_native_open_with_secure_session(env, handle, url, start_position, auth_token, video_id, device_id, secret_id, nonce,
                                                play_session_id, secure_headers, session_expire_at_ms, key_mode,
                                                key_material_b64, key_iv_hex);
 }
@@ -449,10 +450,10 @@ Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithSecureSession(
 // 兼容 JNI 旧入口：内部转发到 nativeOpenWithSecureSession。
 JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithSecureHLS(
-        JNIEnv *env, jobject thiz, jlong handle, jstring url, jstring auth_token, jstring video_id,
+        JNIEnv *env, jobject thiz, jlong handle, jstring url, jdouble start_position, jstring auth_token, jstring video_id,
         jstring device_id, jstring secret_id, jstring nonce, jstring play_session_id,
         jstring secure_headers, jlong session_expire_at_ms, jint key_mode, jstring key_material_b64, jstring key_iv_hex) {
-    return hxc_native_open_with_secure_session(env, handle, url, auth_token, video_id, device_id, secret_id, nonce,
+    return hxc_native_open_with_secure_session(env, handle, url, start_position, auth_token, video_id, device_id, secret_id, nonce,
                                                play_session_id, secure_headers, session_expire_at_ms, key_mode,
                                                key_material_b64, key_iv_hex);
 }
