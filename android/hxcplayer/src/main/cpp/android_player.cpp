@@ -2149,7 +2149,7 @@ void AndroidPlayer::renderLoop() {
                             // Add a short cool-down after resume to avoid rapid pause/resume loops.
                             int64_t cooldown_ms = (playback_rate >= 2.8 && !likely_4k) ? 1300 :
                                                   ((playback_rate >= 2.5 && !likely_4k) ? 1000 :
-                                                   (high_rate ? 700 : 450));
+                                                   ((playback_rate >= 2.0f) ? 700 : 450));
                             audio_rebuffer_cooldown_until_ms_ = now + cooldown_ms;
                             if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                                 SLresult r = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_PLAYING);
