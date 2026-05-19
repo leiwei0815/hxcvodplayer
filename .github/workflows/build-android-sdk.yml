@@ -262,8 +262,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: android-third-libs
-          path: android-third
-          retention-days: 7
+          path: |
+            android-third/ffmpeg-build-android/FFmpeg-Android
+            android-third/mbedtls-build-android/mbedTLS-Android
+            android-third/curl-build-android/curl-Android
+            android-third/soundtouch-build-android/SoundTouch-Android
+          retention-days: 2
 
   # ============================================================
   # Job 2: 编译 AAR
@@ -306,7 +310,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: android-third-libs
-          path: android-third
+          path: .
 
       - name: 验证第三方库
         run: |
