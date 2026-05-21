@@ -267,6 +267,8 @@ private:
     // Triple-gate counter: require consecutive "target+sync ready" frames
     // before resuming audio after seek.
     std::atomic<int>    seek_resume_stable_hits_{0};
+    // Secure HLS / encrypted session: seek sync uses keyframe-ahead landing strategy.
+    std::atomic<bool>   secure_session_active_{false};
     // Seek recovery diagnostics and adaptive lower-bound relaxation.
     int64_t             seek_started_at_ms_{0};
     int                 seek_lower_bound_drop_count_{0};
@@ -299,6 +301,20 @@ private:
 
     std::atomic<bool> has_pending_playback_completed_{false};
     static void playbackCompletedCallback(void* user_data);
+
+    void trySeekAudioWaitDeadlineFallback(int64_t now,
+                                          double pts,
+                                          bool likely_4k,
+                                          int64_t& post_seek_ahead_bypass_until_ms);
+    void resumeSeekAudioAfterKeyframeAhead(int64_t now,
+                                           double pts,
+                                           double& clock,
+                                           double& delay,
+                                           double seek_target_now,
+                                           bool is_backward_seek,
+                                           bool large_forward_seek,
+                                           bool likely_4k,
+                                           int64_t& post_seek_ahead_bypass_until_ms);
 };
 
 #endif // ANDROID_PLAYER_H

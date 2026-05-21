@@ -371,7 +371,7 @@ jobs:
           name: hxcplayer-release-aar
           path: android/hxcplayer/build/outputs/aar/hxcplayer-release.aar
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 1
 
       - name: 上传 AAR（Debug）
         if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'all' }}
@@ -381,7 +381,7 @@ jobs:
           name: hxcplayer-debug-aar
           path: android/hxcplayer/build/outputs/aar/hxcplayer-debug.aar
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 1
 
   # ============================================================
   # Job 3: 发布到 GitHub Release（仅在打 tag 时）

@@ -300,6 +300,14 @@ class HXCPlayerControl @JvmOverloads constructor(
         fun onPlaybackCompleted()
     }
 
+    /**
+     * 异步 [playWithModelAsync] / [openWithPlayModelAsync] 结果回调。
+     * 使用 SAM，便于 Java 调用方避免 Kotlin `Unit` 与 Java `void` 类型不兼容。
+     */
+    fun interface PlayModelAsyncCallback {
+        fun onResult(accepted: Boolean)
+    }
+
     private var nativeHandle: Long = 0
     private var callback: PlayerCallback? = null
     private var completedCallback: PlaybackCompletedCallback? = null
@@ -1002,10 +1010,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun openWithPlayModelAsync(
         model: PlayerDataSourcePlayModel,
         startPosition: Double = 0.0,
-        callback: ((Boolean) -> Unit)? = null
+        callback: PlayModelAsyncCallback? = null
     ) {
         if (isReleased) {
-            callback?.let { cb -> mainHandler.post { cb(false) } }
+            callback?.let { cb -> mainHandler.post { cb.onResult(false) } }
             return
         }
         val safeModel = clonePlayModel(model)
@@ -1014,12 +1022,12 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val result = openWithPlayModel(safeModel, startPosition)
                 mainHandler.post {
                     if (!isReleased) {
-                        callback?.invoke(result)
+                        callback?.onResult(result)
                     }
                 }
             }
         } catch (_: RejectedExecutionException) {
-            callback?.let { cb -> mainHandler.post { cb(false) } }
+            callback?.let { cb -> mainHandler.post { cb.onResult(false) } }
         }
     }
 
@@ -1029,13 +1037,13 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun playWithModelAsync(
         model: PlayerDataSourcePlayModel,
         startPosition: Double = pendingStartPosition,
-        callback: ((Boolean) -> Unit)? = null
+        callback: PlayModelAsyncCallback? = null
     ) {
         openWithPlayModelAsync(model, startPosition) { opened ->
             if (opened && !isReleased && autoPlayer) {
                 play()
             }
-            callback?.invoke(opened)
+            callback?.onResult(opened)
         }
     }
 
