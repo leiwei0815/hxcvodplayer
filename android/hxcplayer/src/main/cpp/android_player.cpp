@@ -830,6 +830,8 @@ void AndroidPlayer::seekTo(double position) {
         std::chrono::steady_clock::now().time_since_epoch()).count();
     seek_started_at_ms_ = now;
     seek_lower_bound_drop_count_ = 0;
+    secure_seek_precise_reseek_count_.store(0, std::memory_order_release);
+    secure_seek_precise_reseek_cooldown_until_ms_ = 0;
     seek_catchup_deadline_ms_ = now + (very_large_seek ? 1200 : 900);
     seek_lower_bound_active_.store(true, std::memory_order_release);
     // Avoid long black/frozen waits after large forward seeks on 4K.
@@ -1783,6 +1785,7 @@ void AndroidPlayer::renderLoop() {
                 bool large_forward_seek = !is_backward_seek && seek_span_sec > 25.0;
                 bool large_seek_any_direction = seek_span_abs_sec > 25.0;
                 bool very_large_seek = seek_span_abs_sec > 180.0;
+                bool secure_session = secure_session_active_.load(std::memory_order_acquire);
                 double stale_future_margin_sec = ultra_high_rate_4k ? 6.0 : 3.5;
                 if (large_forward_seek) {
                     // Tencent/Exo-like seek UX: on large forward jumps, prioritize
@@ -1844,7 +1847,46 @@ void AndroidPlayer::renderLoop() {
                     }
                     seek_epsilon_sec = std::max(seek_epsilon_sec, forced_eps);
                 }
-                if (pts + seek_epsilon_sec < seek_target_now) {
+                double secure_future_guard_sec = is_backward_seek ? 6.0 : (very_large_seek ? 14.0 : 12.0);
+                if (seek_elapsed_ms >= 2600) {
+                    secure_future_guard_sec += 8.0;
+                }
+                bool secure_far_future_hit = secure_session
+                        && pts > seek_target_now + secure_future_guard_sec
+                        && seek_elapsed_ms < 4200;
+                if (secure_far_future_hit) {
+                    should_consume = true;
+                    seek_lower_bound_drop_count_++;
+                    int reseek_count = secure_seek_precise_reseek_count_.load(std::memory_order_acquire);
+                    bool can_reseek = reseek_count < 2
+                            && now >= secure_seek_precise_reseek_cooldown_until_ms_
+                            && seek_elapsed_ms >= 260;
+                    if (can_reseek && player_core_) {
+                        secure_seek_precise_reseek_count_.store(reseek_count + 1, std::memory_order_release);
+                        secure_seek_precise_reseek_cooldown_until_ms_ = now + 700;
+                        seek_from_sec_.store(pts, std::memory_order_release);
+                        seek_target_sec_.store(seek_target_now, std::memory_order_release);
+                        seek_started_at_ms_ = now;
+                        seek_lower_bound_active_.store(true, std::memory_order_release);
+                        seek_lower_bound_deadline_ms_ = now + 2400;
+                        seek_recovery_active_.store(true, std::memory_order_release);
+                        seek_recovery_deadline_ms_ = now + 4600;
+                        seek_audio_wait_video_.store(true, std::memory_order_release);
+                        seek_audio_wait_deadline_ms_ = now + 4200;
+                        seek_resume_stable_hits_.store(0, std::memory_order_release);
+                        sync_warmup_frames_.store(44, std::memory_order_release);
+                        if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                            setOpenSLESPlayState(SL_PLAYSTATE_PAUSED, true);
+                        }
+                        player_core_seek(player_core_, seek_target_now);
+                        render_cv_.notify_one();
+                        SYNCW("evt=seek_secure_precise_reseek target=%.3f pts=%.3f elapsed_ms=%" PRId64 " count=%d guard=%.3f",
+                              seek_target_now, pts, seek_elapsed_ms, reseek_count + 1, secure_future_guard_sec);
+                    } else {
+                        SYNCW_RATE(20, "evt=seek_secure_far_future_drop pts=%.3f target=%.3f elapsed_ms=%" PRId64 " drop_count=%d guard=%.3f reseek_count=%d",
+                                   pts, seek_target_now, seek_elapsed_ms, seek_lower_bound_drop_count_, secure_future_guard_sec, reseek_count);
+                    }
+                } else if (pts + seek_epsilon_sec < seek_target_now) {
                     should_consume = true;
                     seek_lower_bound_drop_count_++;
                     LOGW_RATE(20, "[sync] seek lower-bound drop: pts=%.3f target=%.3f",

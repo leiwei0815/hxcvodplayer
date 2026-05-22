@@ -272,6 +272,9 @@ private:
     // Seek recovery diagnostics and adaptive lower-bound relaxation.
     int64_t             seek_started_at_ms_{0};
     int                 seek_lower_bound_drop_count_{0};
+    // Secure seek precise landing: when first hit is too far ahead, allow bounded reseek.
+    std::atomic<int>    secure_seek_precise_reseek_count_{0};
+    int64_t             secure_seek_precise_reseek_cooldown_until_ms_{0};
     // High-rate cadence: avoid long "all-drop then force old frame" behavior.
     int                 consecutive_drop_count_{0};
     // Severe-lag detector for soft re-anchor (prevents endless drop loops).
