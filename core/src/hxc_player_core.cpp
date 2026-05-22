@@ -1636,12 +1636,48 @@ void PlayerCore::stop() {
     close();
 }
 
+void PlayerCore::prepare_seek_from_ended_session() {
+    const PipelineState ps = pipeline_state_.load(std::memory_order_acquire);
+    const bool ended_pipeline = (ps == PipelineState::Ended);
+    const bool decode_done = decode_finished_.load(std::memory_order_acquire);
+    const bool completed_notified = playback_completed_notified_.load(std::memory_order_acquire);
+    if (!ended_pipeline && !decode_done && !completed_notified) {
+        return;
+    }
+    if (!format_ctx_) {
+        LOG_WARNING("prepare_seek_from_ended_session: format_ctx is null, skip");
+        return;
+    }
+    LOG_INFO("prepare_seek_from_ended_session: ended=", ended_pipeline,
+             " decode_finished=", decode_done,
+             " completed_notified=", completed_notified);
+    playback_completed_notified_.store(false, std::memory_order_release);
+    decode_finished_.store(false, std::memory_order_release);
+    pause_request_ = false;
+    set_play_when_ready_internal(true);
+    if (video_decoder_) {
+        video_decoder_->resume();
+    }
+    if (audio_decoder_) {
+        audio_decoder_->resume();
+    }
+#ifndef NO_SDL
+    if (audio_dev_) {
+        SDL_PauseAudioDevice(audio_dev_, 0);
+    }
+#endif
+    update_pipeline_state_from_runtime();
+    refresh_effective_playing_state();
+}
+
 void PlayerCore::seek(double pos) {
     LOG_INFO("========================================");
     LOG_INFO("请求跳转到位置: ", pos, " 秒");
     LOG_INFO("当前位置: ", get_position(), " 秒");
     LOG_INFO("视频时长: ", get_duration(), " 秒");
     LOG_INFO("========================================");
+
+    prepare_seek_from_ended_session();
     
     if (pos < 0) {
         LOG_WARNING("⚠️ 跳转位置小于 0，修正为 0");

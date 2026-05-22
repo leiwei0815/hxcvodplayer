@@ -810,6 +810,12 @@ void AndroidPlayer::stop() {
 void AndroidPlayer::seekTo(double position) {
     if (!player_core_) return;
 
+    if (player_core_get_pipeline_state(player_core_) == PLAYER_PIPELINE_STATE_ENDED) {
+        player_core_set_play_when_ready(player_core_, 1);
+        player_core_play(player_core_);
+        LOGI("[ctrl] seekTo: resume from ENDED pipeline before seek");
+    }
+
     double seek_from = player_core_get_position(player_core_);
     double seek_span = std::fabs(position - seek_from);
     bool very_large_seek = seek_span > 180.0;
@@ -1906,11 +1912,39 @@ void AndroidPlayer::renderLoop() {
                     seek_recovery_active_.store(false, std::memory_order_release);
                     seek_recovery_deadline_ms_ = 0;
                     seek_lower_bound_active_.store(false, std::memory_order_release);
+                    seek_lower_bound_deadline_ms_ = 0;
                     seek_started_at_ms_ = 0;
                     seek_lower_bound_drop_count_ = 0;
+                    seek_fast_catchup_frames_.store(0, std::memory_order_release);
+                    seek_catchup_deadline_ms_ = 0;
+                    double anchor_pts = (std::isfinite(pts) && pts >= 0.0) ? pts : seek_target_now;
+                    if (player_core_ && std::isfinite(anchor_pts) && anchor_pts >= 0.0) {
+                        player_core_anchor_clock(player_core_, anchor_pts);
+                        clock = player_core_get_position(player_core_);
+                        if (audio_output_latency_sec_ > 0.0) {
+                            clock -= audio_output_latency_sec_;
+                            if (clock < 0.0) clock = 0.0;
+                        }
+                        delay = pts - clock;
+                    }
+                    sync_warmup_frames_.store(likely_4k ? 28 : 20, std::memory_order_release);
+                    post_seek_ahead_bypass_until_ms = now + (likely_4k ? 3200 : 1800);
+                    seek_audio_wait_video_.store(false, std::memory_order_release);
+                    seek_audio_wait_deadline_ms_ = 0;
+                    seek_resume_stable_hits_.store(0, std::memory_order_release);
+                    player_core_set_play_when_ready(player_core_, 1);
+                    if (!player_core_is_playing(player_core_)) {
+                        player_core_play(player_core_);
+                    }
+                    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                        SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
+                        LOGW("[sync] seek recovery timeout resume audio: result=%d anchor=%.3f",
+                             r, anchor_pts);
+                    }
                     should_display = should_consume = true;
                     LOGW("[sync] seek recovery timeout fallback: pts=%.3f target=%.3f", pts, seek_target_now);
-                    SYNCW("evt=seek_recovery_timeout_fallback pts=%.3f target=%.3f", pts, seek_target_now);
+                    SYNCW("evt=seek_recovery_timeout_fallback pts=%.3f target=%.3f anchor=%.3f",
+                          pts, seek_target_now, anchor_pts);
                     in_seek_recovery = false;
                 } else {
                     should_consume = true;

@@ -293,6 +293,8 @@ private:
     void set_io_loading(bool is_loading);
     void set_starvation_loading(bool is_loading);
     void refresh_loading_state();
+    /** 播放结束(Ended)后 seek：重置完成态并恢复 playWhenReady，无需 App 重开流 */
+    void prepare_seek_from_ended_session();
 
 private:
     PlayerConfig config_;
