@@ -16,17 +16,15 @@ on:
         type: choice
         options:
           - release
-          - debug
-          - all
       skip_third_party_cache:
         description: '跳过第三方库缓存（强制重新编译）'
         required: false
         default: false
         type: boolean
       upload_artifact:
-        description: '上传 AAR 到 Artifact（Storage 配额不足时请关闭）'
+        description: '上传 AAR 到 Artifact（Storage 配额不足时可取消勾选）'
         required: false
-        default: false
+        default: true
         type: boolean
 
 env:
@@ -333,19 +331,9 @@ jobs:
         run: bash build_aar.sh --copy-libs || true
 
       - name: 编译 AAR（Release）
-        if: ${{ inputs.build_type != 'debug' }}
         working-directory: android/library
         run: |
           ./gradlew :hxcplayer:assembleRelease \
-            -PANDROID_NDK_HOME=${{ env.NDK_PATH }} \
-            --no-daemon \
-            --stacktrace
-
-      - name: 编译 AAR（Debug）
-        if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'all' }}
-        working-directory: android/library
-        run: |
-          ./gradlew :hxcplayer:assembleDebug \
             -PANDROID_NDK_HOME=${{ env.NDK_PATH }} \
             --no-daemon \
             --stacktrace
@@ -369,27 +357,17 @@ jobs:
             echo ""
             find android -name "*.aar" -exec ls -lh {} \; 2>/dev/null || echo "未找到 AAR"
             echo ""
-            echo "> Storage 配额不足时默认不上传 Artifact；需要下载请在手动运行 workflow 时勾选 upload_artifact，或打 tag 走 Release。"
+            echo "> 仅构建/上传 Release AAR（无 Debug），Artifact 保留 1 天；可在 Actions 页下载或打 tag 走 Release。"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 默认关闭上传，避免 Storage 配额满导致红字；手动运行可勾选 upload_artifact
+      # push / PR / 手动触发均上传；手动运行可取消 upload_artifact；配额满时 continue-on-error 不阻断构建
       - name: 上传 AAR（Release）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_artifact }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.upload_artifact }}
         uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
           name: hxcplayer-release-aar
           path: android/hxcplayer/build/outputs/aar/hxcplayer-release.aar
-          if-no-files-found: warn
-          retention-days: 1
-
-      - name: 上传 AAR（Debug）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_artifact && (inputs.build_type == 'debug' || inputs.build_type == 'all') }}
-        uses: actions/upload-artifact@v4
-        continue-on-error: true
-        with:
-          name: hxcplayer-debug-aar
-          path: android/hxcplayer/build/outputs/aar/hxcplayer-debug.aar
           if-no-files-found: warn
           retention-days: 1
 
