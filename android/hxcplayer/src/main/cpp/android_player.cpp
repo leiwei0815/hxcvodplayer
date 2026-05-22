@@ -1584,6 +1584,10 @@ void AndroidPlayer::renderLoop() {
     const int64_t kSyncStallWatchdogMs = 1200;
     const int64_t kSyncStallWatchdogCooldownMs = 450;
     const double kSyncStallWatchdogEps = 0.002;
+    int secure_bypass_extend_count = 0;
+    int64_t secure_bypass_extend_window_start_ms = 0;
+    const int64_t kSecureBypassExtendWindowMs = 8000;
+    const int kSecureBypassExtendMaxCount = 3;
     // Empty-queue soft-recovery watchdog (stability-first):
     // if playback appears "running" but frame queue stays empty for too long,
     // issue a conservative core/audio wake-up once per cooldown window.
@@ -1891,7 +1895,7 @@ void AndroidPlayer::renderLoop() {
                 bool large_seek_any_direction = seek_span_abs_sec > 25.0;
                 bool very_large_seek = seek_span_abs_sec > 180.0;
                 bool secure_session = secure_session_active_.load(std::memory_order_acquire);
-                double stale_future_margin_sec = ultra_high_rate_4k ? 6.0 : 3.5;
+                double stale_future_margin_sec = ultra_high_rate_4k ? 5.0 : 2.8;
                 if (large_forward_seek) {
                     // Tencent/Exo-like seek UX: on large forward jumps, prioritize
                     // "show something close quickly" over strict exact-target hit.
@@ -1920,11 +1924,14 @@ void AndroidPlayer::renderLoop() {
                 // cannot immediately land near target keyframe. This avoids prolonged
                 // frozen frames and prioritizes visible recovery.
                 if (seek_elapsed_ms >= 1200) {
-                    seek_epsilon_sec = std::max(seek_epsilon_sec, is_backward_seek ? 0.90 : (large_seek_any_direction ? 1.80 : 0.60));
+                    // Tencent-like accurate policy:
+                    // backward seek keeps tighter epsilon to avoid early relaxed hits.
+                    seek_epsilon_sec = std::max(seek_epsilon_sec,
+                                                is_backward_seek ? 0.60 : (large_seek_any_direction ? 1.80 : 0.60));
                 }
                 if (seek_elapsed_ms >= 2200) {
                     if (is_backward_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.20 : 1.60);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 0.90 : 0.80);
                     } else {
                         double forward_relax_eps = very_large_seek ? 8.00 : (large_seek_any_direction ? 3.60 : 1.20);
                         if (playback_rate >= 2.0) {
@@ -1935,7 +1942,7 @@ void AndroidPlayer::renderLoop() {
                 }
                 if (seek_elapsed_ms >= 3200) {
                     if (is_backward_seek) {
-                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 2.80 : 2.20);
+                        seek_epsilon_sec = std::max(seek_epsilon_sec, very_large_seek ? 1.20 : 1.00);
                     } else {
                         double forward_relax_eps = very_large_seek ? 10.50 : (large_seek_any_direction ? 5.00 : 2.00);
                         if (playback_rate >= 2.0) {
@@ -1946,13 +1953,13 @@ void AndroidPlayer::renderLoop() {
                 }
                 bool lower_bound_force_relax = seek_lower_bound_drop_count_ >= (very_large_seek ? 180 : 120);
                 if (lower_bound_force_relax) {
-                    double forced_eps = is_backward_seek ? 2.60 : (very_large_seek ? 9.50 : 4.20);
+                    double forced_eps = is_backward_seek ? 1.40 : (very_large_seek ? 9.50 : 4.20);
                     if (!is_backward_seek && playback_rate >= 2.0) {
                         forced_eps = very_large_seek ? 3.40 : 2.80;
                     }
                     seek_epsilon_sec = std::max(seek_epsilon_sec, forced_eps);
                 }
-                double secure_future_guard_sec = is_backward_seek ? 10.0 : (very_large_seek ? 20.0 : 14.0);
+                double secure_future_guard_sec = is_backward_seek ? 7.0 : (very_large_seek ? 16.0 : 12.0);
                 if (seek_elapsed_ms >= 2600) {
                     secure_future_guard_sec += 6.0;
                 }
@@ -1978,7 +1985,7 @@ void AndroidPlayer::renderLoop() {
                     }
                     bool prefer_drop_only = overshoot_sec <= drop_only_window_sec;
                     bool can_reseek = !prefer_drop_only
-                            && reseek_count < 3
+                            && reseek_count < 4
                             && now >= secure_seek_precise_reseek_cooldown_until_ms_
                             && seek_elapsed_ms >= 260;
                     if (can_reseek && player_core_) {
@@ -2070,6 +2077,64 @@ void AndroidPlayer::renderLoop() {
                                        "evt=seek_secure_accept_gate_drop pts=%.3f target=%.3f future_offset=%.3f accept_max=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
                                        pts, seek_target_now, future_offset_sec, secure_accept_future_sec,
                                        seek_elapsed_ms, seek_lower_bound_drop_count_);
+                        }
+
+                        // Tencent-like precise completion gate:
+                        // even after lower-bound hit, avoid completing seek when still too far ahead.
+                        // Prefer a bounded completion-reseek before accepting large offsets.
+                        double secure_completion_tol_sec = is_backward_seek ? 1.0 : 1.6;
+                        if (large_seek_any_direction) {
+                            secure_completion_tol_sec += is_backward_seek ? 0.3 : 0.7;
+                        }
+                        if (seek_elapsed_ms >= 5000) {
+                            secure_completion_tol_sec += is_backward_seek ? 0.6 : 1.2;
+                        }
+                        if (!should_consume &&
+                            future_offset_sec > secure_completion_tol_sec &&
+                            seek_elapsed_ms < 9500) {
+                            int completion_reseek_count = secure_seek_precise_reseek_count_.load(std::memory_order_acquire);
+                            bool can_completion_reseek = completion_reseek_count < 4
+                                    && now >= secure_seek_precise_reseek_cooldown_until_ms_
+                                    && seek_elapsed_ms >= 650
+                                    && player_core_;
+                            if (can_completion_reseek) {
+                                double completion_backoff_sec = is_backward_seek
+                                        ? std::min(220.0, std::max(8.0, future_offset_sec * 1.45))
+                                        : std::min(180.0, std::max(10.0, future_offset_sec * 1.20));
+                                double completion_dispatch_target = std::max(0.0, seek_target_now - completion_backoff_sec);
+                                secure_seek_precise_reseek_count_.store(completion_reseek_count + 1, std::memory_order_release);
+                                secure_seek_precise_reseek_cooldown_until_ms_ = now + 900;
+                                seek_target_sec_.store(seek_target_now, std::memory_order_release);
+                                seek_started_at_ms_ = now;
+                                seek_lower_bound_active_.store(true, std::memory_order_release);
+                                seek_lower_bound_deadline_ms_ = now + (is_backward_seek ? secure_lower_bound_deadline_large_ms_
+                                                                                          : secure_lower_bound_deadline_normal_ms_);
+                                seek_recovery_active_.store(true, std::memory_order_release);
+                                seek_recovery_deadline_ms_ = now + (is_backward_seek ? secure_recovery_deadline_large_ms_
+                                                                                      : secure_recovery_deadline_normal_ms_);
+                                seek_audio_wait_video_.store(true, std::memory_order_release);
+                                seek_audio_wait_deadline_ms_ = now + (is_backward_seek ? secure_audio_wait_deadline_large_ms_
+                                                                                         : secure_audio_wait_deadline_normal_ms_);
+                                seek_resume_stable_hits_.store(0, std::memory_order_release);
+                                sync_warmup_frames_.store(44, std::memory_order_release);
+                                if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                                    setOpenSLESPlayState(SL_PLAYSTATE_PAUSED, true);
+                                }
+                                player_core_seek(player_core_, completion_dispatch_target);
+                                render_cv_.notify_one();
+                                should_consume = true;
+                                seek_lower_bound_drop_count_++;
+                                SYNCW("evt=seek_secure_completion_reseek target=%.3f dispatch=%.3f pts=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64 " count=%d",
+                                      seek_target_now, completion_dispatch_target, pts, future_offset_sec, secure_completion_tol_sec,
+                                      seek_elapsed_ms, completion_reseek_count + 1);
+                            } else if (seek_elapsed_ms < 7000) {
+                                should_consume = true;
+                                seek_lower_bound_drop_count_++;
+                                SYNCW_RATE(20,
+                                           "evt=seek_secure_completion_drop pts=%.3f target=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
+                                           pts, seek_target_now, future_offset_sec, secure_completion_tol_sec,
+                                           seek_elapsed_ms, seek_lower_bound_drop_count_);
+                            }
                         }
                     }
                     if (!should_consume) {
@@ -2384,6 +2449,11 @@ void AndroidPlayer::renderLoop() {
                     if (secure_session && delay > 3.0 && player_core_ && std::isfinite(pts) && pts >= 0.0) {
                         // Encrypted HLS often lands on a keyframe far ahead of seek target.
                         // Re-anchor and keep bypass instead of cancelling into ahead-hold deadlock.
+                        if (secure_bypass_extend_window_start_ms == 0 ||
+                            (now - secure_bypass_extend_window_start_ms) > kSecureBypassExtendWindowMs) {
+                            secure_bypass_extend_window_start_ms = now;
+                            secure_bypass_extend_count = 0;
+                        }
                         player_core_anchor_clock(player_core_, pts);
                         clock = player_core_get_position(player_core_);
                         if (audio_output_latency_sec_ > 0.0) {
@@ -2391,11 +2461,19 @@ void AndroidPlayer::renderLoop() {
                             if (clock < 0.0) clock = 0.0;
                         }
                         delay = pts - clock;
-                        int64_t extend_ms = (int64_t)std::min(8000.0, std::max(3000.0, delay * 1000.0 + 1500.0));
-                        post_seek_ahead_bypass_until_ms = now + extend_ms;
+                        if (secure_bypass_extend_count < kSecureBypassExtendMaxCount) {
+                            int64_t extend_ms = (int64_t)std::min(4500.0, std::max(1800.0, delay * 700.0 + 900.0));
+                            post_seek_ahead_bypass_until_ms = now + extend_ms;
+                            secure_bypass_extend_count++;
+                            SYNCI_RATE(30, "evt=post_seek_ahead_bypass_secure_extend delay=%.3f extend_ms=%" PRId64 " count=%d",
+                                       delay, extend_ms, secure_bypass_extend_count);
+                        } else {
+                            // Stop repeatedly extending bypass forever; return to normal sync path.
+                            post_seek_ahead_bypass_until_ms = 0;
+                            SYNCI_RATE(30, "evt=post_seek_ahead_bypass_secure_extend_limit delay=%.3f count=%d",
+                                       delay, secure_bypass_extend_count);
+                        }
                         should_display = should_consume = true;
-                        SYNCI_RATE(30, "evt=post_seek_ahead_bypass_secure_extend delay=%.3f extend_ms=%" PRId64,
-                                   delay, extend_ms);
                     } else {
                         // Video has already become too far ahead; stop bypass immediately
                         // and return to normal sync path for faster A/V re-alignment.
