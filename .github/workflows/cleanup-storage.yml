@@ -1,0 +1,112 @@
+# 自动清理 Actions 存储：Artifact 只保留最近 N 条；超期 Cache 删除
+# 配合 build-android-sdk.yml 中 retention-days: 1 使用
+
+name: Cleanup Actions Storage
+
+on:
+  # 每天凌晨 3 点（UTC）执行
+  schedule:
+    - cron: '0 3 * * *'
+  # 每次 Android SDK 打包 workflow 结束后执行
+  workflow_run:
+    workflows: ['Build Android SDK']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      max_artifacts:
+        description: '保留最近几条 Artifact（其余删除）'
+        required: false
+        default: '3'
+      cache_max_age_days:
+        description: '删除多少天前的 Cache；-1=全部删除；0=不删'
+        required: false
+        default: '-1'
+      purge_all_caches:
+        description: '删除本仓库全部 Actions Cache'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  KEEP_ARTIFACT_COUNT: ${{ github.event.inputs.max_artifacts || '3' }}
+  # 打包 workflow 结束后自动触发时：默认清空全部 Cache（防止占满 Storage 配额）
+  CACHE_MAX_AGE_DAYS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.cache_max_age_days || '-1' }}
+  PURGE_ALL_CACHES: ${{ github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && github.event.inputs.purge_all_caches) && 'true' || 'false' }}
+
+jobs:
+  cleanup:
+    name: Prune Artifacts and Caches
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: 清理 Artifact（只保留最近 ${{ env.KEEP_ARTIFACT_COUNT }} 条）
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const keep = Math.max(1, parseInt(process.env.KEEP_ARTIFACT_COUNT || '3', 10));
+
+            let page = 1;
+            const all = [];
+            while (true) {
+              const { data } = await github.rest.actions.listArtifactsForRepo({
+                owner, repo, per_page: 100, page,
+              });
+              all.push(...data.artifacts);
+              if (data.artifacts.length < 100) break;
+              page++;
+            }
+
+            all.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            const toDelete = all.slice(keep);
+
+            core.info(`Artifacts total=${all.length}, keep=${keep}, delete=${toDelete.length}`);
+            for (const a of toDelete) {
+              await github.rest.actions.deleteArtifact({
+                owner, repo, artifact_id: a.id,
+              });
+              core.info(`Deleted artifact: ${a.name} id=${a.id} (${(a.size_in_bytes / 1048576).toFixed(2)} MB)`);
+            }
+
+      - name: 清理 Actions Cache
+        if: ${{ env.PURGE_ALL_CACHES == 'true' || (env.CACHE_MAX_AGE_DAYS != '' && env.CACHE_MAX_AGE_DAYS != '0') }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const purgeAll = process.env.PURGE_ALL_CACHES === 'true'
+              || process.env.CACHE_MAX_AGE_DAYS === '-1';
+            const maxAgeDays = parseInt(process.env.CACHE_MAX_AGE_DAYS || '-1', 10);
+            const cutoff = Date.now() - Math.max(0, maxAgeDays) * 24 * 60 * 60 * 1000;
+
+            let page = 1;
+            const all = [];
+            while (true) {
+              const { data } = await github.rest.actions.getActionsCacheList({
+                owner, repo, per_page: 100, page,
+              });
+              all.push(...(data.actions_caches || []));
+              if ((data.actions_caches || []).length < 100) break;
+              page++;
+            }
+
+            let deleted = 0;
+            let freedMb = 0;
+            for (const c of all) {
+              const created = new Date(c.created_at).getTime();
+              if (!purgeAll && maxAgeDays > 0 && created >= cutoff) continue;
+              await github.rest.actions.deleteActionsCacheById({
+                owner, repo, cache_id: c.id,
+              });
+              deleted++;
+              freedMb += c.size_in_bytes / 1048576;
+              core.info(`Deleted cache: ${c.key} id=${c.id} (${(c.size_in_bytes / 1048576).toFixed(2)} MB)`);
+            }
+            core.info(`Caches total=${all.length}, deleted=${deleted}, freed_mb=${freedMb.toFixed(2)}, purge_all=${purgeAll}`);

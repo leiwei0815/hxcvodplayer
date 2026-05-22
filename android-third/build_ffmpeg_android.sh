@@ -2,10 +2,9 @@
 
 # FFmpeg Android 静态库编译脚本
 # 含 HLS(m3u8) demuxer，与网络 http(s)/本地 file 协议配合使用
-# 支持 arm64-v8a、armeabi-v7a、x86_64 架构
-# arm64-v8a: 真机 + Apple Silicon 模拟器
-# armeabi-v7a: 旧真机
-# x86_64: Intel Mac 模拟器
+# 默认仅编译 arm64-v8a（发布/CI）
+# 全架构: export ANDROID_ABIS="arm64-v8a armeabi-v7a x86_64"
+ANDROID_ABIS="${ANDROID_ABIS:-arm64-v8a}"
 # 输出静态库用于 NDK 集成
 
 set -e
@@ -318,20 +317,20 @@ build_ffmpeg() {
     cd "$BUILD_DIR"
 }
 
-# 编译 arm64-v8a (真机 + Apple Silicon 模拟器)
-build_ffmpeg "aarch64" "arm64-v8a"
-
-# 编译 armeabi-v7a (旧真机)
-build_ffmpeg "armv7-a" "armeabi-v7a"
-
-# 编译 x86_64 (Intel Mac 模拟器)
-build_ffmpeg "x86_64" "x86_64"
+for _abi in $ANDROID_ABIS; do
+  case "$_abi" in
+    arm64-v8a) build_ffmpeg "aarch64" "arm64-v8a" ;;
+    armeabi-v7a) build_ffmpeg "armv7-a" "armeabi-v7a" ;;
+    x86_64) build_ffmpeg "x86_64" "x86_64" ;;
+    *) echo "❌ 不支持的 ABI: $_abi"; exit 1 ;;
+  esac
+done
 
 # 组织输出目录
 echo ""
 echo "📦 组织输出文件..."
 
-for ABI in "arm64-v8a" "armeabi-v7a" "x86_64"; do
+for ABI in $ANDROID_ABIS; do
     mkdir -p "$OUTPUT_DIR/$ABI/lib"
     mkdir -p "$OUTPUT_DIR/$ABI/include"
     
@@ -345,22 +344,10 @@ done
 echo ""
 echo "✅ FFmpeg Android 动态库编译完成！"
 echo ""
-echo "输出目录:"
-echo "  arm64-v8a (真机 + Apple Silicon 模拟器): $OUTPUT_DIR/arm64-v8a"
-echo "  armeabi-v7a (旧真机): $OUTPUT_DIR/armeabi-v7a"
-echo "  x86_64 (Intel Mac 模拟器): $OUTPUT_DIR/x86_64"
-echo ""
-echo "库文件 (arm64-v8a):"
-ls -lh "$OUTPUT_DIR/arm64-v8a/lib/"*.so
-echo ""
-echo "库文件 (armeabi-v7a):"
-ls -lh "$OUTPUT_DIR/armeabi-v7a/lib/"*.so
-echo ""
-echo "库文件 (x86_64):"
-ls -lh "$OUTPUT_DIR/x86_64/lib/"*.so
-echo ""
-echo "大小统计:"
-echo "  arm64-v8a: $(du -sh "$OUTPUT_DIR/arm64-v8a/lib/" | cut -f1)"
-echo "  armeabi-v7a: $(du -sh "$OUTPUT_DIR/armeabi-v7a/lib/" | cut -f1)"
-echo "  x86_64: $(du -sh "$OUTPUT_DIR/x86_64/lib/" | cut -f1)"
+echo "输出目录 (ANDROID_ABIS=$ANDROID_ABIS):"
+for ABI in $ANDROID_ABIS; do
+  echo "  $ABI: $OUTPUT_DIR/$ABI"
+  ls -lh "$OUTPUT_DIR/$ABI/lib/"*.so 2>/dev/null || echo "    (无 .so)"
+  echo "  大小: $(du -sh "$OUTPUT_DIR/$ABI/lib/" 2>/dev/null | cut -f1)"
+done
 echo ""

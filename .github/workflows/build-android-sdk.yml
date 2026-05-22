@@ -23,12 +23,18 @@ on:
         required: false
         default: false
         type: boolean
+      upload_artifact:
+        description: '上传 AAR 到 Artifact（Storage 配额不足时请关闭）'
+        required: false
+        default: false
+        type: boolean
 
 env:
   NDK_VERSION: '26.3.11579264'
   ANDROID_API_LEVEL: '24'
   # 手动提升该值可强制失效第三方缓存（用于排查“脚本已改但产物未更新”）
-  THIRD_PARTY_CACHE_REV: '20260511-mediacodec-v10'
+  THIRD_PARTY_CACHE_REV: '20260521-arm64-only'
+  ANDROID_ABIS: arm64-v8a
 
 jobs:
   # ============================================================
@@ -156,7 +162,7 @@ jobs:
         run: |
           set -e
           echo "=== 校验 mediacodec 解码器符号 ==="
-          for abi in arm64-v8a armeabi-v7a x86_64; do
+          for abi in arm64-v8a; do
             codec_so="ffmpeg-build-android/FFmpeg-Android/${abi}/lib/libavcodec.so"
             if [ ! -f "$codec_so" ]; then
               echo "❌ 缺失 $codec_so"
@@ -178,7 +184,7 @@ jobs:
           fnv64() {
             python3 -c "import sys; h=1469598103934665603; p=1099511628211; f=open(sys.argv[1],'rb'); data=f.read(); [0 for b in data if (h:=((h ^ b) * p & 0xFFFFFFFFFFFFFFFF)) or True]; print(f'{h:016x}')" "$1"
           }
-          for abi in arm64-v8a armeabi-v7a x86_64; do
+          for abi in arm64-v8a; do
             codec_so="ffmpeg-build-android/FFmpeg-Android/${abi}/lib/libavcodec.so"
             if [ ! -f "$codec_so" ]; then
               echo "❌ 缺失 $codec_so"
@@ -195,7 +201,7 @@ jobs:
         run: |
           set -e
           echo "=== 校验 FFmpeg config 宏 ==="
-          for abi in arm64-v8a armeabi-v7a x86_64; do
+          for abi in arm64-v8a; do
             cfg_comp="ffmpeg-build-android/build-${abi}/config_components.h"
             cfg_main="ffmpeg-build-android/build-${abi}/config.h"
             if [ ! -f "$cfg_comp" ] || [ ! -f "$cfg_main" ]; then
@@ -317,16 +323,7 @@ jobs:
           find android-third -name "*.so" | head -30
           find android-third -name "*.a" | head -10
 
-      - name: 设置 Gradle 缓存
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ hashFiles('android/library/build.gradle', 'android/hxcplayer/build.gradle') }}
-          restore-keys: |
-            gradle-
-
+      # 不在 CI 缓存 ~/.gradle（单次约 400MB+，易占满 Actions Storage 配额）
       - name: 赋予 gradlew 执行权限
         working-directory: android/library
         run: chmod +x gradlew
@@ -364,7 +361,20 @@ jobs:
             unzip -l "$aar" | grep "\.so$" || true
           done
 
+      - name: 写入构建摘要（AAR 路径）
+        if: always()
+        run: |
+          {
+            echo "## Android AAR 构建结果"
+            echo ""
+            find android -name "*.aar" -exec ls -lh {} \; 2>/dev/null || echo "未找到 AAR"
+            echo ""
+            echo "> Storage 配额不足时默认不上传 Artifact；需要下载请在手动运行 workflow 时勾选 upload_artifact，或打 tag 走 Release。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 默认关闭上传，避免 Storage 配额满导致红字；手动运行可勾选 upload_artifact
       - name: 上传 AAR（Release）
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_artifact }}
         uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
@@ -374,7 +384,7 @@ jobs:
           retention-days: 1
 
       - name: 上传 AAR（Debug）
-        if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'all' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload_artifact && (inputs.build_type == 'debug' || inputs.build_type == 'all') }}
         uses: actions/upload-artifact@v4
         continue-on-error: true
         with:

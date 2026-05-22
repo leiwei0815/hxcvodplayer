@@ -92,7 +92,7 @@ if [ "$COPY_LIBS" = true ]; then
     
     mkdir -p "$TARGET_JNI"
     
-    for ABI in "arm64-v8a" "armeabi-v7a" "x86_64"; do
+    for ABI in "arm64-v8a"; do
         mkdir -p "$TARGET_JNI/$ABI"
         
         # 复制 FFmpeg

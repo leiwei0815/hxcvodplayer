@@ -5,6 +5,8 @@
 
 set -e
 
+ANDROID_ABIS="${ANDROID_ABIS:-arm64-v8a}"
+
 # 配置
 CURL_VERSION="8.5.0"
 CURL_TARBALL="curl-${CURL_VERSION}.tar.gz"
@@ -96,10 +98,14 @@ build_curl() {
     echo "✅ $ABI 编译完成"
 }
 
-# 编译各架构
-build_curl "aarch64" "arm64-v8a" "aarch64-linux-android"
-build_curl "armv7a" "armeabi-v7a" "armv7a-linux-androideabi"
-build_curl "x86_64" "x86_64" "x86_64-linux-android"
+for _abi in $ANDROID_ABIS; do
+  case "$_abi" in
+    arm64-v8a) build_curl "aarch64" "arm64-v8a" "aarch64-linux-android" ;;
+    armeabi-v7a) build_curl "armv7a" "armeabi-v7a" "armv7a-linux-androideabi" ;;
+    x86_64) build_curl "x86_64" "x86_64" "x86_64-linux-android" ;;
+    *) echo "❌ 不支持的 ABI: $_abi"; exit 1 ;;
+  esac
+done
 
 echo ""
 echo "✅ curl Android 编译完成！"
