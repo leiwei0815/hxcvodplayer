@@ -205,6 +205,44 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     /**
+     * SecureHLS seek 调参配置（运行时生效，默认值与 SDK 内置策略一致）。
+     * 用于快速适配不同加密源 GOP 分布，无需改 C++ 代码。
+     */
+    class SecureSeekTuningConfig {
+        var dropOnlyWindowBackwardSec: Double = 5.0
+        var dropOnlyWindowForwardSec: Double = 8.0
+        var acceptFutureBackwardEarlySec: Double = 2.5
+        var acceptFutureForwardEarlySec: Double = 4.0
+        var acceptFutureBackwardMidSec: Double = 6.0
+        var acceptFutureForwardMidSec: Double = 8.0
+        var acceptFutureBackwardLateSec: Double = 10.0
+        var acceptFutureForwardLateSec: Double = 14.0
+        var lowerBoundDeadlineNormalMs: Int = 2700
+        var lowerBoundDeadlineLargeMs: Int = 3200
+        var recoveryDeadlineNormalMs: Int = 5200
+        var recoveryDeadlineLargeMs: Int = 6400
+        var audioWaitDeadlineNormalMs: Int = 4400
+        var audioWaitDeadlineLargeMs: Int = 5600
+
+        companion object {
+            @JvmStatic
+            fun defaultConfig(): SecureSeekTuningConfig {
+                return SecureSeekTuningConfig()
+            }
+        }
+    }
+
+    /**
+     * SecureHLS seek 调参预设。
+     * - PRECISION_FIRST: 默认，优先落点准确
+     * - SPEED_FIRST: 优先更快恢复画面
+     */
+    enum class SecureSeekPreset {
+        PRECISION_FIRST,
+        SPEED_FIRST
+    }
+
+    /**
      * 对外统一播放模型：只传一个 model 即可。
      *
      * - [url] 必填
@@ -366,6 +404,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         get() = renderView
     init {
         nativeHandle = nativeCreate()
+        applySecureSeekPreset(SecureSeekPreset.PRECISION_FIRST)
         renderView = createRenderView()
         startPositionUpdates()
     }
@@ -638,6 +677,85 @@ class HXCPlayerControl @JvmOverloads constructor(
     private fun applyDecodeModeForHandle(handle: Long) {
         nativeSetDecodeMode(handle, if (decodeMode == DecodeMode.HARDWARE) 1 else 0)
     }
+
+    /**
+     * 应用 SecureHLS seek 调参（对当前 player 实例立即生效）。
+     */
+    fun setSecureSeekTuning(config: SecureSeekTuningConfig) {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeSetSecureSeekTuning(
+            handle = handle,
+            dropOnlyWindowBackwardSec = config.dropOnlyWindowBackwardSec,
+            dropOnlyWindowForwardSec = config.dropOnlyWindowForwardSec,
+            acceptFutureBackwardEarlySec = config.acceptFutureBackwardEarlySec,
+            acceptFutureForwardEarlySec = config.acceptFutureForwardEarlySec,
+            acceptFutureBackwardMidSec = config.acceptFutureBackwardMidSec,
+            acceptFutureForwardMidSec = config.acceptFutureForwardMidSec,
+            acceptFutureBackwardLateSec = config.acceptFutureBackwardLateSec,
+            acceptFutureForwardLateSec = config.acceptFutureForwardLateSec,
+            lowerBoundDeadlineNormalMs = config.lowerBoundDeadlineNormalMs,
+            lowerBoundDeadlineLargeMs = config.lowerBoundDeadlineLargeMs,
+            recoveryDeadlineNormalMs = config.recoveryDeadlineNormalMs,
+            recoveryDeadlineLargeMs = config.recoveryDeadlineLargeMs,
+            audioWaitDeadlineNormalMs = config.audioWaitDeadlineNormalMs,
+            audioWaitDeadlineLargeMs = config.audioWaitDeadlineLargeMs
+        )
+    }
+
+    /**
+     * 应用 SecureHLS seek 预设参数。
+     * 默认推荐 [SecureSeekPreset.PRECISION_FIRST]。
+     */
+    fun applySecureSeekPreset(preset: SecureSeekPreset = SecureSeekPreset.PRECISION_FIRST) {
+        val config = when (preset) {
+            SecureSeekPreset.PRECISION_FIRST -> SecureSeekTuningConfig.defaultConfig().apply {
+                // 默认即精准优先，这里显式设置以便后续维护可读
+                dropOnlyWindowBackwardSec = 5.0
+                dropOnlyWindowForwardSec = 8.0
+                acceptFutureBackwardEarlySec = 2.5
+                acceptFutureForwardEarlySec = 4.0
+                acceptFutureBackwardMidSec = 6.0
+                acceptFutureForwardMidSec = 8.0
+                acceptFutureBackwardLateSec = 10.0
+                acceptFutureForwardLateSec = 14.0
+                lowerBoundDeadlineNormalMs = 2700
+                lowerBoundDeadlineLargeMs = 3200
+                recoveryDeadlineNormalMs = 5200
+                recoveryDeadlineLargeMs = 6400
+                audioWaitDeadlineNormalMs = 4400
+                audioWaitDeadlineLargeMs = 5600
+            }
+            SecureSeekPreset.SPEED_FIRST -> SecureSeekTuningConfig.defaultConfig().apply {
+                // 更快恢复：放宽前滚/接收窗口并缩短超时等待
+                dropOnlyWindowBackwardSec = 7.0
+                dropOnlyWindowForwardSec = 11.0
+                acceptFutureBackwardEarlySec = 4.0
+                acceptFutureForwardEarlySec = 6.0
+                acceptFutureBackwardMidSec = 8.0
+                acceptFutureForwardMidSec = 11.0
+                acceptFutureBackwardLateSec = 12.0
+                acceptFutureForwardLateSec = 17.0
+                lowerBoundDeadlineNormalMs = 2000
+                lowerBoundDeadlineLargeMs = 2500
+                recoveryDeadlineNormalMs = 4200
+                recoveryDeadlineLargeMs = 5200
+                audioWaitDeadlineNormalMs = 3200
+                audioWaitDeadlineLargeMs = 4200
+            }
+        }
+        setSecureSeekTuning(config)
+    }
+
+    /**
+     * 恢复 SecureHLS seek 默认调参。
+     */
+    fun resetSecureSeekTuning() {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeResetSecureSeekTuning(handle)
+    }
+
     private fun isRecoverableErrorCode(errorCode: Int): Boolean {
         return when (errorCode) {
             PlayerErrorCode.OPEN_INPUT_FAILED,
@@ -1474,6 +1592,24 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeSetVolume(handle: Long, volume: Float)
     private external fun nativeSetAspectRatioMode(handle: Long, mode: Int)
     private external fun nativeSetDecodeMode(handle: Long, mode: Int)
+    private external fun nativeSetSecureSeekTuning(
+        handle: Long,
+        dropOnlyWindowBackwardSec: Double,
+        dropOnlyWindowForwardSec: Double,
+        acceptFutureBackwardEarlySec: Double,
+        acceptFutureForwardEarlySec: Double,
+        acceptFutureBackwardMidSec: Double,
+        acceptFutureForwardMidSec: Double,
+        acceptFutureBackwardLateSec: Double,
+        acceptFutureForwardLateSec: Double,
+        lowerBoundDeadlineNormalMs: Int,
+        lowerBoundDeadlineLargeMs: Int,
+        recoveryDeadlineNormalMs: Int,
+        recoveryDeadlineLargeMs: Int,
+        audioWaitDeadlineNormalMs: Int,
+        audioWaitDeadlineLargeMs: Int
+    )
+    private external fun nativeResetSecureSeekTuning(handle: Long)
     private external fun nativeGetDuration(handle: Long): Double
     private external fun nativeGetPosition(handle: Long): Double
     private external fun nativeGetState(handle: Long): Int

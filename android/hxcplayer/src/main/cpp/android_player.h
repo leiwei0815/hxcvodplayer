@@ -87,6 +87,21 @@ public:
     void   setVolume(float volume);
     void   setAspectRatioMode(int mode);   // 0=FIT, 1=FILL
     void   setDecodeMode(int mode);        // 0=software, 1=hardware
+    void   setSecureSeekTuning(double drop_only_window_backward_sec,
+                               double drop_only_window_forward_sec,
+                               double accept_future_backward_early_sec,
+                               double accept_future_forward_early_sec,
+                               double accept_future_backward_mid_sec,
+                               double accept_future_forward_mid_sec,
+                               double accept_future_backward_late_sec,
+                               double accept_future_forward_late_sec,
+                               int lower_bound_deadline_normal_ms,
+                               int lower_bound_deadline_large_ms,
+                               int recovery_deadline_normal_ms,
+                               int recovery_deadline_large_ms,
+                               int audio_wait_deadline_normal_ms,
+                               int audio_wait_deadline_large_ms);
+    void   resetSecureSeekTuning();
     int    getDecodeMode() const;
 
     // --- State queries ---
@@ -275,6 +290,26 @@ private:
     // Secure seek precise landing: when first hit is too far ahead, allow bounded reseek.
     std::atomic<int>    secure_seek_precise_reseek_count_{0};
     int64_t             secure_seek_precise_reseek_cooldown_until_ms_{0};
+    // Externalized secure-seek tuning knobs (runtime adjustable via JNI).
+    double              secure_drop_only_window_backward_sec_{5.0};
+    double              secure_drop_only_window_forward_sec_{8.0};
+    double              secure_drop_only_window_large_seek_bonus_sec_{2.0};
+    double              secure_drop_only_window_elapsed_bonus_sec_{1.5};
+    int64_t             secure_drop_only_window_elapsed_threshold_ms_{1800};
+    double              secure_accept_future_backward_early_sec_{2.5};
+    double              secure_accept_future_forward_early_sec_{4.0};
+    double              secure_accept_future_backward_mid_sec_{6.0};
+    double              secure_accept_future_forward_mid_sec_{8.0};
+    double              secure_accept_future_backward_late_sec_{10.0};
+    double              secure_accept_future_forward_late_sec_{14.0};
+    int64_t             secure_accept_mid_elapsed_ms_{2600};
+    int64_t             secure_accept_late_elapsed_ms_{4200};
+    int64_t             secure_lower_bound_deadline_normal_ms_{2700};
+    int64_t             secure_lower_bound_deadline_large_ms_{3200};
+    int64_t             secure_recovery_deadline_normal_ms_{5200};
+    int64_t             secure_recovery_deadline_large_ms_{6400};
+    int64_t             secure_audio_wait_deadline_normal_ms_{4400};
+    int64_t             secure_audio_wait_deadline_large_ms_{5600};
     // High-rate cadence: avoid long "all-drop then force old frame" behavior.
     int                 consecutive_drop_count_{0};
     // Severe-lag detector for soft re-anchor (prevents endless drop loops).

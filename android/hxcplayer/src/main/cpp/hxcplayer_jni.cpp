@@ -225,6 +225,52 @@ Java_com_hxcplayer_HXCPlayerControl_nativeSetDecodeMode(
     }
 }
 
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeSetSecureSeekTuning(
+        JNIEnv *env, jobject thiz, jlong handle,
+        jdouble drop_only_window_backward_sec,
+        jdouble drop_only_window_forward_sec,
+        jdouble accept_future_backward_early_sec,
+        jdouble accept_future_forward_early_sec,
+        jdouble accept_future_backward_mid_sec,
+        jdouble accept_future_forward_mid_sec,
+        jdouble accept_future_backward_late_sec,
+        jdouble accept_future_forward_late_sec,
+        jint lower_bound_deadline_normal_ms,
+        jint lower_bound_deadline_large_ms,
+        jint recovery_deadline_normal_ms,
+        jint recovery_deadline_large_ms,
+        jint audio_wait_deadline_normal_ms,
+        jint audio_wait_deadline_large_ms) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        player->setSecureSeekTuning(
+                static_cast<double>(drop_only_window_backward_sec),
+                static_cast<double>(drop_only_window_forward_sec),
+                static_cast<double>(accept_future_backward_early_sec),
+                static_cast<double>(accept_future_forward_early_sec),
+                static_cast<double>(accept_future_backward_mid_sec),
+                static_cast<double>(accept_future_forward_mid_sec),
+                static_cast<double>(accept_future_backward_late_sec),
+                static_cast<double>(accept_future_forward_late_sec),
+                static_cast<int>(lower_bound_deadline_normal_ms),
+                static_cast<int>(lower_bound_deadline_large_ms),
+                static_cast<int>(recovery_deadline_normal_ms),
+                static_cast<int>(recovery_deadline_large_ms),
+                static_cast<int>(audio_wait_deadline_normal_ms),
+                static_cast<int>(audio_wait_deadline_large_ms));
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeResetSecureSeekTuning(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        player->resetSecureSeekTuning();
+    }
+}
+
 // 获取时长
 JNIEXPORT jdouble JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeGetDuration(
