@@ -239,6 +239,7 @@ class HXCPlayerControl @JvmOverloads constructor(
      */
     enum class SecureSeekPreset {
         PRECISION_FIRST,
+        PRECISION_STABLE_BACKWARD,
         SPEED_FIRST
     }
 
@@ -725,6 +726,25 @@ class HXCPlayerControl @JvmOverloads constructor(
                 recoveryDeadlineLargeMs = 6400
                 audioWaitDeadlineNormalMs = 4400
                 audioWaitDeadlineLargeMs = 5600
+            }
+            SecureSeekPreset.PRECISION_STABLE_BACKWARD -> SecureSeekTuningConfig.defaultConfig().apply {
+                // 稳定优先的 backward 精准档：
+                // 1) backward 接受窗口更严格，减少“命中过早”
+                // 2) deadline 适度拉长，降低 seek 超时兜底触发概率
+                dropOnlyWindowBackwardSec = 4.5
+                dropOnlyWindowForwardSec = 8.0
+                acceptFutureBackwardEarlySec = 2.0
+                acceptFutureForwardEarlySec = 4.0
+                acceptFutureBackwardMidSec = 5.0
+                acceptFutureForwardMidSec = 8.0
+                acceptFutureBackwardLateSec = 8.0
+                acceptFutureForwardLateSec = 14.0
+                lowerBoundDeadlineNormalMs = 3200
+                lowerBoundDeadlineLargeMs = 3800
+                recoveryDeadlineNormalMs = 6200
+                recoveryDeadlineLargeMs = 7600
+                audioWaitDeadlineNormalMs = 5200
+                audioWaitDeadlineLargeMs = 6800
             }
             SecureSeekPreset.SPEED_FIRST -> SecureSeekTuningConfig.defaultConfig().apply {
                 // 更快恢复：放宽前滚/接收窗口并缩短超时等待

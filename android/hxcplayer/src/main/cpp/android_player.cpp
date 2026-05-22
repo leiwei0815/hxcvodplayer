@@ -1584,6 +1584,12 @@ void AndroidPlayer::renderLoop() {
     const int64_t kSyncStallWatchdogMs = 1200;
     const int64_t kSyncStallWatchdogCooldownMs = 450;
     const double kSyncStallWatchdogEps = 0.002;
+    // Empty-queue soft-recovery watchdog (stability-first):
+    // if playback appears "running" but frame queue stays empty for too long,
+    // issue a conservative core/audio wake-up once per cooldown window.
+    int64_t empty_stall_recover_cooldown_until_ms = 0;
+    const int64_t kEmptyStallRecoverTriggerMs = 2800;
+    const int64_t kEmptyStallRecoverCooldownMs = 12000;
 
     int64_t total_render_ms = 0, total_upload_ms = 0;
     int64_t max_render_ms   = 0, max_upload_ms   = 0;
@@ -2708,6 +2714,49 @@ void AndroidPlayer::renderLoop() {
             bool likely_4k = gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160;
             bool in_loading = is_loading_.load(std::memory_order_acquire);
             bool in_sync_warmup = sync_warmup_frames_.load(std::memory_order_acquire) > 0;
+            // Non-seek soft recovery:
+            // Prevent long "frozen picture + audio underrun" when we are not in
+            // seek-recovery but decoder queue keeps empty unexpectedly.
+            if (!seek_lower_active &&
+                !seek_recovery_active &&
+                !seek_wait_video &&
+                !in_loading &&
+                !in_sync_warmup &&
+                core_playing &&
+                !high_rate &&
+                now >= empty_stall_recover_cooldown_until_ms &&
+                in_empty_streak) {
+                int64_t empty_ms = now - empty_start_ms;
+                if (empty_ms >= kEmptyStallRecoverTriggerMs) {
+                    double recover_anchor = player_core_get_position(player_core_);
+                    if (player_core_) {
+                        player_core_set_play_when_ready(player_core_, 1);
+                        if (!player_core_is_playing(player_core_)) {
+                            player_core_play(player_core_);
+                        }
+                        if (std::isfinite(recover_anchor) && recover_anchor >= 0.0) {
+                            player_core_anchor_clock(player_core_, recover_anchor);
+                        }
+                    }
+                    audio_rebuffer_pending_.store(false, std::memory_order_release);
+                    audio_rebuffer_deadline_ms_ = 0;
+                    audio_rebuffer_paused_at_ms_ = 0;
+                    audio_rebuffer_min_resume_at_ms_ = 0;
+                    if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                        SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
+                        LOGW("[sync] empty-stall soft recover resume audio: result=%d empty_ms=%" PRId64,
+                             r, empty_ms);
+                    }
+                    // Grant a short anti-hold window after recovery to avoid
+                    // immediate re-entry into ahead-hold when frames come back.
+                    post_seek_ahead_bypass_until_ms = now + 1200;
+                    stall_watchdog_since_ms = 0;
+                    stall_watchdog_last_break_ms = now;
+                    empty_stall_recover_cooldown_until_ms = now + kEmptyStallRecoverCooldownMs;
+                    SYNCW("evt=empty_stall_soft_recover empty_ms=%" PRId64 " anchor=%.3f cooldown_ms=%" PRId64,
+                          empty_ms, recover_anchor, kEmptyStallRecoverCooldownMs);
+                }
+            }
             int64_t rebuffer_trigger_ms = high_rate ? 220 : 260;
             if (!likely_4k && playback_rate >= 2.5) {
                 rebuffer_trigger_ms = 260;
