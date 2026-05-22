@@ -1847,24 +1847,33 @@ void AndroidPlayer::renderLoop() {
                     }
                     seek_epsilon_sec = std::max(seek_epsilon_sec, forced_eps);
                 }
-                double secure_future_guard_sec = is_backward_seek ? 6.0 : (very_large_seek ? 14.0 : 12.0);
+                double secure_future_guard_sec = is_backward_seek ? 10.0 : (very_large_seek ? 20.0 : 14.0);
                 if (seek_elapsed_ms >= 2600) {
-                    secure_future_guard_sec += 8.0;
+                    secure_future_guard_sec += 6.0;
                 }
                 bool secure_far_future_hit = secure_session
                         && pts > seek_target_now + secure_future_guard_sec
-                        && seek_elapsed_ms < 4200;
+                        && seek_elapsed_ms < 6500;
                 if (secure_far_future_hit) {
                     should_consume = true;
                     seek_lower_bound_drop_count_++;
                     int reseek_count = secure_seek_precise_reseek_count_.load(std::memory_order_acquire);
-                    bool can_reseek = reseek_count < 2
+                    bool can_reseek = reseek_count < 3
                             && now >= secure_seek_precise_reseek_cooldown_until_ms_
                             && seek_elapsed_ms >= 260;
                     if (can_reseek && player_core_) {
+                        double overshoot_sec = pts - seek_target_now;
+                        double dispatch_seek_target = seek_target_now;
+                        // Forward large-overshoot: seek back before target, then let decoder roll forward.
+                        // This mimics mature players' "fallback to earlier sync-point then converge" behavior.
+                        if (!is_backward_seek && overshoot_sec > 18.0) {
+                            double backoff_sec = std::min(150.0, std::max(12.0, overshoot_sec * 0.85));
+                            dispatch_seek_target = std::max(0.0, seek_target_now - backoff_sec);
+                        }
                         secure_seek_precise_reseek_count_.store(reseek_count + 1, std::memory_order_release);
-                        secure_seek_precise_reseek_cooldown_until_ms_ = now + 700;
-                        seek_from_sec_.store(pts, std::memory_order_release);
+                        secure_seek_precise_reseek_cooldown_until_ms_ = now + 900;
+                        // Keep seek_from baseline from the original request.
+                        // Do not overwrite with current pts, otherwise forward seek may be misclassified as backward.
                         seek_target_sec_.store(seek_target_now, std::memory_order_release);
                         seek_started_at_ms_ = now;
                         seek_lower_bound_active_.store(true, std::memory_order_release);
@@ -1878,10 +1887,10 @@ void AndroidPlayer::renderLoop() {
                         if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                             setOpenSLESPlayState(SL_PLAYSTATE_PAUSED, true);
                         }
-                        player_core_seek(player_core_, seek_target_now);
+                        player_core_seek(player_core_, dispatch_seek_target);
                         render_cv_.notify_one();
-                        SYNCW("evt=seek_secure_precise_reseek target=%.3f pts=%.3f elapsed_ms=%" PRId64 " count=%d guard=%.3f",
-                              seek_target_now, pts, seek_elapsed_ms, reseek_count + 1, secure_future_guard_sec);
+                        SYNCW("evt=seek_secure_precise_reseek target=%.3f dispatch=%.3f pts=%.3f overshoot=%.3f elapsed_ms=%" PRId64 " count=%d guard=%.3f",
+                              seek_target_now, dispatch_seek_target, pts, overshoot_sec, seek_elapsed_ms, reseek_count + 1, secure_future_guard_sec);
                     } else {
                         SYNCW_RATE(20, "evt=seek_secure_far_future_drop pts=%.3f target=%.3f elapsed_ms=%" PRId64 " drop_count=%d guard=%.3f reseek_count=%d",
                                    pts, seek_target_now, seek_elapsed_ms, seek_lower_bound_drop_count_, secure_future_guard_sec, reseek_count);
