@@ -646,9 +646,10 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     PlayerDecodeModeC secure_effective_mode = PLAYER_DECODE_MODE_SOFTWARE;
     DECODEI("evt=secure_decode_policy mode=fixed_software user_pref=%s reason=secure_hls_stability",
             user_pref_hw ? "hardware" : "software");
-    DECODEI("evt=open method=openWithSecureSession decode_mode=%s user_pref=%s",
+    DECODEI("evt=open method=openWithSecureSession decode_mode=%s user_pref=%s start=%.3f",
             secure_effective_mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
-            user_pref_hw ? "hardware" : "software");
+            user_pref_hw ? "hardware" : "software",
+            start_position);
     player_core_set_decode_mode(player_core_, secure_effective_mode);
 
     PlayerDataSourceConfigC config{};
@@ -661,6 +662,12 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
 
     int result = player_core_open_with_mode(player_core_, &source, &config);
     if (result == 0) {
+        if (start_position > 0.001) {
+            // Fallback guard: some secure-open paths may ignore initial start_time.
+            // Apply a post-open seek to enforce first-start progress.
+            player_core_seek(player_core_, start_position);
+            SYNCI("evt=secure_open_apply_startpos start=%.3f", start_position);
+        }
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
@@ -1858,6 +1865,21 @@ void AndroidPlayer::renderLoop() {
             int pwr_retry = player_core_get_play_when_ready(player_core_);
             int state_retry = player_core_get_state(player_core_);
             double pos_retry = player_core_get_position(player_core_);
+            if (pwr_retry != 0 && state_retry == PLAYER_STATE_PLAYING) {
+                seek_phase_.store(SEEK_PHASE_RESUME, std::memory_order_release);
+                seek_force_resume_pending_.store(false, std::memory_order_release);
+                seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
+                seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+                seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                seek_force_resume_nudged_.store(false, std::memory_order_release);
+                uint64_t sid = seek_session_active_id_.load(std::memory_order_acquire);
+                SYNCI("evt=seek_force_resume_soft_success id=%" PRIu64 " phase=%s pwr=%d state=%d pos=%.3f by=state_playing",
+                      sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
+                      pwr_retry, state_retry, pos_retry);
+                seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+                seek_session_active_id_.store(0, std::memory_order_release);
+                return;
+            }
             bool pos_progressing = false;
             if (std::isfinite(pos_retry) && pos_retry >= 0.0) {
                 if (std::isfinite(force_resume_last_pos) &&
@@ -3273,6 +3295,11 @@ void AndroidPlayer::renderLoop() {
                     int pwr_now = player_core_ ? player_core_get_play_when_ready(player_core_) : 0;
                     int state_now = player_core_ ? player_core_get_state(player_core_) : 0;
                     double pos_now = player_core_ ? player_core_get_position(player_core_) : -1.0;
+                    if (pwr_now != 0 && state_now == PLAYER_STATE_PLAYING) {
+                        core_playing_now = true;
+                        SYNCI("evt=seek_empty_timeout_soft_resume_ok target=%.3f from=%.3f pwr=%d state=%d pos=%.3f by=state_playing",
+                              seek_target_now, seek_from_now, pwr_now, state_now, pos_now);
+                    }
                     bool soft_resume_healthy_now = false;
                     if (pwr_now != 0 &&
                         state_now == PLAYER_STATE_PAUSED &&
