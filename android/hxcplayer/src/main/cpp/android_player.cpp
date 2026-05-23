@@ -980,12 +980,15 @@ void AndroidPlayer::seekTo(double position) {
             learned_hits = 0;
         }
         double span_bias_sec = std::max(0.0, seek_span) * secure_forward_preroll_span_gain_;
-        double learned_component_sec = learned_bias_sec * secure_forward_preroll_learned_gain_;
+        double learned_component_sec = std::min(28.0,
+                                                learned_bias_sec * (secure_forward_preroll_learned_gain_ * 0.58));
         double preroll_sec = secure_forward_preroll_base_sec_ + span_bias_sec + learned_component_sec;
         if (very_large_seek) {
             preroll_sec += 8.0;
         }
-        preroll_sec = std::min(secure_forward_preroll_max_sec_, std::max(12.0, preroll_sec));
+        double dynamic_preroll_cap = std::min(96.0, std::max(42.0, 18.0 + seek_span * 0.012));
+        preroll_sec = std::min(std::min(secure_forward_preroll_max_sec_, dynamic_preroll_cap),
+                               std::max(12.0, preroll_sec));
         seek_dispatch_position = std::max(0.0, position - preroll_sec);
         SYNCI("evt=seek_secure_forward_preroll from=%.3f target=%.3f dispatch=%.3f span=%.3f preroll=%.3f learned=%.3f hits=%d stale=%d",
               seek_from, position, seek_dispatch_position, seek_span, preroll_sec, learned_bias_sec,
@@ -1988,11 +1991,44 @@ void AndroidPlayer::renderLoop() {
                 return;
             }
             int retry_count = seek_force_resume_retry_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            bool seek_gates_still_active =
+                    seek_lower_bound_active_.load(std::memory_order_acquire) ||
+                    seek_recovery_active_.load(std::memory_order_acquire) ||
+                    seek_audio_wait_video_.load(std::memory_order_acquire);
             bool can_force_full_play_path =
                     !core_playing_retry &&
                     pwr_retry != 0 &&
                     state_retry == PLAYER_STATE_PAUSED &&
+                    !seek_gates_still_active &&
                     retry_count >= 2;
+            bool can_force_unstick_seek_gate =
+                    !core_playing_retry &&
+                    pwr_retry != 0 &&
+                    state_retry == PLAYER_STATE_PAUSED &&
+                    retry_count >= 3;
+            if (can_force_unstick_seek_gate) {
+                seek_phase_.store(SEEK_PHASE_RESUME, std::memory_order_release);
+                seek_lower_bound_active_.store(false, std::memory_order_release);
+                seek_lower_bound_deadline_ms_ = 0;
+                seek_recovery_active_.store(false, std::memory_order_release);
+                seek_recovery_deadline_ms_ = 0;
+                seek_audio_wait_video_.store(false, std::memory_order_release);
+                seek_audio_wait_deadline_ms_ = 0;
+                seek_started_at_ms_ = 0;
+                seek_lower_bound_drop_count_ = 0;
+                seek_verify_hits_.store(0, std::memory_order_release);
+                sync_warmup_frames_.store(16, std::memory_order_release);
+                if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                    setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
+                }
+                double nudge_target = seek_target_sec_.load(std::memory_order_acquire);
+                if (player_core_ && std::isfinite(nudge_target) && nudge_target >= 0.0) {
+                    player_core_seek(player_core_, std::max(0.0, nudge_target - 0.10));
+                    render_cv_.notify_one();
+                }
+                SYNCW_RATE(8, "evt=seek_force_resume_unstick retry=%d state=%d pwr=%d",
+                           retry_count, state_retry, pwr_retry);
+            }
             if (can_force_full_play_path) {
                 SYNCW("evt=seek_force_resume_try_full_play_path retry=%d state=%d pwr=%d",
                       retry_count, state_retry, pwr_retry);
@@ -2015,7 +2051,7 @@ void AndroidPlayer::renderLoop() {
                     return;
                 }
             }
-            if (!core_playing_retry && retry_count >= 4) {
+            if (!core_playing_retry && retry_count == 4) {
                 if (trySeekSoftRebuild(now_ts, "force_resume_retry")) {
                     seek_phase_.store(SEEK_PHASE_RESUME, std::memory_order_release);
                     seek_force_resume_pending_.store(false, std::memory_order_release);
@@ -2042,9 +2078,10 @@ void AndroidPlayer::renderLoop() {
                           nudge_target, retry_count, player_core_get_state(player_core_));
                 }
             }
-            seek_force_resume_next_try_ms_.store(now_ts + 260, std::memory_order_release);
-            SYNCW_RATE(10, "evt=seek_force_resume_retry playing=0 pwr=%d state=%d retry=%d",
-                       pwr_retry, state_retry, retry_count);
+            int64_t retry_interval_ms = seek_gates_still_active ? 420 : 260;
+            seek_force_resume_next_try_ms_.store(now_ts + retry_interval_ms, std::memory_order_release);
+            SYNCW_RATE(10, "evt=seek_force_resume_retry playing=0 pwr=%d state=%d retry=%d gates_active=%d interval_ms=%" PRId64,
+                       pwr_retry, state_retry, retry_count, seek_gates_still_active ? 1 : 0, retry_interval_ms);
         };
 
         // --- Fetch next decoded video frame ---
@@ -2502,8 +2539,8 @@ void AndroidPlayer::renderLoop() {
                                 reseek_count < 6 &&
                                 now >= secure_seek_precise_reseek_cooldown_until_ms_;
                         if (can_forward_behind_reseek) {
-                            double nudge_factor = 0.55 + 0.12 * std::min(reseek_count, 4);
-                            double forward_nudge_sec = std::min(20.0, std::max(3.5, behind_sec * nudge_factor));
+                            double nudge_factor = 0.36 + 0.08 * std::min(reseek_count, 4);
+                            double forward_nudge_sec = std::min(12.0, std::max(2.5, behind_sec * nudge_factor));
                             double dispatch_forward_target = seek_target_now + forward_nudge_sec;
                             int next_reseek_count = std::min(reseek_count + 1, 3);
                             // Do not let "behind-reseek" inflate the counter too much,
@@ -2582,6 +2619,15 @@ void AndroidPlayer::renderLoop() {
                                     ? secure_accept_future_backward_late_sec_
                                     : secure_accept_future_forward_late_sec_;
                         }
+                        if (!is_backward_seek && large_seek_any_direction) {
+                            // Large forward secure seeks are prone to keyframe cluster jitter.
+                            // Slightly relax early acceptance to reduce reseek ping-pong.
+                            if (seek_elapsed_ms < secure_accept_mid_elapsed_ms_) {
+                                secure_accept_future_sec = std::max(secure_accept_future_sec, 5.5);
+                            } else if (seek_elapsed_ms < secure_accept_late_elapsed_ms_) {
+                                secure_accept_future_sec = std::max(secure_accept_future_sec, 8.8);
+                            }
+                        }
                         if (future_offset_sec > secure_accept_future_sec && seek_elapsed_ms < 7000) {
                             should_consume = true;
                             seek_lower_bound_drop_count_++;
@@ -2601,12 +2647,21 @@ void AndroidPlayer::renderLoop() {
                                 double gate_backoff_sec = is_backward_seek
                                         ? std::min(180.0, std::max(6.0, future_offset_sec * 1.15))
                                         : ([&]() {
-                                            double progressive_factor = 1.10 + 0.30 * reseek_count;
-                                            if (reseek_count >= 3) progressive_factor += 0.40;
-                                            return std::min(240.0,
-                                                            std::max(10.0,
-                                                                     future_offset_sec * progressive_factor +
-                                                                     reseek_count * 6.0));
+                                            bool near_target_forward = future_offset_sec <= 16.0;
+                                            double progressive_factor = near_target_forward
+                                                                        ? (0.78 + 0.14 * reseek_count)
+                                                                        : (1.10 + 0.30 * reseek_count);
+                                            if (!near_target_forward && reseek_count >= 3) {
+                                                progressive_factor += 0.40;
+                                            }
+                                            double additive = near_target_forward
+                                                              ? (reseek_count * 2.5)
+                                                              : (reseek_count * 6.0);
+                                            double max_backoff = near_target_forward ? 48.0 : 240.0;
+                                            double min_backoff = near_target_forward ? 6.0 : 10.0;
+                                            return std::min(max_backoff,
+                                                            std::max(min_backoff,
+                                                                     future_offset_sec * progressive_factor + additive));
                                         })();
                                 double gate_dispatch_target = std::max(0.0, seek_target_now - gate_backoff_sec);
                                 secure_seek_precise_reseek_count_.store(reseek_count + 1, std::memory_order_release);
