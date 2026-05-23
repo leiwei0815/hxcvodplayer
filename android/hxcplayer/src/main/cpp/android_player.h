@@ -36,6 +36,14 @@ namespace hxcplayer { class ICustomDataSource; }
  */
 class AndroidPlayer {
 public:
+    enum SeekPhase {
+        SEEK_PHASE_IDLE = 0,
+        SEEK_PHASE_PRIME = 1,
+        SEEK_PHASE_CONVERGE = 2,
+        SEEK_PHASE_VERIFY = 3,
+        SEEK_PHASE_RESUME = 4,
+        SEEK_PHASE_FAILOVER = 5
+    };
     AndroidPlayer();
     ~AndroidPlayer();
 
@@ -285,11 +293,17 @@ private:
     // Whether this seek should resume playback automatically after converge.
     // Captured at seek dispatch from current core intent (playing/playWhenReady).
     std::atomic<bool>   seek_resume_on_complete_{true};
+    std::atomic<uint64_t> seek_session_seq_{0};
+    std::atomic<uint64_t> seek_session_active_id_{0};
+    std::atomic<int>    seek_phase_{SEEK_PHASE_IDLE};
+    std::atomic<int>    seek_verify_hits_{0};
     // If fallback issued play but core didn't flip to playing immediately,
     // keep a short retry window to avoid "seek settled but no autoplay".
     std::atomic<bool>   seek_force_resume_pending_{false};
     std::atomic<int64_t> seek_force_resume_deadline_ms_{0};
     std::atomic<int64_t> seek_force_resume_next_try_ms_{0};
+    std::atomic<int>    seek_force_resume_retry_count_{0};
+    std::atomic<bool>   seek_force_resume_nudged_{false};
     // Secure HLS / encrypted session: seek sync uses keyframe-ahead landing strategy.
     std::atomic<bool>   secure_session_active_{false};
     // Seek recovery diagnostics and adaptive lower-bound relaxation.

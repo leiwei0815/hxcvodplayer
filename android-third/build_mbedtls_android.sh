@@ -5,9 +5,6 @@
 
 set -e
 
-# 默认仅 arm64-v8a；全架构: export ANDROID_ABIS="arm64-v8a armeabi-v7a x86_64"
-ANDROID_ABIS="${ANDROID_ABIS:-arm64-v8a}"
-
 # 配置
 MBEDTLS_VERSION="2.28.9"
 MBEDTLS_TARBALL="mbedtls-${MBEDTLS_VERSION}.tar.gz"
@@ -146,20 +143,14 @@ build_mbedtls() {
     cd "$BUILD_DIR"
 }
 
-for _abi in $ANDROID_ABIS; do
-  case "$_abi" in
-    arm64-v8a) build_mbedtls "aarch64" "arm64-v8a" ;;
-    armeabi-v7a) build_mbedtls "armv7-a" "armeabi-v7a" ;;
-    x86_64) build_mbedtls "x86_64" "x86_64" ;;
-    *) echo "❌ 不支持的 ABI: $_abi"; exit 1 ;;
-  esac
-done
+# 编译 arm64-v8a
+build_mbedtls "aarch64" "arm64-v8a"
 
 # 组织输出目录
 echo ""
 echo "📦 组织输出文件..."
 
-for ABI in $ANDROID_ABIS; do
+for ABI in "arm64-v8a"; do
     mkdir -p "$OUTPUT_DIR/$ABI/lib"
     mkdir -p "$OUTPUT_DIR/$ABI/include"
     
@@ -178,9 +169,9 @@ done
 echo ""
 echo "✅ mbedTLS Android 动态库编译完成！"
 echo ""
-echo "输出目录 (ANDROID_ABIS=$ANDROID_ABIS):"
-for ABI in $ANDROID_ABIS; do
-  echo "  $ABI: $OUTPUT_DIR/$ABI"
-  ls -lh "$OUTPUT_DIR/$ABI/lib/"*.so 2>/dev/null || ls -lh "$OUTPUT_DIR/$ABI/lib/"*.a 2>/dev/null || echo "    (无库文件)"
-done
+echo "输出目录:"
+echo "  arm64-v8a: $OUTPUT_DIR/arm64-v8a"
+echo ""
+echo "库文件 (arm64-v8a):"
+ls -lh "$OUTPUT_DIR/arm64-v8a/lib/"*.so 2>/dev/null || echo "  (未找到库文件)"
 echo ""

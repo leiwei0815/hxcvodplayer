@@ -155,6 +155,19 @@ inline int64_t clampi64(int64_t value, int64_t min_value, int64_t max_value) {
     return std::max(min_value, std::min(max_value, value));
 }
 
+inline const char* seek_phase_name(int phase) {
+    switch (phase) {
+        case AndroidPlayer::SEEK_PHASE_PRIME: return "PRIME";
+        case AndroidPlayer::SEEK_PHASE_CONVERGE: return "CONVERGE";
+        case AndroidPlayer::SEEK_PHASE_VERIFY: return "VERIFY";
+        case AndroidPlayer::SEEK_PHASE_RESUME: return "RESUME";
+        case AndroidPlayer::SEEK_PHASE_FAILOVER: return "FAILOVER";
+        case AndroidPlayer::SEEK_PHASE_IDLE:
+        default:
+            return "IDLE";
+    }
+}
+
 inline float rgb_clip_penalty(float y, float u, float v) {
     float r = y + 1.402f * v;
     float g = y - 0.344f * u - 0.714f * v;
@@ -713,9 +726,14 @@ void AndroidPlayer::play() {
     seek_audio_wait_deadline_ms_ = 0;
     seek_resume_stable_hits_.store(0, std::memory_order_release);
     seek_resume_on_complete_.store(true, std::memory_order_release);
+    seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+    seek_verify_hits_.store(0, std::memory_order_release);
+    seek_session_active_id_.store(0, std::memory_order_release);
     seek_force_resume_pending_.store(false, std::memory_order_release);
     seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
     seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+    seek_force_resume_retry_count_.store(0, std::memory_order_release);
+    seek_force_resume_nudged_.store(false, std::memory_order_release);
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
@@ -766,9 +784,14 @@ void AndroidPlayer::pause() {
     seek_audio_wait_deadline_ms_ = 0;
     seek_resume_stable_hits_.store(0, std::memory_order_release);
     seek_resume_on_complete_.store(false, std::memory_order_release);
+    seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+    seek_verify_hits_.store(0, std::memory_order_release);
+    seek_session_active_id_.store(0, std::memory_order_release);
     seek_force_resume_pending_.store(false, std::memory_order_release);
     seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
     seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+    seek_force_resume_retry_count_.store(0, std::memory_order_release);
+    seek_force_resume_nudged_.store(false, std::memory_order_release);
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
@@ -801,9 +824,14 @@ void AndroidPlayer::stop() {
     seek_audio_wait_deadline_ms_ = 0;
     seek_resume_stable_hits_.store(0, std::memory_order_release);
     seek_resume_on_complete_.store(false, std::memory_order_release);
+    seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+    seek_verify_hits_.store(0, std::memory_order_release);
+    seek_session_active_id_.store(0, std::memory_order_release);
     seek_force_resume_pending_.store(false, std::memory_order_release);
     seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
     seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+    seek_force_resume_retry_count_.store(0, std::memory_order_release);
+    seek_force_resume_nudged_.store(false, std::memory_order_release);
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
@@ -852,10 +880,16 @@ void AndroidPlayer::seekTo(double position) {
     seek_force_resume_pending_.store(false, std::memory_order_release);
     seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
     seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+    seek_force_resume_retry_count_.store(0, std::memory_order_release);
+    seek_force_resume_nudged_.store(false, std::memory_order_release);
     // 约 1 秒左右的渲染 tick 追赶窗口，避免 seek 后先看到大量旧帧。
     seek_fast_catchup_frames_.store(very_large_seek ? 128 : 96, std::memory_order_release);
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+    uint64_t seek_session_id = seek_session_seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    seek_session_active_id_.store(seek_session_id, std::memory_order_release);
+    seek_phase_.store(SEEK_PHASE_PRIME, std::memory_order_release);
+    seek_verify_hits_.store(0, std::memory_order_release);
     seek_started_at_ms_ = now;
     seek_lower_bound_drop_count_ = 0;
     secure_seek_precise_reseek_count_.store(0, std::memory_order_release);
@@ -892,6 +926,12 @@ void AndroidPlayer::seekTo(double position) {
     severe_lag_audio_pause_start_ms_ = 0;
     last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
     player_core_seek(player_core_, position);
+    seek_phase_.store(SEEK_PHASE_CONVERGE, std::memory_order_release);
+    SYNCI("evt=seek_phase id=%" PRIu64 " phase=%s from=%.3f target=%.3f",
+          seek_session_id,
+          seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
+          seek_from,
+          position);
     SYNCI("evt=seek_policy_init secure=%d from=%.3f target=%.3f span=%.3f lower_deadline_ms=%" PRId64 " recovery_deadline_ms=%" PRId64 " audio_wait_deadline_ms=%" PRId64,
           secure_session ? 1 : 0,
           seek_from,
@@ -1472,6 +1512,7 @@ void AndroidPlayer::trySeekAudioWaitDeadlineFallback(int64_t now,
     if (seek_audio_wait_deadline_ms_ <= 0 || now < seek_audio_wait_deadline_ms_) {
         return;
     }
+    seek_phase_.store(SEEK_PHASE_FAILOVER, std::memory_order_release);
     if (!seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
@@ -1495,11 +1536,17 @@ void AndroidPlayer::trySeekAudioWaitDeadlineFallback(int64_t now,
     }
     sync_warmup_frames_.store(likely_4k ? 28 : 20, std::memory_order_release);
     post_seek_ahead_bypass_until_ms = now + (likely_4k ? 3200 : 1800);
+    uint64_t sid = seek_session_active_id_.load(std::memory_order_acquire);
+    seek_phase_.store(SEEK_PHASE_RESUME, std::memory_order_release);
     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
         SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
         LOGI("[sync] seek wait-video deadline resume audio: result=%d anchor=%.3f", r, anchor_pts);
-        SYNCI("evt=seek_wait_video_deadline_resume anchor=%.3f target=%.3f", anchor_pts, seek_target_now);
     }
+    SYNCI("evt=seek_wait_video_deadline_resume id=%" PRIu64 " phase=%s anchor=%.3f target=%.3f abs_err=%.3f",
+          sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
+          anchor_pts, seek_target_now, std::fabs(anchor_pts - seek_target_now));
+    seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+    seek_session_active_id_.store(0, std::memory_order_release);
 }
 
 void AndroidPlayer::resumeSeekAudioAfterKeyframeAhead(int64_t now,
@@ -1542,6 +1589,7 @@ void AndroidPlayer::resumeSeekAudioAfterKeyframeAhead(int64_t now,
 
     bool should_resume_on_complete = seek_resume_on_complete_.load(std::memory_order_acquire);
     if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
+        seek_phase_.store(SEEK_PHASE_RESUME, std::memory_order_release);
         seek_resume_stable_hits_.store(0, std::memory_order_release);
         seek_audio_wait_deadline_ms_ = 0;
         if (player_core_ && should_resume_on_complete) {
@@ -1554,9 +1602,13 @@ void AndroidPlayer::resumeSeekAudioAfterKeyframeAhead(int64_t now,
             SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
             LOGI("[sync] seek keyframe-ahead resume audio: result=%d delay=%.3f secure=%d target=%.3f",
                  r, delay, secure_session ? 1 : 0, seek_target_now);
-            SYNCI("evt=seek_keyframe_ahead_resume_audio delay=%.3f secure=%d pts=%.3f target=%.3f bypass_ms=%" PRId64,
-                  delay, secure_session ? 1 : 0, pts, seek_target_now, bypass_ms);
+            uint64_t sid = seek_session_active_id_.load(std::memory_order_acquire);
+            SYNCI("evt=seek_keyframe_ahead_resume_audio id=%" PRIu64 " phase=%s delay=%.3f secure=%d pts=%.3f target=%.3f abs_err=%.3f bypass_ms=%" PRId64,
+                  sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
+                  delay, secure_session ? 1 : 0, pts, seek_target_now, std::fabs(pts - seek_target_now), bypass_ms);
         }
+        seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+        seek_session_active_id_.store(0, std::memory_order_release);
     }
 }
 
@@ -1694,6 +1746,66 @@ void AndroidPlayer::renderLoop() {
 
         if (!surface_ready || !player_core_) continue;
 
+        auto trySeekForceResume = [&](int64_t now_ts) {
+            if (!seek_force_resume_pending_.load(std::memory_order_acquire)) return;
+            int64_t deadline_ms = seek_force_resume_deadline_ms_.load(std::memory_order_acquire);
+            int64_t next_try_ms = seek_force_resume_next_try_ms_.load(std::memory_order_acquire);
+            if (deadline_ms <= 0 || now_ts >= deadline_ms) {
+                seek_force_resume_pending_.store(false, std::memory_order_release);
+                seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
+                seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+                seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                seek_force_resume_nudged_.store(false, std::memory_order_release);
+                seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+                seek_session_active_id_.store(0, std::memory_order_release);
+                SYNCW("evt=seek_force_resume_expired");
+                return;
+            }
+            if (now_ts < next_try_ms || !player_core_ ||
+                !seek_resume_on_complete_.load(std::memory_order_acquire)) {
+                return;
+            }
+            player_core_set_play_when_ready(player_core_, 1);
+            if (!player_core_is_playing(player_core_)) {
+                player_core_play(player_core_);
+            }
+            bool core_playing_retry = player_core_is_playing(player_core_);
+            int pwr_retry = player_core_get_play_when_ready(player_core_);
+            if (core_playing_retry) {
+                seek_phase_.store(SEEK_PHASE_RESUME, std::memory_order_release);
+                seek_force_resume_pending_.store(false, std::memory_order_release);
+                seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
+                seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+                seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                seek_force_resume_nudged_.store(false, std::memory_order_release);
+                if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                    SLresult rr = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
+                    LOGI("[sync] seek force-resume retry audio: result=%d", rr);
+                }
+                uint64_t sid = seek_session_active_id_.load(std::memory_order_acquire);
+                SYNCI("evt=seek_force_resume_success id=%" PRIu64 " phase=%s playing=1 pwr=%d",
+                      sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)), pwr_retry);
+                seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+                seek_session_active_id_.store(0, std::memory_order_release);
+                return;
+            }
+            int retry_count = seek_force_resume_retry_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            bool can_nudge_seek = !seek_force_resume_nudged_.load(std::memory_order_acquire) && retry_count >= 3;
+            if (can_nudge_seek && player_core_) {
+                double nudge_target = seek_target_sec_.load(std::memory_order_acquire);
+                if (std::isfinite(nudge_target) && nudge_target >= 0.0) {
+                    player_core_seek(player_core_, nudge_target);
+                    render_cv_.notify_one();
+                    seek_force_resume_nudged_.store(true, std::memory_order_release);
+                    SYNCW("evt=seek_force_resume_nudge_seek target=%.3f retry=%d state=%d",
+                          nudge_target, retry_count, player_core_get_state(player_core_));
+                }
+            }
+            seek_force_resume_next_try_ms_.store(now_ts + 260, std::memory_order_release);
+            SYNCW_RATE(10, "evt=seek_force_resume_retry playing=0 pwr=%d state=%d retry=%d",
+                       pwr_retry, player_core_get_state(player_core_), retry_count);
+        };
+
         // --- Fetch next decoded video frame ---
         VideoFrameDataC frame_data;
         int get_result = player_core_get_video_frame(player_core_, &frame_data);
@@ -1719,6 +1831,7 @@ void AndroidPlayer::renderLoop() {
             }
             double delay = pts - clock;
             int64_t now = now_ms();
+            trySeekForceResume(now);
             bool likely_4k_early = (frame_data.width >= 3840 || frame_data.height >= 2160);
             trySeekAudioWaitDeadlineFallback(now, pts, likely_4k_early, post_seek_ahead_bypass_until_ms);
             double playback_rate = player_core_get_playback_rate(player_core_);
@@ -2041,6 +2154,8 @@ void AndroidPlayer::renderLoop() {
                         // Do not overwrite with current pts, otherwise forward seek may be misclassified as backward.
                         seek_target_sec_.store(seek_target_now, std::memory_order_release);
                         seek_started_at_ms_ = now;
+                        seek_phase_.store(SEEK_PHASE_CONVERGE, std::memory_order_release);
+                        seek_verify_hits_.store(0, std::memory_order_release);
                         seek_lower_bound_active_.store(true, std::memory_order_release);
                         seek_lower_bound_deadline_ms_ = now + (is_backward_seek ? 3600 : 2400);
                         seek_recovery_active_.store(true, std::memory_order_release);
@@ -2109,27 +2224,41 @@ void AndroidPlayer::renderLoop() {
                         if (future_offset_sec > secure_accept_future_sec && seek_elapsed_ms < 7000) {
                             should_consume = true;
                             seek_lower_bound_drop_count_++;
+                            bool backward_gate_stuck = is_backward_seek
+                                    && future_offset_sec > (secure_accept_future_sec + 1.5)
+                                    && seek_elapsed_ms >= 1600
+                                    && player_core_;
                             bool forward_gate_stuck = !is_backward_seek
                                     && future_offset_sec > (secure_accept_future_sec + 3.0)
                                     && seek_elapsed_ms >= 1200
                                     && player_core_;
                             int reseek_count = secure_seek_precise_reseek_count_.load(std::memory_order_acquire);
-                            bool can_gate_reseek = forward_gate_stuck
-                                    && reseek_count < 5
+                            bool can_gate_reseek = ((forward_gate_stuck && reseek_count < 5) ||
+                                                    (backward_gate_stuck && reseek_count < 3))
                                     && now >= secure_seek_precise_reseek_cooldown_until_ms_;
                             if (can_gate_reseek) {
-                                double gate_backoff_sec = std::min(260.0, std::max(18.0, future_offset_sec * 1.70));
+                                double gate_backoff_sec = is_backward_seek
+                                        ? std::min(220.0, std::max(10.0, future_offset_sec * 1.45))
+                                        : std::min(260.0, std::max(18.0, future_offset_sec * 1.70));
                                 double gate_dispatch_target = std::max(0.0, seek_target_now - gate_backoff_sec);
                                 secure_seek_precise_reseek_count_.store(reseek_count + 1, std::memory_order_release);
                                 secure_seek_precise_reseek_cooldown_until_ms_ = now + 900;
                                 seek_target_sec_.store(seek_target_now, std::memory_order_release);
                                 seek_started_at_ms_ = now;
+                                seek_phase_.store(SEEK_PHASE_CONVERGE, std::memory_order_release);
+                                seek_verify_hits_.store(0, std::memory_order_release);
                                 seek_lower_bound_active_.store(true, std::memory_order_release);
-                                seek_lower_bound_deadline_ms_ = now + secure_lower_bound_deadline_normal_ms_;
+                                seek_lower_bound_deadline_ms_ = now + (is_backward_seek
+                                                                       ? secure_lower_bound_deadline_large_ms_
+                                                                       : secure_lower_bound_deadline_normal_ms_);
                                 seek_recovery_active_.store(true, std::memory_order_release);
-                                seek_recovery_deadline_ms_ = now + secure_recovery_deadline_normal_ms_;
+                                seek_recovery_deadline_ms_ = now + (is_backward_seek
+                                                                    ? secure_recovery_deadline_large_ms_
+                                                                    : secure_recovery_deadline_normal_ms_);
                                 seek_audio_wait_video_.store(true, std::memory_order_release);
-                                seek_audio_wait_deadline_ms_ = now + secure_audio_wait_deadline_normal_ms_;
+                                seek_audio_wait_deadline_ms_ = now + (is_backward_seek
+                                                                      ? secure_audio_wait_deadline_large_ms_
+                                                                      : secure_audio_wait_deadline_normal_ms_);
                                 seek_resume_stable_hits_.store(0, std::memory_order_release);
                                 sync_warmup_frames_.store(44, std::memory_order_release);
                                 if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
@@ -2137,9 +2266,10 @@ void AndroidPlayer::renderLoop() {
                                 }
                                 player_core_seek(player_core_, gate_dispatch_target);
                                 render_cv_.notify_one();
-                                SYNCW("evt=seek_secure_accept_gate_reseek target=%.3f dispatch=%.3f pts=%.3f future_offset=%.3f accept_max=%.3f elapsed_ms=%" PRId64 " count=%d",
+                                SYNCW("evt=seek_secure_accept_gate_reseek target=%.3f dispatch=%.3f pts=%.3f future_offset=%.3f accept_max=%.3f elapsed_ms=%" PRId64 " count=%d backward=%d",
                                       seek_target_now, gate_dispatch_target, pts, future_offset_sec,
-                                      secure_accept_future_sec, seek_elapsed_ms, reseek_count + 1);
+                                      secure_accept_future_sec, seek_elapsed_ms, reseek_count + 1,
+                                      is_backward_seek ? 1 : 0);
                             } else {
                                 SYNCW_RATE(20,
                                            "evt=seek_secure_accept_gate_drop pts=%.3f target=%.3f future_offset=%.3f accept_max=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
@@ -2177,6 +2307,8 @@ void AndroidPlayer::renderLoop() {
                                 secure_seek_precise_reseek_cooldown_until_ms_ = now + 900;
                                 seek_target_sec_.store(seek_target_now, std::memory_order_release);
                                 seek_started_at_ms_ = now;
+                                seek_phase_.store(SEEK_PHASE_CONVERGE, std::memory_order_release);
+                                seek_verify_hits_.store(0, std::memory_order_release);
                                 seek_lower_bound_active_.store(true, std::memory_order_release);
                                 seek_lower_bound_deadline_ms_ = now + (is_backward_seek ? secure_lower_bound_deadline_large_ms_
                                                                                           : secure_lower_bound_deadline_normal_ms_);
@@ -2205,6 +2337,36 @@ void AndroidPlayer::renderLoop() {
                                            "evt=seek_secure_completion_drop pts=%.3f target=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
                                            pts, seek_target_now, future_offset_sec, secure_completion_tol_sec,
                                            seek_elapsed_ms, seek_lower_bound_drop_count_);
+                            }
+                        }
+                    }
+                    if (!should_consume && secure_session) {
+                        seek_phase_.store(SEEK_PHASE_VERIFY, std::memory_order_release);
+                        double verify_max_offset_sec = is_backward_seek ? 1.6 : 2.2;
+                        if (large_seek_any_direction) {
+                            verify_max_offset_sec += is_backward_seek ? 0.4 : 0.8;
+                        }
+                        double verify_offset_sec = std::fabs(pts - seek_target_now);
+                        int verify_need_hits = is_backward_seek ? 2 : 3;
+                        if (verify_offset_sec > verify_max_offset_sec && seek_elapsed_ms < 9000) {
+                            should_consume = true;
+                            seek_verify_hits_.store(0, std::memory_order_release);
+                            seek_lower_bound_drop_count_++;
+                            SYNCW_RATE(20,
+                                       "evt=seek_verify_drop pts=%.3f target=%.3f offset=%.3f verify_max=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
+                                       pts, seek_target_now, verify_offset_sec, verify_max_offset_sec,
+                                       seek_elapsed_ms, seek_lower_bound_drop_count_);
+                        } else {
+                            int verify_hits = seek_verify_hits_.fetch_add(1, std::memory_order_acq_rel) + 1;
+                            if (verify_hits < verify_need_hits && seek_elapsed_ms < 8000) {
+                                should_consume = true;
+                                seek_lower_bound_drop_count_++;
+                                SYNCW_RATE(20,
+                                           "evt=seek_verify_wait pts=%.3f target=%.3f offset=%.3f hits=%d/%d elapsed_ms=%" PRId64 " drop_count=%d",
+                                           pts, seek_target_now, verify_offset_sec, verify_hits, verify_need_hits,
+                                           seek_elapsed_ms, seek_lower_bound_drop_count_);
+                            } else {
+                                seek_verify_hits_.store(0, std::memory_order_release);
                             }
                         }
                     }
@@ -2246,6 +2408,7 @@ void AndroidPlayer::renderLoop() {
             // During seek recovery, disable normal sync branches entirely.
             if (in_seek_recovery && !should_consume && !should_display) {
                 if (now >= seek_recovery_deadline_ms_) {
+                    seek_phase_.store(SEEK_PHASE_FAILOVER, std::memory_order_release);
                     // Timeout fallback: stop recovery loop and render latest frame.
                     seek_recovery_active_.store(false, std::memory_order_release);
                     seek_recovery_deadline_ms_ = 0;
@@ -2253,6 +2416,7 @@ void AndroidPlayer::renderLoop() {
                     seek_lower_bound_deadline_ms_ = 0;
                     seek_started_at_ms_ = 0;
                     seek_lower_bound_drop_count_ = 0;
+                    seek_verify_hits_.store(0, std::memory_order_release);
                     seek_fast_catchup_frames_.store(0, std::memory_order_release);
                     seek_catchup_deadline_ms_ = 0;
                     double anchor_pts = (std::isfinite(pts) && pts >= 0.0) ? pts : seek_target_now;
@@ -2280,6 +2444,8 @@ void AndroidPlayer::renderLoop() {
                             seek_force_resume_pending_.store(true, std::memory_order_release);
                             seek_force_resume_deadline_ms_.store(now + 2600, std::memory_order_release);
                             seek_force_resume_next_try_ms_.store(now + 220, std::memory_order_release);
+                            seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                            seek_force_resume_nudged_.store(false, std::memory_order_release);
                             SYNCW("evt=seek_recovery_timeout_force_resume_pending target=%.3f",
                                   seek_target_now);
                         }
@@ -2291,8 +2457,10 @@ void AndroidPlayer::renderLoop() {
                     }
                     should_display = should_consume = true;
                     LOGW("[sync] seek recovery timeout fallback: pts=%.3f target=%.3f", pts, seek_target_now);
-                    SYNCW("evt=seek_recovery_timeout_fallback pts=%.3f target=%.3f anchor=%.3f",
-                          pts, seek_target_now, anchor_pts);
+                    uint64_t sid = seek_session_active_id_.load(std::memory_order_acquire);
+                    SYNCW("evt=seek_recovery_timeout_fallback id=%" PRIu64 " phase=%s pts=%.3f target=%.3f anchor=%.3f abs_err=%.3f",
+                          sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
+                          pts, seek_target_now, anchor_pts, std::fabs(anchor_pts - seek_target_now));
                     in_seek_recovery = false;
                 } else {
                     should_consume = true;
@@ -2802,40 +2970,7 @@ void AndroidPlayer::renderLoop() {
             // if video queue stays empty for a while, pause OpenSL audio so user
             // doesn't hear a long "audio-only" segment and then permanent A/V drift.
             int64_t now = now_ms();
-            // If a previous seek fallback requested resume but core didn't switch to playing
-            // immediately, retry in a short bounded window to avoid "seek settled not autoplay".
-            if (seek_force_resume_pending_.load(std::memory_order_acquire)) {
-                int64_t deadline_ms = seek_force_resume_deadline_ms_.load(std::memory_order_acquire);
-                int64_t next_try_ms = seek_force_resume_next_try_ms_.load(std::memory_order_acquire);
-                if (deadline_ms <= 0 || now >= deadline_ms) {
-                    seek_force_resume_pending_.store(false, std::memory_order_release);
-                    seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
-                    seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
-                    SYNCW("evt=seek_force_resume_expired");
-                } else if (now >= next_try_ms && player_core_ &&
-                           seek_resume_on_complete_.load(std::memory_order_acquire)) {
-                    player_core_set_play_when_ready(player_core_, 1);
-                    if (!player_core_is_playing(player_core_)) {
-                        player_core_play(player_core_);
-                    }
-                    bool core_playing_retry = player_core_is_playing(player_core_);
-                    int pwr_retry = player_core_get_play_when_ready(player_core_);
-                    if (core_playing_retry) {
-                        seek_force_resume_pending_.store(false, std::memory_order_release);
-                        seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
-                        seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
-                        if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
-                            SLresult rr = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
-                            LOGI("[sync] seek force-resume retry audio: result=%d", rr);
-                        }
-                        SYNCI("evt=seek_force_resume_success playing=1 pwr=%d", pwr_retry);
-                    } else {
-                        seek_force_resume_next_try_ms_.store(now + 260, std::memory_order_release);
-                        SYNCW_RATE(10, "evt=seek_force_resume_retry playing=0 pwr=%d state=%d",
-                                   pwr_retry, player_core_get_state(player_core_));
-                    }
-                }
-            }
+            trySeekForceResume(now);
             // Seek watchdog in empty-frame path:
             // seek recovery timeout fallback previously only ran in the "frame available"
             // branch. If decoder keeps returning no frames, the player can stay in
@@ -2852,6 +2987,7 @@ void AndroidPlayer::renderLoop() {
                                         (seek_from_now - seek_target_now) > 0.5;
                 int64_t seek_empty_timeout_ms = is_backward_seek ? 7000 : 5500;
                 if (seek_elapsed_ms >= seek_empty_timeout_ms) {
+                    seek_phase_.store(SEEK_PHASE_FAILOVER, std::memory_order_release);
                     seek_lower_bound_active_.store(false, std::memory_order_release);
                     seek_lower_bound_deadline_ms_ = 0;
                     seek_recovery_active_.store(false, std::memory_order_release);
@@ -2862,6 +2998,7 @@ void AndroidPlayer::renderLoop() {
                     seek_audio_wait_deadline_ms_ = 0;
                     seek_started_at_ms_ = 0;
                     seek_lower_bound_drop_count_ = 0;
+                    seek_verify_hits_.store(0, std::memory_order_release);
                     seek_resume_stable_hits_.store(0, std::memory_order_release);
                     sync_warmup_frames_.store(28, std::memory_order_release);
                     int64_t timeout_bypass_ms = likely_4k_empty ? 3200 : 1800;
@@ -2883,6 +3020,8 @@ void AndroidPlayer::renderLoop() {
                             seek_force_resume_pending_.store(true, std::memory_order_release);
                             seek_force_resume_deadline_ms_.store(now + 2600, std::memory_order_release);
                             seek_force_resume_next_try_ms_.store(now + 220, std::memory_order_release);
+                            seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                            seek_force_resume_nudged_.store(false, std::memory_order_release);
                             SYNCW("evt=seek_empty_timeout_force_resume_pending target=%.3f from=%.3f",
                                   seek_target_now, seek_from_now);
                         }
@@ -2893,7 +3032,9 @@ void AndroidPlayer::renderLoop() {
                     }
                     SEEKW("seek_empty_timeout_fallback elapsed_ms=%" PRId64 " backward=%d target=%.3f from=%.3f",
                           seek_elapsed_ms, is_backward_seek ? 1 : 0, seek_target_now, seek_from_now);
-                    SYNCW("evt=seek_empty_timeout_fallback elapsed_ms=%" PRId64 " backward=%d target=%.3f from=%.3f",
+                    uint64_t sid = seek_session_active_id_.load(std::memory_order_acquire);
+                    SYNCW("evt=seek_empty_timeout_fallback id=%" PRIu64 " phase=%s elapsed_ms=%" PRId64 " backward=%d target=%.3f from=%.3f",
+                          sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
                           seek_elapsed_ms, is_backward_seek ? 1 : 0, seek_target_now, seek_from_now);
                 }
             }

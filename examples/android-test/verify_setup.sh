@@ -44,7 +44,7 @@ echo ""
 # 2. 检查 .so 库
 echo "📚 检查 Native 库..."
 
-for ABI in "arm64-v8a" "armeabi-v7a" "x86_64"; do
+for ABI in "arm64-v8a"; do
     JNI_DIR="$SCRIPT_DIR/hxcplayer/src/main/jniLibs/$ABI"
     if [ -d "$JNI_DIR" ]; then
         SO_COUNT=$(ls "$JNI_DIR"/*.so 2>/dev/null | wc -l | xargs)
