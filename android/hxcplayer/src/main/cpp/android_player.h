@@ -312,6 +312,12 @@ private:
     // Secure seek precise landing: when first hit is too far ahead, allow bounded reseek.
     std::atomic<int>    secure_seek_precise_reseek_count_{0};
     int64_t             secure_seek_precise_reseek_cooldown_until_ms_{0};
+    // Secure forward seek adaptive pre-roll bias.
+    // Learns "first landed ahead amount" so next large forward seek dispatches
+    // to an earlier point and avoids repeatedly hitting the same future keyframe cluster.
+    std::atomic<double> secure_forward_seek_bias_sec_{0.0};
+    std::atomic<int>    secure_forward_seek_bias_hits_{0};
+    std::atomic<int64_t> secure_forward_seek_bias_last_update_ms_{0};
     // Externalized secure-seek tuning knobs (runtime adjustable via JNI).
     double              secure_drop_only_window_backward_sec_{5.0};
     double              secure_drop_only_window_forward_sec_{8.0};
@@ -332,6 +338,11 @@ private:
     int64_t             secure_recovery_deadline_large_ms_{6400};
     int64_t             secure_audio_wait_deadline_normal_ms_{4400};
     int64_t             secure_audio_wait_deadline_large_ms_{5600};
+    double              secure_forward_preroll_base_sec_{10.0};
+    double              secure_forward_preroll_span_gain_{0.010};
+    double              secure_forward_preroll_learned_gain_{0.85};
+    double              secure_forward_preroll_max_sec_{260.0};
+    int64_t             secure_forward_preroll_bias_expire_ms_{45000};
     // High-rate cadence: avoid long "all-drop then force old frame" behavior.
     int                 consecutive_drop_count_{0};
     // Severe-lag detector for soft re-anchor (prevents endless drop loops).
