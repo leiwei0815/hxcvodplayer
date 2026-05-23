@@ -7,6 +7,7 @@
 #include "hxc_player_core_c_bridge.h"
 
 #define LOG_TAG "HXCPlayerJNI"
+#define LOG_TAG_DECODE "HXCSDK_DECODE"
 #ifndef HXC_PLAYER_JNI_DEBUG_LOG
 #define HXC_PLAYER_JNI_DEBUG_LOG 0
 #endif
@@ -18,6 +19,9 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define DECODEI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG_DECODE, __VA_ARGS__)
+#define DECODEW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG_DECODE, __VA_ARGS__)
+#define DECODEE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG_DECODE, __VA_ARGS__)
 
 extern "C" {
 
@@ -29,14 +33,17 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     auto* sym = dlsym(RTLD_DEFAULT, "av_jni_set_java_vm");
     if (!sym) {
         LOGW("JNI_OnLoad: av_jni_set_java_vm symbol not found, MediaCodec may fallback to software");
+        DECODEW("evt=jni_vm_bind status=symbol_not_found func=av_jni_set_java_vm");
         return JNI_VERSION_1_6;
     }
     auto fn = reinterpret_cast<AvJniSetJavaVmFn>(sym);
     int ret = fn(reinterpret_cast<void*>(vm), nullptr);
     if (ret < 0) {
         LOGE("JNI_OnLoad: av_jni_set_java_vm failed ret=%d", ret);
+        DECODEE("evt=jni_vm_bind status=failed ret=%d", ret);
     } else {
         LOGI("JNI_OnLoad: av_jni_set_java_vm success ret=%d", ret);
+        DECODEI("evt=jni_vm_bind status=ok ret=%d", ret);
     }
     return JNI_VERSION_1_6;
 }

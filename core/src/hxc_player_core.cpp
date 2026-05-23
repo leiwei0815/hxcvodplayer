@@ -2324,9 +2324,21 @@ int PlayerCore::stream_component_open(int stream_index) {
     // 打开解码器（若硬解打开失败，自动回退软解）
     int open_ret = avcodec_open2(codec_ctx, codec, nullptr);
     if (open_ret < 0 && request_video_hw_decode && hw_decode_enabled) {
+        std::string open_err = hxc_av_err_to_string(open_ret);
         LOG_WARNING("硬解打开失败，自动回退软解。ret=", open_ret);
         if (is_video_stream) {
             decode_diag += " reason=hw_open2_failed_fallback_soft";
+            decode_diag += " open_ret=" + std::to_string(open_ret);
+            decode_diag += " open_err=" + open_err;
+            decode_diag += " codec_id=" + std::to_string(codecpar->codec_id);
+            decode_diag += " profile=" + std::to_string(codecpar->profile);
+            decode_diag += " level=" + std::to_string(codecpar->level);
+            decode_diag += " width=" + std::to_string(codecpar->width);
+            decode_diag += " height=" + std::to_string(codecpar->height);
+            decode_diag += " par_fmt=" + std::to_string(codecpar->format);
+            if (codec && codec->name) {
+                decode_diag += std::string(" open_codec=") + codec->name;
+            }
         }
         codec = fallback_codec ? fallback_codec : codec;
         avcodec_free_context(&codec_ctx);
@@ -2345,7 +2357,10 @@ int PlayerCore::stream_component_open(int stream_index) {
     if (open_ret < 0) {
         if (is_video_stream) {
             std::lock_guard<std::mutex> lock(video_decode_diag_mutex_);
-            video_decode_diag_ = decode_diag + " final=open_failed";
+            video_decode_diag_ = decode_diag +
+                                 " final=open_failed" +
+                                 " open_ret=" + std::to_string(open_ret) +
+                                 " open_err=" + hxc_av_err_to_string(open_ret);
         }
         LOG_ERROR("打开解码器失败~ ret=", open_ret);
         emit_error(ERROR_CODEC_OPEN_FAILED, "打开解码器失败");
