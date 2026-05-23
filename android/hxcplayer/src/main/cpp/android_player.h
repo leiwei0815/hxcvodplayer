@@ -285,6 +285,11 @@ private:
     // Whether this seek should resume playback automatically after converge.
     // Captured at seek dispatch from current core intent (playing/playWhenReady).
     std::atomic<bool>   seek_resume_on_complete_{true};
+    // If fallback issued play but core didn't flip to playing immediately,
+    // keep a short retry window to avoid "seek settled but no autoplay".
+    std::atomic<bool>   seek_force_resume_pending_{false};
+    std::atomic<int64_t> seek_force_resume_deadline_ms_{0};
+    std::atomic<int64_t> seek_force_resume_next_try_ms_{0};
     // Secure HLS / encrypted session: seek sync uses keyframe-ahead landing strategy.
     std::atomic<bool>   secure_session_active_{false};
     // Seek recovery diagnostics and adaptive lower-bound relaxation.
