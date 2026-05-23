@@ -1790,6 +1790,34 @@ void AndroidPlayer::renderLoop() {
                 return;
             }
             int retry_count = seek_force_resume_retry_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            int state_retry = player_core_get_state(player_core_);
+            bool can_force_full_play_path =
+                    !core_playing_retry &&
+                    pwr_retry != 0 &&
+                    state_retry == PLAYER_STATE_PAUSED &&
+                    retry_count >= 2;
+            if (can_force_full_play_path) {
+                SYNCW("evt=seek_force_resume_try_full_play_path retry=%d state=%d pwr=%d",
+                      retry_count, state_retry, pwr_retry);
+                play();
+                core_playing_retry = player_core_is_playing(player_core_);
+                pwr_retry = player_core_get_play_when_ready(player_core_);
+                state_retry = player_core_get_state(player_core_);
+                if (core_playing_retry) {
+                    seek_phase_.store(SEEK_PHASE_RESUME, std::memory_order_release);
+                    seek_force_resume_pending_.store(false, std::memory_order_release);
+                    seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
+                    seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+                    seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                    seek_force_resume_nudged_.store(false, std::memory_order_release);
+                    uint64_t sid = seek_session_active_id_.load(std::memory_order_acquire);
+                    SYNCI("evt=seek_force_resume_success id=%" PRIu64 " phase=%s playing=1 pwr=%d by=full_play_path",
+                          sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)), pwr_retry);
+                    seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+                    seek_session_active_id_.store(0, std::memory_order_release);
+                    return;
+                }
+            }
             bool can_nudge_seek = !seek_force_resume_nudged_.load(std::memory_order_acquire) && retry_count >= 3;
             if (can_nudge_seek && player_core_) {
                 double nudge_target = seek_target_sec_.load(std::memory_order_acquire);
@@ -1803,7 +1831,7 @@ void AndroidPlayer::renderLoop() {
             }
             seek_force_resume_next_try_ms_.store(now_ts + 260, std::memory_order_release);
             SYNCW_RATE(10, "evt=seek_force_resume_retry playing=0 pwr=%d state=%d retry=%d",
-                       pwr_retry, player_core_get_state(player_core_), retry_count);
+                       pwr_retry, state_retry, retry_count);
         };
 
         // --- Fetch next decoded video frame ---
@@ -3016,6 +3044,18 @@ void AndroidPlayer::renderLoop() {
                         core_playing_now = player_core_is_playing(player_core_);
                         SEEKW("seek_empty_timeout_fallback force_core_play playing=%d",
                               core_playing_now ? 1 : 0);
+                        int state_after_core_play = player_core_get_state(player_core_);
+                        int pwr_after_core_play = player_core_get_play_when_ready(player_core_);
+                        if (!core_playing_now &&
+                            pwr_after_core_play != 0 &&
+                            state_after_core_play == PLAYER_STATE_PAUSED) {
+                            SYNCW("evt=seek_empty_timeout_try_full_play_path state=%d pwr=%d",
+                                  state_after_core_play, pwr_after_core_play);
+                            play();
+                            core_playing_now = player_core_is_playing(player_core_);
+                            SEEKW("seek_empty_timeout_fallback force_full_play_path playing=%d",
+                                  core_playing_now ? 1 : 0);
+                        }
                         if (!core_playing_now) {
                             seek_force_resume_pending_.store(true, std::memory_order_release);
                             seek_force_resume_deadline_ms_.store(now + 2600, std::memory_order_release);

@@ -2,6 +2,7 @@
 #include <string>
 #include <android/log.h>
 #include <android/native_window_jni.h>
+#include <dlfcn.h>
 #include "android_player.h"
 #include "hxc_player_core_c_bridge.h"
 
@@ -19,6 +20,26 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 extern "C" {
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    (void)reserved;
+    // FFmpeg Android MediaCodec 依赖 JavaVM 绑定；未绑定时常见表现是：
+    // 能找到 h264_mediacodec 解码器，但 avcodec_open2 失败并回退软解。
+    using AvJniSetJavaVmFn = int(*)(void*, void*);
+    auto* sym = dlsym(RTLD_DEFAULT, "av_jni_set_java_vm");
+    if (!sym) {
+        LOGW("JNI_OnLoad: av_jni_set_java_vm symbol not found, MediaCodec may fallback to software");
+        return JNI_VERSION_1_6;
+    }
+    auto fn = reinterpret_cast<AvJniSetJavaVmFn>(sym);
+    int ret = fn(reinterpret_cast<void*>(vm), nullptr);
+    if (ret < 0) {
+        LOGE("JNI_OnLoad: av_jni_set_java_vm failed ret=%d", ret);
+    } else {
+        LOGI("JNI_OnLoad: av_jni_set_java_vm success ret=%d", ret);
+    }
+    return JNI_VERSION_1_6;
+}
 
 static jboolean hxc_native_open_with_secure_session(JNIEnv *env,
                                                     jlong handle,
