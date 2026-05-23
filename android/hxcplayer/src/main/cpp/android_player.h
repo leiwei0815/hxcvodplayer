@@ -282,6 +282,9 @@ private:
     // Triple-gate counter: require consecutive "target+sync ready" frames
     // before resuming audio after seek.
     std::atomic<int>    seek_resume_stable_hits_{0};
+    // Whether this seek should resume playback automatically after converge.
+    // Captured at seek dispatch from current core intent (playing/playWhenReady).
+    std::atomic<bool>   seek_resume_on_complete_{true};
     // Secure HLS / encrypted session: seek sync uses keyframe-ahead landing strategy.
     std::atomic<bool>   secure_session_active_{false};
     // Seek recovery diagnostics and adaptive lower-bound relaxation.

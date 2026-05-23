@@ -712,6 +712,7 @@ void AndroidPlayer::play() {
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
     seek_resume_stable_hits_.store(0, std::memory_order_release);
+    seek_resume_on_complete_.store(true, std::memory_order_release);
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
@@ -761,6 +762,7 @@ void AndroidPlayer::pause() {
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
     seek_resume_stable_hits_.store(0, std::memory_order_release);
+    seek_resume_on_complete_.store(false, std::memory_order_release);
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
@@ -792,6 +794,7 @@ void AndroidPlayer::stop() {
     seek_audio_wait_video_.store(false, std::memory_order_release);
     seek_audio_wait_deadline_ms_ = 0;
     seek_resume_stable_hits_.store(0, std::memory_order_release);
+    seek_resume_on_complete_.store(false, std::memory_order_release);
     seek_started_at_ms_ = 0;
     seek_lower_bound_drop_count_ = 0;
     consecutive_drop_count_ = 0;
@@ -828,11 +831,15 @@ void AndroidPlayer::seekTo(double position) {
     double seek_span = std::fabs(position - seek_from);
     bool very_large_seek = seek_span > 180.0;
     bool secure_session = secure_session_active_.load(std::memory_order_acquire);
+    bool should_resume_on_complete =
+            player_core_is_playing(player_core_) ||
+            player_core_get_play_when_ready(player_core_) != 0;
     LOGI("[ctrl] seekTo: %.3fs (current pos=%.3f state=%d)", position, seek_from, player_core_get_state(player_core_));
     seek_just_happened_.store(true, std::memory_order_release);
     sync_warmup_frames_.store(40, std::memory_order_release); // wider warmup after seek
     seek_from_sec_.store(seek_from, std::memory_order_release);
     seek_target_sec_.store(position, std::memory_order_release);
+    seek_resume_on_complete_.store(should_resume_on_complete, std::memory_order_release);
     // 约 1 秒左右的渲染 tick 追赶窗口，避免 seek 后先看到大量旧帧。
     seek_fast_catchup_frames_.store(very_large_seek ? 128 : 96, std::memory_order_release);
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1467,6 +1474,13 @@ void AndroidPlayer::trySeekAudioWaitDeadlineFallback(int64_t now,
     if (player_core_ && std::isfinite(anchor_pts) && anchor_pts >= 0.0) {
         player_core_anchor_clock(player_core_, anchor_pts);
     }
+    bool should_resume_on_complete = seek_resume_on_complete_.load(std::memory_order_acquire);
+    if (player_core_ && should_resume_on_complete) {
+        player_core_set_play_when_ready(player_core_, 1);
+        if (!player_core_is_playing(player_core_)) {
+            player_core_play(player_core_);
+        }
+    }
     sync_warmup_frames_.store(likely_4k ? 28 : 20, std::memory_order_release);
     post_seek_ahead_bypass_until_ms = now + (likely_4k ? 3200 : 1800);
     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
@@ -1514,9 +1528,16 @@ void AndroidPlayer::resumeSeekAudioAfterKeyframeAhead(int64_t now,
     }
     post_seek_ahead_bypass_until_ms = now + bypass_ms;
 
+    bool should_resume_on_complete = seek_resume_on_complete_.load(std::memory_order_acquire);
     if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
         seek_resume_stable_hits_.store(0, std::memory_order_release);
         seek_audio_wait_deadline_ms_ = 0;
+        if (player_core_ && should_resume_on_complete) {
+            player_core_set_play_when_ready(player_core_, 1);
+            if (!player_core_is_playing(player_core_)) {
+                player_core_play(player_core_);
+            }
+        }
         if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
             SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
             LOGI("[sync] seek keyframe-ahead resume audio: result=%d delay=%.3f secure=%d target=%.3f",
@@ -1895,7 +1916,7 @@ void AndroidPlayer::renderLoop() {
                 bool large_seek_any_direction = seek_span_abs_sec > 25.0;
                 bool very_large_seek = seek_span_abs_sec > 180.0;
                 bool secure_session = secure_session_active_.load(std::memory_order_acquire);
-                double stale_future_margin_sec = ultra_high_rate_4k ? 5.0 : 2.8;
+                double stale_future_margin_sec = ultra_high_rate_4k ? 5.0 : 3.5;
                 if (large_forward_seek) {
                     // Tencent/Exo-like seek UX: on large forward jumps, prioritize
                     // "show something close quickly" over strict exact-target hit.
@@ -1959,7 +1980,7 @@ void AndroidPlayer::renderLoop() {
                     }
                     seek_epsilon_sec = std::max(seek_epsilon_sec, forced_eps);
                 }
-                double secure_future_guard_sec = is_backward_seek ? 7.0 : (very_large_seek ? 16.0 : 12.0);
+                double secure_future_guard_sec = is_backward_seek ? 10.0 : (very_large_seek ? 20.0 : 14.0);
                 if (seek_elapsed_ms >= 2600) {
                     secure_future_guard_sec += 6.0;
                 }
@@ -1984,8 +2005,10 @@ void AndroidPlayer::renderLoop() {
                         drop_only_window_sec += secure_drop_only_window_elapsed_bonus_sec_;
                     }
                     bool prefer_drop_only = overshoot_sec <= drop_only_window_sec;
+                    bool likely_preseek_stale_frame = seek_elapsed_ms < 900 && overshoot_sec > 120.0;
                     bool can_reseek = !prefer_drop_only
-                            && reseek_count < 4
+                            && !likely_preseek_stale_frame
+                            && reseek_count < 3
                             && now >= secure_seek_precise_reseek_cooldown_until_ms_
                             && seek_elapsed_ms >= 260;
                     if (can_reseek && player_core_) {
@@ -2082,7 +2105,7 @@ void AndroidPlayer::renderLoop() {
                         // Tencent-like precise completion gate:
                         // even after lower-bound hit, avoid completing seek when still too far ahead.
                         // Prefer a bounded completion-reseek before accepting large offsets.
-                        double secure_completion_tol_sec = is_backward_seek ? 1.0 : 1.6;
+                        double secure_completion_tol_sec = is_backward_seek ? 1.2 : 1.8;
                         if (large_seek_any_direction) {
                             secure_completion_tol_sec += is_backward_seek ? 0.3 : 0.7;
                         }
@@ -2093,7 +2116,8 @@ void AndroidPlayer::renderLoop() {
                             future_offset_sec > secure_completion_tol_sec &&
                             seek_elapsed_ms < 9500) {
                             int completion_reseek_count = secure_seek_precise_reseek_count_.load(std::memory_order_acquire);
-                            bool can_completion_reseek = completion_reseek_count < 4
+                            bool can_completion_reseek = future_offset_sec <= 20.0
+                                    && completion_reseek_count < 2
                                     && now >= secure_seek_precise_reseek_cooldown_until_ms_
                                     && seek_elapsed_ms >= 650
                                     && player_core_;
@@ -2199,9 +2223,12 @@ void AndroidPlayer::renderLoop() {
                     seek_audio_wait_video_.store(false, std::memory_order_release);
                     seek_audio_wait_deadline_ms_ = 0;
                     seek_resume_stable_hits_.store(0, std::memory_order_release);
-                    player_core_set_play_when_ready(player_core_, 1);
-                    if (!player_core_is_playing(player_core_)) {
-                        player_core_play(player_core_);
+                    bool should_resume_on_complete = seek_resume_on_complete_.load(std::memory_order_acquire);
+                    if (should_resume_on_complete) {
+                        player_core_set_play_when_ready(player_core_, 1);
+                        if (!player_core_is_playing(player_core_)) {
+                            player_core_play(player_core_);
+                        }
                     }
                     if (playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
@@ -2754,15 +2781,12 @@ void AndroidPlayer::renderLoop() {
                     // Reset stall-watchdog baseline so timeout recovery starts from a clean edge.
                     stall_watchdog_since_ms = 0;
                     stall_watchdog_last_break_ms = now;
-                    if (player_core_ && std::isfinite(seek_target_now) && seek_target_now >= 0.0) {
-                        // Timeout fallback 后优先重锚到目标附近，避免后续长期落入 ahead-hold 死区。
-                        player_core_anchor_clock(player_core_, seek_target_now);
-                    }
-                    if (player_core_) {
+                    bool should_resume_on_complete = seek_resume_on_complete_.load(std::memory_order_acquire);
+                    if (player_core_ && should_resume_on_complete) {
                         player_core_set_play_when_ready(player_core_, 1);
                     }
-                    bool core_playing_now = player_core_is_playing(player_core_);
-                    if (!core_playing_now && player_core_) {
+                    bool core_playing_now = player_core_ && player_core_is_playing(player_core_);
+                    if (!core_playing_now && player_core_ && should_resume_on_complete) {
                         player_core_play(player_core_);
                         core_playing_now = player_core_is_playing(player_core_);
                         SEEKW("seek_empty_timeout_fallback force_core_play playing=%d",
