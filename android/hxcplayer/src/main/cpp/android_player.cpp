@@ -2000,7 +2000,7 @@ void AndroidPlayer::renderLoop() {
                     pwr_retry != 0 &&
                     state_retry == PLAYER_STATE_PAUSED &&
                     !seek_gates_still_active &&
-                    retry_count >= 2;
+                    retry_count == 4;
             bool can_force_unstick_seek_gate =
                     !core_playing_retry &&
                     pwr_retry != 0 &&
