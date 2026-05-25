@@ -2776,13 +2776,7 @@ void AndroidPlayer::renderLoop() {
                                     && seek_elapsed_ms >= 700
                                     && seek_elapsed_ms <= 1700
                                     && player_core_;
-                            bool forward_gate_stuck = !is_backward_seek
-                                    && future_offset_sec > (secure_accept_future_sec + 3.0)
-                                    && seek_elapsed_ms >= 1200
-                                    && seek_elapsed_ms <= 3600
-                                    && player_core_;
-                            bool can_gate_reseek = ((forward_gate_stuck && reseek_count < 4) ||
-                                                    (backward_gate_stuck && reseek_count < 1))
+                            bool can_gate_reseek = ((backward_gate_stuck && reseek_count < 1))
                                     && now >= secure_seek_precise_reseek_cooldown_until_ms_;
                             if (!is_backward_seek) {
                                 // Forward only keeps precise_reseek channel.
@@ -2917,25 +2911,6 @@ void AndroidPlayer::renderLoop() {
                                                         large_seek_any_direction &&
                                                         seek_elapsed_ms >= 1200 &&
                                                         future_offset_sec <= 5.8;
-                            bool forward_stuck_escape_accept = !is_backward_seek &&
-                                                               large_seek_any_direction &&
-                                                               seek_elapsed_ms >= 1800 &&
-                                                               completion_reseek_count >= 1 &&
-                                                               std::isfinite(seek_progress_best_abs_err) &&
-                                                               seek_progress_best_abs_err <= 20.0 &&
-                                                               future_offset_sec <= 20.0;
-                            bool forward_loop_escape_accept = !is_backward_seek &&
-                                                              large_seek_any_direction &&
-                                                              seek_elapsed_ms >= 1800 &&
-                                                              std::isfinite(seek_progress_best_abs_err) &&
-                                                              seek_progress_best_abs_err <= 18.0 &&
-                                                              future_offset_sec <= 18.0;
-                            bool forward_fast_accept = !is_backward_seek &&
-                                                       large_seek_any_direction &&
-                                                       seek_elapsed_ms >= 2800 &&
-                                                       future_offset_sec <= (secure_completion_tol_sec + 2.0) &&
-                                                       std::isfinite(seek_progress_best_abs_err) &&
-                                                       seek_progress_best_abs_err < 7.5;
                             if (can_completion_reseek) {
                                 double completion_backoff_sec = is_backward_seek
                                         ? std::min(180.0, std::max(5.0, future_offset_sec * 1.20))
@@ -2978,26 +2953,6 @@ void AndroidPlayer::renderLoop() {
                                 SYNCI_RATE(20,
                                            "evt=seek_secure_completion_backward_fast_accept pts=%.3f target=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64,
                                            pts, seek_target_now, future_offset_sec, secure_completion_tol_sec, seek_elapsed_ms);
-                            } else if (forward_loop_escape_accept) {
-                                forward_soft_accept_active = true;
-                                forward_soft_accept_offset_sec = std::max(forward_soft_accept_offset_sec, std::fabs(future_offset_sec));
-                                SYNCI_RATE(20,
-                                           "evt=seek_secure_forward_loop_escape_accept pts=%.3f target=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64 " best_abs_err=%.3f",
-                                           pts, seek_target_now, future_offset_sec, secure_completion_tol_sec, seek_elapsed_ms,
-                                           seek_progress_best_abs_err);
-                            } else if (forward_stuck_escape_accept) {
-                                forward_soft_accept_active = true;
-                                forward_soft_accept_offset_sec = std::max(forward_soft_accept_offset_sec, std::fabs(future_offset_sec));
-                                SYNCI_RATE(20,
-                                           "evt=seek_secure_forward_stuck_escape_accept pts=%.3f target=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64 " reseek_count=%d best_abs_err=%.3f",
-                                           pts, seek_target_now, future_offset_sec, secure_completion_tol_sec, seek_elapsed_ms,
-                                           completion_reseek_count, seek_progress_best_abs_err);
-                            } else if (forward_fast_accept) {
-                                forward_soft_accept_active = true;
-                                forward_soft_accept_offset_sec = std::max(forward_soft_accept_offset_sec, std::fabs(future_offset_sec));
-                                SYNCI_RATE(20,
-                                           "evt=seek_secure_completion_forward_fast_accept pts=%.3f target=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64 " best_abs_err=%.3f",
-                                           pts, seek_target_now, future_offset_sec, secure_completion_tol_sec, seek_elapsed_ms, seek_progress_best_abs_err);
                             } else if (seek_elapsed_ms < 7000) {
                                 should_consume = true;
                                 seek_lower_bound_drop_count_++;
@@ -3842,20 +3797,43 @@ void AndroidPlayer::renderLoop() {
                                       seek_target_now, seek_from_now);
                             }
                         } else {
-                            // Forward seek timeout: one-shot resume only, no rebuild loop.
+                            // Forward seek timeout: avoid infinite loop, but do not give up too early.
+                            // Try core play first, then full play path once, and finally arm short bounded retries.
                             player_core_play(player_core_);
                             core_playing_now = player_core_is_playing(player_core_);
                             SEEKW("seek_empty_timeout_forward_single_play playing=%d",
                                   core_playing_now ? 1 : 0);
-                            seek_force_resume_pending_.store(false, std::memory_order_release);
-                            seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
-                            seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
-                            seek_force_resume_retry_count_.store(0, std::memory_order_release);
-                            seek_force_resume_nudged_.store(false, std::memory_order_release);
-                            seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
-                            seek_session_active_id_.store(0, std::memory_order_release);
-                            SYNCW("evt=seek_empty_timeout_forward_stop_retry target=%.3f from=%.3f",
-                                  seek_target_now, seek_from_now);
+                            int state_after_forward_play = player_core_get_state(player_core_);
+                            int pwr_after_forward_play = player_core_get_play_when_ready(player_core_);
+                            if (!core_playing_now &&
+                                pwr_after_forward_play != 0 &&
+                                state_after_forward_play == PLAYER_STATE_PAUSED) {
+                                SYNCW("evt=seek_empty_timeout_forward_try_full_play_path state=%d pwr=%d",
+                                      state_after_forward_play, pwr_after_forward_play);
+                                play();
+                                core_playing_now = player_core_is_playing(player_core_);
+                                SEEKW("seek_empty_timeout_forward_full_play_path playing=%d",
+                                      core_playing_now ? 1 : 0);
+                            }
+                            if (!core_playing_now) {
+                                seek_force_resume_pending_.store(true, std::memory_order_release);
+                                seek_force_resume_deadline_ms_.store(now + 1400, std::memory_order_release);
+                                seek_force_resume_next_try_ms_.store(now + 220, std::memory_order_release);
+                                seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                                seek_force_resume_nudged_.store(false, std::memory_order_release);
+                                SYNCW("evt=seek_empty_timeout_forward_force_resume_pending target=%.3f from=%.3f",
+                                      seek_target_now, seek_from_now);
+                            } else {
+                                seek_force_resume_pending_.store(false, std::memory_order_release);
+                                seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
+                                seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+                                seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                                seek_force_resume_nudged_.store(false, std::memory_order_release);
+                                seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+                                seek_session_active_id_.store(0, std::memory_order_release);
+                                SYNCW("evt=seek_empty_timeout_forward_stop_retry target=%.3f from=%.3f",
+                                      seek_target_now, seek_from_now);
+                            }
                         }
                     }
                     if (core_playing_now && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
