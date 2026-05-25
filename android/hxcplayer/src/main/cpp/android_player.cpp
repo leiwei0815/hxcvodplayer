@@ -2838,7 +2838,9 @@ void AndroidPlayer::renderLoop() {
                                                        large_seek_any_direction &&
                                                        seek_elapsed_ms >= 2600 &&
                                                        has_seek_progress &&
-                                                       future_offset_sec <= 14.5;
+                                                       std::isfinite(seek_progress_best_abs_err) &&
+                                                       seek_progress_best_abs_err <= 6.5 &&
+                                                       future_offset_sec <= 8.5;
                         if (forward_terminal_accept) {
                             SYNCI_RATE(20,
                                        "evt=seek_secure_forward_terminal_accept pts=%.3f target=%.3f future_offset=%.3f elapsed_ms=%" PRId64 " best_abs_err=%.3f",
@@ -2869,9 +2871,9 @@ void AndroidPlayer::renderLoop() {
                             bool forward_fast_accept = !is_backward_seek &&
                                                        large_seek_any_direction &&
                                                        seek_elapsed_ms >= 2800 &&
-                                                       future_offset_sec <= (secure_completion_tol_sec + 4.2) &&
+                                                       future_offset_sec <= (secure_completion_tol_sec + 2.0) &&
                                                        std::isfinite(seek_progress_best_abs_err) &&
-                                                       seek_progress_best_abs_err < 8.8;
+                                                       seek_progress_best_abs_err < 7.5;
                             if (can_completion_reseek) {
                                 double completion_backoff_sec = is_backward_seek
                                         ? std::min(180.0, std::max(5.0, future_offset_sec * 1.20))
@@ -2970,7 +2972,7 @@ void AndroidPlayer::renderLoop() {
                             seek_elapsed_ms >= 2600 &&
                             std::isfinite(seek_progress_best_abs_err) &&
                             seek_progress_best_abs_err < 9.5) {
-                            verify_max_offset_sec = std::max(verify_max_offset_sec, 14.5);
+                            verify_max_offset_sec = std::max(verify_max_offset_sec, 9.0);
                             verify_need_hits = 1;
                         }
                         if (verify_offset_sec > verify_max_offset_sec && seek_elapsed_ms < 9000) {
