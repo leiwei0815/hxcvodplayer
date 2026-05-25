@@ -1009,13 +1009,15 @@ void AndroidPlayer::seekTo(double position) {
             learned_hits = 0;
         }
         double span_bias_sec = std::max(0.0, seek_span) * secure_forward_preroll_span_gain_;
-        double learned_component_sec = std::min(28.0,
+        double learned_component_sec = std::min(14.0,
                                                 learned_bias_sec * (secure_forward_preroll_learned_gain_ * 0.58));
         double preroll_sec = secure_forward_preroll_base_sec_ + span_bias_sec + learned_component_sec;
         if (very_large_seek) {
-            preroll_sec += 8.0;
+            preroll_sec += 4.0;
         }
-        double dynamic_preroll_cap = std::min(96.0, std::max(42.0, 18.0 + seek_span * 0.012));
+        // Secure forward preroll should be conservative enough to avoid repeatedly
+        // landing into the same far-future keyframe cluster on long encrypted seeks.
+        double dynamic_preroll_cap = std::min(56.0, std::max(24.0, 12.0 + seek_span * 0.007));
         preroll_sec = std::min(std::min(secure_forward_preroll_max_sec_, dynamic_preroll_cap),
                                std::max(12.0, preroll_sec));
         seek_dispatch_position = std::max(0.0, position - preroll_sec);
@@ -2523,11 +2525,11 @@ void AndroidPlayer::renderLoop() {
                     }
                     bool prefer_drop_only = overshoot_sec <= drop_only_window_sec;
                     bool likely_preseek_stale_frame = seek_elapsed_ms < 900 && overshoot_sec > 120.0;
-                    int max_precise_reseek = is_backward_seek ? 3 : 3;
+                    int max_precise_reseek = is_backward_seek ? 3 : (large_seek_any_direction ? 5 : 3);
                     bool forward_reseek_budget_reached = !is_backward_seek &&
                                                          std::isfinite(seek_progress_best_abs_err) &&
-                                                         seek_progress_best_abs_err <= 12.0 &&
-                                                         reseek_count >= 2 &&
+                                                         seek_progress_best_abs_err <= 6.5 &&
+                                                         reseek_count >= 4 &&
                                                          seek_elapsed_ms >= 1500;
                     bool can_reseek = !prefer_drop_only
                             && !likely_preseek_stale_frame
@@ -2764,9 +2766,28 @@ void AndroidPlayer::renderLoop() {
                                        pts, seek_target_now, future_offset_sec, secure_accept_future_sec, seek_elapsed_ms,
                                        reseek_count, seek_progress_best_abs_err);
                         }
+                        bool forward_anti_stall_relax =
+                                !is_backward_seek &&
+                                large_seek_any_direction &&
+                                (
+                                        (seek_elapsed_ms >= 1800 &&
+                                         seek_lower_bound_drop_count_ >= 18 &&
+                                         has_seek_progress) ||
+                                        (seek_elapsed_ms >= 4200 &&
+                                         seek_lower_bound_drop_count_ >= 30)
+                                );
+                        if (forward_anti_stall_relax) {
+                            forward_soft_accept_active = true;
+                            forward_soft_accept_offset_sec = std::max(forward_soft_accept_offset_sec, std::fabs(future_offset_sec));
+                            SYNCI_RATE(20,
+                                       "evt=seek_forward_anti_stall_relax pts=%.3f target=%.3f future_offset=%.3f elapsed_ms=%" PRId64 " drop_count=%d best_abs_err=%.3f",
+                                       pts, seek_target_now, future_offset_sec, seek_elapsed_ms,
+                                       seek_lower_bound_drop_count_, seek_progress_best_abs_err);
+                        }
                         if (!forward_ux_fast_accept &&
                             !backward_ux_fast_accept &&
                             !forward_one_way_converge &&
+                            !forward_anti_stall_relax &&
                             future_offset_sec > secure_accept_future_sec &&
                             seek_elapsed_ms < 7000) {
                             should_consume = true;
@@ -3017,6 +3038,19 @@ void AndroidPlayer::renderLoop() {
                             seek_progress_best_abs_err < 9.5) {
                             verify_max_offset_sec = std::max(verify_max_offset_sec, 9.0);
                             verify_need_hits = 1;
+                        }
+                        if (!is_backward_seek &&
+                            large_seek_any_direction &&
+                            seek_elapsed_ms >= 2200 &&
+                            seek_lower_bound_drop_count_ >= 18) {
+                            // Emergency anti-stall path:
+                            // after many drops on forward large secure seek, prefer "resume quickly"
+                            // over strict frame accuracy to avoid repeated timeout-rebuild loops.
+                            verify_max_offset_sec = std::max(verify_max_offset_sec, 26.0);
+                            verify_need_hits = 1;
+                            SYNCI_RATE(20,
+                                       "evt=seek_forward_verify_relax verify_max=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
+                                       verify_max_offset_sec, seek_elapsed_ms, seek_lower_bound_drop_count_);
                         }
                         if (verify_offset_sec > verify_max_offset_sec && seek_elapsed_ms < 9000) {
                             should_consume = true;
