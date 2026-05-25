@@ -304,6 +304,11 @@ private:
     std::atomic<int64_t> seek_force_resume_next_try_ms_{0};
     std::atomic<int>    seek_force_resume_retry_count_{0};
     std::atomic<bool>   seek_force_resume_nudged_{false};
+    // Per-seek anti-loop budgets:
+    // - failover budget: how many times this seek session can arm force-resume retries
+    // - soft-rebuild budget: how many in-session soft-rebuild attempts are allowed
+    std::atomic<int>    seek_failover_budget_left_{2};
+    std::atomic<int>    seek_soft_rebuild_budget_left_{1};
     // Secure HLS / encrypted session: seek sync uses keyframe-ahead landing strategy.
     std::atomic<bool>   secure_session_active_{false};
     // Seek recovery diagnostics and adaptive lower-bound relaxation.
