@@ -2564,15 +2564,16 @@ void AndroidPlayer::renderLoop() {
                         double behind_sec = seek_target_now - pts;
                         int reseek_count = secure_seek_precise_reseek_count_.load(std::memory_order_acquire);
                         bool can_forward_behind_reseek =
-                                behind_sec > 4.0 &&
+                                behind_sec > 8.0 &&
                                 seek_elapsed_ms >= 1100 &&
-                                reseek_count < 6 &&
+                                seek_elapsed_ms <= 2600 &&
+                                reseek_count < 2 &&
                                 now >= secure_seek_precise_reseek_cooldown_until_ms_;
                         if (can_forward_behind_reseek) {
                             double nudge_factor = 0.36 + 0.08 * std::min(reseek_count, 4);
                             double forward_nudge_sec = std::min(12.0, std::max(2.5, behind_sec * nudge_factor));
                             double dispatch_forward_target = seek_target_now + forward_nudge_sec;
-                            int next_reseek_count = std::min(reseek_count + 1, 3);
+                            int next_reseek_count = std::min(reseek_count + 1, 2);
                             // Do not let "behind-reseek" inflate the counter too much,
                             // otherwise later overshoot branch may over-backoff.
                             secure_seek_precise_reseek_count_.store(next_reseek_count, std::memory_order_release);
@@ -2652,12 +2653,12 @@ void AndroidPlayer::renderLoop() {
                         if (is_backward_seek && large_seek_any_direction) {
                             // UX-first backward seek: earlier relaxed accept window
                             // shortens long drop loops on encrypted streams.
-                            secure_accept_future_sec = std::max(secure_accept_future_sec, 3.6);
+                            secure_accept_future_sec = std::max(secure_accept_future_sec, 4.8);
                             if (seek_elapsed_ms >= 900) {
-                                secure_accept_future_sec = std::max(secure_accept_future_sec, 4.8);
+                                secure_accept_future_sec = std::max(secure_accept_future_sec, 6.5);
                             }
                             if (seek_elapsed_ms >= 1800) {
-                                secure_accept_future_sec = std::max(secure_accept_future_sec, 6.2);
+                                secure_accept_future_sec = std::max(secure_accept_future_sec, 8.0);
                             }
                         }
                         if (!is_backward_seek && large_seek_any_direction) {
@@ -2743,10 +2744,10 @@ void AndroidPlayer::renderLoop() {
                                     && seek_elapsed_ms >= 1200
                                     && seek_elapsed_ms <= 3600
                                     && player_core_;
-                            bool can_gate_reseek = ((forward_gate_stuck && reseek_count < 8) ||
+                            bool can_gate_reseek = ((forward_gate_stuck && reseek_count < 4) ||
                                                     (backward_gate_stuck && reseek_count < 1))
                                     && now >= secure_seek_precise_reseek_cooldown_until_ms_;
-                            if (!is_backward_seek && seek_elapsed_ms >= 2600 && reseek_count >= 6) {
+                            if (!is_backward_seek && seek_elapsed_ms >= 1800 && reseek_count >= 3) {
                                 can_gate_reseek = false;
                             }
                             if (can_gate_reseek) {
@@ -2810,9 +2811,9 @@ void AndroidPlayer::renderLoop() {
                         // Tencent-like precise completion gate:
                         // even after lower-bound hit, avoid completing seek when still too far ahead.
                         // Prefer a bounded completion-reseek before accepting large offsets.
-                        double secure_completion_tol_sec = is_backward_seek ? 3.0 : 1.8;
+                        double secure_completion_tol_sec = is_backward_seek ? 4.2 : 1.8;
                         if (large_seek_any_direction) {
-                            secure_completion_tol_sec += is_backward_seek ? 1.6 : 0.7;
+                            secure_completion_tol_sec += is_backward_seek ? 1.8 : 0.7;
                         }
                         if (seek_elapsed_ms >= 5000) {
                             secure_completion_tol_sec += is_backward_seek ? 0.6 : 1.2;
@@ -2873,6 +2874,19 @@ void AndroidPlayer::renderLoop() {
                                                         large_seek_any_direction &&
                                                         seek_elapsed_ms >= 1200 &&
                                                         future_offset_sec <= 5.8;
+                            bool forward_stuck_escape_accept = !is_backward_seek &&
+                                                               large_seek_any_direction &&
+                                                               seek_elapsed_ms >= 1800 &&
+                                                               completion_reseek_count >= 1 &&
+                                                               std::isfinite(seek_progress_best_abs_err) &&
+                                                               seek_progress_best_abs_err <= 20.0 &&
+                                                               future_offset_sec <= 20.0;
+                            bool forward_loop_escape_accept = !is_backward_seek &&
+                                                              large_seek_any_direction &&
+                                                              seek_elapsed_ms >= 1800 &&
+                                                              std::isfinite(seek_progress_best_abs_err) &&
+                                                              seek_progress_best_abs_err <= 18.0 &&
+                                                              future_offset_sec <= 18.0;
                             bool forward_fast_accept = !is_backward_seek &&
                                                        large_seek_any_direction &&
                                                        seek_elapsed_ms >= 2800 &&
@@ -2921,6 +2935,16 @@ void AndroidPlayer::renderLoop() {
                                 SYNCI_RATE(20,
                                            "evt=seek_secure_completion_backward_fast_accept pts=%.3f target=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64,
                                            pts, seek_target_now, future_offset_sec, secure_completion_tol_sec, seek_elapsed_ms);
+                            } else if (forward_loop_escape_accept) {
+                                SYNCI_RATE(20,
+                                           "evt=seek_secure_forward_loop_escape_accept pts=%.3f target=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64 " best_abs_err=%.3f",
+                                           pts, seek_target_now, future_offset_sec, secure_completion_tol_sec, seek_elapsed_ms,
+                                           seek_progress_best_abs_err);
+                            } else if (forward_stuck_escape_accept) {
+                                SYNCI_RATE(20,
+                                           "evt=seek_secure_forward_stuck_escape_accept pts=%.3f target=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64 " reseek_count=%d best_abs_err=%.3f",
+                                           pts, seek_target_now, future_offset_sec, secure_completion_tol_sec, seek_elapsed_ms,
+                                           completion_reseek_count, seek_progress_best_abs_err);
                             } else if (forward_fast_accept) {
                                 SYNCI_RATE(20,
                                            "evt=seek_secure_completion_forward_fast_accept pts=%.3f target=%.3f future_offset=%.3f tol=%.3f elapsed_ms=%" PRId64 " best_abs_err=%.3f",
