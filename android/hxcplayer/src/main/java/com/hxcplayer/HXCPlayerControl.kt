@@ -329,6 +329,14 @@ class HXCPlayerControl @JvmOverloads constructor(
         fun onPlayerLoadingChanged(isLoading: Boolean) {}
         // 弱网 QoE 指标：当前卡顿时长/累计卡顿时长/自动恢复次数
         fun onNetworkQoEUpdated(currentStallMs: Long, totalStallMs: Long, reconnectCount: Int) {}
+        // seek 进入可用状态（SDK 侧统一结算）后回调，业务层可据此收敛 loading / 更新 UI 状态。
+        fun onSeekCompleted(
+            requestId: Long,
+            targetPosition: Double,
+            currentPosition: Double,
+            elapsedMs: Long,
+            byTimeout: Boolean
+        ) {}
     }
 
     /**
@@ -375,6 +383,15 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var loadingSessionLikelySeek: Boolean = false
     private var suppressLoadingShowUntilMs: Long = 0L
     private var lastPositionForLoadingHeuristicSec: Double = Double.NaN
+    private val seekCompletionTimeoutMs = 5600L
+    private val seekCompletionNearTargetSec = 1.5
+    private val seekCompletionMovedFromOldSec = 0.35
+    private var pendingSeekRequestId: Long = 0L
+    private var pendingSeekTargetSec: Double = Double.NaN
+    private var pendingSeekFromSec: Double = Double.NaN
+    private var pendingSeekStartAtMs: Long = 0L
+    private var pendingSeekLoadingObserved: Boolean = false
+    private var pendingSeekActive: Boolean = false
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
     private var autoReopenOnRecoverableErrorEnabled: Boolean = false
@@ -1259,7 +1276,15 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("seekTo")) {
             return
         }
-        nativeSeekTo(handle, position)
+        val target = maxOf(0.0, position)
+        pendingSeekRequestId += 1L
+        pendingSeekTargetSec = target
+        pendingSeekFromSec = getPosition()
+        pendingSeekStartAtMs = SystemClock.elapsedRealtime()
+        pendingSeekLoadingObserved = false
+        pendingSeekActive = true
+        loadingSessionLikelySeek = true
+        nativeSeekTo(handle, target)
     }
 
     // 设置播放速度
@@ -1503,6 +1528,40 @@ class HXCPlayerControl @JvmOverloads constructor(
                         }
                     }
                 }
+
+                if (pendingSeekActive) {
+                    if (loading) {
+                        pendingSeekLoadingObserved = true
+                    }
+                    val seekElapsedMs = now - pendingSeekStartAtMs
+                    val target = pendingSeekTargetSec
+                    val from = pendingSeekFromSec
+                    val nearTarget = !target.isNaN() && abs(position - target) <= seekCompletionNearTargetSec
+                    val movedFromOldPos = !from.isNaN() && abs(position - from) >= seekCompletionMovedFromOldSec
+                    val loadingRecovered = pendingSeekLoadingObserved && !loading
+                    val hardTimeout = seekElapsedMs >= seekCompletionTimeoutMs && (movedFromOldPos || nearTarget)
+                    if ((loadingRecovered && (nearTarget || movedFromOldPos)) || hardTimeout) {
+                        val requestId = pendingSeekRequestId
+                        pendingSeekActive = false
+                        pendingSeekLoadingObserved = false
+                        pendingSeekTargetSec = Double.NaN
+                        pendingSeekFromSec = Double.NaN
+                        pendingSeekStartAtMs = 0L
+                        Log.i(
+                            TAG,
+                            "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$hardTimeout loading_recovered=$loadingRecovered"
+                        )
+                        mainHandler.post {
+                            callback?.onSeekCompleted(
+                                requestId = requestId,
+                                targetPosition = target,
+                                currentPosition = position,
+                                elapsedMs = seekElapsedMs,
+                                byTimeout = hardTimeout
+                            )
+                        }
+                    }
+                }
                 lastPositionForLoadingHeuristicSec = position
 
                 // 透传播放中错误（由 core 错误回调写入，Java 侧轮询消费）
@@ -1566,6 +1625,11 @@ class HXCPlayerControl @JvmOverloads constructor(
         loadingSessionLikelySeek = false
         suppressLoadingShowUntilMs = 0L
         lastPositionForLoadingHeuristicSec = Double.NaN
+        pendingSeekActive = false
+        pendingSeekLoadingObserved = false
+        pendingSeekTargetSec = Double.NaN
+        pendingSeekFromSec = Double.NaN
+        pendingSeekStartAtMs = 0L
         networkLoadingSinceMs = 0L
         networkTotalStallMs = 0L
         networkReconnectCount = 0
