@@ -731,6 +731,8 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
 
 void AndroidPlayer::play() {
     if (!player_core_) return;
+    user_manual_pause_.store(false, std::memory_order_release);
+    user_manual_pause_block_until_ms_.store(0, std::memory_order_release);
 
     int core_decode_mode = player_core_get_decode_mode(player_core_);
     LOGI("[ctrl] play: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
@@ -814,6 +816,11 @@ void AndroidPlayer::play() {
 void AndroidPlayer::pause() {
     if (!player_core_) return;
 
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    user_manual_pause_.store(true, std::memory_order_release);
+    // Manual pause should hard-block seek failover auto-resume attempts briefly.
+    user_manual_pause_block_until_ms_.store(now + 5000, std::memory_order_release);
     LOGI("[ctrl] pause: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
     // Cancel any pending deferred audio start.
     audio_start_pending_.store(false, std::memory_order_release);
@@ -857,6 +864,8 @@ void AndroidPlayer::pause() {
 void AndroidPlayer::stop() {
     if (!player_core_) return;
 
+    user_manual_pause_.store(false, std::memory_order_release);
+    user_manual_pause_block_until_ms_.store(0, std::memory_order_release);
     LOGI("[ctrl] stop: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
     audio_start_pending_.store(false, std::memory_order_release);
     audio_rebuffer_pending_.store(false, std::memory_order_release);
@@ -907,7 +916,15 @@ void AndroidPlayer::stop() {
 void AndroidPlayer::seekTo(double position) {
     if (!player_core_) return;
 
-    if (player_core_get_pipeline_state(player_core_) == PLAYER_PIPELINE_STATE_ENDED) {
+    bool manual_pause_blocked = false;
+    if (user_manual_pause_.load(std::memory_order_acquire)) {
+        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t block_until = user_manual_pause_block_until_ms_.load(std::memory_order_acquire);
+        manual_pause_blocked = block_until <= 0 || now < block_until;
+    }
+    if (!manual_pause_blocked &&
+        player_core_get_pipeline_state(player_core_) == PLAYER_PIPELINE_STATE_ENDED) {
         player_core_set_play_when_ready(player_core_, 1);
         player_core_play(player_core_);
         LOGI("[ctrl] seekTo: resume from ENDED pipeline before seek");
@@ -1641,7 +1658,16 @@ void AndroidPlayer::trySeekAudioWaitDeadlineFallback(int64_t now,
     if (player_core_ && std::isfinite(anchor_pts) && anchor_pts >= 0.0) {
         player_core_anchor_clock(player_core_, anchor_pts);
     }
+    bool manual_pause_blocked = false;
+    if (user_manual_pause_.load(std::memory_order_acquire)) {
+        int64_t block_until = user_manual_pause_block_until_ms_.load(std::memory_order_acquire);
+        manual_pause_blocked = block_until <= 0 || now < block_until;
+    }
     bool should_resume_on_complete = seek_resume_on_complete_.load(std::memory_order_acquire);
+    if (manual_pause_blocked) {
+        should_resume_on_complete = false;
+        SYNCI_RATE(10, "evt=seek_wait_video_deadline_skip_autoplay reason=manual_pause");
+    }
     if (player_core_ && should_resume_on_complete) {
         player_core_set_play_when_ready(player_core_, 1);
         if (!player_core_is_playing(player_core_)) {
@@ -1701,7 +1727,15 @@ void AndroidPlayer::resumeSeekAudioAfterKeyframeAhead(int64_t now,
     }
     post_seek_ahead_bypass_until_ms = now + bypass_ms;
 
+    bool manual_pause_blocked = false;
+    if (user_manual_pause_.load(std::memory_order_acquire)) {
+        int64_t block_until = user_manual_pause_block_until_ms_.load(std::memory_order_acquire);
+        manual_pause_blocked = block_until <= 0 || now < block_until;
+    }
     bool should_resume_on_complete = seek_resume_on_complete_.load(std::memory_order_acquire);
+    if (manual_pause_blocked) {
+        should_resume_on_complete = false;
+    }
     if (seek_audio_wait_video_.exchange(false, std::memory_order_acq_rel)) {
         seek_phase_.store(SEEK_PHASE_RESUME, std::memory_order_release);
         seek_resume_stable_hits_.store(0, std::memory_order_release);
@@ -1874,6 +1908,15 @@ void AndroidPlayer::renderLoop() {
 
         auto trySeekSoftRebuild = [&](int64_t now_ts, const char* reason) -> bool {
             if (!player_core_) return false;
+            bool manual_pause_blocked = false;
+            if (user_manual_pause_.load(std::memory_order_acquire)) {
+                int64_t block_until = user_manual_pause_block_until_ms_.load(std::memory_order_acquire);
+                manual_pause_blocked = block_until <= 0 || now_ts < block_until;
+            }
+            if (manual_pause_blocked) {
+                SYNCW_RATE(8, "evt=seek_soft_rebuild_skip reason=%s manual_pause=1", reason);
+                return false;
+            }
             double target = seek_target_sec_.load(std::memory_order_acquire);
             if (!std::isfinite(target) || target < 0.0) {
                 return false;
@@ -1939,6 +1982,15 @@ void AndroidPlayer::renderLoop() {
                                              double from,
                                              int64_t deadline_ms,
                                              const char* event_tag) -> bool {
+            bool manual_pause_blocked = false;
+            if (user_manual_pause_.load(std::memory_order_acquire)) {
+                int64_t block_until = user_manual_pause_block_until_ms_.load(std::memory_order_acquire);
+                manual_pause_blocked = block_until <= 0 || now_ts < block_until;
+            }
+            if (manual_pause_blocked) {
+                SYNCW("evt=seek_force_resume_skip_manual_pause target=%.3f from=%.3f", target, from);
+                return false;
+            }
             int budget_before = seek_failover_budget_left_.fetch_sub(1, std::memory_order_acq_rel);
             if (budget_before <= 0) {
                 seek_failover_budget_left_.store(0, std::memory_order_release);
@@ -1966,6 +2018,20 @@ void AndroidPlayer::renderLoop() {
 
         auto trySeekForceResume = [&](int64_t now_ts) {
             if (!seek_force_resume_pending_.load(std::memory_order_acquire)) return;
+            bool manual_pause_blocked = false;
+            if (user_manual_pause_.load(std::memory_order_acquire)) {
+                int64_t block_until = user_manual_pause_block_until_ms_.load(std::memory_order_acquire);
+                manual_pause_blocked = block_until <= 0 || now_ts < block_until;
+            }
+            if (manual_pause_blocked) {
+                seek_force_resume_pending_.store(false, std::memory_order_release);
+                seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
+                seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+                seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                seek_force_resume_nudged_.store(false, std::memory_order_release);
+                SYNCW_RATE(6, "evt=seek_force_resume_cancel_manual_pause");
+                return;
+            }
             int64_t deadline_ms = seek_force_resume_deadline_ms_.load(std::memory_order_acquire);
             int64_t next_try_ms = seek_force_resume_next_try_ms_.load(std::memory_order_acquire);
             if (deadline_ms <= 0 || now_ts >= deadline_ms) {
@@ -3204,6 +3270,14 @@ void AndroidPlayer::renderLoop() {
                     seek_audio_wait_deadline_ms_ = 0;
                     seek_resume_stable_hits_.store(0, std::memory_order_release);
                     bool should_resume_on_complete = seek_resume_on_complete_.load(std::memory_order_acquire);
+                    bool manual_pause_blocked = false;
+                    if (user_manual_pause_.load(std::memory_order_acquire)) {
+                        int64_t block_until = user_manual_pause_block_until_ms_.load(std::memory_order_acquire);
+                        manual_pause_blocked = block_until <= 0 || now < block_until;
+                    }
+                    if (manual_pause_blocked) {
+                        should_resume_on_complete = false;
+                    }
                     if (should_resume_on_complete) {
                         player_core_set_play_when_ready(player_core_, 1);
                         if (!player_core_is_playing(player_core_)) {
@@ -3803,6 +3877,16 @@ void AndroidPlayer::renderLoop() {
                     stall_watchdog_since_ms = 0;
                     stall_watchdog_last_break_ms = now;
                     bool should_resume_on_complete = seek_resume_on_complete_.load(std::memory_order_acquire);
+                    bool manual_pause_blocked = false;
+                    if (user_manual_pause_.load(std::memory_order_acquire)) {
+                        int64_t block_until = user_manual_pause_block_until_ms_.load(std::memory_order_acquire);
+                        manual_pause_blocked = block_until <= 0 || now < block_until;
+                    }
+                    if (manual_pause_blocked) {
+                        should_resume_on_complete = false;
+                        SYNCW("evt=seek_empty_timeout_skip_autoplay target=%.3f from=%.3f reason=manual_pause",
+                              seek_target_now, seek_from_now);
+                    }
                     if (player_core_ && should_resume_on_complete) {
                         player_core_set_play_when_ready(player_core_, 1);
                     }

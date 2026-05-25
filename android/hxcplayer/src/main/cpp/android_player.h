@@ -304,6 +304,9 @@ private:
     std::atomic<int64_t> seek_force_resume_next_try_ms_{0};
     std::atomic<int>    seek_force_resume_retry_count_{0};
     std::atomic<bool>   seek_force_resume_nudged_{false};
+    // User manually pressed pause recently; suppress seek/failover auto-resume.
+    std::atomic<bool>   user_manual_pause_{false};
+    std::atomic<int64_t> user_manual_pause_block_until_ms_{0};
     // Per-seek anti-loop budgets:
     // - failover budget: how many times this seek session can arm force-resume retries
     // - soft-rebuild budget: how many in-session soft-rebuild attempts are allowed
