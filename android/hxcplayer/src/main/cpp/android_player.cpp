@@ -753,6 +753,11 @@ void AndroidPlayer::play() {
             seek_audio_wait_video_.load(std::memory_order_acquire) ||
             seek_force_resume_pending_.load(std::memory_order_acquire) ||
             seek_session_active_id_.load(std::memory_order_acquire) != 0;
+    bool seek_in_failover = seek_phase_.load(std::memory_order_acquire) == SEEK_PHASE_FAILOVER;
+    if (seek_in_failover) {
+        // Timeout fallback should not carry stale seek context into play().
+        seek_flow_active = false;
+    }
     seek_resume_on_complete_.store(true, std::memory_order_release);
     if (!seek_flow_active) {
         seek_recovery_active_.store(false, std::memory_order_release);
@@ -3686,7 +3691,7 @@ void AndroidPlayer::renderLoop() {
                     recent_seek_progress = false;
                 }
                 if (recent_seek_progress && seek_elapsed_ms < 15000) {
-                    int64_t progress_timeout_ms = is_backward_seek ? 11000 : 13500;
+                    int64_t progress_timeout_ms = is_backward_seek ? 10000 : 8200;
                     seek_empty_timeout_ms = std::max(seek_empty_timeout_ms, progress_timeout_ms);
                     SYNCW_RATE(15,
                                "evt=seek_empty_timeout_hold_by_progress id=%" PRIu64 " elapsed_ms=%" PRId64 " timeout_ms=%" PRId64 " best_abs_err=%.3f backward=%d",
@@ -3776,13 +3781,26 @@ void AndroidPlayer::renderLoop() {
                             core_playing_now = true;
                         }
                         if (!core_playing_now) {
-                            seek_force_resume_pending_.store(true, std::memory_order_release);
-                            seek_force_resume_deadline_ms_.store(now + 2600, std::memory_order_release);
-                            seek_force_resume_next_try_ms_.store(now + 220, std::memory_order_release);
-                            seek_force_resume_retry_count_.store(0, std::memory_order_release);
-                            seek_force_resume_nudged_.store(false, std::memory_order_release);
-                            SYNCW("evt=seek_empty_timeout_force_resume_pending target=%.3f from=%.3f",
-                                  seek_target_now, seek_from_now);
+                            // Avoid endless forward seek retry loops after timeout fallback.
+                            if (is_backward_seek) {
+                                seek_force_resume_pending_.store(true, std::memory_order_release);
+                                seek_force_resume_deadline_ms_.store(now + 1800, std::memory_order_release);
+                                seek_force_resume_next_try_ms_.store(now + 220, std::memory_order_release);
+                                seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                                seek_force_resume_nudged_.store(false, std::memory_order_release);
+                                SYNCW("evt=seek_empty_timeout_force_resume_pending target=%.3f from=%.3f",
+                                      seek_target_now, seek_from_now);
+                            } else {
+                                seek_force_resume_pending_.store(false, std::memory_order_release);
+                                seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
+                                seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+                                seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                                seek_force_resume_nudged_.store(false, std::memory_order_release);
+                                seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+                                seek_session_active_id_.store(0, std::memory_order_release);
+                                SYNCW("evt=seek_empty_timeout_forward_stop_retry target=%.3f from=%.3f",
+                                      seek_target_now, seek_from_now);
+                            }
                         }
                     }
                     if (core_playing_now && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
