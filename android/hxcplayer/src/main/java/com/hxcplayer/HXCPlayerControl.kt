@@ -1381,11 +1381,11 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (coreStateRaw == 1 || pipelineStateRaw == 1) {
             return PlayerState.OPENING
         }
-        if (pipelineStateRaw == 2) {
-            return PlayerState.LOADING
-        }
         if (isPlayingNow) {
             return PlayerState.PLAYING
+        }
+        if (pipelineStateRaw == 2) {
+            return PlayerState.LOADING
         }
         if (coreStateRaw == 3 || !playWhenReady) {
             return PlayerState.PAUSED
