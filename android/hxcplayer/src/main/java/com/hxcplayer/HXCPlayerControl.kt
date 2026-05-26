@@ -386,12 +386,23 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val seekCompletionTimeoutMs = 5600L
     private val seekCompletionNearTargetSec = 1.5
     private val seekCompletionMovedFromOldSec = 0.35
+    private val playStallDetectDelayMs = 1700L
+    private val playStallRetryDelayMs = 1200L
+    private val playStallMinProgressSec = 0.20
+    private val playStallRecoverReseekBackSec = 0.30
+    private val playStallRecoverCooldownMs = 5000L
     private var pendingSeekRequestId: Long = 0L
     private var pendingSeekTargetSec: Double = Double.NaN
     private var pendingSeekFromSec: Double = Double.NaN
     private var pendingSeekStartAtMs: Long = 0L
     private var pendingSeekLoadingObserved: Boolean = false
     private var pendingSeekActive: Boolean = false
+    private var playStallCheckArmed = false
+    private var playStallArmedAtMs: Long = 0L
+    private var playStallBasePosSec: Double = Double.NaN
+    private var playStallRecoverStage: Int = 0
+    private var playStallLastRecoverAtMs: Long = 0L
+    private var playStallLastPlayReqAtMs: Long = 0L
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
     private var autoReopenOnRecoverableErrorEnabled: Boolean = false
@@ -641,6 +652,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             networkTotalStallMs = 0L
             networkReconnectCount = 0
         }
+        playStallCheckArmed = false
         applyDecodeModeForHandle(handle)
         val result = when (workingModel.mode) {
             PlayerDataSourceMode.DEFAULT ->
@@ -1066,6 +1078,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             networkTotalStallMs = 0L
             networkReconnectCount = 0
         }
+        playStallCheckArmed = false
         applyDecodeModeForHandle(handle)
         // 始终用带起始位置的接口，确保 startPosition=0 时也能清除上次残留进度
         val result = nativeOpenURLWithStartPosition(handle, url, startPosition)
@@ -1090,6 +1103,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
             return
         }
+        playStallCheckArmed = false
         lastOpenUrl = url
         lastOpenStartPosition = startPosition
         lastOpenPlayModel = null
@@ -1251,6 +1265,11 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("play")) {
             return
         }
+        playStallLastPlayReqAtMs = SystemClock.elapsedRealtime()
+        playStallCheckArmed = true
+        playStallArmedAtMs = playStallLastPlayReqAtMs
+        playStallBasePosSec = getPosition()
+        playStallRecoverStage = 0
         nativePlay(handle)
     }
 
@@ -1258,6 +1277,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun pause() {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
+        playStallCheckArmed = false
         nativePause(handle)
     }
 
@@ -1266,6 +1286,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         nativeStop(handle)
+        playStallCheckArmed = false
         networkLoadingSinceMs = 0L
     }
 
@@ -1284,6 +1305,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekLoadingObserved = false
         pendingSeekActive = true
         loadingSessionLikelySeek = true
+        playStallCheckArmed = false
         nativeSeekTo(handle, target)
     }
 
@@ -1472,6 +1494,16 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
 
                 val now = SystemClock.elapsedRealtime()
+                maybeRecoverPlayStall(
+                    handle = handle,
+                    nowMs = now,
+                    positionSec = position,
+                    durationSec = duration,
+                    loading = loading,
+                    state = state,
+                    isPlayingNow = isPlaying,
+                    playWhenReady = playWhenReady
+                )
                 if (loadingCandidateState == null || loadingCandidateState != loading) {
                     if (loading) {
                         val likelySeekByJump = !lastPositionForLoadingHeuristicSec.isNaN() &&
@@ -1605,6 +1637,92 @@ class HXCPlayerControl @JvmOverloads constructor(
         }, 0, 100, TimeUnit.MILLISECONDS)
     }
 
+    private fun maybeRecoverPlayStall(
+        handle: Long,
+        nowMs: Long,
+        positionSec: Double,
+        durationSec: Double,
+        loading: Boolean,
+        state: PlayerState,
+        isPlayingNow: Boolean,
+        playWhenReady: Boolean
+    ) {
+        if (!playStallCheckArmed) return
+        if (pendingSeekActive || loading) return
+        if (!playWhenReady) {
+            playStallCheckArmed = false
+            return
+        }
+        if (!(isPlayingNow || state == PlayerState.PLAYING)) {
+            return
+        }
+        if ((nowMs - playStallLastPlayReqAtMs) > 15000L) {
+            playStallCheckArmed = false
+            return
+        }
+        if (durationSec <= 0.0 || positionSec < 0.0) {
+            return
+        }
+        if (!playStallBasePosSec.isFinite()) {
+            playStallBasePosSec = positionSec
+            playStallArmedAtMs = nowMs
+            return
+        }
+        val progressed = positionSec - playStallBasePosSec
+        if (progressed >= playStallMinProgressSec) {
+            playStallCheckArmed = false
+            return
+        }
+        val elapsedMs = nowMs - playStallArmedAtMs
+        val requiredDelayMs = if (playStallRecoverStage <= 0) {
+            playStallDetectDelayMs
+        } else {
+            playStallRetryDelayMs
+        }
+        if (elapsedMs < requiredDelayMs) {
+            return
+        }
+        if (playStallRecoverStage <= 0) {
+            if ((nowMs - playStallLastRecoverAtMs) < playStallRecoverCooldownMs) {
+                Log.i(
+                    TAG,
+                    "evt=play_stall_recover_skip reason=cooldown since_last_ms=${nowMs - playStallLastRecoverAtMs}"
+                )
+                playStallCheckArmed = false
+                return
+            }
+            val recoverTarget = maxOf(0.0, positionSec - playStallRecoverReseekBackSec)
+            playStallRecoverStage = 1
+            playStallArmedAtMs = nowMs
+            playStallBasePosSec = recoverTarget
+            pendingSeekRequestId += 1L
+            pendingSeekTargetSec = recoverTarget
+            pendingSeekFromSec = positionSec
+            pendingSeekStartAtMs = nowMs
+            pendingSeekLoadingObserved = false
+            pendingSeekActive = true
+            loadingSessionLikelySeek = true
+            Log.i(
+                TAG,
+                "evt=play_stall_recover_seek base=$positionSec target=$recoverTarget duration=$durationSec"
+            )
+            nativeSeekTo(handle, recoverTarget)
+            return
+        }
+        val reopenStart = maxOf(0.0, positionSec - playStallRecoverReseekBackSec)
+        playStallCheckArmed = false
+        playStallRecoverStage = 0
+        playStallLastRecoverAtMs = nowMs
+        Log.i(
+            TAG,
+            "evt=play_stall_recover_reopen base=$positionSec reopen_start=$reopenStart duration=$durationSec"
+        )
+        openExecutor.execute {
+            if (isReleased) return@execute
+            replayFrom(reopenStart)
+        }
+    }
+
     // 释放资源
     fun release() {
         synchronized(lifecycleLock) {
@@ -1644,6 +1762,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekTargetSec = Double.NaN
         pendingSeekFromSec = Double.NaN
         pendingSeekStartAtMs = 0L
+        playStallCheckArmed = false
+        playStallArmedAtMs = 0L
+        playStallBasePosSec = Double.NaN
+        playStallRecoverStage = 0
+        playStallLastRecoverAtMs = 0L
+        playStallLastPlayReqAtMs = 0L
         networkLoadingSinceMs = 0L
         networkTotalStallMs = 0L
         networkReconnectCount = 0
