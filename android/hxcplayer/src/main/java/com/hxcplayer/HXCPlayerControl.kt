@@ -384,6 +384,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var suppressLoadingShowUntilMs: Long = 0L
     private var lastPositionForLoadingHeuristicSec: Double = Double.NaN
     private val seekCompletionTimeoutMs = 5600L
+    // Native seek session occasionally stays active while position has already converged.
+    // Keep SDK completion bounded to avoid long loading tail and follow-up play deadlocks.
+    private val seekCompletionNativeConvergedWatchdogMs = 8200L
+    private val seekCompletionConvergedStableMs = 420L
     private val seekCompletionNearTargetSec = 1.5
     private val seekCompletionMovedFromOldSec = 0.35
     private val playStallDetectDelayMs = 1700L
@@ -397,6 +401,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var pendingSeekStartAtMs: Long = 0L
     private var pendingSeekLoadingObserved: Boolean = false
     private var pendingSeekActive: Boolean = false
+    private var pendingSeekConvergedSinceMs: Long = 0L
     private var playStallCheckArmed = false
     private var playStallArmedAtMs: Long = 0L
     private var playStallBasePosSec: Double = Double.NaN
@@ -1310,6 +1315,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekStartAtMs = SystemClock.elapsedRealtime()
         pendingSeekLoadingObserved = false
         pendingSeekActive = true
+        pendingSeekConvergedSinceMs = 0L
         loadingSessionLikelySeek = true
         playStallCheckArmed = false
         nativeSeekToWithIntent(handle, target, resumeAfterSeek)
@@ -1580,17 +1586,28 @@ class HXCPlayerControl @JvmOverloads constructor(
                     val from = pendingSeekFromSec
                     val nearTarget = !target.isNaN() && abs(position - target) <= seekCompletionNearTargetSec
                     val movedFromOldPos = !from.isNaN() && abs(position - from) >= seekCompletionMovedFromOldSec
+                    val convergedNow = nearTarget || movedFromOldPos
+                    if (convergedNow) {
+                        if (pendingSeekConvergedSinceMs <= 0L) {
+                            pendingSeekConvergedSinceMs = now
+                        }
+                    } else {
+                        pendingSeekConvergedSinceMs = 0L
+                    }
+                    val convergedStable = pendingSeekConvergedSinceMs > 0L
+                            && (now - pendingSeekConvergedSinceMs) >= seekCompletionConvergedStableMs
                     val loadingRecovered = pendingSeekLoadingObserved && !loading
                     val nativeSeekActive = nativeIsSeekSessionActive(handle)
-                    // Seek completion must align with native session convergence.
-                    // This avoids Java-side early timeout completion while native failover
-                    // is still running (which can cause post-complete playback stalls).
-                    val nativeSeekSettled = !nativeSeekActive
-                    val hardTimeout = nativeSeekSettled
-                            && seekElapsedMs >= seekCompletionTimeoutMs
+                    val nativeConvergedButStuck = nativeSeekActive
+                            && seekElapsedMs >= seekCompletionNativeConvergedWatchdogMs
+                            && convergedStable
+                    // Prefer native seek settle as source of truth, but bound wait time
+                    // when native session remains active despite already converged position.
+                    val nativeSeekSettled = !nativeSeekActive || nativeConvergedButStuck
+                    val hardTimeout = seekElapsedMs >= seekCompletionTimeoutMs
                             && !loadingRecovered
                     val shouldComplete = nativeSeekSettled
-                            && (loadingRecovered || nearTarget || movedFromOldPos || hardTimeout)
+                            && (loadingRecovered || convergedStable || hardTimeout)
                     if (shouldComplete) {
                         val requestId = pendingSeekRequestId
                         pendingSeekActive = false
@@ -1598,10 +1615,12 @@ class HXCPlayerControl @JvmOverloads constructor(
                         pendingSeekTargetSec = Double.NaN
                         pendingSeekFromSec = Double.NaN
                         pendingSeekStartAtMs = 0L
-                        nativeSettleSeekSession(handle, hardTimeout)
+                        pendingSeekConvergedSinceMs = 0L
+                        val completeByTimeout = hardTimeout || nativeConvergedButStuck
+                        nativeSettleSeekSession(handle, completeByTimeout)
                         Log.i(
                             TAG,
-                            "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$hardTimeout loading_recovered=$loadingRecovered"
+                            "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered native_converged_stuck=$nativeConvergedButStuck"
                         )
                         mainHandler.post {
                             callback?.onSeekCompleted(
@@ -1609,7 +1628,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 targetPosition = target,
                                 currentPosition = position,
                                 elapsedMs = seekElapsedMs,
-                                byTimeout = hardTimeout
+                                byTimeout = completeByTimeout
                             )
                         }
                     }
@@ -1707,6 +1726,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             pendingSeekStartAtMs = nowMs
             pendingSeekLoadingObserved = false
             pendingSeekActive = true
+            pendingSeekConvergedSinceMs = 0L
             loadingSessionLikelySeek = true
             Log.i(
                 TAG,
@@ -1768,6 +1788,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekTargetSec = Double.NaN
         pendingSeekFromSec = Double.NaN
         pendingSeekStartAtMs = 0L
+        pendingSeekConvergedSinceMs = 0L
         playStallCheckArmed = false
         playStallArmedAtMs = 0L
         playStallBasePosSec = Double.NaN

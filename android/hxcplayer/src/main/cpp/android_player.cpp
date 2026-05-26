@@ -777,11 +777,8 @@ void AndroidPlayer::play() {
             seek_audio_wait_video_.load(std::memory_order_acquire) ||
             seek_force_resume_pending_.load(std::memory_order_acquire) ||
             seek_session_active_id_.load(std::memory_order_acquire) != 0;
-    bool seek_in_failover = seek_phase_.load(std::memory_order_acquire) == SEEK_PHASE_FAILOVER;
-    if (seek_in_failover) {
-        // Timeout fallback should not carry stale seek context into play().
-        seek_flow_active = false;
-    }
+    // Keep failover lifecycle decided by real seek gates/session flags below.
+    // Forcing seek_flow_active=false in failover can prematurely clear session context.
     bool seek_started_while_paused = seek_started_while_paused_.load(std::memory_order_acquire);
     bool allow_seek_autoresume = !(seek_flow_active && seek_started_while_paused);
     seek_resume_on_complete_.store(allow_seek_autoresume, std::memory_order_release);
@@ -1801,8 +1798,8 @@ void AndroidPlayer::trySeekAudioWaitDeadlineFallback(int64_t now,
     SYNCI("evt=seek_wait_video_deadline_resume id=%" PRIu64 " phase=%s anchor=%.3f target=%.3f abs_err=%.3f",
           sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
           anchor_pts, seek_target_now, std::fabs(anchor_pts - seek_target_now));
-    seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
-    seek_session_active_id_.store(0, std::memory_order_release);
+    // Keep seek session alive here; this is only an audio-wait fallback edge.
+    // Session settlement should happen at an explicit success/abort boundary.
 }
 
 void AndroidPlayer::resumeSeekAudioAfterKeyframeAhead(int64_t now,
@@ -1871,8 +1868,8 @@ void AndroidPlayer::resumeSeekAudioAfterKeyframeAhead(int64_t now,
                   sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
                   delay, secure_session ? 1 : 0, pts, seek_target_now, std::fabs(pts - seek_target_now), bypass_ms);
         }
-        seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
-        seek_session_active_id_.store(0, std::memory_order_release);
+        // Keyframe-ahead resume only advances phase; do not clear session id here.
+        // Premature session clear can cause id=0/IDLE loops in later failover retries.
     }
 }
 
@@ -2055,8 +2052,10 @@ void AndroidPlayer::renderLoop() {
             bool is_backward_seek = (from - target) > 0.5;
             uint64_t sid = seek_session_active_id_.load(std::memory_order_acquire);
             if (sid == 0) {
-                sid = seek_session_seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
-                seek_session_active_id_.store(sid, std::memory_order_release);
+                // Internal rebuild must stay inside an existing seek session.
+                // Creating a new sid here breaks app/native session mapping.
+                SYNCW("evt=seek_soft_rebuild_skip reason=%s no_active_session=1", reason);
+                return false;
             }
             seek_phase_.store(SEEK_PHASE_CONVERGE, std::memory_order_release);
             seek_verify_hits_.store(0, std::memory_order_release);
@@ -4136,6 +4135,18 @@ void AndroidPlayer::renderLoop() {
                     if (core_playing_now && playItf_ && current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                         SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
                         LOGW("[sync] seek empty fallback resume audio: result=%d", r);
+                    }
+                    if (core_playing_now) {
+                        uint64_t sid = seek_session_active_id_.load(std::memory_order_acquire);
+                        seek_force_resume_pending_.store(false, std::memory_order_release);
+                        seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
+                        seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+                        seek_force_resume_retry_count_.store(0, std::memory_order_release);
+                        seek_force_resume_nudged_.store(false, std::memory_order_release);
+                        seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+                        seek_session_active_id_.store(0, std::memory_order_release);
+                        SYNCI("evt=seek_timeout_settle_success id=%" PRIu64 " target=%.3f from=%.3f",
+                              sid, seek_target_now, seek_from_now);
                     }
                     if (should_resume_on_complete || core_playing_now) {
                         SEEKW("seek_empty_timeout_fallback elapsed_ms=%" PRId64 " backward=%d target=%.3f from=%.3f",
