@@ -211,6 +211,16 @@ Java_com_hxcplayer_HXCPlayerControl_nativeSeekTo(
     }
 }
 
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeSeekToWithIntent(
+        JNIEnv *env, jobject thiz, jlong handle, jdouble position, jboolean resume_after_seek) {
+    LOGD("nativeSeekToWithIntent: %f resume=%d", position, resume_after_seek ? 1 : 0);
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        player->seekToWithIntent(position, resume_after_seek == JNI_TRUE);
+    }
+}
+
 // 设置播放速度
 JNIEXPORT void JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeSetPlaybackRate(

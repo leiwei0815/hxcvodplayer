@@ -945,6 +945,11 @@ void AndroidPlayer::stop() {
     player_core_stop(player_core_);
 }
 
+void AndroidPlayer::seekToWithIntent(double position, bool resume_after_seek) {
+    seek_resume_intent_override_.store(resume_after_seek ? 1 : 0, std::memory_order_release);
+    seekTo(position);
+}
+
 void AndroidPlayer::seekTo(double position) {
     if (!player_core_) return;
 
@@ -969,10 +974,19 @@ void AndroidPlayer::seekTo(double position) {
     int core_state_now = player_core_get_state(player_core_);
     bool core_paused_now = core_state_now == PLAYER_STATE_PAUSED;
     bool user_manual_pause_now = user_manual_pause_.load(std::memory_order_acquire);
+    int seek_resume_override = seek_resume_intent_override_.exchange(-1, std::memory_order_acq_rel);
     bool should_resume_on_complete =
             player_core_is_playing(player_core_) ||
             player_core_get_play_when_ready(player_core_) != 0;
-    if (core_paused_now || user_manual_pause_now) {
+    if (seek_resume_override == 1) {
+        should_resume_on_complete = true;
+        user_manual_pause_.store(false, std::memory_order_release);
+        user_manual_pause_block_until_ms_.store(0, std::memory_order_release);
+        player_core_set_play_when_ready(player_core_, 1);
+    } else if (seek_resume_override == 0) {
+        should_resume_on_complete = false;
+        player_core_set_play_when_ready(player_core_, 0);
+    } else if (core_paused_now || user_manual_pause_now) {
         should_resume_on_complete = false;
         // Pause-origin seek must keep paused intent explicit to avoid timeout fallback
         // reading stale playWhenReady=1 and entering force-resume paths.

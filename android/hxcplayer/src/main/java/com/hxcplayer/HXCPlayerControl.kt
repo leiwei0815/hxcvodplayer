@@ -1292,6 +1292,12 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     // 跳转
     fun seekTo(position: Double) {
+        val resumeAfterSeek = isPlaying() || getPlayWhenReady()
+        seekToWithIntent(position, resumeAfterSeek)
+    }
+
+    // 跳转（显式指定 seek 完成后是否恢复播放）
+    fun seekToWithIntent(position: Double, resumeAfterSeek: Boolean) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         if (!licenseAllowedOrNotify("seekTo")) {
@@ -1306,7 +1312,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekActive = true
         loadingSessionLikelySeek = true
         playStallCheckArmed = false
-        nativeSeekTo(handle, target)
+        nativeSeekToWithIntent(handle, target, resumeAfterSeek)
     }
 
     fun getLastSeekRequestId(): Long {
@@ -1810,6 +1816,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativePause(handle: Long)
     private external fun nativeStop(handle: Long)
     private external fun nativeSeekTo(handle: Long, position: Double)
+    private external fun nativeSeekToWithIntent(handle: Long, position: Double, resumeAfterSeek: Boolean)
     private external fun nativeSetPlaybackRate(handle: Long, rate: Float)
     private external fun nativeSetVolume(handle: Long, volume: Float)
     private external fun nativeSetAspectRatioMode(handle: Long, mode: Int)

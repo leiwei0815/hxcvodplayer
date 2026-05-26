@@ -91,6 +91,7 @@ public:
     void   pause();
     void   stop();
     void   seekTo(double position);
+    void   seekToWithIntent(double position, bool resume_after_seek);
     void   setPlaybackRate(float rate);
     void   setVolume(float volume);
     void   setAspectRatioMode(int mode);   // 0=FIT, 1=FILL
@@ -298,6 +299,8 @@ private:
     // Marks seek requests issued while player was paused/manual-pause semantic.
     // In this mode timeout failover must not force autoplay/soft-rebuild.
     std::atomic<bool>   seek_started_while_paused_{false};
+    // -1: follow current core intent, 0: keep paused after seek, 1: resume play after seek
+    std::atomic<int>    seek_resume_intent_override_{-1};
     std::atomic<uint64_t> seek_session_seq_{0};
     std::atomic<uint64_t> seek_session_active_id_{0};
     std::atomic<int>    seek_phase_{SEEK_PHASE_IDLE};
