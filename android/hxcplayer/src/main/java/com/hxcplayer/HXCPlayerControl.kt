@@ -1547,6 +1547,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                         pendingSeekTargetSec = Double.NaN
                         pendingSeekFromSec = Double.NaN
                         pendingSeekStartAtMs = 0L
+                        nativeSettleSeekSession(handle, hardTimeout)
                         Log.i(
                             TAG,
                             "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$hardTimeout loading_recovered=$loadingRecovered"
@@ -1705,6 +1706,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeIsHardwareDecodingActive(handle: Long): Boolean
     private external fun nativeConsumeLastError(handle: Long, outCode: IntArray): String?
     private external fun nativeConsumePlaybackCompleted(handle: Long): Boolean
+    private external fun nativeSettleSeekSession(handle: Long, byTimeout: Boolean)
 
     // 获取当前是否处于加载中（可用于主动查询 UI 状态）
     fun isLoading(): Boolean {

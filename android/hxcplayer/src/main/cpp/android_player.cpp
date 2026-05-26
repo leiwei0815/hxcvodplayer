@@ -1387,6 +1387,52 @@ bool AndroidPlayer::consumePlaybackCompleted() {
     return completed;
 }
 
+void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
+    if (!player_core_) return;
+
+    seek_lower_bound_active_.store(false, std::memory_order_release);
+    seek_lower_bound_deadline_ms_ = 0;
+    seek_recovery_active_.store(false, std::memory_order_release);
+    seek_recovery_deadline_ms_ = 0;
+    seek_audio_wait_video_.store(false, std::memory_order_release);
+    seek_audio_wait_deadline_ms_ = 0;
+    seek_fast_catchup_frames_.store(0, std::memory_order_release);
+    seek_catchup_deadline_ms_ = 0;
+    seek_resume_stable_hits_.store(0, std::memory_order_release);
+    seek_verify_hits_.store(0, std::memory_order_release);
+    seek_force_resume_pending_.store(false, std::memory_order_release);
+    seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
+    seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
+    seek_force_resume_retry_count_.store(0, std::memory_order_release);
+    seek_force_resume_nudged_.store(false, std::memory_order_release);
+    seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
+    seek_session_active_id_.store(0, std::memory_order_release);
+    seek_started_at_ms_ = 0;
+    seek_lower_bound_drop_count_ = 0;
+    seek_failover_budget_left_.store(2, std::memory_order_release);
+    seek_soft_rebuild_budget_left_.store(1, std::memory_order_release);
+
+    bool manual_pause_blocked = false;
+    int64_t now = now_ms();
+    if (user_manual_pause_.load(std::memory_order_acquire)) {
+        int64_t block_until = user_manual_pause_block_until_ms_.load(std::memory_order_acquire);
+        manual_pause_blocked = block_until <= 0 || now < block_until;
+    }
+    bool paused_origin = seek_started_while_paused_.load(std::memory_order_acquire);
+    if (manual_pause_blocked || paused_origin) {
+        player_core_set_play_when_ready(player_core_, 0);
+        player_core_pause(player_core_);
+    }
+    seek_started_while_paused_.store(false, std::memory_order_release);
+
+    SYNCI("evt=seek_session_settled_by_app by_timeout=%d paused_origin=%d manual_pause_blocked=%d pos=%.3f state=%d",
+          by_timeout ? 1 : 0,
+          paused_origin ? 1 : 0,
+          manual_pause_blocked ? 1 : 0,
+          player_core_get_position(player_core_),
+          player_core_get_state(player_core_));
+}
+
 // ========== OpenGL ES YUV renderer ==========
 
 // Vertex shader: two separate texcoord sets so Y and UV can have different

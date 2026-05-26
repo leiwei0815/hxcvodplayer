@@ -124,6 +124,7 @@ public:
     bool   isHardwareDecodingActive() const;
     bool   consumeLastError(int& error_code, std::string& error_message);
     bool   consumePlaybackCompleted();
+    void   settleSeekSessionFromApp(bool by_timeout);
 
 private:
     // -----------------------------------------------------------------------

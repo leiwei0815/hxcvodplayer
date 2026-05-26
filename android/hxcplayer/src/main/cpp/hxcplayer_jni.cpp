@@ -432,6 +432,16 @@ Java_com_hxcplayer_HXCPlayerControl_nativeConsumePlaybackCompleted(
     return result ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeSettleSeekSession(
+        JNIEnv *env, jobject thiz, jlong handle, jboolean by_timeout) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) {
+        return;
+    }
+    player->settleSeekSessionFromApp(by_timeout == JNI_TRUE);
+}
+
 // ========== 日志配置方法 ==========
 
 // 启用文件日志
