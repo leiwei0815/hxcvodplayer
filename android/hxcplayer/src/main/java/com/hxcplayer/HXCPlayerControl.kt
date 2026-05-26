@@ -392,6 +392,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val seekCompletionMovedFromOldSec = 0.35
     private val playStallDetectDelayMs = 1700L
     private val playStallRetryDelayMs = 1200L
+    private val playStallPausedStateDetectDelayMs = 1100L
     private val playStallMinProgressSec = 0.20
     private val playStallRecoverReseekBackSec = 0.30
     private val playStallRecoverCooldownMs = 5000L
@@ -1678,7 +1679,8 @@ class HXCPlayerControl @JvmOverloads constructor(
             playStallCheckArmed = false
             return
         }
-        if (!(isPlayingNow || state == PlayerState.PLAYING)) {
+        val pausedButWantsPlay = state == PlayerState.PAUSED && playWhenReady
+        if (!(isPlayingNow || state == PlayerState.PLAYING || pausedButWantsPlay)) {
             return
         }
         if ((nowMs - playStallLastPlayReqAtMs) > 15000L) {
@@ -1699,6 +1701,9 @@ class HXCPlayerControl @JvmOverloads constructor(
             return
         }
         val elapsedMs = nowMs - playStallArmedAtMs
+        if (pausedButWantsPlay && elapsedMs < playStallPausedStateDetectDelayMs) {
+            return
+        }
         val requiredDelayMs = if (playStallRecoverStage <= 0) {
             playStallDetectDelayMs
         } else {

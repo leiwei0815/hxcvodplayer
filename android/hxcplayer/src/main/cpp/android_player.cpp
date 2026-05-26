@@ -1332,6 +1332,11 @@ bool AndroidPlayer::isSeekSessionActive() const {
             seek_force_resume_pending_.load(std::memory_order_acquire);
     int seek_phase = seek_phase_.load(std::memory_order_acquire);
     bool phase_active = seek_phase != SEEK_PHASE_IDLE;
+    // Session id is a correlation token, not an activity gate.
+    // A stale sid alone must not keep Java side waiting for seek completion.
+    if (!seek_gates_active && !phase_active) {
+        return false;
+    }
     return active_sid || seek_gates_active || phase_active;
 }
 
@@ -1798,8 +1803,9 @@ void AndroidPlayer::trySeekAudioWaitDeadlineFallback(int64_t now,
     SYNCI("evt=seek_wait_video_deadline_resume id=%" PRIu64 " phase=%s anchor=%.3f target=%.3f abs_err=%.3f",
           sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
           anchor_pts, seek_target_now, std::fabs(anchor_pts - seek_target_now));
-    // Keep seek session alive here; this is only an audio-wait fallback edge.
-    // Session settlement should happen at an explicit success/abort boundary.
+    // This fallback edge has completed its native gates. Mark phase idle and
+    // let upper layer settle/clear sid through nativeSettleSeekSession.
+    seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
 }
 
 void AndroidPlayer::resumeSeekAudioAfterKeyframeAhead(int64_t now,
@@ -1868,8 +1874,9 @@ void AndroidPlayer::resumeSeekAudioAfterKeyframeAhead(int64_t now,
                   sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
                   delay, secure_session ? 1 : 0, pts, seek_target_now, std::fabs(pts - seek_target_now), bypass_ms);
         }
-        // Keyframe-ahead resume only advances phase; do not clear session id here.
-        // Premature session clear can cause id=0/IDLE loops in later failover retries.
+        // Keyframe-ahead edge has finished all native seek gates.
+        // Keep sid for correlation, but mark phase idle so seek can settle promptly.
+        seek_phase_.store(SEEK_PHASE_IDLE, std::memory_order_release);
     }
 }
 
