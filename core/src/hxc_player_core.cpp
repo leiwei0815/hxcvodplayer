@@ -1689,6 +1689,16 @@ void PlayerCore::seek(double pos) {
         LOG_WARNING("⚠️ 跳转位置超过视频时长，修正为时长值");
         pos = duration;
     }
+    // 部分 HLS 流（尤其加密分片）在“精确 seek 到 duration”时会返回失败；
+    // 统一将尾点 seek 收敛到尾前一个小窗口，避免 -1011。
+    if (duration > 0 && pos >= duration - 0.001) {
+        constexpr double kSeekTailGuardSec = 0.35;
+        double guarded = std::max(0.0, duration - kSeekTailGuardSec);
+        if (guarded < pos) {
+            LOG_INFO("尾点 seek 防护: pos=", pos, " -> ", guarded, " (duration=", duration, ")");
+            pos = guarded;
+        }
+    }
     
     // ⚠️ 【关键修复】保存 seek 目标位置，在 seeking 期间直接返回此值
     seek_target_pos_.store(pos, std::memory_order_release);
@@ -1769,11 +1779,25 @@ void PlayerCore::read_thread() {
             
             // 注意：seeking_ 标志已在 seek() 方法中设置为 true，这里不需要重复设置
             
-            int64_t seek_target = target_pos * AV_TIME_BASE;
+            int64_t seek_target = static_cast<int64_t>(target_pos * AV_TIME_BASE);
             
             LOG_INFO("开始 Seek 到: ", target_pos, " 秒");
-            if (av_seek_frame(format_ctx_, -1, seek_target, AVSEEK_FLAG_BACKWARD) < 0) {
-                LOG_ERROR("Seek 失败");
+            int seek_ret = av_seek_frame(format_ctx_, -1, seek_target, AVSEEK_FLAG_BACKWARD);
+            if (seek_ret < 0) {
+                seek_ret = av_seek_frame(format_ctx_, -1, seek_target, AVSEEK_FLAG_ANY);
+                LOG_WARNING("seek BACKWARD 失败，尝试 ANY，ret=", seek_ret);
+            }
+            if (seek_ret < 0 && video_stream_ >= 0 && format_ctx_->streams && format_ctx_->streams[video_stream_]) {
+                AVStream* seek_stream = format_ctx_->streams[video_stream_];
+                int64_t stream_target = av_rescale_q(seek_target, AV_TIME_BASE_Q, seek_stream->time_base);
+                seek_ret = av_seek_frame(format_ctx_, video_stream_, stream_target, AVSEEK_FLAG_BACKWARD);
+                if (seek_ret < 0) {
+                    seek_ret = av_seek_frame(format_ctx_, video_stream_, stream_target, AVSEEK_FLAG_ANY);
+                }
+                LOG_WARNING("seek 全局失败，尝试视频流索引 seek，ret=", seek_ret, " stream=", video_stream_);
+            }
+            if (seek_ret < 0) {
+                LOG_ERROR("Seek 失败，ret=", seek_ret);
                 emit_error(PLAYER_ERROR_SEEK_FAILED, "跳转到指定位置失败");
                 seeking_.store(false, std::memory_order_release);  // Seek 失败也要清除标志
                 set_seek_loading(false);

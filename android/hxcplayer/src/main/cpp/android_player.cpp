@@ -648,6 +648,28 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         LOGE("Player core not initialized");
         return false;
     }
+    LOGI("[open] openWithSecureSession start_pos=%.3f url=%s", start_position, url ? url : "(null)");
+    // Keep secure-open behavior consistent with openURL:
+    // clear stale loading and force core back to IDLE before reopen.
+    bool stale_loading = is_loading_.exchange(false, std::memory_order_acq_rel);
+    if (stale_loading) {
+        LOGI("[open] clear stale loading=true before secure open switch");
+    }
+    int cur_state = player_core_get_state(player_core_);
+    if (cur_state != 0) { // 0 == IDLE
+        LOGI("[open] pre-stop core (state=%d) before secure open", cur_state);
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        suppress_transient_loading_false_.store(true, std::memory_order_release);
+        suppress_transient_loading_false_until_ms_.store(now_ms + 1200, std::memory_order_release);
+        audio_start_pending_.store(false, std::memory_order_release);
+        setOpenSLESPlayState(SL_PLAYSTATE_STOPPED, false);
+        {
+            std::lock_guard<std::mutex> lock(audio_mutex_);
+            // Lock acquired means no callback is in swr_convert right now.
+        }
+        player_core_stop(player_core_);
+    }
     bool user_pref_hw = (decode_mode_ == 1);
     // SecureHLS on some Android devices frequently fails at avcodec_open2
     // with h264_mediacodec (-22 Invalid argument). For stability, force
