@@ -393,6 +393,16 @@ Java_com_hxcplayer_HXCPlayerControl_nativeIsHardwareDecodingActive(
     return JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeIsSeekSessionActive(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        return player->isSeekSessionActive() ? JNI_TRUE : JNI_FALSE;
+    }
+    return JNI_FALSE;
+}
+
 // 消费一次播放中错误（有错误返回 message；无错误返回 null）
 JNIEXPORT jstring JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeConsumeLastError(

@@ -1287,6 +1287,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         nativeSeekTo(handle, target)
     }
 
+    fun getLastSeekRequestId(): Long {
+        return pendingSeekRequestId
+    }
+
     // 设置播放速度
     fun setPlaybackRate(rate: Float) {
         val handle = currentHandle()
@@ -1539,8 +1543,17 @@ class HXCPlayerControl @JvmOverloads constructor(
                     val nearTarget = !target.isNaN() && abs(position - target) <= seekCompletionNearTargetSec
                     val movedFromOldPos = !from.isNaN() && abs(position - from) >= seekCompletionMovedFromOldSec
                     val loadingRecovered = pendingSeekLoadingObserved && !loading
-                    val hardTimeout = seekElapsedMs >= seekCompletionTimeoutMs && (movedFromOldPos || nearTarget)
-                    if ((loadingRecovered && (nearTarget || movedFromOldPos)) || hardTimeout) {
+                    val nativeSeekActive = nativeIsSeekSessionActive(handle)
+                    // Seek completion must align with native session convergence.
+                    // This avoids Java-side early timeout completion while native failover
+                    // is still running (which can cause post-complete playback stalls).
+                    val nativeSeekSettled = !nativeSeekActive
+                    val hardTimeout = nativeSeekSettled
+                            && seekElapsedMs >= seekCompletionTimeoutMs
+                            && !loadingRecovered
+                    val shouldComplete = nativeSeekSettled
+                            && (loadingRecovered || nearTarget || movedFromOldPos || hardTimeout)
+                    if (shouldComplete) {
                         val requestId = pendingSeekRequestId
                         pendingSeekActive = false
                         pendingSeekLoadingObserved = false
@@ -1704,6 +1717,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeSetPlayWhenReady(handle: Long, playWhenReady: Boolean)
     private external fun nativeIsLoading(handle: Long): Boolean
     private external fun nativeIsHardwareDecodingActive(handle: Long): Boolean
+    private external fun nativeIsSeekSessionActive(handle: Long): Boolean
     private external fun nativeConsumeLastError(handle: Long, outCode: IntArray): String?
     private external fun nativeConsumePlaybackCompleted(handle: Long): Boolean
     private external fun nativeSettleSeekSession(handle: Long, byTimeout: Boolean)

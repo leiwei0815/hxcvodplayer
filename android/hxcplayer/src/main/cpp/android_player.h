@@ -122,6 +122,7 @@ public:
     void   setPlayWhenReady(bool play_when_ready);
     bool   isLoading() const;
     bool   isHardwareDecodingActive() const;
+    bool   isSeekSessionActive() const;
     bool   consumeLastError(int& error_code, std::string& error_message);
     bool   consumePlaybackCompleted();
     void   settleSeekSessionFromApp(bool by_timeout);

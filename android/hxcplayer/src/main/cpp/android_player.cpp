@@ -1312,6 +1312,18 @@ bool AndroidPlayer::isHardwareDecodingActive() const {
     return player_core_is_video_hardware_decoding(player_core_) != 0;
 }
 
+bool AndroidPlayer::isSeekSessionActive() const {
+    bool active_sid = seek_session_active_id_.load(std::memory_order_acquire) != 0;
+    bool seek_gates_active =
+            seek_lower_bound_active_.load(std::memory_order_acquire) ||
+            seek_recovery_active_.load(std::memory_order_acquire) ||
+            seek_audio_wait_video_.load(std::memory_order_acquire) ||
+            seek_force_resume_pending_.load(std::memory_order_acquire);
+    int seek_phase = seek_phase_.load(std::memory_order_acquire);
+    bool phase_active = seek_phase != SEEK_PHASE_IDLE;
+    return active_sid || seek_gates_active || phase_active;
+}
+
 void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
     auto* player = static_cast<AndroidPlayer*>(user_data);
     if (!player) {
@@ -1413,7 +1425,8 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
     seek_soft_rebuild_budget_left_.store(1, std::memory_order_release);
 
     bool manual_pause_blocked = false;
-    int64_t now = now_ms();
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
     if (user_manual_pause_.load(std::memory_order_acquire)) {
         int64_t block_until = user_manual_pause_block_until_ms_.load(std::memory_order_acquire);
         manual_pause_blocked = block_until <= 0 || now < block_until;
