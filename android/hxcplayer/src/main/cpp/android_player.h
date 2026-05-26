@@ -293,6 +293,9 @@ private:
     // Whether this seek should resume playback automatically after converge.
     // Captured at seek dispatch from current core intent (playing/playWhenReady).
     std::atomic<bool>   seek_resume_on_complete_{true};
+    // Marks seek requests issued while player was paused/manual-pause semantic.
+    // In this mode timeout failover must not force autoplay/soft-rebuild.
+    std::atomic<bool>   seek_started_while_paused_{false};
     std::atomic<uint64_t> seek_session_seq_{0};
     std::atomic<uint64_t> seek_session_active_id_{0};
     std::atomic<int>    seek_phase_{SEEK_PHASE_IDLE};
