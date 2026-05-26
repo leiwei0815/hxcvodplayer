@@ -390,12 +390,21 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val seekCompletionConvergedStableMs = 420L
     private val seekCompletionNearTargetSec = 1.5
     private val seekCompletionMovedFromOldSec = 0.35
-    private val playStallDetectDelayMs = 1700L
-    private val playStallRetryDelayMs = 1200L
-    private val playStallPausedStateDetectDelayMs = 1100L
-    private val playStallMinProgressSec = 0.20
-    private val playStallRecoverReseekBackSec = 0.30
-    private val playStallRecoverCooldownMs = 5000L
+    private var playStallRecoveryEnabled = true
+    private var playLoopRecoveryEnabled = true
+    private var playbackMetricsLogEnabled = true
+    private var playStallDetectDelayMs = 1700L
+    private var playStallRetryDelayMs = 1200L
+    private var playStallPausedStateDetectDelayMs = 1100L
+    private var playStallMinProgressSec = 0.20
+    private var playStallRecoverReseekBackSec = 0.30
+    private var playStallRecoverCooldownMs = 5000L
+    private var playLoopBackwardThresholdSec = 2.2
+    private var playLoopMinForwardSpanSec = 6.0
+    private var playLoopRequiredHits = 3
+    private var playLoopWindowMs = 12000L
+    private var playLoopRecoverCooldownMs = 15000L
+    private var playLoopRecoverBackoffSec = 0.20
     private var pendingSeekRequestId: Long = 0L
     private var pendingSeekTargetSec: Double = Double.NaN
     private var pendingSeekFromSec: Double = Double.NaN
@@ -409,6 +418,18 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var playStallRecoverStage: Int = 0
     private var playStallLastRecoverAtMs: Long = 0L
     private var playStallLastPlayReqAtMs: Long = 0L
+    private var playLoopMaxPosSec: Double = Double.NaN
+    private var playLoopAnchorPosSec: Double = Double.NaN
+    private var playLoopHitCount: Int = 0
+    private var playLoopWindowStartMs: Long = 0L
+    private var playLoopLastRecoverAtMs: Long = 0L
+    private var metricsLastLogAtMs: Long = 0L
+    private val metricsLogIntervalMs: Long = 30000L
+    private var metricsSeekCompletedCount: Long = 0L
+    private var metricsSeekCompletedTimeoutCount: Long = 0L
+    private var metricsPlayStallRecoverSeekCount: Long = 0L
+    private var metricsPlayStallRecoverReopenCount: Long = 0L
+    private var metricsPlayLoopRecoverCount: Long = 0L
     private val lifecycleLock = Any()
     @Volatile private var isReleased = false
     private var autoReopenOnRecoverableErrorEnabled: Boolean = false
@@ -464,6 +485,38 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun configureWeakNetworkRecovery(enabled: Boolean, maxAttempts: Int = 1) {
         autoReopenOnRecoverableErrorEnabled = enabled
         autoReopenMaxAttempts = maxAttempts.coerceAtLeast(0)
+    }
+
+    /**
+     * 配置播放稳定性策略开关（建议灰度发布时使用）。
+     */
+    fun configurePlaybackStability(
+        enablePlayStallRecovery: Boolean = true,
+        enablePlaybackLoopRecovery: Boolean = true,
+        enableMetricsLog: Boolean = true
+    ) {
+        playStallRecoveryEnabled = enablePlayStallRecovery
+        playLoopRecoveryEnabled = enablePlaybackLoopRecovery
+        playbackMetricsLogEnabled = enableMetricsLog
+    }
+
+    /**
+     * 配置“回环重复播放”守卫阈值。
+     */
+    fun configurePlaybackLoopGuard(
+        backwardThresholdSec: Double = 2.2,
+        minForwardSpanSec: Double = 6.0,
+        requiredHits: Int = 3,
+        windowMs: Long = 12000L,
+        recoverCooldownMs: Long = 15000L,
+        recoverBackoffSec: Double = 0.20
+    ) {
+        playLoopBackwardThresholdSec = backwardThresholdSec.coerceAtLeast(0.8)
+        playLoopMinForwardSpanSec = minForwardSpanSec.coerceAtLeast(playLoopBackwardThresholdSec + 1.5)
+        playLoopRequiredHits = requiredHits.coerceIn(2, 5)
+        playLoopWindowMs = windowMs.coerceAtLeast(4000L)
+        playLoopRecoverCooldownMs = recoverCooldownMs.coerceAtLeast(5000L)
+        playLoopRecoverBackoffSec = recoverBackoffSec.coerceIn(0.05, 1.50)
     }
 
     private fun clonePlayModel(model: PlayerDataSourcePlayModel): PlayerDataSourcePlayModel {
@@ -1517,6 +1570,17 @@ class HXCPlayerControl @JvmOverloads constructor(
                     isPlayingNow = isPlaying,
                     playWhenReady = playWhenReady
                 )
+                maybeRecoverPlaybackLoop(
+                    handle = handle,
+                    nowMs = now,
+                    positionSec = position,
+                    durationSec = duration,
+                    loading = loading,
+                    state = state,
+                    isPlayingNow = isPlaying,
+                    playWhenReady = playWhenReady
+                )
+                maybeLogPlaybackMetrics(now, position, state, loading)
                 if (loadingCandidateState == null || loadingCandidateState != loading) {
                     if (loading) {
                         val likelySeekByJump = !lastPositionForLoadingHeuristicSec.isNaN() &&
@@ -1617,7 +1681,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                         pendingSeekFromSec = Double.NaN
                         pendingSeekStartAtMs = 0L
                         pendingSeekConvergedSinceMs = 0L
+                        metricsSeekCompletedCount += 1L
                         val completeByTimeout = hardTimeout || nativeConvergedButStuck
+                        if (completeByTimeout) {
+                            metricsSeekCompletedTimeoutCount += 1L
+                        }
                         nativeSettleSeekSession(handle, completeByTimeout)
                         Log.i(
                             TAG,
@@ -1673,6 +1741,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         isPlayingNow: Boolean,
         playWhenReady: Boolean
     ) {
+        if (!playStallRecoveryEnabled) return
         if (!playStallCheckArmed) return
         if (pendingSeekActive || loading) return
         if (!playWhenReady) {
@@ -1737,6 +1806,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 TAG,
                 "evt=play_stall_recover_seek base=$positionSec target=$recoverTarget duration=$durationSec"
             )
+            metricsPlayStallRecoverSeekCount += 1L
             nativeSeekTo(handle, recoverTarget)
             return
         }
@@ -1748,10 +1818,108 @@ class HXCPlayerControl @JvmOverloads constructor(
             TAG,
             "evt=play_stall_recover_reopen base=$positionSec reopen_start=$reopenStart duration=$durationSec"
         )
+        metricsPlayStallRecoverReopenCount += 1L
         openExecutor.execute {
             if (isReleased) return@execute
             replayFrom(reopenStart)
         }
+    }
+
+    private fun maybeRecoverPlaybackLoop(
+        handle: Long,
+        nowMs: Long,
+        positionSec: Double,
+        durationSec: Double,
+        loading: Boolean,
+        state: PlayerState,
+        isPlayingNow: Boolean,
+        playWhenReady: Boolean
+    ) {
+        if (!playLoopRecoveryEnabled) return
+        if (durationSec <= 0.0 || positionSec < 0.0) return
+        if (pendingSeekActive || loading || !playWhenReady) {
+            if (positionSec.isFinite()) {
+                playLoopMaxPosSec = positionSec
+                playLoopAnchorPosSec = positionSec
+            }
+            playLoopHitCount = 0
+            playLoopWindowStartMs = 0L
+            return
+        }
+        val wantsPlayback = isPlayingNow || state == PlayerState.PLAYING || (state == PlayerState.PAUSED && playWhenReady)
+        if (!wantsPlayback) return
+
+        if (!playLoopMaxPosSec.isFinite() || positionSec > playLoopMaxPosSec) {
+            playLoopMaxPosSec = positionSec
+        }
+        if (!playLoopAnchorPosSec.isFinite()) {
+            playLoopAnchorPosSec = playLoopMaxPosSec
+        }
+
+        val backwardSec = playLoopMaxPosSec - positionSec
+        val forwardSpanSec = playLoopMaxPosSec - playLoopAnchorPosSec
+        if (backwardSec < playLoopBackwardThresholdSec || forwardSpanSec < playLoopMinForwardSpanSec) {
+            return
+        }
+
+        if (playLoopWindowStartMs <= 0L || (nowMs - playLoopWindowStartMs) > playLoopWindowMs) {
+            playLoopWindowStartMs = nowMs
+            playLoopHitCount = 1
+        } else {
+            playLoopHitCount += 1
+        }
+
+        if (playLoopHitCount < playLoopRequiredHits) {
+            return
+        }
+        if ((nowMs - playLoopLastRecoverAtMs) < playLoopRecoverCooldownMs) {
+            return
+        }
+
+        val maxPosBeforeRecover = playLoopMaxPosSec
+        val recoverTarget = maxOf(0.0, maxPosBeforeRecover - playLoopRecoverBackoffSec)
+        playLoopLastRecoverAtMs = nowMs
+        playLoopHitCount = 0
+        playLoopWindowStartMs = 0L
+        playLoopAnchorPosSec = recoverTarget
+        playLoopMaxPosSec = recoverTarget
+
+        pendingSeekRequestId += 1L
+        pendingSeekTargetSec = recoverTarget
+        pendingSeekFromSec = positionSec
+        pendingSeekStartAtMs = nowMs
+        pendingSeekLoadingObserved = false
+        pendingSeekActive = true
+        pendingSeekConvergedSinceMs = 0L
+        loadingSessionLikelySeek = true
+
+        Log.w(
+            TAG,
+            "evt=play_loop_recover_seek pos=$positionSec max=$maxPosBeforeRecover back=$backwardSec target=$recoverTarget hits=$playLoopHitCount required=$playLoopRequiredHits"
+        )
+        metricsPlayLoopRecoverCount += 1L
+        nativeSeekToWithIntent(handle, recoverTarget, true)
+    }
+
+    private fun maybeLogPlaybackMetrics(
+        nowMs: Long,
+        positionSec: Double,
+        state: PlayerState,
+        loading: Boolean
+    ) {
+        if (!playbackMetricsLogEnabled) return
+        if (metricsLastLogAtMs > 0L && (nowMs - metricsLastLogAtMs) < metricsLogIntervalMs) return
+        metricsLastLogAtMs = nowMs
+        Log.i(
+            TAG,
+            "evt=playback_stability_metrics " +
+                "seek_completed=$metricsSeekCompletedCount " +
+                "seek_timeout=$metricsSeekCompletedTimeoutCount " +
+                "stall_recover_seek=$metricsPlayStallRecoverSeekCount " +
+                "stall_recover_reopen=$metricsPlayStallRecoverReopenCount " +
+                "loop_recover=$metricsPlayLoopRecoverCount " +
+                "state=${state.name} loading=$loading pos=$positionSec"
+        )
     }
 
     // 释放资源
@@ -1800,6 +1968,17 @@ class HXCPlayerControl @JvmOverloads constructor(
         playStallRecoverStage = 0
         playStallLastRecoverAtMs = 0L
         playStallLastPlayReqAtMs = 0L
+        playLoopMaxPosSec = Double.NaN
+        playLoopAnchorPosSec = Double.NaN
+        playLoopHitCount = 0
+        playLoopWindowStartMs = 0L
+        playLoopLastRecoverAtMs = 0L
+        metricsLastLogAtMs = 0L
+        metricsSeekCompletedCount = 0L
+        metricsSeekCompletedTimeoutCount = 0L
+        metricsPlayStallRecoverSeekCount = 0L
+        metricsPlayStallRecoverReopenCount = 0L
+        metricsPlayLoopRecoverCount = 0L
         networkLoadingSinceMs = 0L
         networkTotalStallMs = 0L
         networkReconnectCount = 0
