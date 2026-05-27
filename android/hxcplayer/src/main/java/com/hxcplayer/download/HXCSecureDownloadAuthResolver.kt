@@ -25,8 +25,8 @@ object HXCSecureDownloadAuthResolver {
                 Log.i(TAG, "resolve plainUrl directly, videoId=${request.videoId}")
                 return HXCResolvedDownloadSource(
                     url = request.plainUrl,
-                    secureHeaders = "",
-                    encrypted = false
+                    secureHeaders = request.secureHeaders,
+                    encrypted = request.encrypted || request.secureHeaders.isNotBlank()
                 )
             }
             throw IllegalArgumentException("下载缺少 plainUrl 或 secureCredential")

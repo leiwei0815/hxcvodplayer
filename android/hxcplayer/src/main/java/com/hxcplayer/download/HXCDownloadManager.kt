@@ -172,6 +172,7 @@ object HXCDownloadManager {
             .fileSize(info.fileSize)
             .duration(info.duration)
             .encrypted(info.isEncrypted)
+            .secureHeaders(info.secureHeaders)
         startDownload(request)
     }
 
@@ -497,8 +498,10 @@ object HXCDownloadManager {
                 downloadTaskResource(task, headers)
             }
             if (task.needsDecrypt()) {
-                decryptAes128SegmentInPlace(task)
-                decryptedSegments += 1
+                val decrypted = decryptAes128SegmentInPlace(task)
+                if (decrypted) {
+                    decryptedSegments += 1
+                }
             }
             finished += 1
             info.downloadedBytes = finished
@@ -722,8 +725,8 @@ object HXCDownloadManager {
         return value.removePrefix("\"").removeSuffix("\"").trim()
     }
 
-    private fun decryptAes128SegmentInPlace(task: M3u8ResourceTask) {
-        val keyFile = task.decryptKeyFile ?: return
+    private fun decryptAes128SegmentInPlace(task: M3u8ResourceTask): Boolean {
+        val keyFile = task.decryptKeyFile ?: return false
         if (!keyFile.exists()) {
             throw IllegalStateException("aes key file missing: ${keyFile.absolutePath}")
         }
@@ -732,17 +735,35 @@ object HXCDownloadManager {
             throw IllegalStateException("invalid aes-128 key length=${keyBytes.size}")
         }
         val encryptedBytes = task.target.readBytes()
+        if (looksLikeClearTs(encryptedBytes)) {
+            d("aes128 decrypt skipped(clear_ts), file=${task.target.name}, seq=${task.segmentSequence}")
+            return false
+        }
+        if (encryptedBytes.size % 16 != 0) {
+            d("aes128 decrypt skipped(non_block_aligned), file=${task.target.name}, size=${encryptedBytes.size}")
+            return false
+        }
         val ivBytes = resolveSegmentIv(task.decryptIvHex, task.segmentSequence)
         val clearBytes = runCatching {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
             cipher.doFinal(encryptedBytes)
-        }.getOrElse {
-            val fallback = Cipher.getInstance("AES/CBC/NoPadding")
-            fallback.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
-            fallback.doFinal(encryptedBytes)
+        }.getOrElse { firstError ->
+            runCatching {
+                val fallback = Cipher.getInstance("AES/CBC/NoPadding")
+                fallback.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
+                fallback.doFinal(encryptedBytes)
+            }.getOrElse {
+                d("aes128 decrypt failed, file=${task.target.name}, reason=${firstError.message}")
+                return false
+            }
+        }
+        if (!looksLikeClearTs(clearBytes)) {
+            d("aes128 decrypt result invalid_ts, file=${task.target.name}, seq=${task.segmentSequence}")
+            return false
         }
         task.target.writeBytes(clearBytes)
+        return true
     }
 
     private fun resolveSegmentIv(ivHex: String?, sequence: Long): ByteArray {
@@ -774,6 +795,15 @@ object HXCDownloadManager {
             i += 2
         }
         return out
+    }
+
+    private fun looksLikeClearTs(bytes: ByteArray): Boolean {
+        if (bytes.size < 188 * 2) return false
+        if (bytes[0] != 0x47.toByte()) return false
+        val second = 188
+        val third = 376
+        return second < bytes.size && bytes[second] == 0x47.toByte()
+            && third < bytes.size && bytes[third] == 0x47.toByte()
     }
 
     private fun parseByteRange(line: String, prevEnd: Long): Pair<Long, Long> {

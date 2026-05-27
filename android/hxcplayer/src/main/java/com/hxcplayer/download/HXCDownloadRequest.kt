@@ -16,6 +16,7 @@ class HXCDownloadRequest(
     var fileSize: Long = 0L
     var duration: Long = 0L
     var encrypted: Boolean = false
+    var secureHeaders: String = ""
 
     fun plainUrl(url: String): HXCDownloadRequest {
         this.plainUrl = url
@@ -74,6 +75,11 @@ class HXCDownloadRequest(
 
     fun encrypted(value: Boolean): HXCDownloadRequest {
         encrypted = value
+        return this
+    }
+
+    fun secureHeaders(value: String): HXCDownloadRequest {
+        secureHeaders = value
         return this
     }
 
