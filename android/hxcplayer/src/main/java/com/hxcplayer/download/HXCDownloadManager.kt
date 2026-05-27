@@ -156,10 +156,6 @@ object HXCDownloadManager {
         keys.forEach { deleteDownload(it, deleteFile) }
     }
 
-    fun deleteDownloads(infos: List<HXCDownloadInfo>, deleteFile: Boolean = true) {
-        deleteDownloads(infos.map { it.downloadKey }, deleteFile)
-    }
-
     fun getAllDownloads(): List<HXCDownloadInfo> = downloads.values.toList()
 
     fun getDownloadsByStatus(status: HXCDownloadStatus): List<HXCDownloadInfo> {
