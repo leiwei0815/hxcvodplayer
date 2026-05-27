@@ -4,7 +4,6 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import com.hxcplayer.BuildConfig
 import com.hxcplayer.download.m3u8.HXCM3u8Parser
 import java.io.File
 import java.io.RandomAccessFile
@@ -440,8 +439,6 @@ object HXCDownloadManager {
     }
 
     private fun d(msg: String) {
-        if (BuildConfig.DEBUG) {
-            Log.d(TAG, msg)
-        }
+        Log.d(TAG, msg)
     }
 }
