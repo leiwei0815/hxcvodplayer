@@ -1,5 +1,6 @@
 package com.hxcplayer.download
 
+import android.util.Log
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -11,21 +12,26 @@ data class HXCResolvedDownloadSource(
 )
 
 object HXCSecureDownloadAuthResolver {
+    private const val TAG = "HXCSecureResolver"
 
     @Throws(Exception::class)
     fun resolve(
         request: HXCDownloadRequest,
         config: HXCDownloadConfig
     ): HXCResolvedDownloadSource {
-        if (request.plainUrl.isNotBlank()) {
-            return HXCResolvedDownloadSource(
-                url = request.plainUrl,
-                secureHeaders = "",
-                encrypted = false
-            )
-        }
         val secure = request.secureCredential
-            ?: throw IllegalArgumentException("下载缺少 plainUrl 或 secureCredential")
+        if (secure == null) {
+            if (request.plainUrl.isNotBlank()) {
+                Log.i(TAG, "resolve plainUrl directly, videoId=${request.videoId}")
+                return HXCResolvedDownloadSource(
+                    url = request.plainUrl,
+                    secureHeaders = "",
+                    encrypted = false
+                )
+            }
+            throw IllegalArgumentException("下载缺少 plainUrl 或 secureCredential")
+        }
+        Log.i(TAG, "resolve secure auth first, videoId=${secure.videoId}")
         if (secure.videoId.isBlank() || secure.sign.isBlank() || secure.secretId.isBlank()) {
             throw IllegalArgumentException("加密下载鉴权参数不完整：videoId/sign/secretId")
         }
@@ -66,6 +72,7 @@ object HXCSecureDownloadAuthResolver {
             if (playUrl.isBlank()) {
                 throw IllegalStateException("下载鉴权成功但未返回可下载 URL")
             }
+            Log.i(TAG, "secure auth success, got real url, encrypted=${data.optInt("encrypt_type", 0) == 1}")
             val encrypted = data.optInt("encrypt_type", 0) == 1 || data.optBoolean("is_encrypted", false)
             var secureHeaders = data.optString("secure_headers", "")
             if (encrypted && secureHeaders.isBlank()) {
