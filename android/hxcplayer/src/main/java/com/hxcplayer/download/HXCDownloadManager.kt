@@ -432,7 +432,14 @@ object HXCDownloadManager {
                 info.isWaiting = false
                 postStatusChanged(info)
                 notifyListChanged()
-                return ""
+                return M3u8BuildArtifacts(
+                    outputContent = "",
+                    resources = resources.toList(),
+                    tsCount = tsCount,
+                    mapCount = mapCount,
+                    keyCount = keyCount,
+                    byterangeCount = byterangeCount
+                )
             }
             if (!task.target.exists() || !isResourceComplete(task)) {
                 downloadTaskResource(task, headers)
