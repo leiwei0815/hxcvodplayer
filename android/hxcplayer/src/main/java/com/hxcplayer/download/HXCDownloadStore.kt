@@ -56,6 +56,7 @@ internal class HXCDownloadStore(context: Context) {
             put("errorMessage", info.errorMessage)
             put("resolvedUrl", info.resolvedUrl)
             put("secureHeaders", info.secureHeaders)
+            put("isEncrypted", info.isEncrypted)
         }
     }
 
@@ -84,6 +85,7 @@ internal class HXCDownloadStore(context: Context) {
             errorMessage = obj.optString("errorMessage")
             resolvedUrl = obj.optString("resolvedUrl")
             secureHeaders = obj.optString("secureHeaders")
+            isEncrypted = obj.optBoolean("isEncrypted", secureHeaders.isNotBlank())
         }
     }
 }

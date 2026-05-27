@@ -15,6 +15,7 @@ class HXCDownloadRequest(
     var imagePath: String = ""
     var fileSize: Long = 0L
     var duration: Long = 0L
+    var encrypted: Boolean = false
 
     fun plainUrl(url: String): HXCDownloadRequest {
         this.plainUrl = url
@@ -68,6 +69,11 @@ class HXCDownloadRequest(
 
     fun duration(value: Long): HXCDownloadRequest {
         duration = value
+        return this
+    }
+
+    fun encrypted(value: Boolean): HXCDownloadRequest {
+        encrypted = value
         return this
     }
 

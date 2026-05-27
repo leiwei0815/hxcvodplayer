@@ -23,4 +23,5 @@ data class HXCDownloadInfo(
     var errorMessage: String = ""
     var resolvedUrl: String = ""
     var secureHeaders: String = ""
+    var isEncrypted: Boolean = false
 }

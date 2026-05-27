@@ -10,6 +10,7 @@ import java.io.RandomAccessFile
 import java.net.URI
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -43,6 +44,15 @@ object HXCDownloadManager {
         fun hasRange(): Boolean = rangeStart >= 0L && rangeEnd >= rangeStart
         fun expectedLength(): Long = if (hasRange()) rangeEnd - rangeStart + 1 else -1L
     }
+
+    private data class M3u8BuildArtifacts(
+        val outputContent: String,
+        val resources: List<M3u8ResourceTask>,
+        val tsCount: Int,
+        val mapCount: Int,
+        val keyCount: Int,
+        val byterangeCount: Int
+    )
 
     @Synchronized
     fun init(context: Context, config: HXCDownloadConfig = HXCDownloadConfig()) {
@@ -90,6 +100,11 @@ object HXCDownloadManager {
                     val source = HXCSecureDownloadAuthResolver.resolve(req, config)
                     info.resolvedUrl = source.url
                     info.secureHeaders = source.secureHeaders
+                    info.isEncrypted = info.isEncrypted || req.encrypted || source.encrypted
+                    d(
+                        "download source resolved, key=$key, encrypted=${info.isEncrypted}, " +
+                            "secureHeaders=${info.secureHeaders.isNotBlank()}, finalUrl=${info.resolvedUrl}"
+                    )
                     runDownload(info, cancelFlag)
                 } catch (t: Throwable) {
                     info.status = HXCDownloadStatus.ERROR
@@ -142,6 +157,7 @@ object HXCDownloadManager {
             .imagePath(info.imagePath)
             .fileSize(info.fileSize)
             .duration(info.duration)
+            .encrypted(info.isEncrypted)
         startDownload(request)
     }
 
@@ -267,7 +283,7 @@ object HXCDownloadManager {
         }
         val (content, finalUrl) = fetchTextWithFinalUrl(info.resolvedUrl, info.secureHeaders)
         d("m3u8 source fetched, key=${info.downloadKey}, finalUrl=$finalUrl, chars=${content.length}")
-        val buildResult = buildLocalM3u8AndDownloadResources(
+        val artifacts = buildLocalM3u8AndDownloadResources(
             sourceContent = content,
             baseUrl = finalUrl,
             saveDir = m3u8Dir,
@@ -280,11 +296,12 @@ object HXCDownloadManager {
             return
         }
         val localM3u8 = File(m3u8Dir, "index.m3u8")
-        localM3u8.writeText(buildResult)
+        localM3u8.writeText(artifacts.outputContent)
         d(
             "m3u8 local index written, key=${info.downloadKey}, path=${localM3u8.absolutePath}, " +
-                    "size=${localM3u8.length()}, lines=${buildResult.lines().size}"
+                    "size=${localM3u8.length()}, lines=${artifacts.outputContent.lines().size}"
         )
+        auditLocalM3u8(info, localM3u8, artifacts)
         info.localPath = localM3u8.absolutePath
         info.progress = 1f
         info.status = HXCDownloadStatus.FINISH
@@ -301,12 +318,13 @@ object HXCDownloadManager {
         headers: String,
         cancelFlag: AtomicBoolean,
         info: HXCDownloadInfo
-    ): String {
+    ): M3u8BuildArtifacts {
         val resources = mutableListOf<M3u8ResourceTask>()
         val outputLines = mutableListOf<String>()
         var segmentIndex = 0
         var mapIndex = 0
         var keyIndex = 0
+        var byterangeCount = 0
         var byteRangeLength = -1L
         var byteRangeOffset = -1L
 
@@ -321,7 +339,8 @@ object HXCDownloadManager {
                     val (length, offset) = parseByteRange(line, byteRangeOffset + if (byteRangeLength > 0) byteRangeLength else 0L)
                     byteRangeLength = length
                     byteRangeOffset = offset
-                    outputLines.add(line)
+                    byterangeCount += 1
+                    // 本地离线已将目标切分成独立文件，保留原 BYTERANGE 会导致再次裁剪而读坏数据。
                 }
                 line.startsWith("#EXT-X-MAP") -> {
                     val mapUri = extractUriAttr(line)
@@ -397,7 +416,7 @@ object HXCDownloadManager {
         val tsCount = resources.size - mapCount - keyCount
         d(
             "m3u8 parse summary, key=${info.downloadKey}, resources=${resources.size}, " +
-                    "ts=$tsCount, map=$mapCount, key=$keyCount"
+                    "ts=$tsCount, map=$mapCount, key=$keyCount, byterange=$byterangeCount"
         )
 
         info.status = HXCDownloadStatus.RUNNING
@@ -427,7 +446,80 @@ object HXCDownloadManager {
             "m3u8 resources complete, key=${info.downloadKey}, finished=$finished/${resources.size}, " +
                     "outputLines=${outputLines.size}"
         )
-        return outputLines.joinToString("\n", postfix = "\n")
+        return M3u8BuildArtifacts(
+            outputContent = outputLines.joinToString("\n", postfix = "\n"),
+            resources = resources.toList(),
+            tsCount = tsCount,
+            mapCount = mapCount,
+            keyCount = keyCount,
+            byterangeCount = byterangeCount
+        )
+    }
+
+    private fun auditLocalM3u8(info: HXCDownloadInfo, localM3u8: File, artifacts: M3u8BuildArtifacts) {
+        runCatching {
+            val lines = localM3u8.readLines(Charsets.UTF_8)
+            val mediaUris = lines.filter { it.isNotBlank() && !it.trimStart().startsWith("#") }
+            val firstUri = mediaUris.firstOrNull().orEmpty()
+            val lastUri = mediaUris.lastOrNull().orEmpty()
+            val keyLine = lines.firstOrNull { it.startsWith("#EXT-X-KEY") }.orEmpty()
+            val mapLine = lines.firstOrNull { it.startsWith("#EXT-X-MAP") }.orEmpty()
+            val firstFile = parseLocalFileFromM3u8Uri(firstUri)
+            val lastFile = parseLocalFileFromM3u8Uri(lastUri)
+            d(
+                "m3u8 audit summary, key=${info.downloadKey}, encrypted=${info.isEncrypted}, " +
+                    "resources=${artifacts.resources.size}, ts=${artifacts.tsCount}, map=${artifacts.mapCount}, " +
+                    "key=${artifacts.keyCount}, byterange=${artifacts.byterangeCount}, mediaUris=${mediaUris.size}"
+            )
+            d(
+                "m3u8 audit lines, key=${info.downloadKey}, total=${lines.size}, " +
+                    "first='${lines.firstOrNull().orEmpty()}', last='${lines.lastOrNull().orEmpty()}'"
+            )
+            d(
+                "m3u8 audit uri, key=${info.downloadKey}, firstUri=$firstUri, lastUri=$lastUri, " +
+                    "firstExists=${firstFile?.exists() == true}, lastExists=${lastFile?.exists() == true}, " +
+                    "firstSize=${firstFile?.length() ?: -1}, lastSize=${lastFile?.length() ?: -1}"
+            )
+            if (keyLine.isNotBlank() || mapLine.isNotBlank()) {
+                d(
+                    "m3u8 audit tags, key=${info.downloadKey}, keyTag=$keyLine, mapTag=$mapLine"
+                )
+            }
+            val keyResource = artifacts.resources.firstOrNull { it.target.name.endsWith(".key") }
+            if (keyResource != null && keyResource.target.exists()) {
+                d(
+                    "m3u8 audit keyfile, key=${info.downloadKey}, path=${keyResource.target.absolutePath}, " +
+                        "size=${keyResource.target.length()}, md5=${md5Hex(keyResource.target)}"
+                )
+            }
+        }.onFailure {
+            d("m3u8 audit failed, key=${info.downloadKey}, reason=${it.message}")
+        }
+    }
+
+    private fun parseLocalFileFromM3u8Uri(uri: String): File? {
+        if (uri.isBlank()) return null
+        val path = when {
+            uri.startsWith("file://") -> uri.removePrefix("file://")
+            uri.startsWith("/") -> uri
+            else -> return null
+        }
+        return File(path)
+    }
+
+    private fun md5Hex(file: File): String {
+        return runCatching {
+            val digest = MessageDigest.getInstance("MD5")
+            file.inputStream().use { input ->
+                val buffer = ByteArray(8 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        }.getOrDefault("")
     }
 
     private fun fetchTextWithFinalUrl(url: String, headers: String): Pair<String, String> {
@@ -615,6 +707,7 @@ object HXCDownloadManager {
             duration = req.duration
             status = HXCDownloadStatus.IDLE
             resolvedUrl = req.plainUrl
+            isEncrypted = req.encrypted || (req.secureCredential != null)
         }
     }
 
