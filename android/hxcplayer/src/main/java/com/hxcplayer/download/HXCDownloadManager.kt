@@ -33,6 +33,17 @@ object HXCDownloadManager {
     private val cancelledFlags = ConcurrentHashMap<String, AtomicBoolean>()
     private var store: HXCDownloadStore? = null
 
+    private data class M3u8ResourceTask(
+        val url: String,
+        val rawUrl: String,
+        val target: File,
+        val rangeStart: Long = -1L,
+        val rangeEnd: Long = -1L
+    ) {
+        fun hasRange(): Boolean = rangeStart >= 0L && rangeEnd >= rangeStart
+        fun expectedLength(): Long = if (hasRange()) rangeEnd - rangeStart + 1 else -1L
+    }
+
     @Synchronized
     fun init(context: Context, config: HXCDownloadConfig = HXCDownloadConfig()) {
         appContext = context.applicationContext
@@ -255,48 +266,25 @@ object HXCDownloadManager {
             m3u8Dir.mkdirs()
         }
         val (content, finalUrl) = fetchTextWithFinalUrl(info.resolvedUrl, info.secureHeaders)
-        val parsed = HXCM3u8Parser.parse(finalUrl, content)
-        if (parsed.tsList.isEmpty()) {
-            throw IllegalStateException("m3u8 ts list is empty")
-        }
-        info.status = HXCDownloadStatus.RUNNING
-        info.isWaiting = false
-        info.totalBytes = parsed.tsList.size.toLong()
-        postStatusChanged(info)
-
-        var finished = 0L
-        parsed.tsList.forEach { ts ->
-            if (cancelFlag.get() || Thread.currentThread().isInterrupted) {
-                info.status = HXCDownloadStatus.PAUSE
-                info.isWaiting = false
-                postStatusChanged(info)
-                notifyListChanged()
-                return
-            }
-            val tsFile = File(m3u8Dir, ts.localName)
-            if (!tsFile.exists() || tsFile.length() <= 0L) {
-                downloadSimpleFile(ts.url, tsFile, info.secureHeaders)
-            }
-            finished += 1
-            info.downloadedBytes = finished
-            info.progress = (finished.toFloat() / info.totalBytes.toFloat()).coerceIn(0f, 1f)
-            postProgress(info)
+        d("m3u8 source fetched, key=${info.downloadKey}, finalUrl=$finalUrl, chars=${content.length}")
+        val buildResult = buildLocalM3u8AndDownloadResources(
+            sourceContent = content,
+            baseUrl = finalUrl,
+            saveDir = m3u8Dir,
+            headers = info.secureHeaders,
+            cancelFlag = cancelFlag,
+            info = info
+        )
+        if (info.status == HXCDownloadStatus.PAUSE) {
+            d("m3u8 paused before index write, key=${info.downloadKey}")
+            return
         }
         val localM3u8 = File(m3u8Dir, "index.m3u8")
-        val body = buildString {
-            append("#EXTM3U\n")
-            parsed.headerLines.forEach { line ->
-                if (!line.startsWith("#EXTM3U")) {
-                    append(line).append('\n')
-                }
-            }
-            parsed.tsList.forEach { ts ->
-                append("#EXTINF:${ts.duration},\n")
-                append(ts.localName).append('\n')
-            }
-            append("#EXT-X-ENDLIST\n")
-        }
-        localM3u8.writeText(body)
+        localM3u8.writeText(buildResult)
+        d(
+            "m3u8 local index written, key=${info.downloadKey}, path=${localM3u8.absolutePath}, " +
+                    "size=${localM3u8.length()}, lines=${buildResult.lines().size}"
+        )
         info.localPath = localM3u8.absolutePath
         info.progress = 1f
         info.status = HXCDownloadStatus.FINISH
@@ -304,6 +292,142 @@ object HXCDownloadManager {
         postStatusChanged(info)
         notifyListChanged()
         d("m3u8 finish key=${info.downloadKey} path=${info.localPath}")
+    }
+
+    private fun buildLocalM3u8AndDownloadResources(
+        sourceContent: String,
+        baseUrl: String,
+        saveDir: File,
+        headers: String,
+        cancelFlag: AtomicBoolean,
+        info: HXCDownloadInfo
+    ): String {
+        val resources = mutableListOf<M3u8ResourceTask>()
+        val outputLines = mutableListOf<String>()
+        var segmentIndex = 0
+        var mapIndex = 0
+        var keyIndex = 0
+        var byteRangeLength = -1L
+        var byteRangeOffset = -1L
+
+        sourceContent.lines().forEach { raw ->
+            val line = raw.trim()
+            if (line.isEmpty()) {
+                outputLines.add("")
+                return@forEach
+            }
+            when {
+                line.startsWith("#EXT-X-BYTERANGE") -> {
+                    val (length, offset) = parseByteRange(line, byteRangeOffset + if (byteRangeLength > 0) byteRangeLength else 0L)
+                    byteRangeLength = length
+                    byteRangeOffset = offset
+                    outputLines.add(line)
+                }
+                line.startsWith("#EXT-X-MAP") -> {
+                    val mapUri = extractUriAttr(line)
+                    if (!mapUri.isNullOrBlank()) {
+                        val abs = HXCM3u8Parser.toAbsoluteUrl(baseUrl, mapUri)
+                        val localName = String.format("init_%04d.map", mapIndex++)
+                        val localFile = File(saveDir, localName)
+                        resources.add(M3u8ResourceTask(abs, abs, localFile))
+                        outputLines.add(replaceUriAttr(line, "file://${localFile.absolutePath}"))
+                    } else {
+                        outputLines.add(line)
+                    }
+                }
+                line.startsWith("#EXT-X-KEY") -> {
+                    val keyUri = extractUriAttr(line)
+                    if (!keyUri.isNullOrBlank()) {
+                        val abs = HXCM3u8Parser.toAbsoluteUrl(baseUrl, keyUri)
+                        val localName = String.format("key_%04d.key", keyIndex++)
+                        val localFile = File(saveDir, localName)
+                        resources.add(M3u8ResourceTask(abs, abs, localFile))
+                        outputLines.add(replaceUriAttr(line, "file://${localFile.absolutePath}"))
+                    } else {
+                        outputLines.add(line)
+                    }
+                }
+                line.startsWith("#") -> {
+                    outputLines.add(line)
+                }
+                else -> {
+                    val localName = String.format("%04d.ts", segmentIndex++)
+                    val localFile = File(saveDir, localName)
+                    val absRaw = HXCM3u8Parser.toAbsoluteUrl(baseUrl, line)
+                    val queryRange = parseStartEndQuery(line)
+                    val task = if (queryRange.first >= 0L && queryRange.second >= queryRange.first) {
+                        val cleanLine = stripQuery(line)
+                        val cleanAbs = HXCM3u8Parser.toAbsoluteUrl(baseUrl, cleanLine)
+                        M3u8ResourceTask(
+                            url = cleanAbs,
+                            rawUrl = absRaw,
+                            target = localFile,
+                            rangeStart = queryRange.first,
+                            rangeEnd = queryRange.second
+                        )
+                    } else if (byteRangeLength > 0L) {
+                        val start = byteRangeOffset
+                        val end = byteRangeOffset + byteRangeLength - 1
+                        byteRangeLength = -1L
+                        M3u8ResourceTask(
+                            url = absRaw,
+                            rawUrl = absRaw,
+                            target = localFile,
+                            rangeStart = start,
+                            rangeEnd = end
+                        )
+                    } else {
+                        M3u8ResourceTask(
+                            url = absRaw,
+                            rawUrl = absRaw,
+                            target = localFile
+                        )
+                    }
+                    resources.add(task)
+                    outputLines.add("file://${localFile.absolutePath}")
+                }
+            }
+        }
+
+        if (resources.isEmpty()) {
+            throw IllegalStateException("m3u8 resources list is empty")
+        }
+        val mapCount = resources.count { it.target.name.endsWith(".map") }
+        val keyCount = resources.count { it.target.name.endsWith(".key") }
+        val tsCount = resources.size - mapCount - keyCount
+        d(
+            "m3u8 parse summary, key=${info.downloadKey}, resources=${resources.size}, " +
+                    "ts=$tsCount, map=$mapCount, key=$keyCount"
+        )
+
+        info.status = HXCDownloadStatus.RUNNING
+        info.isWaiting = false
+        info.totalBytes = resources.size.toLong()
+        info.downloadedBytes = 0L
+        postStatusChanged(info)
+
+        var finished = 0L
+        for (task in resources) {
+            if (cancelFlag.get() || Thread.currentThread().isInterrupted) {
+                info.status = HXCDownloadStatus.PAUSE
+                info.isWaiting = false
+                postStatusChanged(info)
+                notifyListChanged()
+                return ""
+            }
+            if (!task.target.exists() || !isResourceComplete(task)) {
+                downloadTaskResource(task, headers)
+            }
+            finished += 1
+            info.downloadedBytes = finished
+            info.progress = (finished.toFloat() / info.totalBytes.toFloat()).coerceIn(0f, 1f)
+            postProgress(info)
+        }
+        d(
+            "m3u8 resources complete, key=${info.downloadKey}, finished=$finished/${resources.size}, " +
+                    "outputLines=${outputLines.size}"
+        )
+        return outputLines.joinToString("\n", postfix = "\n")
     }
 
     private fun fetchTextWithFinalUrl(url: String, headers: String): Pair<String, String> {
@@ -366,6 +490,112 @@ object HXCDownloadManager {
             }
         }
         conn.disconnect()
+    }
+
+    private fun downloadTaskResource(task: M3u8ResourceTask, headers: String) {
+        if (!task.hasRange()) {
+            downloadSimpleFile(task.url, task.target, headers)
+            return
+        }
+        val rangeHeader = "bytes=${task.rangeStart}-${task.rangeEnd}"
+        val conn = (URL(task.url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = config.connectTimeoutMs
+            readTimeout = config.readTimeoutMs
+            setRequestProperty("Range", rangeHeader)
+            applyHeaders(this, headers)
+        }
+        conn.connect()
+        val code = conn.responseCode
+        if (code in 200..299 || code == 206) {
+            task.target.outputStream().use { out ->
+                conn.inputStream.use { input ->
+                    val buf = ByteArray(8 * 1024)
+                    while (true) {
+                        val len = input.read(buf)
+                        if (len <= 0) break
+                        out.write(buf, 0, len)
+                    }
+                }
+            }
+            conn.disconnect()
+            return
+        }
+        conn.disconnect()
+        if (task.target.exists()) {
+            task.target.delete()
+        }
+        if (task.rawUrl != task.url) {
+            downloadSimpleFile(task.rawUrl, task.target, headers)
+            return
+        }
+        throw IllegalStateException("download ts failed: HTTP $code, range=$rangeHeader")
+    }
+
+    private fun isResourceComplete(task: M3u8ResourceTask): Boolean {
+        if (!task.target.exists() || task.target.length() <= 0L) return false
+        val expected = task.expectedLength()
+        return expected <= 0L || task.target.length() == expected
+    }
+
+    private fun extractUriAttr(line: String): String? {
+        val start = line.indexOf("URI=\"")
+        if (start < 0) return null
+        val from = start + 5
+        val end = line.indexOf('"', from)
+        return if (end > from) line.substring(from, end) else null
+    }
+
+    private fun replaceUriAttr(line: String, newUri: String): String {
+        val start = line.indexOf("URI=\"")
+        if (start < 0) return line
+        val from = start + 5
+        val end = line.indexOf('"', from)
+        if (end <= from) return line
+        return line.substring(0, from) + newUri + line.substring(end)
+    }
+
+    private fun parseByteRange(line: String, prevEnd: Long): Pair<Long, Long> {
+        return try {
+            val value = line.substringAfter(':').trim()
+            val at = value.indexOf('@')
+            val length: Long
+            val offset: Long
+            if (at >= 0) {
+                length = value.substring(0, at).trim().toLong()
+                offset = value.substring(at + 1).trim().toLong()
+            } else {
+                length = value.toLong()
+                offset = if (prevEnd >= 0L) prevEnd else 0L
+            }
+            length to offset
+        } catch (_: Throwable) {
+            -1L to 0L
+        }
+    }
+
+    private fun parseStartEndQuery(line: String): Pair<Long, Long> {
+        return try {
+            val q = line.indexOf('?')
+            if (q < 0) return -1L to -1L
+            var start = -1L
+            var end = -1L
+            val query = line.substring(q + 1)
+            query.split("&").forEach { p ->
+                when {
+                    p.startsWith("start=") -> start = p.substringAfter("start=").toLongOrNull() ?: -1L
+                    p.startsWith("end=") -> end = p.substringAfter("end=").toLongOrNull() ?: -1L
+                }
+            }
+            start to end
+        } catch (_: Throwable) {
+            -1L to -1L
+        }
+    }
+
+    private fun stripQuery(url: String): String {
+        val q = url.indexOf('?')
+        return if (q > 0) url.substring(0, q) else url
     }
 
     private fun createInfoFromRequest(req: HXCDownloadRequest): HXCDownloadInfo {
