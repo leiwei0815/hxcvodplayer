@@ -349,7 +349,7 @@ object HXCDownloadManager {
                         val localName = String.format("init_%04d.map", mapIndex++)
                         val localFile = File(saveDir, localName)
                         resources.add(M3u8ResourceTask(abs, abs, localFile))
-                        outputLines.add(replaceUriAttr(line, "file://${localFile.absolutePath}"))
+                        outputLines.add(replaceUriAttr(line, localName))
                     } else {
                         outputLines.add(line)
                     }
@@ -361,7 +361,7 @@ object HXCDownloadManager {
                         val localName = String.format("key_%04d.key", keyIndex++)
                         val localFile = File(saveDir, localName)
                         resources.add(M3u8ResourceTask(abs, abs, localFile))
-                        outputLines.add(replaceUriAttr(line, "file://${localFile.absolutePath}"))
+                        outputLines.add(replaceUriAttr(line, localName))
                     } else {
                         outputLines.add(line)
                     }
@@ -403,7 +403,7 @@ object HXCDownloadManager {
                         )
                     }
                     resources.add(task)
-                    outputLines.add("file://${localFile.absolutePath}")
+                    outputLines.add(localName)
                 }
             }
         }
@@ -471,8 +471,8 @@ object HXCDownloadManager {
             val lastUri = mediaUris.lastOrNull().orEmpty()
             val keyLine = lines.firstOrNull { it.startsWith("#EXT-X-KEY") }.orEmpty()
             val mapLine = lines.firstOrNull { it.startsWith("#EXT-X-MAP") }.orEmpty()
-            val firstFile = parseLocalFileFromM3u8Uri(firstUri)
-            val lastFile = parseLocalFileFromM3u8Uri(lastUri)
+            val firstFile = parseLocalFileFromM3u8Uri(localM3u8.parentFile, firstUri)
+            val lastFile = parseLocalFileFromM3u8Uri(localM3u8.parentFile, lastUri)
             d(
                 "m3u8 audit summary, key=${info.downloadKey}, encrypted=${info.isEncrypted}, " +
                     "resources=${artifacts.resources.size}, ts=${artifacts.tsCount}, map=${artifacts.mapCount}, " +
@@ -504,14 +504,17 @@ object HXCDownloadManager {
         }
     }
 
-    private fun parseLocalFileFromM3u8Uri(uri: String): File? {
+    private fun parseLocalFileFromM3u8Uri(baseDir: File?, uri: String): File? {
         if (uri.isBlank()) return null
-        val path = when {
-            uri.startsWith("file://") -> uri.removePrefix("file://")
-            uri.startsWith("/") -> uri
-            else -> return null
+        val resolved = when {
+            uri.startsWith("file://") -> File(uri.removePrefix("file://"))
+            uri.startsWith("/") -> File(uri)
+            else -> {
+                val dir = baseDir ?: return null
+                File(dir, uri)
+            }
         }
-        return File(path)
+        return resolved
     }
 
     private fun md5Hex(file: File): String {
