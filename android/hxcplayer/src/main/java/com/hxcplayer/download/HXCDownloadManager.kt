@@ -10,6 +10,9 @@ import java.io.RandomAccessFile
 import java.net.URI
 import java.net.HttpURLConnection
 import java.net.URL
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
@@ -39,10 +42,14 @@ object HXCDownloadManager {
         val rawUrl: String,
         val target: File,
         val rangeStart: Long = -1L,
-        val rangeEnd: Long = -1L
+        val rangeEnd: Long = -1L,
+        val segmentSequence: Long = -1L,
+        val decryptKeyFile: File? = null,
+        val decryptIvHex: String? = null
     ) {
         fun hasRange(): Boolean = rangeStart >= 0L && rangeEnd >= rangeStart
         fun expectedLength(): Long = if (hasRange()) rangeEnd - rangeStart + 1 else -1L
+        fun needsDecrypt(): Boolean = decryptKeyFile != null && target.name.endsWith(".ts")
     }
 
     private data class M3u8BuildArtifacts(
@@ -51,7 +58,14 @@ object HXCDownloadManager {
         val tsCount: Int,
         val mapCount: Int,
         val keyCount: Int,
-        val byterangeCount: Int
+        val byterangeCount: Int,
+        val decryptedSegments: Int
+    )
+
+    private data class HlsKeyContext(
+        val method: String,
+        val keyFile: File?,
+        val ivHex: String?
     )
 
     @Synchronized
@@ -301,6 +315,14 @@ object HXCDownloadManager {
             "m3u8 local index written, key=${info.downloadKey}, path=${localM3u8.absolutePath}, " +
                     "size=${localM3u8.length()}, lines=${artifacts.outputContent.lines().size}"
         )
+        d(
+            "offline_decrypt_applied, key=${info.downloadKey}, encrypted=${info.isEncrypted}, " +
+                    "applied=${artifacts.decryptedSegments > 0}, decryptedTs=${artifacts.decryptedSegments}, " +
+                    "tsTotal=${artifacts.tsCount}"
+        )
+        if (info.isEncrypted && artifacts.tsCount > 0 && artifacts.decryptedSegments == 0) {
+            d("offline_decrypt_warning, key=${info.downloadKey}, reason=encrypted_stream_but_no_segment_decrypted")
+        }
         auditLocalM3u8(info, localM3u8, artifacts)
         info.localPath = localM3u8.absolutePath
         info.progress = 1f
@@ -324,9 +346,13 @@ object HXCDownloadManager {
         var segmentIndex = 0
         var mapIndex = 0
         var keyIndex = 0
+        var decryptedSegments = 0
         var byterangeCount = 0
         var byteRangeLength = -1L
         var byteRangeOffset = -1L
+        var mediaSequenceBase = 0L
+        var mediaSequence = 0L
+        var activeKey: HlsKeyContext? = null
 
         sourceContent.lines().forEach { raw ->
             val line = raw.trim()
@@ -335,6 +361,11 @@ object HXCDownloadManager {
                 return@forEach
             }
             when {
+                line.startsWith("#EXT-X-MEDIA-SEQUENCE") -> {
+                    mediaSequenceBase = line.substringAfter(":").trim().toLongOrNull() ?: mediaSequenceBase
+                    mediaSequence = mediaSequenceBase
+                    outputLines.add(line)
+                }
                 line.startsWith("#EXT-X-BYTERANGE") -> {
                     val (length, offset) = parseByteRange(line, byteRangeOffset + if (byteRangeLength > 0) byteRangeLength else 0L)
                     byteRangeLength = length
@@ -356,12 +387,21 @@ object HXCDownloadManager {
                 }
                 line.startsWith("#EXT-X-KEY") -> {
                     val keyUri = extractUriAttr(line)
-                    if (!keyUri.isNullOrBlank()) {
+                    val method = extractAttrValue(line, "METHOD").ifBlank { "AES-128" }.uppercase()
+                    val ivHex = extractAttrValue(line, "IV")
+                    if (method == "NONE") {
+                        activeKey = null
+                        outputLines.add(line)
+                    } else if (!keyUri.isNullOrBlank()) {
                         val abs = HXCM3u8Parser.toAbsoluteUrl(baseUrl, keyUri)
                         val localName = String.format("key_%04d.key", keyIndex++)
                         val localFile = File(saveDir, localName)
                         resources.add(M3u8ResourceTask(abs, abs, localFile))
-                        outputLines.add(replaceUriAttr(line, localName))
+                        activeKey = HlsKeyContext(method = method, keyFile = localFile, ivHex = ivHex)
+                        if (method != "AES-128") {
+                            // 非 AES-128 维持原始 KEY 标签，避免误处理。
+                            outputLines.add(replaceUriAttr(line, localName))
+                        }
                     } else {
                         outputLines.add(line)
                     }
@@ -374,6 +414,7 @@ object HXCDownloadManager {
                     val localFile = File(saveDir, localName)
                     val absRaw = HXCM3u8Parser.toAbsoluteUrl(baseUrl, line)
                     val queryRange = parseStartEndQuery(line)
+                    val keyCtx = activeKey
                     val task = if (queryRange.first >= 0L && queryRange.second >= queryRange.first) {
                         val cleanLine = stripQuery(line)
                         val cleanAbs = HXCM3u8Parser.toAbsoluteUrl(baseUrl, cleanLine)
@@ -382,7 +423,10 @@ object HXCDownloadManager {
                             rawUrl = absRaw,
                             target = localFile,
                             rangeStart = queryRange.first,
-                            rangeEnd = queryRange.second
+                            rangeEnd = queryRange.second,
+                            segmentSequence = mediaSequence,
+                            decryptKeyFile = if (keyCtx?.method == "AES-128") keyCtx.keyFile else null,
+                            decryptIvHex = if (keyCtx?.method == "AES-128") keyCtx.ivHex else null
                         )
                     } else if (byteRangeLength > 0L) {
                         val start = byteRangeOffset
@@ -393,17 +437,24 @@ object HXCDownloadManager {
                             rawUrl = absRaw,
                             target = localFile,
                             rangeStart = start,
-                            rangeEnd = end
+                            rangeEnd = end,
+                            segmentSequence = mediaSequence,
+                            decryptKeyFile = if (keyCtx?.method == "AES-128") keyCtx.keyFile else null,
+                            decryptIvHex = if (keyCtx?.method == "AES-128") keyCtx.ivHex else null
                         )
                     } else {
                         M3u8ResourceTask(
                             url = absRaw,
                             rawUrl = absRaw,
-                            target = localFile
+                            target = localFile,
+                            segmentSequence = mediaSequence,
+                            decryptKeyFile = if (keyCtx?.method == "AES-128") keyCtx.keyFile else null,
+                            decryptIvHex = if (keyCtx?.method == "AES-128") keyCtx.ivHex else null
                         )
                     }
                     resources.add(task)
                     outputLines.add(localName)
+                    mediaSequence += 1
                 }
             }
         }
@@ -438,11 +489,16 @@ object HXCDownloadManager {
                     tsCount = tsCount,
                     mapCount = mapCount,
                     keyCount = keyCount,
-                    byterangeCount = byterangeCount
+                    byterangeCount = byterangeCount,
+                    decryptedSegments = decryptedSegments
                 )
             }
             if (!task.target.exists() || !isResourceComplete(task)) {
                 downloadTaskResource(task, headers)
+            }
+            if (task.needsDecrypt()) {
+                decryptAes128SegmentInPlace(task)
+                decryptedSegments += 1
             }
             finished += 1
             info.downloadedBytes = finished
@@ -451,7 +507,7 @@ object HXCDownloadManager {
         }
         d(
             "m3u8 resources complete, key=${info.downloadKey}, finished=$finished/${resources.size}, " +
-                    "outputLines=${outputLines.size}"
+                    "outputLines=${outputLines.size}, decryptedTs=$decryptedSegments"
         )
         return M3u8BuildArtifacts(
             outputContent = outputLines.joinToString("\n", postfix = "\n"),
@@ -459,7 +515,8 @@ object HXCDownloadManager {
             tsCount = tsCount,
             mapCount = mapCount,
             keyCount = keyCount,
-            byterangeCount = byterangeCount
+            byterangeCount = byterangeCount,
+            decryptedSegments = decryptedSegments
         )
     }
 
@@ -476,7 +533,8 @@ object HXCDownloadManager {
             d(
                 "m3u8 audit summary, key=${info.downloadKey}, encrypted=${info.isEncrypted}, " +
                     "resources=${artifacts.resources.size}, ts=${artifacts.tsCount}, map=${artifacts.mapCount}, " +
-                    "key=${artifacts.keyCount}, byterange=${artifacts.byterangeCount}, mediaUris=${mediaUris.size}"
+                    "key=${artifacts.keyCount}, byterange=${artifacts.byterangeCount}, " +
+                    "decryptedTs=${artifacts.decryptedSegments}, mediaUris=${mediaUris.size}"
             )
             d(
                 "m3u8 audit lines, key=${info.downloadKey}, total=${lines.size}, " +
@@ -655,6 +713,67 @@ object HXCDownloadManager {
         val end = line.indexOf('"', from)
         if (end <= from) return line
         return line.substring(0, from) + newUri + line.substring(end)
+    }
+
+    private fun extractAttrValue(line: String, attrName: String): String {
+        val regex = Regex("""$attrName=("[^"]*"|[^,]*)""")
+        val match = regex.find(line) ?: return ""
+        val value = match.groupValues.getOrNull(1).orEmpty().trim()
+        return value.removePrefix("\"").removeSuffix("\"").trim()
+    }
+
+    private fun decryptAes128SegmentInPlace(task: M3u8ResourceTask) {
+        val keyFile = task.decryptKeyFile ?: return
+        if (!keyFile.exists()) {
+            throw IllegalStateException("aes key file missing: ${keyFile.absolutePath}")
+        }
+        val keyBytes = keyFile.readBytes()
+        if (keyBytes.size != 16) {
+            throw IllegalStateException("invalid aes-128 key length=${keyBytes.size}")
+        }
+        val encryptedBytes = task.target.readBytes()
+        val ivBytes = resolveSegmentIv(task.decryptIvHex, task.segmentSequence)
+        val clearBytes = runCatching {
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
+            cipher.doFinal(encryptedBytes)
+        }.getOrElse {
+            val fallback = Cipher.getInstance("AES/CBC/NoPadding")
+            fallback.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
+            fallback.doFinal(encryptedBytes)
+        }
+        task.target.writeBytes(clearBytes)
+    }
+
+    private fun resolveSegmentIv(ivHex: String?, sequence: Long): ByteArray {
+        if (!ivHex.isNullOrBlank()) {
+            val normalized = ivHex.removePrefix("0x").removePrefix("0X")
+            val iv = ByteArray(16)
+            val raw = hexToBytes(normalized)
+            val copyStart = (16 - raw.size).coerceAtLeast(0)
+            val from = (raw.size - 16).coerceAtLeast(0)
+            val copyLen = minOf(16, raw.size)
+            System.arraycopy(raw, from, iv, copyStart, copyLen)
+            return iv
+        }
+        val iv = ByteArray(16)
+        for (i in 0 until 8) {
+            iv[15 - i] = ((sequence ushr (8 * i)) and 0xFF).toByte()
+        }
+        return iv
+    }
+
+    private fun hexToBytes(hex: String): ByteArray {
+        if (hex.isBlank()) return ByteArray(0)
+        val normalized = if (hex.length % 2 == 0) hex else "0$hex"
+        val out = ByteArray(normalized.length / 2)
+        var i = 0
+        while (i < normalized.length) {
+            val byteVal = normalized.substring(i, i + 2).toInt(16)
+            out[i / 2] = byteVal.toByte()
+            i += 2
+        }
+        return out
     }
 
     private fun parseByteRange(line: String, prevEnd: Long): Pair<Long, Long> {
