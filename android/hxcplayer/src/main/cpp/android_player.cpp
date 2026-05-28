@@ -2082,7 +2082,18 @@ void AndroidPlayer::renderLoop() {
             double dispatch_target = target;
             if (is_backward_seek) {
                 // Backward seek软重建时给一个很小的回退，避免二次落点过早。
-                dispatch_target = std::max(0.0, target - 2.0);
+                double backward_backoff_sec = 2.0;
+                double duration_now = player_core_get_duration(player_core_);
+                // 临近结尾（最后 5 分钟）时，减小软重建回退幅度，避免 seek 在尾段来回拉扯。
+                if (std::isfinite(duration_now) && duration_now > 0.0) {
+                    double remain = duration_now - target;
+                    if (remain <= 180.0) {
+                        backward_backoff_sec = 0.4;
+                    } else if (remain <= 300.0) {
+                        backward_backoff_sec = 0.8;
+                    }
+                }
+                dispatch_target = std::max(0.0, target - backward_backoff_sec);
             }
             seek_target_sec_.store(target, std::memory_order_release);
 
@@ -3222,11 +3233,20 @@ void AndroidPlayer::renderLoop() {
                     }
                     if (!should_consume && secure_session) {
                         seek_phase_.store(SEEK_PHASE_VERIFY, std::memory_order_release);
+                        double duration_now = player_core_get_duration(player_core_);
+                        bool near_end_seek = false;
+                        if (std::isfinite(duration_now) && duration_now > 0.0 && std::isfinite(seek_target_now)) {
+                            near_end_seek = (duration_now - seek_target_now) <= 300.0;
+                        }
                         double verify_max_offset_sec = is_backward_seek ? 3.8 : 2.2;
                         if (large_seek_any_direction) {
                             verify_max_offset_sec += is_backward_seek ? 0.6 : 0.8;
                         }
-                        if (seek_elapsed_ms >= 5200) {
+                        if (is_backward_seek && near_end_seek) {
+                            // 尾段 backward seek 使用更严格的收敛容忍，减少“看似完成但仍偏离目标”的假收敛。
+                            verify_max_offset_sec = std::min(verify_max_offset_sec, 2.4);
+                        }
+                        if (seek_elapsed_ms >= 5200 && !(is_backward_seek && near_end_seek)) {
                             verify_max_offset_sec = std::max(verify_max_offset_sec, is_backward_seek ? 4.8 : 3.0);
                         }
                         if (!is_backward_seek && large_seek_any_direction) {
@@ -3243,13 +3263,16 @@ void AndroidPlayer::renderLoop() {
                         }
                         double verify_offset_sec = std::fabs(pts - seek_target_now);
                         int verify_need_hits = is_backward_seek ? 2 : 3;
-                        if (is_backward_seek && seek_elapsed_ms >= 900 && verify_offset_sec <= 3.0) {
+                        if (is_backward_seek && near_end_seek) {
+                            verify_need_hits = 3;
+                        }
+                        if (is_backward_seek && !near_end_seek && seek_elapsed_ms >= 900 && verify_offset_sec <= 3.0) {
                             verify_need_hits = 1;
                         }
-                        if (is_backward_seek && seek_elapsed_ms >= 1800 && verify_offset_sec <= 2.4) {
+                        if (is_backward_seek && !near_end_seek && seek_elapsed_ms >= 1800 && verify_offset_sec <= 2.4) {
                             verify_need_hits = 1;
                         }
-                        if (is_backward_seek && seek_elapsed_ms >= 3200) {
+                        if (is_backward_seek && !near_end_seek && seek_elapsed_ms >= 3200) {
                             verify_need_hits = 1;
                         }
                         if (!is_backward_seek && seek_elapsed_ms >= 2600 && verify_offset_sec <= 2.5) {
@@ -3261,8 +3284,22 @@ void AndroidPlayer::renderLoop() {
                         if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 3400 && verify_offset_sec <= 5.0) {
                             verify_need_hits = 1;
                         }
-                        if (seek_elapsed_ms >= 5600) {
+                        if (seek_elapsed_ms >= 5600 && !(is_backward_seek && near_end_seek)) {
                             verify_need_hits = 1;
+                        }
+                        if (is_backward_seek && near_end_seek) {
+                            // 尾段下避免过早降为单次命中放行，优先保证落点稳定。
+                            if (seek_elapsed_ms < 5000 || verify_offset_sec > 1.8) {
+                                verify_need_hits = std::max(verify_need_hits, 2);
+                            }
+                            if (seek_elapsed_ms < 9000 && verify_offset_sec > 2.2) {
+                                should_consume = true;
+                                seek_verify_hits_.store(0, std::memory_order_release);
+                                seek_lower_bound_drop_count_++;
+                                SYNCW_RATE(20,
+                                           "evt=seek_verify_tail_backward_hold pts=%.3f target=%.3f offset=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
+                                           pts, seek_target_now, verify_offset_sec, seek_elapsed_ms, seek_lower_bound_drop_count_);
+                            }
                         }
                         if (!is_backward_seek && forward_soft_accept_active) {
                             verify_need_hits = 1;
@@ -3325,6 +3362,14 @@ void AndroidPlayer::renderLoop() {
                             // 4K keeps a slightly longer anti-freeze window, but still
                             // much shorter than before to avoid multi-second A/V drift tails.
                             bypass_ms = is_backward_seek ? 1800 : 1200;
+                        }
+                        double duration_now = player_core_get_duration(player_core_);
+                        bool near_end_seek = false;
+                        if (std::isfinite(duration_now) && duration_now > 0.0 && std::isfinite(seek_target_now)) {
+                            near_end_seek = (duration_now - seek_target_now) <= 300.0;
+                        }
+                        if (is_backward_seek && near_end_seek) {
+                            bypass_ms = std::max<int64_t>(bypass_ms, likely_4k ? 4200 : 3200);
                         }
                         post_seek_ahead_bypass_until_ms = now + bypass_ms;
                         should_display = should_consume = true;
