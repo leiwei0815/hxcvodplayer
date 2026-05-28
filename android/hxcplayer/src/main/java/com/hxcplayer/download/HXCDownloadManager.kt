@@ -6,6 +6,7 @@ import android.os.Looper
 import android.util.Log
 import com.hxcplayer.download.m3u8.HXCM3u8Parser
 import java.io.File
+import java.io.InterruptedIOException
 import java.io.RandomAccessFile
 import java.net.URI
 import java.net.HttpURLConnection
@@ -35,6 +36,8 @@ object HXCDownloadManager {
     private val downloads = ConcurrentHashMap<String, HXCDownloadInfo>()
     private val runningFutures = ConcurrentHashMap<String, Future<*>>()
     private val cancelledFlags = ConcurrentHashMap<String, AtomicBoolean>()
+    private val progressEmitStates = ConcurrentHashMap<String, ProgressEmitState>()
+    private val decryptLogCounters = ConcurrentHashMap<String, Int>()
     private var store: HXCDownloadStore? = null
 
     private data class M3u8ResourceTask(
@@ -68,10 +71,19 @@ object HXCDownloadManager {
         val ivHex: String?
     )
 
+    private data class ProgressEmitState(
+        var lastEmitAt: Long = 0L,
+        var lastProgress: Float = 0f
+    )
+
     @Synchronized
     fun init(context: Context, config: HXCDownloadConfig = HXCDownloadConfig()) {
         appContext = context.applicationContext
-        this.config = config.copy(maxConcurrent = config.maxConcurrent.coerceAtLeast(1))
+        val normalized = config.copy(maxConcurrent = config.maxConcurrent.coerceAtLeast(1))
+        normalized.resourceRetryCount = config.resourceRetryCount.coerceAtLeast(1)
+        normalized.resourceRetryBaseDelayMs = config.resourceRetryBaseDelayMs.coerceAtLeast(0L)
+        normalized.resourceRetryMaxDelayMs = config.resourceRetryMaxDelayMs.coerceAtLeast(0L)
+        this.config = normalized
         ioExecutor.shutdownNow()
         ioExecutor = Executors.newFixedThreadPool(this.config.maxConcurrent)
         store = HXCDownloadStore(appContext)
@@ -101,9 +113,20 @@ object HXCDownloadManager {
         requests.forEach { req ->
             val key = req.buildDownloadKey()
             val info = downloads[key] ?: createInfoFromRequest(req)
+            if (info.status == HXCDownloadStatus.FINISH && info.localPath.isNotBlank() && File(info.localPath).exists()) {
+                d("start ignored: task already finished, key=$key, path=${info.localPath}")
+                return@forEach
+            }
+            val runningFuture = runningFutures[key]
+            if (runningFuture != null && !runningFuture.isDone) {
+                d("start ignored: task already scheduled/running, key=$key, status=${info.status}")
+                return@forEach
+            }
             downloads[key] = info
             info.status = HXCDownloadStatus.WAITING
             info.isWaiting = true
+            info.errorMessage = ""
+            updateStage(info, stage = "WAITING", stageProgress = 0f, overallProgress = info.progress)
             postStatusChanged(info)
             notifyListChanged()
 
@@ -121,14 +144,27 @@ object HXCDownloadManager {
                     )
                     runDownload(info, cancelFlag)
                 } catch (t: Throwable) {
-                    info.status = HXCDownloadStatus.ERROR
-                    info.errorMessage = t.message ?: "download failed"
+                    val interrupted = isTaskInterrupted(cancelFlag, t)
+                    info.status = if (interrupted) HXCDownloadStatus.PAUSE else HXCDownloadStatus.ERROR
+                    info.errorMessage = if (interrupted) "" else (t.message ?: "download failed")
                     info.isWaiting = false
+                    updateStage(
+                        info,
+                        stage = if (interrupted) "PAUSED" else "ERROR",
+                        stageProgress = info.stageProgress,
+                        overallProgress = info.overallProgress
+                    )
                     postStatusChanged(info)
                     notifyListChanged()
-                    d("download error key=$key msg=${info.errorMessage}")
+                    if (interrupted) {
+                        d("download interrupted key=$key")
+                    } else {
+                        d("download error key=$key msg=${info.errorMessage}")
+                    }
                 } finally {
                     runningFutures.remove(key)
+                    cancelledFlags.remove(key)
+                    clearProgressState(key)
                 }
             }
             runningFutures[key] = future
@@ -141,6 +177,7 @@ object HXCDownloadManager {
         runningFutures[downloadKey]?.cancel(true)
         info.status = HXCDownloadStatus.PAUSE
         info.isWaiting = false
+        updateStage(info, stage = "PAUSED", stageProgress = info.stageProgress, overallProgress = info.overallProgress)
         postStatusChanged(info)
         notifyListChanged()
     }
@@ -153,6 +190,11 @@ object HXCDownloadManager {
 
     fun resumeDownload(downloadKey: String) {
         val info = downloads[downloadKey] ?: return
+        val runningFuture = runningFutures[downloadKey]
+        if (runningFuture != null && !runningFuture.isDone) {
+            d("resume ignored: task already scheduled/running, key=$downloadKey, status=${info.status}")
+            return
+        }
         if (info.resolvedUrl.isBlank()) {
             info.status = HXCDownloadStatus.ERROR
             info.errorMessage = "resume failed: missing resolved url"
@@ -187,9 +229,17 @@ object HXCDownloadManager {
         runningFutures[downloadKey]?.cancel(true)
         runningFutures.remove(downloadKey)
         cancelledFlags.remove(downloadKey)
+        clearProgressState(downloadKey)
         val info = downloads.remove(downloadKey) ?: return
         if (deleteFile && info.localPath.isNotBlank()) {
-            kotlin.runCatching { File(info.localPath).delete() }
+            kotlin.runCatching {
+                val local = File(info.localPath)
+                if (local.name.equals("index.m3u8", ignoreCase = true) && local.parentFile?.exists() == true) {
+                    local.parentFile?.deleteRecursively()
+                } else {
+                    local.delete()
+                }
+            }
         }
         notifyListChanged()
     }
@@ -226,19 +276,33 @@ object HXCDownloadManager {
             return
         }
 
-        val existing = if (targetFile.exists()) targetFile.length() else 0L
-        val conn = (URL(info.resolvedUrl).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = config.connectTimeoutMs
-            readTimeout = config.readTimeoutMs
-            if (existing > 0L) {
-                setRequestProperty("Range", "bytes=$existing-")
-            }
-            applyHeaders(this, info.secureHeaders)
-        }
-
+        var existing = if (targetFile.exists()) targetFile.length() else 0L
+        var conn = createHttpGetConnection(info.resolvedUrl, info.secureHeaders, if (existing > 0L) existing else null)
         conn.connect()
-        val code = conn.responseCode
+        var code = conn.responseCode
+        if (code == 416 && existing > 0L) {
+            // 服务端认为 Range 已超过文件末尾，按已完成处理。
+            conn.disconnect()
+            info.totalBytes = existing
+            info.downloadedBytes = existing
+            info.progress = 1f
+            postProgress(info, force = true)
+            info.status = HXCDownloadStatus.FINISH
+            info.isWaiting = false
+            postStatusChanged(info)
+            notifyListChanged()
+            d("download finish via 416 key=$key path=${info.localPath}")
+            return
+        }
+        if (existing > 0L && code == 200) {
+            // 服务端不支持续传，必须回退全量下载，避免在旧文件末尾拼接造成脏文件。
+            conn.disconnect()
+            existing = 0L
+            if (targetFile.exists()) targetFile.delete()
+            conn = createHttpGetConnection(info.resolvedUrl, info.secureHeaders, null)
+            conn.connect()
+            code = conn.responseCode
+        }
         if (code !in 200..299 && code != 206) {
             conn.disconnect()
             throw IllegalStateException("HTTP $code")
@@ -254,6 +318,12 @@ object HXCDownloadManager {
         info.fileSize = if (info.fileSize <= 0L && total > 0L) total / (1024 * 1024) else info.fileSize
         info.status = HXCDownloadStatus.RUNNING
         info.isWaiting = false
+        updateStage(
+            info,
+            stage = "DOWNLOADING_FILE",
+            stageProgress = if (total > 0L) (existing.toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0f,
+            overallProgress = if (total > 0L) (existing.toFloat() / total.toFloat()).coerceIn(0f, 1f) else 0f
+        )
         postStatusChanged(info)
 
         RandomAccessFile(targetFile, "rw").use { raf ->
@@ -275,17 +345,19 @@ object HXCDownloadManager {
                     raf.write(buffer, 0, len)
                     info.downloadedBytes += len
                     if (info.totalBytes > 0L) {
-                        info.progress = (info.downloadedBytes.toFloat() / info.totalBytes.toFloat())
-                            .coerceIn(0f, 1f)
+                        val p = (info.downloadedBytes.toFloat() / info.totalBytes.toFloat()).coerceIn(0f, 1f)
+                        updateStage(info, stage = "DOWNLOADING_FILE", stageProgress = p, overallProgress = p)
                     }
                     postProgress(info)
                 }
             }
         }
         conn.disconnect()
-        info.progress = 1f
+        updateStage(info, stage = "FINISHING", stageProgress = 1f, overallProgress = 1f)
+        postProgress(info, force = true)
         info.status = HXCDownloadStatus.FINISH
         info.isWaiting = false
+        updateStage(info, stage = "FINISHED", stageProgress = 1f, overallProgress = 1f)
         postStatusChanged(info)
         notifyListChanged()
         d("download finish key=$key path=${info.localPath}")
@@ -296,6 +368,7 @@ object HXCDownloadManager {
         if (!m3u8Dir.exists()) {
             m3u8Dir.mkdirs()
         }
+        updateStage(info, stage = "FETCHING_MANIFEST", stageProgress = 0f, overallProgress = 0.02f)
         val (content, finalUrl) = fetchTextWithFinalUrl(info.resolvedUrl, info.secureHeaders)
         d("m3u8 source fetched, key=${info.downloadKey}, finalUrl=$finalUrl, chars=${content.length}")
         val artifacts = buildLocalM3u8AndDownloadResources(
@@ -326,9 +399,11 @@ object HXCDownloadManager {
         }
         auditLocalM3u8(info, localM3u8, artifacts)
         info.localPath = localM3u8.absolutePath
-        info.progress = 1f
+        updateStage(info, stage = "FINALIZING_PLAYLIST", stageProgress = 1f, overallProgress = 0.98f)
+        postProgress(info, force = true)
         info.status = HXCDownloadStatus.FINISH
         info.isWaiting = false
+        updateStage(info, stage = "FINISHED", stageProgress = 1f, overallProgress = 1f)
         postStatusChanged(info)
         notifyListChanged()
         d("m3u8 finish key=${info.downloadKey} path=${info.localPath}")
@@ -475,6 +550,7 @@ object HXCDownloadManager {
         info.isWaiting = false
         info.totalBytes = resources.size.toLong()
         info.downloadedBytes = 0L
+        updateStage(info, stage = "DOWNLOADING_RESOURCES", stageProgress = 0f, overallProgress = 0.05f)
         postStatusChanged(info)
 
         var finished = 0L
@@ -482,6 +558,7 @@ object HXCDownloadManager {
             if (cancelFlag.get() || Thread.currentThread().isInterrupted) {
                 info.status = HXCDownloadStatus.PAUSE
                 info.isWaiting = false
+                updateStage(info, stage = "PAUSED", stageProgress = info.stageProgress, overallProgress = info.overallProgress)
                 postStatusChanged(info)
                 notifyListChanged()
                 return M3u8BuildArtifacts(
@@ -494,18 +571,27 @@ object HXCDownloadManager {
                     decryptedSegments = decryptedSegments
                 )
             }
+            var downloadedNow = false
             if (!task.target.exists() || !isResourceComplete(task)) {
-                downloadTaskResource(task, headers)
+                downloadTaskResourceWithRetry(task, headers)
+                downloadedNow = true
             }
             if (task.needsDecrypt()) {
-                val decrypted = decryptAes128SegmentInPlace(task)
-                if (decrypted) {
-                    decryptedSegments += 1
+                // 恢复下载时，已处理完成的 TS 不要再次整文件解密，避免长时间“假等待”。
+                if (!downloadedNow && isLikelyClearTsFile(task.target)) {
+                    logDecryptEvent(task, "resume_skip_already_clear", "seq=${task.segmentSequence}")
+                } else {
+                    val decrypted = decryptAes128SegmentInPlace(task)
+                    if (decrypted) {
+                        decryptedSegments += 1
+                    }
                 }
             }
             finished += 1
             info.downloadedBytes = finished
-            info.progress = (finished.toFloat() / info.totalBytes.toFloat()).coerceIn(0f, 1f)
+            val stageP = (finished.toFloat() / info.totalBytes.toFloat()).coerceIn(0f, 1f)
+            val overallP = (0.05f + stageP * 0.90f).coerceIn(0f, 0.98f)
+            updateStage(info, stage = "DOWNLOADING_RESOURCES", stageProgress = stageP, overallProgress = overallP)
             postProgress(info)
         }
         d(
@@ -695,6 +781,33 @@ object HXCDownloadManager {
         throw IllegalStateException("download ts failed: HTTP $code, range=$rangeHeader")
     }
 
+    private fun downloadTaskResourceWithRetry(task: M3u8ResourceTask, headers: String) {
+        val retries = config.resourceRetryCount.coerceAtLeast(1)
+        var lastError: Throwable? = null
+        repeat(retries) { attempt ->
+            try {
+                downloadTaskResource(task, headers)
+                return
+            } catch (t: Throwable) {
+                lastError = t
+                if (attempt < retries - 1) {
+                    d("resource retry, file=${task.target.name}, attempt=${attempt + 1}, reason=${t.message}")
+                    val backoff = (config.resourceRetryBaseDelayMs * (attempt + 1))
+                        .coerceAtMost(config.resourceRetryMaxDelayMs)
+                    if (backoff > 0) {
+                        try {
+                            Thread.sleep(backoff)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            throw t
+                        }
+                    }
+                }
+            }
+        }
+        throw lastError ?: IllegalStateException("resource download failed")
+    }
+
     private fun isResourceComplete(task: M3u8ResourceTask): Boolean {
         if (!task.target.exists() || task.target.length() <= 0L) return false
         val expected = task.expectedLength()
@@ -736,11 +849,11 @@ object HXCDownloadManager {
         }
         val encryptedBytes = task.target.readBytes()
         if (looksLikeClearTs(encryptedBytes)) {
-            d("aes128 decrypt skipped(clear_ts), file=${task.target.name}, seq=${task.segmentSequence}")
+            logDecryptEvent(task, "skipped_clear_ts", "seq=${task.segmentSequence}")
             return false
         }
         if (encryptedBytes.size % 16 != 0) {
-            d("aes128 decrypt skipped(non_block_aligned), file=${task.target.name}, size=${encryptedBytes.size}")
+            logDecryptEvent(task, "skipped_non_block_aligned", "size=${encryptedBytes.size}")
             return false
         }
         val ivBytes = resolveSegmentIv(task.decryptIvHex, task.segmentSequence)
@@ -754,12 +867,12 @@ object HXCDownloadManager {
                 fallback.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
                 fallback.doFinal(encryptedBytes)
             }.getOrElse {
-                d("aes128 decrypt failed, file=${task.target.name}, reason=${firstError.message}")
+                logDecryptEvent(task, "failed", "reason=${firstError.message}")
                 return false
             }
         }
         if (!looksLikeClearTs(clearBytes)) {
-            d("aes128 decrypt result invalid_ts, file=${task.target.name}, seq=${task.segmentSequence}")
+            logDecryptEvent(task, "result_invalid_ts", "seq=${task.segmentSequence}")
             return false
         }
         task.target.writeBytes(clearBytes)
@@ -804,6 +917,18 @@ object HXCDownloadManager {
         val third = 376
         return second < bytes.size && bytes[second] == 0x47.toByte()
             && third < bytes.size && bytes[third] == 0x47.toByte()
+    }
+
+    private fun isLikelyClearTsFile(file: File): Boolean {
+        if (!file.exists() || file.length() < 188L * 2L) return false
+        return runCatching {
+            RandomAccessFile(file, "r").use { raf ->
+                val probeSize = (188 * 3).coerceAtMost(file.length().toInt())
+                val probe = ByteArray(probeSize)
+                raf.readFully(probe)
+                looksLikeClearTs(probe)
+            }
+        }.getOrDefault(false)
     }
 
     private fun parseByteRange(line: String, prevEnd: Long): Pair<Long, Long> {
@@ -885,13 +1010,36 @@ object HXCDownloadManager {
         }
     }
 
+    private fun createHttpGetConnection(url: String, headers: String, rangeStart: Long?): HttpURLConnection {
+        return (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = config.connectTimeoutMs
+            readTimeout = config.readTimeoutMs
+            if (rangeStart != null && rangeStart > 0L) {
+                setRequestProperty("Range", "bytes=$rangeStart-")
+            }
+            applyHeaders(this, headers)
+        }
+    }
+
     private fun notifyListChanged() {
         val all = getAllDownloads()
         store?.save(all)
         mainHandler.post { listener?.onDownloadListChanged(all) }
     }
 
-    private fun postProgress(info: HXCDownloadInfo) {
+    private fun postProgress(info: HXCDownloadInfo, force: Boolean = false) {
+        val key = info.downloadKey
+        val now = System.currentTimeMillis()
+        val progress = info.progress.coerceIn(0f, 1f)
+        val state = progressEmitStates.getOrPut(key) { ProgressEmitState(lastEmitAt = 0L, lastProgress = 0f) }
+        val shouldEmit = force ||
+            progress >= 1f ||
+            now - state.lastEmitAt >= 250L ||
+            progress - state.lastProgress >= 0.0025f
+        if (!shouldEmit) return
+        state.lastEmitAt = now
+        state.lastProgress = progress
         val copy = info.copy()
         mainHandler.post { listener?.onProgressUpdate(copy) }
     }
@@ -903,6 +1051,43 @@ object HXCDownloadManager {
 
     private fun ensureInit() {
         check(inited) { "HXCDownloadManager not initialized. Call init(context, config) first." }
+    }
+
+    private fun isTaskInterrupted(cancelFlag: AtomicBoolean, t: Throwable): Boolean {
+        return cancelFlag.get() ||
+            Thread.currentThread().isInterrupted ||
+            t is InterruptedException ||
+            t is InterruptedIOException
+    }
+
+    private fun clearProgressState(downloadKey: String) {
+        progressEmitStates.remove(downloadKey)
+        decryptLogCounters.keys.removeIf { it.startsWith("$downloadKey#") }
+    }
+
+    private fun logDecryptEvent(task: M3u8ResourceTask, reason: String, detail: String) {
+        val downloadKey = task.target.parentFile?.name ?: "unknown"
+        val counterKey = "$downloadKey#$reason"
+        val next = (decryptLogCounters[counterKey] ?: 0) + 1
+        decryptLogCounters[counterKey] = next
+        if (next <= 3 || next % 200 == 0) {
+            d(
+                "aes128 decrypt $reason, key=$downloadKey, file=${task.target.name}, " +
+                    "$detail, count=$next"
+            )
+        }
+    }
+
+    private fun updateStage(
+        info: HXCDownloadInfo,
+        stage: String,
+        stageProgress: Float,
+        overallProgress: Float
+    ) {
+        info.progressStage = stage
+        info.stageProgress = stageProgress.coerceIn(0f, 1f)
+        info.overallProgress = overallProgress.coerceIn(0f, 1f)
+        info.progress = info.overallProgress
     }
 
     fun formattedTime(second: Long): String {

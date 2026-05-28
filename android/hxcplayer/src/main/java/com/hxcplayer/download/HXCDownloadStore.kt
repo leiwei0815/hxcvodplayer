@@ -57,6 +57,9 @@ internal class HXCDownloadStore(context: Context) {
             put("resolvedUrl", info.resolvedUrl)
             put("secureHeaders", info.secureHeaders)
             put("isEncrypted", info.isEncrypted)
+            put("progressStage", info.progressStage)
+            put("stageProgress", info.stageProgress.toDouble())
+            put("overallProgress", info.overallProgress.toDouble())
         }
     }
 
@@ -86,6 +89,9 @@ internal class HXCDownloadStore(context: Context) {
             resolvedUrl = obj.optString("resolvedUrl")
             secureHeaders = obj.optString("secureHeaders")
             isEncrypted = obj.optBoolean("isEncrypted", secureHeaders.isNotBlank())
+            progressStage = obj.optString("progressStage", "IDLE")
+            stageProgress = obj.optDouble("stageProgress", progress.toDouble()).toFloat()
+            overallProgress = obj.optDouble("overallProgress", progress.toDouble()).toFloat()
         }
     }
 }

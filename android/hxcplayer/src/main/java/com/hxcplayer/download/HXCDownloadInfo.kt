@@ -24,4 +24,7 @@ data class HXCDownloadInfo(
     var resolvedUrl: String = ""
     var secureHeaders: String = ""
     var isEncrypted: Boolean = false
+    var progressStage: String = "IDLE"
+    var stageProgress: Float = 0f
+    var overallProgress: Float = 0f
 }
