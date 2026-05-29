@@ -778,7 +778,6 @@ object HXCDownloadManager {
                 }
             }
         }
-        onProgress?.invoke(downloaded, total)
         conn.disconnect()
     }
 
@@ -824,7 +823,6 @@ object HXCDownloadManager {
                     }
                 }
             }
-            onProgress?.invoke(downloaded, total)
             conn.disconnect()
             return
         }
