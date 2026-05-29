@@ -38,6 +38,7 @@ object HXCDownloadManager {
     private val cancelledFlags = ConcurrentHashMap<String, AtomicBoolean>()
     private val progressEmitStates = ConcurrentHashMap<String, ProgressEmitState>()
     private val decryptLogCounters = ConcurrentHashMap<String, Int>()
+    private val segmentProgressLogAt = ConcurrentHashMap<String, Long>()
     private var store: HXCDownloadStore? = null
 
     private data class M3u8ResourceTask(
@@ -573,7 +574,26 @@ object HXCDownloadManager {
             }
             var downloadedNow = false
             if (!task.target.exists() || !isResourceComplete(task)) {
-                downloadTaskResourceWithRetry(task, headers)
+                downloadTaskResourceWithRetry(task, headers) { downloaded, expected ->
+                    if (info.totalBytes <= 0L) return@downloadTaskResourceWithRetry
+                    val taskProgress = if (expected > 0L) {
+                        (downloaded.toFloat() / expected.toFloat()).coerceIn(0f, 1f)
+                    } else {
+                        0f
+                    }
+                    val stageP = ((finished.toFloat() + taskProgress) / info.totalBytes.toFloat()).coerceIn(0f, 1f)
+                    val overallP = (0.05f + stageP * 0.90f).coerceIn(0f, 0.98f)
+                    updateStage(info, stage = "DOWNLOADING_RESOURCES", stageProgress = stageP, overallProgress = overallP)
+                    logSegmentProgress(
+                        info = info,
+                        task = task,
+                        finished = finished,
+                        total = info.totalBytes,
+                        segmentDownloaded = downloaded,
+                        segmentExpected = expected
+                    )
+                    postProgress(info)
+                }
                 downloadedNow = true
             }
             if (task.needsDecrypt()) {
@@ -716,6 +736,15 @@ object HXCDownloadManager {
     }
 
     private fun downloadSimpleFile(url: String, target: File, headers: String) {
+        downloadSimpleFile(url, target, headers, null)
+    }
+
+    private fun downloadSimpleFile(
+        url: String,
+        target: File,
+        headers: String,
+        onProgress: ((downloaded: Long, total: Long) -> Unit)?
+    ) {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = config.connectTimeoutMs
@@ -728,6 +757,9 @@ object HXCDownloadManager {
             conn.disconnect()
             throw IllegalStateException("download ts failed: HTTP $code")
         }
+        val total = conn.contentLengthLong.coerceAtLeast(0L)
+        var downloaded = 0L
+        var lastEmitAt = 0L
         target.outputStream().use { out ->
             conn.inputStream.use { input ->
                 val buf = ByteArray(8 * 1024)
@@ -735,15 +767,28 @@ object HXCDownloadManager {
                     val len = input.read(buf)
                     if (len <= 0) break
                     out.write(buf, 0, len)
+                    downloaded += len
+                    if (onProgress != null) {
+                        val now = System.currentTimeMillis()
+                        if (downloaded >= total || now - lastEmitAt >= 150L) {
+                            lastEmitAt = now
+                            onProgress.invoke(downloaded, total)
+                        }
+                    }
                 }
             }
         }
+        onProgress?.invoke(downloaded, total)
         conn.disconnect()
     }
 
-    private fun downloadTaskResource(task: M3u8ResourceTask, headers: String) {
+    private fun downloadTaskResource(
+        task: M3u8ResourceTask,
+        headers: String,
+        onProgress: ((downloaded: Long, total: Long) -> Unit)?
+    ) {
         if (!task.hasRange()) {
-            downloadSimpleFile(task.url, task.target, headers)
+            downloadSimpleFile(task.url, task.target, headers, onProgress)
             return
         }
         val rangeHeader = "bytes=${task.rangeStart}-${task.rangeEnd}"
@@ -757,6 +802,10 @@ object HXCDownloadManager {
         conn.connect()
         val code = conn.responseCode
         if (code in 200..299 || code == 206) {
+            val expectedFromRange = task.expectedLength()
+            val total = if (expectedFromRange > 0L) expectedFromRange else conn.contentLengthLong.coerceAtLeast(0L)
+            var downloaded = 0L
+            var lastEmitAt = 0L
             task.target.outputStream().use { out ->
                 conn.inputStream.use { input ->
                     val buf = ByteArray(8 * 1024)
@@ -764,9 +813,18 @@ object HXCDownloadManager {
                         val len = input.read(buf)
                         if (len <= 0) break
                         out.write(buf, 0, len)
+                        downloaded += len
+                        if (onProgress != null) {
+                            val now = System.currentTimeMillis()
+                            if (downloaded >= total || now - lastEmitAt >= 150L) {
+                                lastEmitAt = now
+                                onProgress.invoke(downloaded, total)
+                            }
+                        }
                     }
                 }
             }
+            onProgress?.invoke(downloaded, total)
             conn.disconnect()
             return
         }
@@ -775,18 +833,22 @@ object HXCDownloadManager {
             task.target.delete()
         }
         if (task.rawUrl != task.url) {
-            downloadSimpleFile(task.rawUrl, task.target, headers)
+            downloadSimpleFile(task.rawUrl, task.target, headers, onProgress)
             return
         }
         throw IllegalStateException("download ts failed: HTTP $code, range=$rangeHeader")
     }
 
-    private fun downloadTaskResourceWithRetry(task: M3u8ResourceTask, headers: String) {
+    private fun downloadTaskResourceWithRetry(
+        task: M3u8ResourceTask,
+        headers: String,
+        onProgress: ((downloaded: Long, total: Long) -> Unit)?
+    ) {
         val retries = config.resourceRetryCount.coerceAtLeast(1)
         var lastError: Throwable? = null
         repeat(retries) { attempt ->
             try {
-                downloadTaskResource(task, headers)
+                downloadTaskResource(task, headers, onProgress)
                 return
             } catch (t: Throwable) {
                 lastError = t
@@ -1063,6 +1125,7 @@ object HXCDownloadManager {
     private fun clearProgressState(downloadKey: String) {
         progressEmitStates.remove(downloadKey)
         decryptLogCounters.keys.removeIf { it.startsWith("$downloadKey#") }
+        segmentProgressLogAt.remove(downloadKey)
     }
 
     private fun logDecryptEvent(task: M3u8ResourceTask, reason: String, detail: String) {
@@ -1076,6 +1139,27 @@ object HXCDownloadManager {
                     "$detail, count=$next"
             )
         }
+    }
+
+    private fun logSegmentProgress(
+        info: HXCDownloadInfo,
+        task: M3u8ResourceTask,
+        finished: Long,
+        total: Long,
+        segmentDownloaded: Long,
+        segmentExpected: Long
+    ) {
+        val key = info.downloadKey
+        val now = System.currentTimeMillis()
+        val last = segmentProgressLogAt[key] ?: 0L
+        if (now - last < 1200L && segmentDownloaded < segmentExpected) return
+        segmentProgressLogAt[key] = now
+        d(
+            "m3u8 segment progress, key=$key, segment=${task.target.name}, " +
+                "segmentBytes=$segmentDownloaded/$segmentExpected, " +
+                "finished=$finished/$total, stage=${"%.4f".format(info.stageProgress)}, " +
+                "overall=${"%.4f".format(info.overallProgress)}"
+        )
     }
 
     private fun updateStage(
