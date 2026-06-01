@@ -64,9 +64,13 @@ static jboolean hxc_native_open_with_secure_session(JNIEnv *env,
                                                     jstring key_material_b64,
                                                     jstring key_iv_hex) {
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
-    if (!player) return JNI_FALSE;
+    if (!player || !url) return JNI_FALSE;
 
     const char* c_url = env->GetStringUTFChars(url, nullptr);
+    if (!c_url || c_url[0] == '\0') {
+        if (c_url) env->ReleaseStringUTFChars(url, c_url);
+        return JNI_FALSE;
+    }
     const char* c_auth = auth_token ? env->GetStringUTFChars(auth_token, nullptr) : nullptr;
     const char* c_vid = video_id ? env->GetStringUTFChars(video_id, nullptr) : nullptr;
     const char* c_dev = device_id ? env->GetStringUTFChars(device_id, nullptr) : nullptr;
@@ -143,9 +147,13 @@ JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeOpenURL(
         JNIEnv *env, jobject thiz, jlong handle, jstring url) {
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
-    if (!player) return JNI_FALSE;
+    if (!player || !url) return JNI_FALSE;
     
     const char* urlStr = env->GetStringUTFChars(url, nullptr);
+    if (!urlStr || urlStr[0] == '\0') {
+        if (urlStr) env->ReleaseStringUTFChars(url, urlStr);
+        return JNI_FALSE;
+    }
     LOGD("nativeOpenURL: %s", urlStr);
     
     bool result = player->openURL(urlStr);
@@ -159,9 +167,13 @@ JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeOpenURLWithStartPosition(
         JNIEnv *env, jobject thiz, jlong handle, jstring url, jdouble start_position) {
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
-    if (!player) return JNI_FALSE;
+    if (!player || !url) return JNI_FALSE;
     
     const char* urlStr = env->GetStringUTFChars(url, nullptr);
+    if (!urlStr || urlStr[0] == '\0') {
+        if (urlStr) env->ReleaseStringUTFChars(url, urlStr);
+        return JNI_FALSE;
+    }
     LOGD("nativeOpenURLWithStartPosition: %s, position: %.2f", urlStr, start_position);
     
     bool result = player->openURL(urlStr, start_position);
@@ -530,9 +542,13 @@ JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomHTTP(
         JNIEnv *env, jobject thiz, jlong handle, jstring url, jint timeout_ms, jint max_retries, jboolean encrypted_file) {
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
-    if (!player) return JNI_FALSE;
+    if (!player || !url) return JNI_FALSE;
 
     const char* urlStr = env->GetStringUTFChars(url, nullptr);
+    if (!urlStr || urlStr[0] == '\0') {
+        if (urlStr) env->ReleaseStringUTFChars(url, urlStr);
+        return JNI_FALSE;
+    }
     LOGD("nativeOpenWithCustomHTTP: %s encrypted=%d", urlStr, encrypted_file ? 1 : 0);
 
     bool result = player->openWithCustomHTTP(urlStr, timeout_ms, max_retries, encrypted_file == JNI_TRUE);
@@ -567,9 +583,13 @@ JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomFile(
         JNIEnv *env, jobject thiz, jlong handle, jstring path, jint avio_buffer_size, jboolean encrypted_file) {
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
-    if (!player) return JNI_FALSE;
+    if (!player || !path) return JNI_FALSE;
 
     const char* pathStr = env->GetStringUTFChars(path, nullptr);
+    if (!pathStr || pathStr[0] == '\0') {
+        if (pathStr) env->ReleaseStringUTFChars(path, pathStr);
+        return JNI_FALSE;
+    }
     LOGD("nativeOpenWithCustomFile: %s avio_buffer_size=%d encrypted=%d",
          pathStr, avio_buffer_size, encrypted_file ? 1 : 0);
 

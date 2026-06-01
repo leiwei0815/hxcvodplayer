@@ -206,12 +206,12 @@ void player_core_destroy(PlayerCoreHandle* handle) {
 }
 
 int player_core_open(PlayerCoreHandle* handle, const char* url) {
-    if (!handle || !handle->core) return -1;
+    if (!handle || !handle->core || !url || url[0] == '\0') return -1;
     return handle->core->open(url);  // 直接返回，0=成功，-1=失败
 }
 
 int player_core_open_with_start_position(PlayerCoreHandle* handle, const char* url, double start_pos) {
-    if (!handle || !handle->core) return -1;
+    if (!handle || !handle->core || !url || url[0] == '\0') return -1;
     
     // 无论是否 > 0，都写入 start_time，确保 start_pos=0 时能清除上次残留的值。
     auto config = handle->core->get_config();
@@ -223,7 +223,7 @@ int player_core_open_with_start_position(PlayerCoreHandle* handle, const char* u
 }
 
 int player_core_open_with_mode(PlayerCoreHandle* handle, const PlayerDataSourceC* data_source, const PlayerDataSourceConfigC* config) {
-    if (!handle || !handle->core || !data_source || !data_source->url) {
+    if (!handle || !handle->core || !data_source || !data_source->url || data_source->url[0] == '\0') {
         return -1;
     }
 

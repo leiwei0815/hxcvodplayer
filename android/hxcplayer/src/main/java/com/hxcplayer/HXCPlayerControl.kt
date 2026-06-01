@@ -13,6 +13,7 @@ import android.view.TextureView
 import android.view.View
 import kotlin.jvm.JvmOverloads
 import kotlin.math.abs
+import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
@@ -698,6 +699,10 @@ class HXCPlayerControl @JvmOverloads constructor(
             dispatchError(PlayerErrorCode.INVALID_URL, "播放参数无效：video 和 url 不能同时为空")
             return false
         }
+        validatePlayModelInput(workingModel)?.let { reason ->
+            dispatchError(PlayerErrorCode.INVALID_URL, reason)
+            return false
+        }
 
         lastOpenUrl = workingModel.url
         lastOpenStartPosition = maxOf(0.0, startPosition)
@@ -751,6 +756,56 @@ class HXCPlayerControl @JvmOverloads constructor(
             armOpenLoadingHideGuard()
         }
         return result
+    }
+
+    private fun validatePlayModelInput(model: PlayerDataSourcePlayModel): String? {
+        if (model.url.isBlank()) {
+            return "播放地址为空"
+        }
+        return when (model.mode) {
+            PlayerDataSourceMode.CUSTOM_FILE -> validateLocalPathStrict(model.url, "CustomFile")
+            PlayerDataSourceMode.DEFAULT -> validateLocalPathIfNeeded(model.url)
+            PlayerDataSourceMode.CUSTOM_HTTP,
+            PlayerDataSourceMode.SECURE_HLS -> null
+        }
+    }
+
+    private fun validateLocalPathIfNeeded(path: String): String? {
+        if (!looksLikeLocalPath(path)) {
+            return null
+        }
+        return validateLocalPathStrict(path, "Default")
+    }
+
+    private fun validateLocalPathStrict(path: String, scene: String): String? {
+        val normalized = normalizeLocalPath(path)
+        if (normalized.isBlank()) {
+            return "$scene 本地路径为空"
+        }
+        if (normalized.startsWith("content://")) {
+            return null
+        }
+        val file = File(normalized)
+        if (!file.exists() || !file.isFile || file.length() <= 0L) {
+            return "$scene 本地文件不可用: $normalized"
+        }
+        return null
+    }
+
+    private fun looksLikeLocalPath(path: String): Boolean {
+        if (path.isBlank()) return false
+        val lower = path.lowercase()
+        if (lower.startsWith("http://") || lower.startsWith("https://") || lower.startsWith("hxc://")) {
+            return false
+        }
+        return lower.startsWith("file://")
+            || lower.startsWith("content://")
+            || lower.startsWith("/")
+            || (path.length > 2 && path[1] == ':' && path[0].isLetter())
+    }
+
+    private fun normalizeLocalPath(path: String): String {
+        return if (path.startsWith("file://")) path.removePrefix("file://") else path
     }
 
     fun setDecodeMode(mode: DecodeMode) {
@@ -1122,6 +1177,14 @@ class HXCPlayerControl @JvmOverloads constructor(
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
             return false
         }
+        if (url.isBlank()) {
+            dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+            return false
+        }
+        validateLocalPathIfNeeded(url)?.let { reason ->
+            dispatchError(PlayerErrorCode.INVALID_URL, reason)
+            return false
+        }
         if (!licenseAllowedOrNotify("openURL")) {
             return false
         }
@@ -1160,6 +1223,14 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun openURLAsync(url: String, startPosition: Double = 0.0) {
         if (isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
+            return
+        }
+        if (url.isBlank()) {
+            dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+            return
+        }
+        validateLocalPathIfNeeded(url)?.let { reason ->
+            dispatchError(PlayerErrorCode.INVALID_URL, reason)
             return
         }
         playStallCheckArmed = false
