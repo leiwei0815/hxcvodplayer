@@ -391,6 +391,16 @@ private:
     std::atomic<bool> has_pending_playback_completed_{false};
     static void playbackCompletedCallback(void* user_data);
 
+    // Seek state helpers: keep session cleanup and resume-intent decision centralized.
+    void setSeekPhase(int new_phase, const char* reason);
+    void resetSeekFlowState(bool clear_session_id,
+                            bool clear_paused_origin,
+                            bool reset_budgets,
+                            bool reset_fast_catchup);
+    bool resolveSeekResumeOnComplete(int seek_resume_override,
+                                     bool core_paused_now,
+                                     bool user_manual_pause_now);
+
     void trySeekAudioWaitDeadlineFallback(int64_t now,
                                           double pts,
                                           bool likely_4k,
