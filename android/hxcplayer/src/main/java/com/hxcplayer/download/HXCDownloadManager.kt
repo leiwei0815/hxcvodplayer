@@ -8,9 +8,15 @@ import com.hxcplayer.download.m3u8.HXCM3u8Parser
 import java.io.File
 import java.io.InterruptedIOException
 import java.io.RandomAccessFile
+import java.net.ConnectException
 import java.net.URI
 import java.net.HttpURLConnection
+import java.net.NoRouteToHostException
+import java.net.SocketException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.net.URL
+import javax.net.ssl.SSLException
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -81,6 +87,9 @@ object HXCDownloadManager {
     fun init(context: Context, config: HXCDownloadConfig = HXCDownloadConfig()) {
         appContext = context.applicationContext
         val normalized = config.copy(maxConcurrent = config.maxConcurrent.coerceAtLeast(1))
+        normalized.taskRetryCount = config.taskRetryCount.coerceAtLeast(1)
+        normalized.taskRetryBaseDelayMs = config.taskRetryBaseDelayMs.coerceAtLeast(0L)
+        normalized.taskRetryMaxDelayMs = config.taskRetryMaxDelayMs.coerceAtLeast(0L)
         normalized.resourceRetryCount = config.resourceRetryCount.coerceAtLeast(1)
         normalized.resourceRetryBaseDelayMs = config.resourceRetryBaseDelayMs.coerceAtLeast(0L)
         normalized.resourceRetryMaxDelayMs = config.resourceRetryMaxDelayMs.coerceAtLeast(0L)
@@ -135,15 +144,7 @@ object HXCDownloadManager {
                 val cancelFlag = AtomicBoolean(false)
                 cancelledFlags[key] = cancelFlag
                 try {
-                    val source = HXCSecureDownloadAuthResolver.resolve(req, config)
-                    info.resolvedUrl = source.url
-                    info.secureHeaders = source.secureHeaders
-                    info.isEncrypted = info.isEncrypted || req.encrypted || source.encrypted
-                    d(
-                        "download source resolved, key=$key, encrypted=${info.isEncrypted}, " +
-                            "secureHeaders=${info.secureHeaders.isNotBlank()}, finalUrl=${info.resolvedUrl}"
-                    )
-                    runDownload(info, cancelFlag)
+                    runDownloadWithTaskRetry(info, req, cancelFlag)
                 } catch (t: Throwable) {
                     val interrupted = isTaskInterrupted(cancelFlag, t)
                     info.status = if (interrupted) HXCDownloadStatus.PAUSE else HXCDownloadStatus.ERROR
@@ -306,7 +307,7 @@ object HXCDownloadManager {
         }
         if (code !in 200..299 && code != 206) {
             conn.disconnect()
-            throw IllegalStateException("HTTP $code")
+            throw HXCDownloadHttpException(code, "media_file_open")
         }
 
         val total = if (code == 206) {
@@ -362,6 +363,63 @@ object HXCDownloadManager {
         postStatusChanged(info)
         notifyListChanged()
         d("download finish key=$key path=${info.localPath}")
+    }
+
+    private fun runDownloadWithTaskRetry(
+        info: HXCDownloadInfo,
+        request: HXCDownloadRequest,
+        cancelFlag: AtomicBoolean
+    ) {
+        val attempts = config.taskRetryCount.coerceAtLeast(1)
+        var lastError: Throwable? = null
+        for (attempt in 1..attempts) {
+            if (cancelFlag.get() || Thread.currentThread().isInterrupted) {
+                throw InterruptedException("download cancelled before attempt")
+            }
+            try {
+                val source = HXCSecureDownloadAuthResolver.resolve(request, config)
+                info.resolvedUrl = source.url
+                info.secureHeaders = source.secureHeaders
+                info.isEncrypted = info.isEncrypted || request.encrypted || source.encrypted
+                d(
+                    "download source resolved, key=${info.downloadKey}, attempt=$attempt/$attempts, " +
+                        "encrypted=${info.isEncrypted}, secureHeaders=${info.secureHeaders.isNotBlank()}, " +
+                        "finalUrl=${info.resolvedUrl}"
+                )
+                runDownload(info, cancelFlag)
+                return
+            } catch (t: Throwable) {
+                if (isTaskInterrupted(cancelFlag, t)) throw t
+                val (retryable, retryReason) = evaluateRetryable(t)
+                lastError = t
+                if (!retryable) {
+                    d(
+                        "download retry skipped(non-retryable), key=${info.downloadKey}, " +
+                            "attempt=$attempt/$attempts, reason=$retryReason, err=${t.message}"
+                    )
+                    break
+                }
+                if (attempt >= attempts) break
+                val backoffMs = calcTaskRetryBackoffMs(attempt)
+                info.status = HXCDownloadStatus.WAITING
+                info.isWaiting = true
+                info.errorMessage = t.message ?: "download failed"
+                updateStage(
+                    info,
+                    stage = "RETRY_WAIT",
+                    stageProgress = attempt.toFloat() / attempts.toFloat(),
+                    overallProgress = info.overallProgress
+                )
+                postStatusChanged(info)
+                notifyListChanged()
+                d(
+                    "download auto retry scheduled, key=${info.downloadKey}, " +
+                        "attempt=$attempt/$attempts, waitMs=$backoffMs, reason=$retryReason, err=${t.message}"
+                )
+                sleepRetryBackoff(backoffMs, cancelFlag)
+            }
+        }
+        throw lastError ?: IllegalStateException("download failed after retries")
     }
 
     private fun runM3u8Download(info: HXCDownloadInfo, cancelFlag: AtomicBoolean, rootDir: File) {
@@ -711,7 +769,7 @@ object HXCDownloadManager {
         val code = conn.responseCode
         if (code !in 200..299) {
             conn.disconnect()
-            throw IllegalStateException("HTTP $code")
+            throw HXCDownloadHttpException(code, "m3u8_manifest")
         }
         val text = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
         val finalUrl = conn.url?.toString()
@@ -755,7 +813,7 @@ object HXCDownloadManager {
         val code = conn.responseCode
         if (code !in 200..299) {
             conn.disconnect()
-            throw IllegalStateException("download ts failed: HTTP $code")
+            throw HXCDownloadHttpException(code, "m3u8_resource")
         }
         val total = conn.contentLengthLong.coerceAtLeast(0L)
         var downloaded = 0L
@@ -834,7 +892,7 @@ object HXCDownloadManager {
             downloadSimpleFile(task.rawUrl, task.target, headers, onProgress)
             return
         }
-        throw IllegalStateException("download ts failed: HTTP $code, range=$rangeHeader")
+        throw HXCDownloadHttpException(code, "m3u8_resource_range", "download ts failed: HTTP $code, range=$rangeHeader")
     }
 
     private fun downloadTaskResourceWithRetry(
@@ -844,16 +902,29 @@ object HXCDownloadManager {
     ) {
         val retries = config.resourceRetryCount.coerceAtLeast(1)
         var lastError: Throwable? = null
-        repeat(retries) { attempt ->
+        for (attempt in 1..retries) {
+            if (Thread.currentThread().isInterrupted) {
+                throw InterruptedException("resource retry interrupted")
+            }
             try {
                 downloadTaskResource(task, headers, onProgress)
                 return
             } catch (t: Throwable) {
+                val (retryable, retryReason) = evaluateRetryable(t)
                 lastError = t
-                if (attempt < retries - 1) {
-                    d("resource retry, file=${task.target.name}, attempt=${attempt + 1}, reason=${t.message}")
-                    val backoff = (config.resourceRetryBaseDelayMs * (attempt + 1))
-                        .coerceAtMost(config.resourceRetryMaxDelayMs)
+                if (!retryable) {
+                    d(
+                        "resource retry skipped(non-retryable), file=${task.target.name}, " +
+                            "attempt=$attempt/$retries, reason=$retryReason, err=${t.message}"
+                    )
+                    break
+                }
+                if (attempt < retries) {
+                    d(
+                        "resource retry, file=${task.target.name}, attempt=$attempt/$retries, " +
+                            "reason=$retryReason, err=${t.message}"
+                    )
+                    val backoff = calcResourceRetryBackoffMs(attempt)
                     if (backoff > 0) {
                         try {
                             Thread.sleep(backoff)
@@ -866,6 +937,73 @@ object HXCDownloadManager {
             }
         }
         throw lastError ?: IllegalStateException("resource download failed")
+    }
+
+    private fun calcTaskRetryBackoffMs(attempt: Int): Long {
+        val base = config.taskRetryBaseDelayMs.coerceAtLeast(0L)
+        val max = config.taskRetryMaxDelayMs.coerceAtLeast(base)
+        if (base == 0L) return 0L
+        val factor = 1L shl (attempt - 1).coerceAtLeast(0).coerceAtMost(10)
+        return applyRetryJitter((base * factor).coerceAtMost(max))
+    }
+
+    private fun calcResourceRetryBackoffMs(attempt: Int): Long {
+        val base = config.resourceRetryBaseDelayMs.coerceAtLeast(0L)
+        val max = config.resourceRetryMaxDelayMs.coerceAtLeast(base)
+        if (base == 0L) return 0L
+        val factor = 1L shl (attempt - 1).coerceAtLeast(0).coerceAtMost(10)
+        return applyRetryJitter((base * factor).coerceAtMost(max))
+    }
+
+    private fun applyRetryJitter(backoffMs: Long): Long {
+        if (backoffMs <= 1L) return backoffMs
+        val floor = (backoffMs * 0.80).toLong().coerceAtLeast(1L)
+        val ceil = (backoffMs * 1.20).toLong().coerceAtLeast(floor)
+        return floor + kotlin.random.Random.nextLong((ceil - floor + 1L).coerceAtLeast(1L))
+    }
+
+    private fun evaluateRetryable(t: Throwable): Pair<Boolean, String> {
+        return when (t) {
+            is HXCDownloadNonRetryableException -> false to "biz_non_retryable"
+            is IllegalArgumentException -> false to "invalid_argument"
+            is HXCDownloadHttpException -> {
+                val retryable = isRetryableHttpCode(t.statusCode)
+                retryable to "http_${t.statusCode}_${t.scene}"
+            }
+            is SocketTimeoutException -> true to "socket_timeout"
+            is ConnectException -> true to "connect_error"
+            is UnknownHostException -> true to "dns_error"
+            is NoRouteToHostException -> true to "no_route"
+            is SSLException -> true to "ssl_error"
+            is SocketException -> true to "socket_exception"
+            is InterruptedIOException -> {
+                val interrupted = Thread.currentThread().isInterrupted
+                (!interrupted) to if (interrupted) "thread_interrupted" else "io_timeout_like"
+            }
+            else -> true to "transient_unknown"
+        }
+    }
+
+    private fun isRetryableHttpCode(code: Int): Boolean {
+        return code == 408 || code == 409 || code == 425 || code == 429 || code in 500..599
+    }
+
+    private fun sleepRetryBackoff(delayMs: Long, cancelFlag: AtomicBoolean) {
+        if (delayMs <= 0L) return
+        var remain = delayMs
+        while (remain > 0L) {
+            if (cancelFlag.get() || Thread.currentThread().isInterrupted) {
+                throw InterruptedException("retry cancelled")
+            }
+            val step = minOf(remain, 200L)
+            try {
+                Thread.sleep(step)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw InterruptedException("retry interrupted")
+            }
+            remain -= step
+        }
     }
 
     private fun isResourceComplete(task: M3u8ResourceTask): Boolean {
@@ -1117,7 +1255,7 @@ object HXCDownloadManager {
         return cancelFlag.get() ||
             Thread.currentThread().isInterrupted ||
             t is InterruptedException ||
-            t is InterruptedIOException
+            (t is InterruptedIOException && Thread.currentThread().isInterrupted)
     }
 
     private fun clearProgressState(downloadKey: String) {

@@ -29,11 +29,11 @@ object HXCSecureDownloadAuthResolver {
                     encrypted = request.encrypted || request.secureHeaders.isNotBlank()
                 )
             }
-            throw IllegalArgumentException("下载缺少 plainUrl 或 secureCredential")
+            throw HXCDownloadNonRetryableException("下载缺少 plainUrl 或 secureCredential")
         }
         Log.i(TAG, "resolve secure auth first, videoId=${secure.videoId}")
         if (secure.videoId.isBlank() || secure.sign.isBlank() || secure.secretId.isBlank()) {
-            throw IllegalArgumentException("加密下载鉴权参数不完整：videoId/sign/secretId")
+            throw HXCDownloadNonRetryableException("加密下载鉴权参数不完整：videoId/sign/secretId")
         }
         val connection = (URL(config.secureAuthUrl).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
@@ -64,13 +64,20 @@ object HXCSecureDownloadAuthResolver {
             val root = JSONObject(body)
             val hasBizCode = root.has("code") && !root.isNull("code")
             val bizCode = if (hasBizCode) root.optLong("code", 200L) else 200L
-            if (code !in 200..299 || (hasBizCode && bizCode != 200L)) {
-                throw IllegalStateException(root.optString("msg", "下载鉴权失败"))
+            if (code !in 200..299) {
+                throw HXCDownloadHttpException(
+                    statusCode = code,
+                    scene = "secure_auth",
+                    message = root.optString("msg", "下载鉴权失败：HTTP $code")
+                )
+            }
+            if (hasBizCode && bizCode != 200L) {
+                throw HXCDownloadNonRetryableException(root.optString("msg", "下载鉴权失败($bizCode)"))
             }
             val data = root.optJSONObject("data") ?: root
             val playUrl = firstNonEmpty(data, "download_url", "play_url", "url")
             if (playUrl.isBlank()) {
-                throw IllegalStateException("下载鉴权成功但未返回可下载 URL")
+                throw HXCDownloadNonRetryableException("下载鉴权成功但未返回可下载 URL")
             }
             Log.i(TAG, "secure auth success, got real url, encrypted=${data.optInt("encrypt_type", 0) == 1}")
             val encrypted = data.optInt("encrypt_type", 0) == 1 || data.optBoolean("is_encrypted", false)
