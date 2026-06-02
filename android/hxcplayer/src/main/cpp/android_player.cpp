@@ -303,6 +303,7 @@ AndroidPlayer::AndroidPlayer()
 }
 
 AndroidPlayer::~AndroidPlayer() {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
     LOGI("[lifecycle] AndroidPlayer destroying this=%p", (void*)this);
 
     // 1. Stop audio callback before anything else (avoids use-after-free on player_core_)
@@ -408,6 +409,7 @@ bool AndroidPlayer::openURL(const char* url) {
 }
 
 bool AndroidPlayer::openURL(const char* url, double start_position) {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) {
         LOGE("Player core not initialized");
         return false;
@@ -517,6 +519,7 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
 }
 
 bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_retries, bool encrypted_file) {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) {
         LOGE("Player core not initialized");
         return false;
@@ -569,6 +572,7 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
 }
 
 bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size, bool encrypted_file) {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) {
         LOGE("Player core not initialized");
         return false;
@@ -634,6 +638,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
                                           int key_mode,
                                           const char* key_material_b64,
                                           const char* key_iv_hex) {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
     (void)auth_token;
     (void)video_id;
     (void)device_id;
@@ -752,6 +757,7 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
 }
 
 void AndroidPlayer::play() {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) return;
     user_manual_pause_.store(false, std::memory_order_release);
     user_manual_pause_block_until_ms_.store(0, std::memory_order_release);
@@ -841,6 +847,7 @@ void AndroidPlayer::play() {
 }
 
 void AndroidPlayer::pause() {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) return;
 
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -890,6 +897,7 @@ void AndroidPlayer::pause() {
 }
 
 void AndroidPlayer::stop() {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) return;
 
     user_manual_pause_.store(false, std::memory_order_release);
@@ -948,6 +956,7 @@ void AndroidPlayer::seekToWithIntent(double position, bool resume_after_seek) {
 }
 
 void AndroidPlayer::seekTo(double position) {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) return;
 
     bool manual_pause_blocked = false;

@@ -432,6 +432,8 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var metricsPlayStallRecoverReopenCount: Long = 0L
     private var metricsPlayLoopRecoverCount: Long = 0L
     private val lifecycleLock = Any()
+    // 串行化 open/reopen/stop，避免与 release 并发触发 native 资源竞态。
+    private val openSerialLock = Any()
     @Volatile private var isReleased = false
     private var autoReopenOnRecoverableErrorEnabled: Boolean = false
     private var autoReopenMaxAttempts: Int = 1
@@ -667,95 +669,97 @@ class HXCPlayerControl @JvmOverloads constructor(
      * [openWithPlayModel] 带起始位置重载（支持 [playWithModel] 传入 startPosition）。
      */
     fun openWithPlayModel(model: PlayerDataSourcePlayModel, startPosition: Double): Boolean {
-        val handle = currentHandle()
-        if (handle == 0L || isReleased) {
-            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开播放模型")
-            return false
-        }
-        if (!licenseAllowedOrNotify("openWithPlayModel")) return false
-        val workingModel = clonePlayModel(model)
-        val cfg = effectiveDataSourceConfig()
-        var secureHeaders: String? = null
-        if (workingModel.video != null) {
-            try {
-                val authResult = performSecureHlsAuth(cfg, workingModel.video!!)
-                workingModel.url = authResult.playUrl
-                workingModel.encryptedFile = authResult.encrypted
-                secureHeaders = authResult.secureHeaders
-                val needsSecure = authResult.encrypted || secureHeaders.isNullOrBlank().not()
-                if (needsSecure) {
-                    workingModel.mode = PlayerDataSourceMode.SECURE_HLS
-                } else if (workingModel.mode == PlayerDataSourceMode.SECURE_HLS &&
-                    !workingModel.url.contains(".m3u8", ignoreCase = true)
-                ) {
-                    workingModel.mode = PlayerDataSourceMode.DEFAULT
+        return synchronized(openSerialLock) {
+            val handle = currentHandle()
+            if (handle == 0L || isReleased) {
+                dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开播放模型")
+                return@synchronized false
+            }
+            if (!licenseAllowedOrNotify("openWithPlayModel")) return@synchronized false
+            val workingModel = clonePlayModel(model)
+            val cfg = effectiveDataSourceConfig()
+            var secureHeaders: String? = null
+            if (workingModel.video != null) {
+                try {
+                    val authResult = performSecureHlsAuth(cfg, workingModel.video!!)
+                    workingModel.url = authResult.playUrl
+                    workingModel.encryptedFile = authResult.encrypted
+                    secureHeaders = authResult.secureHeaders
+                    val needsSecure = authResult.encrypted || secureHeaders.isNullOrBlank().not()
+                    if (needsSecure) {
+                        workingModel.mode = PlayerDataSourceMode.SECURE_HLS
+                    } else if (workingModel.mode == PlayerDataSourceMode.SECURE_HLS &&
+                        !workingModel.url.contains(".m3u8", ignoreCase = true)
+                    ) {
+                        workingModel.mode = PlayerDataSourceMode.DEFAULT
+                    }
+                } catch (e: Exception) {
+                    dispatchError(PlayerErrorCode.SECURE_AUTH_FAILED, e.message ?: "SecureHLS 鉴权失败")
+                    return@synchronized false
                 }
-            } catch (e: Exception) {
-                dispatchError(PlayerErrorCode.SECURE_AUTH_FAILED, e.message ?: "SecureHLS 鉴权失败")
-                return false
             }
-        }
-        if (workingModel.url.isBlank()) {
-            dispatchError(PlayerErrorCode.INVALID_URL, "播放参数无效：video 和 url 不能同时为空")
-            return false
-        }
-        validatePlayModelInput(workingModel)?.let { reason ->
-            dispatchError(PlayerErrorCode.INVALID_URL, reason)
-            return false
-        }
+            if (workingModel.url.isBlank()) {
+                dispatchError(PlayerErrorCode.INVALID_URL, "播放参数无效：video 和 url 不能同时为空")
+                return@synchronized false
+            }
+            validatePlayModelInput(workingModel)?.let { reason ->
+                dispatchError(PlayerErrorCode.INVALID_URL, reason)
+                return@synchronized false
+            }
 
-        lastOpenUrl = workingModel.url
-        lastOpenStartPosition = maxOf(0.0, startPosition)
-        lastOpenPlayModel = clonePlayModel(workingModel)
-        // New open session should not inherit previous seek-loading heuristics.
-        loadingSessionLikelySeek = false
-        loadingCandidateState = null
-        loadingCandidateSinceMs = 0L
-        if (!autoReopenInFlight) {
-            autoReopenAttemptCount = 0
-            networkTotalStallMs = 0L
-            networkReconnectCount = 0
-        }
-        playStallCheckArmed = false
-        applyDecodeModeForHandle(handle)
-        val result = when (workingModel.mode) {
-            PlayerDataSourceMode.DEFAULT ->
-                nativeOpenURLWithStartPosition(handle, workingModel.url, lastOpenStartPosition)
-            PlayerDataSourceMode.CUSTOM_HTTP -> {
-                nativeOpenWithCustomHTTP(handle, workingModel.url, cfg.timeoutMs, cfg.maxRetries, workingModel.encryptedFile)
+            lastOpenUrl = workingModel.url
+            lastOpenStartPosition = maxOf(0.0, startPosition)
+            lastOpenPlayModel = clonePlayModel(workingModel)
+            // New open session should not inherit previous seek-loading heuristics.
+            loadingSessionLikelySeek = false
+            loadingCandidateState = null
+            loadingCandidateSinceMs = 0L
+            if (!autoReopenInFlight) {
+                autoReopenAttemptCount = 0
+                networkTotalStallMs = 0L
+                networkReconnectCount = 0
             }
-            PlayerDataSourceMode.CUSTOM_FILE -> {
-                nativeOpenWithCustomFile(handle, workingModel.url, cfg.avioBufferSize, workingModel.encryptedFile)
+            playStallCheckArmed = false
+            applyDecodeModeForHandle(handle)
+            val result = when (workingModel.mode) {
+                PlayerDataSourceMode.DEFAULT ->
+                    nativeOpenURLWithStartPosition(handle, workingModel.url, lastOpenStartPosition)
+                PlayerDataSourceMode.CUSTOM_HTTP -> {
+                    nativeOpenWithCustomHTTP(handle, workingModel.url, cfg.timeoutMs, cfg.maxRetries, workingModel.encryptedFile)
+                }
+                PlayerDataSourceMode.CUSTOM_FILE -> {
+                    nativeOpenWithCustomFile(handle, workingModel.url, cfg.avioBufferSize, workingModel.encryptedFile)
+                }
+                PlayerDataSourceMode.SECURE_HLS -> {
+                    val video = workingModel.video
+                    nativeOpenWithSecureSession(
+                        handle = handle,
+                        url = workingModel.url,
+                        startPosition = lastOpenStartPosition,
+                        authToken = null,
+                        videoId = video?.videoId,
+                        deviceId = null,
+                        secretId = video?.secretId,
+                        nonce = null,
+                        playSessionId = null,
+                        secureHeaders = secureHeaders,
+                        sessionExpireAtMs = 0L,
+                        keyMode = 0,
+                        keyMaterialB64 = null,
+                        keyIvHex = null
+                    )
+                }
             }
-            PlayerDataSourceMode.SECURE_HLS -> {
-                val video = workingModel.video
-                nativeOpenWithSecureSession(
-                    handle = handle,
-                    url = workingModel.url,
-                    startPosition = lastOpenStartPosition,
-                    authToken = null,
-                    videoId = video?.videoId,
-                    deviceId = null,
-                    secretId = video?.secretId,
-                    nonce = null,
-                    playSessionId = null,
-                    secureHeaders = secureHeaders,
-                    sessionExpireAtMs = 0L,
-                    keyMode = 0,
-                    keyMaterialB64 = null,
-                    keyIvHex = null
-                )
+            if (!result) {
+                openLoadingHideProtectUntilMs = 0L
+                openLoadingHideHardDeadlineMs = 0L
+                openLoadingGuardStartPosSec = -1.0
+                dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "打开失败: mode=${workingModel.mode}, url=${workingModel.url}")
+            } else {
+                armOpenLoadingHideGuard()
             }
+            result
         }
-        if (!result) {
-            openLoadingHideProtectUntilMs = 0L
-            openLoadingHideHardDeadlineMs = 0L
-            openLoadingGuardStartPosSec = -1.0
-            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "打开失败: mode=${workingModel.mode}, url=${workingModel.url}")
-        } else {
-            armOpenLoadingHideGuard()
-        }
-        return result
     }
 
     private fun validatePlayModelInput(model: PlayerDataSourcePlayModel): String? {
@@ -1172,48 +1176,50 @@ class HXCPlayerControl @JvmOverloads constructor(
     // 打开 URL 并指定起始位置（秒）
     // 注意：该接口为同步调用，可能阻塞调用线程（例如网络抖动时）
     fun openURL(url: String, startPosition: Double): Boolean {
-        val handle = currentHandle()
-        if (handle == 0L || isReleased) {
-            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
-            return false
-        }
-        if (url.isBlank()) {
-            dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
-            return false
-        }
-        validateLocalPathIfNeeded(url)?.let { reason ->
-            dispatchError(PlayerErrorCode.INVALID_URL, reason)
-            return false
-        }
-        if (!licenseAllowedOrNotify("openURL")) {
-            return false
-        }
-        lastOpenUrl = url
-        lastOpenStartPosition = startPosition
-        lastOpenPlayModel = null
-        // New open session should not inherit previous seek-loading heuristics.
-        loadingSessionLikelySeek = false
-        loadingCandidateState = null
-        loadingCandidateSinceMs = 0L
-        if (!autoReopenInFlight) {
-            autoReopenAttemptCount = 0
-            networkTotalStallMs = 0L
-            networkReconnectCount = 0
-        }
-        playStallCheckArmed = false
-        applyDecodeModeForHandle(handle)
-        // 始终用带起始位置的接口，确保 startPosition=0 时也能清除上次残留进度
-        val result = nativeOpenURLWithStartPosition(handle, url, startPosition)
+        return synchronized(openSerialLock) {
+            val handle = currentHandle()
+            if (handle == 0L || isReleased) {
+                dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开 URL: $url")
+                return@synchronized false
+            }
+            if (url.isBlank()) {
+                dispatchError(PlayerErrorCode.INVALID_URL, "URL 不能为空")
+                return@synchronized false
+            }
+            validateLocalPathIfNeeded(url)?.let { reason ->
+                dispatchError(PlayerErrorCode.INVALID_URL, reason)
+                return@synchronized false
+            }
+            if (!licenseAllowedOrNotify("openURL")) {
+                return@synchronized false
+            }
+            lastOpenUrl = url
+            lastOpenStartPosition = startPosition
+            lastOpenPlayModel = null
+            // New open session should not inherit previous seek-loading heuristics.
+            loadingSessionLikelySeek = false
+            loadingCandidateState = null
+            loadingCandidateSinceMs = 0L
+            if (!autoReopenInFlight) {
+                autoReopenAttemptCount = 0
+                networkTotalStallMs = 0L
+                networkReconnectCount = 0
+            }
+            playStallCheckArmed = false
+            applyDecodeModeForHandle(handle)
+            // 始终用带起始位置的接口，确保 startPosition=0 时也能清除上次残留进度
+            val result = nativeOpenURLWithStartPosition(handle, url, startPosition)
 
-        if (!result) {
-            openLoadingHideProtectUntilMs = 0L
-            openLoadingHideHardDeadlineMs = 0L
-            openLoadingGuardStartPosSec = -1.0
-            dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
-        } else {
-            armOpenLoadingHideGuard()
+            if (!result) {
+                openLoadingHideProtectUntilMs = 0L
+                openLoadingHideHardDeadlineMs = 0L
+                openLoadingGuardStartPosSec = -1.0
+                dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
+            } else {
+                armOpenLoadingHideGuard()
+            }
+            result
         }
-        return result
     }
 
     /**
@@ -1415,7 +1421,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun stop() {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        nativeStop(handle)
+        synchronized(openSerialLock) {
+            if (isReleased) return
+            nativeStop(handle)
+        }
         playStallCheckArmed = false
         networkLoadingSinceMs = 0L
     }
@@ -2000,13 +2009,27 @@ class HXCPlayerControl @JvmOverloads constructor(
             isReleased = true
         }
 
-        updateExecutor?.shutdownNow()
-        openExecutor.shutdownNow()
+        updateExecutor?.shutdown()
+        openExecutor.shutdown()
         try {
-            updateExecutor?.awaitTermination(800, TimeUnit.MILLISECONDS)
-            openExecutor.awaitTermination(800, TimeUnit.MILLISECONDS)
+            val updateDone = updateExecutor?.awaitTermination(2500, TimeUnit.MILLISECONDS) ?: true
+            val openDone = openExecutor.awaitTermination(2500, TimeUnit.MILLISECONDS)
+            if (!updateDone) {
+                updateExecutor?.shutdownNow()
+            }
+            if (!openDone) {
+                openExecutor.shutdownNow()
+            }
+            if (!updateDone || !openDone) {
+                updateExecutor?.awaitTermination(800, TimeUnit.MILLISECONDS)
+                openExecutor.awaitTermination(800, TimeUnit.MILLISECONDS)
+            }
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
+        }
+        // 等待正在进行的 open/reopen/stop 流程退出，避免 nativeRelease 与 open 并发。
+        synchronized(openSerialLock) {
+            // no-op: only as lifecycle barrier
         }
 
         val handle: Long
