@@ -384,13 +384,13 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var loadingSessionLikelySeek: Boolean = false
     private var suppressLoadingShowUntilMs: Long = 0L
     private var lastPositionForLoadingHeuristicSec: Double = Double.NaN
-    private val seekCompletionTimeoutMs = 5600L
+    private val seekCompletionTimeoutMs = 7600L
     // Native seek session occasionally stays active while position has already converged.
     // Keep SDK completion bounded to avoid long loading tail and follow-up play deadlocks.
-    private val seekCompletionNativeConvergedWatchdogMs = 8200L
+    private val seekCompletionNativeConvergedWatchdogMs = 10500L
     private val seekCompletionConvergedStableMs = 420L
     private val seekCompletionNearTargetSec = 1.5
-    private val seekCompletionMovedFromOldSec = 0.35
+    private val seekCompletionMovedFromOldSec = 0.9
     private var playStallRecoveryEnabled = true
     private var playLoopRecoveryEnabled = true
     private var playbackMetricsLogEnabled = true
