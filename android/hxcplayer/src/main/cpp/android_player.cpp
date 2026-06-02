@@ -568,6 +568,10 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
 
     if (result == 0) {
         LOGI("Custom HTTP opened successfully");
+        // Custom HTTP open path does not use start_position overload.
+        // Force reset playback anchor to stream head for replay/start-from-zero semantics.
+        player_core_seek(player_core_, 0.0);
+        player_core_anchor_clock(player_core_, 0.0);
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
@@ -643,6 +647,10 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
 
     if (result == 0) {
         LOGI("Custom file opened successfully");
+        // Custom file open path does not use start_position overload.
+        // Force reset playback anchor to stream head for replay/start-from-zero semantics.
+        player_core_seek(player_core_, 0.0);
+        player_core_anchor_clock(player_core_, 0.0);
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
