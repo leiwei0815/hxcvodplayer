@@ -524,6 +524,26 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
         LOGE("Player core not initialized");
         return false;
     }
+    LOGI("[open] openWithCustomHTTP url=%s encrypted=%d", url ? url : "(null)", encrypted_file ? 1 : 0);
+    bool stale_loading = is_loading_.exchange(false, std::memory_order_acq_rel);
+    if (stale_loading) {
+        LOGI("[open] clear stale loading=true before custom HTTP open switch");
+    }
+    int cur_state = player_core_get_state(player_core_);
+    if (cur_state != 0) { // 0 == IDLE
+        LOGI("[open] pre-stop core (state=%d) before custom HTTP open", cur_state);
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        suppress_transient_loading_false_.store(true, std::memory_order_release);
+        suppress_transient_loading_false_until_ms_.store(now_ms + 1200, std::memory_order_release);
+        audio_start_pending_.store(false, std::memory_order_release);
+        setOpenSLESPlayState(SL_PLAYSTATE_STOPPED, false);
+        {
+            std::lock_guard<std::mutex> lock(audio_mutex_);
+            // Lock acquired means no callback is in swr_convert right now.
+        }
+        player_core_stop(player_core_);
+    }
     DECODEI("evt=open method=openWithCustomHTTP decode_mode=%s",
             decode_mode_ == 1 ? "hardware" : "software");
     player_core_set_decode_mode(player_core_,
@@ -576,6 +596,27 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
     if (!player_core_) {
         LOGE("Player core not initialized");
         return false;
+    }
+    LOGI("[open] openWithCustomFile path=%s start=0 encrypted=%d",
+         path ? path : "(null)", encrypted_file ? 1 : 0);
+    bool stale_loading = is_loading_.exchange(false, std::memory_order_acq_rel);
+    if (stale_loading) {
+        LOGI("[open] clear stale loading=true before custom file open switch");
+    }
+    int cur_state = player_core_get_state(player_core_);
+    if (cur_state != 0) { // 0 == IDLE
+        LOGI("[open] pre-stop core (state=%d) before custom file open", cur_state);
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        suppress_transient_loading_false_.store(true, std::memory_order_release);
+        suppress_transient_loading_false_until_ms_.store(now_ms + 1200, std::memory_order_release);
+        audio_start_pending_.store(false, std::memory_order_release);
+        setOpenSLESPlayState(SL_PLAYSTATE_STOPPED, false);
+        {
+            std::lock_guard<std::mutex> lock(audio_mutex_);
+            // Lock acquired means no callback is in swr_convert right now.
+        }
+        player_core_stop(player_core_);
     }
     DECODEI("evt=open method=openWithCustomFile decode_mode=%s",
             decode_mode_ == 1 ? "hardware" : "software");

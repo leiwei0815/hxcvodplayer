@@ -1918,6 +1918,16 @@ class HXCPlayerControl @JvmOverloads constructor(
             return
         }
         val reopenStart = maxOf(0.0, positionSec - playStallRecoverReseekBackSec)
+        if (manualPlayHardRecoverEnabled && manualPlayHardRecoverPending) {
+            // 手动播放硬兜底已挂起时，避免 stall_recover 与 hard_recover 同时触发重复 reopen。
+            playStallCheckArmed = false
+            playStallRecoverStage = 0
+            Log.i(
+                TAG,
+                "evt=play_stall_recover_reopen_skip reason=manual_hard_recover_pending base=$positionSec reopen_start=$reopenStart"
+            )
+            return
+        }
         playStallCheckArmed = false
         playStallRecoverStage = 0
         playStallLastRecoverAtMs = nowMs
@@ -2059,6 +2069,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         val reopenStart = maxOf(0.0, positionSec - playStallRecoverReseekBackSec)
         manualPlayHardRecoverPending = false
+        playStallCheckArmed = false
+        playStallRecoverStage = 0
         manualPlayHardRecoverLastAtMs = nowMs
         metricsManualPlayHardRecoverCount += 1L
         Log.w(
