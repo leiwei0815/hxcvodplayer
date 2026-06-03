@@ -1898,6 +1898,25 @@ class HXCPlayerControl @JvmOverloads constructor(
                 return
             }
             val recoverTarget = maxOf(0.0, positionSec - playStallRecoverReseekBackSec)
+            val reseekDelta = abs(positionSec - recoverTarget)
+            if (reseekDelta < 0.01) {
+                // 首播/起播初期常见 0->0 no-op seek：直接重开更快打破“PLAYING 但进度不走”。
+                val reopenStart = recoverTarget
+                playStallCheckArmed = false
+                playStallRecoverStage = 0
+                playStallLastRecoverAtMs = nowMs
+                manualPlayHardRecoverPending = false
+                metricsPlayStallRecoverReopenCount += 1L
+                Log.i(
+                    TAG,
+                    "evt=play_stall_recover_noop_seek_reopen base=$positionSec target=$recoverTarget delta=$reseekDelta duration=$durationSec loading=$loading state=${state.name}"
+                )
+                openExecutor.execute {
+                    if (isReleased) return@execute
+                    replayFrom(reopenStart)
+                }
+                return
+            }
             playStallRecoverStage = 1
             playStallArmedAtMs = nowMs
             playStallBasePosSec = recoverTarget
@@ -1919,14 +1938,13 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         val reopenStart = maxOf(0.0, positionSec - playStallRecoverReseekBackSec)
         if (manualPlayHardRecoverEnabled && manualPlayHardRecoverPending) {
-            // 手动播放硬兜底已挂起时，避免 stall_recover 与 hard_recover 同时触发重复 reopen。
-            playStallCheckArmed = false
-            playStallRecoverStage = 0
+            // 旧逻辑在这里直接 return，会导致“stall_recover 被挡住、hard_recover 又未触发”的卡死窗口。
+            // 统一由 stall_recover 执行一次 reopen，并撤销 hard_recover 挂起，避免双重 reopen。
+            manualPlayHardRecoverPending = false
             Log.i(
                 TAG,
-                "evt=play_stall_recover_reopen_skip reason=manual_hard_recover_pending base=$positionSec reopen_start=$reopenStart"
+                "evt=play_stall_recover_reopen_takeover reason=manual_hard_recover_pending base=$positionSec reopen_start=$reopenStart"
             )
-            return
         }
         playStallCheckArmed = false
         playStallRecoverStage = 0
@@ -2062,8 +2080,9 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (durationSec <= 0.0 || positionSec < 0.0) {
             return
         }
-        // 当手动点播放后持续卡在 loading/paused 或状态显示 playing 但位置不动时，直接重开解冻。
-        val likelyStuck = loading || state == PlayerState.PAUSED || !isPlayingNow
+        // 当点播放后持续卡在 loading/paused，或虽是 PLAYING 但位置长期不动时，直接重开解冻。
+        val likelyPlayingButFrozen = state == PlayerState.PLAYING && isPlayingNow && progressed < manualPlayHardRecoverMinProgressSec
+        val likelyStuck = loading || state == PlayerState.PAUSED || !isPlayingNow || likelyPlayingButFrozen
         if (!likelyStuck) {
             return
         }
