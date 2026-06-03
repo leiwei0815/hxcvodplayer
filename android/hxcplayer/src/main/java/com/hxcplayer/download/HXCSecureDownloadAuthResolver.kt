@@ -23,7 +23,7 @@ object HXCSecureDownloadAuthResolver {
         val secure = request.secureCredential
         if (secure == null) {
             if (request.plainUrl.isNotBlank()) {
-                logLevel2(
+                logDebugOnly(
                     "resolve_plain_direct videoId=${request.videoId}, " +
                         "url=${maskUrl(request.plainUrl)}, hasSecureHeaders=${request.secureHeaders.isNotBlank()}"
                 )
@@ -35,7 +35,7 @@ object HXCSecureDownloadAuthResolver {
             }
             throw HXCDownloadNonRetryableException("下载缺少 plainUrl 或 secureCredential")
         }
-        logLevel2(
+        logDebugOnly(
             "resolve_secure_start videoId=${secure.videoId}, hasSign=${secure.sign.isNotBlank()}, " +
                 "hasSecretId=${secure.secretId.isNotBlank()}, ts=${secure.timestamp}"
         )
@@ -65,7 +65,7 @@ object HXCSecureDownloadAuthResolver {
             val code = connection.responseCode
             val body = (if (code in 200..299) connection.inputStream else connection.errorStream)
                 ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-            logLevel2(
+            logDebugOnly(
                 "resolve_secure_http videoId=${secure.videoId}, httpCode=$code, bodySize=${body.length}"
             )
             if (body.isBlank()) {
@@ -100,7 +100,7 @@ object HXCSecureDownloadAuthResolver {
                     append("P-HX-Terminal-Type: Android\r\n")
                 }
             }
-            logLevel2(
+            logDebugOnly(
                 "resolve_secure_success videoId=${secure.videoId}, encrypted=$encrypted, " +
                     "url=${maskUrl(playUrl)}, hasSecureHeaders=${secureHeaders.isNotBlank()}"
             )
@@ -122,16 +122,16 @@ object HXCSecureDownloadAuthResolver {
         return ""
     }
 
-    private fun shouldLogAtLevel2(): Boolean {
+    private fun shouldLogAtDebug(): Boolean {
         return try {
-            HXCPlayerControl.getLogLevel() == 2
+            HXCPlayerControl.getLogLevel() == 0
         } catch (_: Throwable) {
             false
         }
     }
 
-    private fun logLevel2(msg: String) {
-        if (shouldLogAtLevel2()) {
+    private fun logDebugOnly(msg: String) {
+        if (shouldLogAtDebug()) {
             Log.w(TAG, msg)
         }
     }
