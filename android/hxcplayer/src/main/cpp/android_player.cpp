@@ -125,6 +125,10 @@
 } while(0)
 
 namespace {
+// Process-wide guard for player_core_open_*.
+// Some FFmpeg/mbedtls paths are unstable under multi-instance concurrent opens.
+std::mutex g_player_core_open_mutex;
+
 constexpr float kMinPlaybackRate = 0.5f;
 constexpr float kMaxPlaybackRate = 3.0f;
 constexpr float kMaxPlaybackRateSnapEpsilon = 0.01f;
@@ -457,7 +461,11 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
                                 decode_mode_ == 1 ? PLAYER_DECODE_MODE_HARDWARE
                                                   : PLAYER_DECODE_MODE_SOFTWARE);
 
-    int result = player_core_open_with_start_position(player_core_, url, start_position);
+    int result = -1;
+    {
+        std::lock_guard<std::mutex> open_guard(g_player_core_open_mutex);
+        result = player_core_open_with_start_position(player_core_, url, start_position);
+    }
     
     if (result == 0) {
         LOGI("[open] openURL OK");
@@ -564,7 +572,11 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
     source.encrypted_file = encrypted_file ? 1 : 0;
     source.secure_headers = nullptr;
 
-    int result = player_core_open_with_mode(player_core_, &source, &config);
+    int result = -1;
+    {
+        std::lock_guard<std::mutex> open_guard(g_player_core_open_mutex);
+        result = player_core_open_with_mode(player_core_, &source, &config);
+    }
 
     if (result == 0) {
         LOGI("Custom HTTP opened successfully");
@@ -643,7 +655,11 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
     source.encrypted_file = encrypted_file ? 1 : 0;
     source.secure_headers = nullptr;
 
-    int result = player_core_open_with_mode(player_core_, &source, &config);
+    int result = -1;
+    {
+        std::lock_guard<std::mutex> open_guard(g_player_core_open_mutex);
+        result = player_core_open_with_mode(player_core_, &source, &config);
+    }
 
     if (result == 0) {
         LOGI("Custom file opened successfully");
@@ -745,7 +761,11 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     source.encrypted_file = 0;
     source.secure_headers = secure_headers;
 
-    int result = player_core_open_with_mode(player_core_, &source, &config);
+    int result = -1;
+    {
+        std::lock_guard<std::mutex> open_guard(g_player_core_open_mutex);
+        result = player_core_open_with_mode(player_core_, &source, &config);
+    }
     if (result == 0) {
         if (start_position > 0.001) {
             // Fallback guard: some secure-open paths may ignore initial start_time.
