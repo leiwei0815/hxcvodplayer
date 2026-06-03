@@ -1594,13 +1594,19 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (coreStateRaw == 1 || pipelineStateRaw == 1) {
             return PlayerState.OPENING
         }
+        // 统一状态语义：未请求播放（playWhenReady=false）时，不能对外报 PLAYING。
+        // 某些机型/链路在 open 初期会短暂返回 isPlaying=true 或 coreState=PLAYING，
+        // 若直接透传会导致上层出现 "PLAYING -> PAUSED -> PLAYING" 抖动与按钮错态。
+        if (!playWhenReady) {
+            return PlayerState.PAUSED
+        }
         if (isPlayingNow) {
             return PlayerState.PLAYING
         }
         if (pipelineStateRaw == 2) {
             return PlayerState.LOADING
         }
-        if (coreStateRaw == 3 || !playWhenReady) {
+        if (coreStateRaw == 3) {
             return PlayerState.PAUSED
         }
         return mapPlayerState(coreStateRaw)
