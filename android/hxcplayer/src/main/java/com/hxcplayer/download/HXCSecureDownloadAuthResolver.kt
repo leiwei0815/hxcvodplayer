@@ -1,5 +1,6 @@
 package com.hxcplayer.download
 
+import com.hxcplayer.HXCPlayerControl
 import android.util.Log
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -22,7 +23,10 @@ object HXCSecureDownloadAuthResolver {
         val secure = request.secureCredential
         if (secure == null) {
             if (request.plainUrl.isNotBlank()) {
-                Log.i(TAG, "resolve plainUrl directly, videoId=${request.videoId}")
+                logLevel2(
+                    "resolve_plain_direct videoId=${request.videoId}, " +
+                        "url=${maskUrl(request.plainUrl)}, hasSecureHeaders=${request.secureHeaders.isNotBlank()}"
+                )
                 return HXCResolvedDownloadSource(
                     url = request.plainUrl,
                     secureHeaders = request.secureHeaders,
@@ -31,7 +35,10 @@ object HXCSecureDownloadAuthResolver {
             }
             throw HXCDownloadNonRetryableException("下载缺少 plainUrl 或 secureCredential")
         }
-        Log.i(TAG, "resolve secure auth first, videoId=${secure.videoId}")
+        logLevel2(
+            "resolve_secure_start videoId=${secure.videoId}, hasSign=${secure.sign.isNotBlank()}, " +
+                "hasSecretId=${secure.secretId.isNotBlank()}, ts=${secure.timestamp}"
+        )
         if (secure.videoId.isBlank() || secure.sign.isBlank() || secure.secretId.isBlank()) {
             throw HXCDownloadNonRetryableException("加密下载鉴权参数不完整：videoId/sign/secretId")
         }
@@ -58,6 +65,9 @@ object HXCSecureDownloadAuthResolver {
             val code = connection.responseCode
             val body = (if (code in 200..299) connection.inputStream else connection.errorStream)
                 ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+            logLevel2(
+                "resolve_secure_http videoId=${secure.videoId}, httpCode=$code, bodySize=${body.length}"
+            )
             if (body.isBlank()) {
                 throw IllegalStateException("下载鉴权响应为空")
             }
@@ -79,7 +89,6 @@ object HXCSecureDownloadAuthResolver {
             if (playUrl.isBlank()) {
                 throw HXCDownloadNonRetryableException("下载鉴权成功但未返回可下载 URL")
             }
-            Log.i(TAG, "secure auth success, got real url, encrypted=${data.optInt("encrypt_type", 0) == 1}")
             val encrypted = data.optInt("encrypt_type", 0) == 1 || data.optBoolean("is_encrypted", false)
             var secureHeaders = data.optString("secure_headers", "")
             if (encrypted && secureHeaders.isBlank()) {
@@ -91,6 +100,10 @@ object HXCSecureDownloadAuthResolver {
                     append("P-HX-Terminal-Type: Android\r\n")
                 }
             }
+            logLevel2(
+                "resolve_secure_success videoId=${secure.videoId}, encrypted=$encrypted, " +
+                    "url=${maskUrl(playUrl)}, hasSecureHeaders=${secureHeaders.isNotBlank()}"
+            )
             return HXCResolvedDownloadSource(
                 url = playUrl,
                 secureHeaders = secureHeaders,
@@ -107,5 +120,36 @@ object HXCSecureDownloadAuthResolver {
             if (value.isNotBlank()) return value
         }
         return ""
+    }
+
+    private fun shouldLogAtLevel2(): Boolean {
+        return try {
+            HXCPlayerControl.getLogLevel() == 2
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun logLevel2(msg: String) {
+        if (shouldLogAtLevel2()) {
+            Log.w(TAG, msg)
+        }
+    }
+
+    private fun maskUrl(raw: String): String {
+        if (raw.isBlank()) return ""
+        return try {
+            val uri = URL(raw)
+            val host = uri.host ?: "unknown"
+            val path = uri.path ?: ""
+            val suffix = when {
+                path.endsWith(".m3u8", ignoreCase = true) -> "m3u8"
+                path.endsWith(".mp4", ignoreCase = true) -> "mp4"
+                else -> "other"
+            }
+            "host=$host,suffix=$suffix,pathHash=${path.hashCode()}"
+        } catch (_: Throwable) {
+            "invalid_url"
+        }
     }
 }
