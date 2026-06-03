@@ -8,18 +8,35 @@
 
 #define LOG_TAG "HXCPlayerJNI"
 #define LOG_TAG_DECODE "HXCSDK_DECODE"
-#ifndef HXC_PLAYER_JNI_DEBUG_LOG
-#define HXC_PLAYER_JNI_DEBUG_LOG 0
+#ifndef HXC_PLAYER_RUNTIME_LOG_LEVEL
+#define HXC_PLAYER_RUNTIME_LOG_LEVEL 2
 #endif
-#if HXC_PLAYER_JNI_DEBUG_LOG
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#else
-#define LOGD(...) ((void)0)
-#endif
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
+static int g_hxc_jni_runtime_log_level = HXC_PLAYER_RUNTIME_LOG_LEVEL;
+
+#define LOGD(...) do { \
+    if (g_hxc_jni_runtime_log_level <= 0) { \
+        __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__); \
+    } \
+} while (0)
+
+#define LOGI(...) do { \
+    if (g_hxc_jni_runtime_log_level <= 1) { \
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__); \
+    } \
+} while (0)
+
+#define DECODEI(...) do { \
+    if (g_hxc_jni_runtime_log_level <= 1) { \
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG_DECODE, __VA_ARGS__); \
+    } \
+} while (0)
+
+#define LOGW(...) do { \
+    if (g_hxc_jni_runtime_log_level <= 2) { \
+        __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__); \
+    } \
+} while (0)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-#define DECODEI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG_DECODE, __VA_ARGS__)
 #define DECODEW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG_DECODE, __VA_ARGS__)
 #define DECODEE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG_DECODE, __VA_ARGS__)
 
@@ -502,15 +519,20 @@ Java_com_hxcplayer_HXCPlayerControl_disableFileLogging(JNIEnv *env, jclass clazz
 // 设置日志级别
 JNIEXPORT void JNICALL
 Java_com_hxcplayer_HXCPlayerControl_setLogLevel(JNIEnv *env, jclass clazz, jint level) {
-    LOGD("setLogLevel: %d", level);
-    player_core_set_log_level(level);
+    int clamped = level;
+    if (clamped < 0) clamped = 0;
+    if (clamped > 3) clamped = 3;
+    g_hxc_jni_runtime_log_level = clamped;
+    hxc_sdk_set_runtime_log_level(clamped);
+    player_core_set_log_level(clamped);
+    LOGI("setLogLevel: %d", clamped);
 }
 
 // 获取日志级别（0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR）
 JNIEXPORT jint JNICALL
 Java_com_hxcplayer_HXCPlayerControl_getLogLevel(JNIEnv *env, jclass clazz) {
-    jint level = static_cast<jint>(player_core_get_log_level());
-    LOGD("getLogLevel: %d", level);
+    jint level = static_cast<jint>(hxc_sdk_get_runtime_log_level());
+    LOGI("getLogLevel: %d", level);
     return level;
 }
 

@@ -452,6 +452,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var networkLoadingSinceMs: Long = 0L
     private var networkTotalStallMs: Long = 0L
     private var networkReconnectCount: Int = 0
+    @Volatile private var preferredPlaybackRate: Float = 1.0f
     private var lastOpenUrl: String? = null
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
@@ -1420,6 +1421,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         manualPlayHardRecoverArmedAtMs = playStallLastPlayReqAtMs
         manualPlayHardRecoverBasePosSec = playStallBasePosSec
         nativePlay(handle)
+        // 某些设备/解码链路在 pause->play 后会把速率短暂回落到 1.0，
+        // play 后立刻回放业务侧目标倍速，保证体感一致。
+        val targetRate = preferredPlaybackRate
+        nativeSetPlaybackRate(handle, targetRate)
     }
 
     // 暂停
@@ -1477,13 +1482,14 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     // 设置播放速度
     fun setPlaybackRate(rate: Float) {
-        val handle = currentHandle()
-        if (handle == 0L || isReleased) return
         var normalizedRate = if (rate.isFinite()) rate else 1.0f
         normalizedRate = normalizedRate.coerceIn(MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE)
         if (abs(normalizedRate - MAX_PLAYBACK_RATE) <= MAX_PLAYBACK_RATE_SNAP_EPSILON) {
             normalizedRate = MAX_PLAYBACK_RATE
         }
+        preferredPlaybackRate = normalizedRate
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
         nativeSetPlaybackRate(handle, normalizedRate)
     }
 

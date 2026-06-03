@@ -416,4 +416,7 @@ private:
                                            int64_t& post_seek_ahead_bypass_until_ms);
 };
 
+extern "C" void hxc_sdk_set_runtime_log_level(int level);
+extern "C" int hxc_sdk_get_runtime_log_level();
+
 #endif // ANDROID_PLAYER_H

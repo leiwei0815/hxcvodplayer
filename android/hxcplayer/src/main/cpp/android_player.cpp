@@ -18,31 +18,33 @@
 
 #define LOG_TAG "HXCSDK"
 // Runtime log level:
-//   0 = ERROR only (release default)
-//   1 = WARN + ERROR
-//   2 = INFO + WARN + ERROR
-//   3 = DEBUG + INFO + WARN + ERROR
+//   0 = DEBUG + INFO + WARN + ERROR
+//   1 = INFO  + WARN + ERROR
+//   2 = WARN  + ERROR
+//   3 = ERROR only
+// Keep default as WARN for release.
 #ifndef HXC_PLAYER_RUNTIME_LOG_LEVEL
 #define HXC_PLAYER_RUNTIME_LOG_LEVEL 2
 #endif
+static std::atomic<int> g_hxc_runtime_log_level{HXC_PLAYER_RUNTIME_LOG_LEVEL};
 
-#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 3
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#else
-#define LOGD(...) ((void)0)
-#endif
+#define LOGD(...) do { \
+    if (g_hxc_runtime_log_level.load(std::memory_order_relaxed) <= 0) { \
+        __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__); \
+    } \
+} while (0)
 
-#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 2
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#else
-#define LOGI(...) ((void)0)
-#endif
+#define LOGI(...) do { \
+    if (g_hxc_runtime_log_level.load(std::memory_order_relaxed) <= 1) { \
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__); \
+    } \
+} while (0)
 
-#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 1
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
-#else
-#define LOGW(...) ((void)0)
-#endif
+#define LOGW(...) do { \
+    if (g_hxc_runtime_log_level.load(std::memory_order_relaxed) <= 2) { \
+        __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__); \
+    } \
+} while (0)
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
@@ -53,23 +55,23 @@
 #define LOG_TAG_PBO    "HXCSDK_PBO"
 #define LOG_TAG_SEEK_WATCH "HXCSDK_SEEK_WATCH"
 
-#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 3
-#define TAGD(TAG, ...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
-#else
-#define TAGD(TAG, ...) ((void)0)
-#endif
+#define TAGD(TAG, ...) do { \
+    if (g_hxc_runtime_log_level.load(std::memory_order_relaxed) <= 0) { \
+        __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__); \
+    } \
+} while (0)
 
-#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 2
-#define TAGI(TAG, ...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
-#else
-#define TAGI(TAG, ...) ((void)0)
-#endif
+#define TAGI(TAG, ...) do { \
+    if (g_hxc_runtime_log_level.load(std::memory_order_relaxed) <= 1) { \
+        __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__); \
+    } \
+} while (0)
 
-#if HXC_PLAYER_RUNTIME_LOG_LEVEL >= 1
-#define TAGW(TAG, ...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
-#else
-#define TAGW(TAG, ...) ((void)0)
-#endif
+#define TAGW(TAG, ...) do { \
+    if (g_hxc_runtime_log_level.load(std::memory_order_relaxed) <= 2) { \
+        __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__); \
+    } \
+} while (0)
 
 #define TAGE(TAG, ...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
@@ -123,6 +125,17 @@
         LOGW(__VA_ARGS__); \
     } \
 } while(0)
+
+extern "C" void hxc_sdk_set_runtime_log_level(int level) {
+    int clamped = level;
+    if (clamped < 0) clamped = 0;
+    if (clamped > 3) clamped = 3;
+    g_hxc_runtime_log_level.store(clamped, std::memory_order_relaxed);
+}
+
+extern "C" int hxc_sdk_get_runtime_log_level() {
+    return g_hxc_runtime_log_level.load(std::memory_order_relaxed);
+}
 
 namespace {
 // Process-wide guard for player_core_open_*.
