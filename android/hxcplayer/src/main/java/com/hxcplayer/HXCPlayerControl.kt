@@ -573,6 +573,20 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
     }
 
+    private fun canEmitInfoLog(): Boolean {
+        return try {
+            getLogLevel() <= 1
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun logInfo(message: String) {
+        if (canEmitInfoLog()) {
+            Log.i(TAG, message)
+        }
+    }
+
     /**
      * When UI page (re)binds callback (e.g. entering from floating window),
      * immediately push current player snapshot so UI buttons don't rely on stale state.
@@ -739,10 +753,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 mode = workingModel.mode,
                 encryptedFile = workingModel.encryptedFile
             )
-            Log.i(
-                TAG,
-                "evt=open_source_classify category=$currentSourceCategory mode=${workingModel.mode} encrypted=${workingModel.encryptedFile} start_pos=$lastOpenStartPosition"
-            )
+            logInfo("evt=open_source_classify category=$currentSourceCategory mode=${workingModel.mode} encrypted=${workingModel.encryptedFile} start_pos=$lastOpenStartPosition")
             // New open session should not inherit previous seek-loading heuristics.
             loadingSessionLikelySeek = false
             loadingCandidateState = null
@@ -1250,10 +1261,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 mode = PlayerDataSourceMode.DEFAULT,
                 encryptedFile = false
             )
-            Log.i(
-                TAG,
-                "evt=open_source_classify category=$currentSourceCategory mode=${PlayerDataSourceMode.DEFAULT} encrypted=false start_pos=$startPosition"
-            )
+            logInfo("evt=open_source_classify category=$currentSourceCategory mode=${PlayerDataSourceMode.DEFAULT} encrypted=false start_pos=$startPosition")
             // New open session should not inherit previous seek-loading heuristics.
             loadingSessionLikelySeek = false
             loadingCandidateState = null
@@ -1306,10 +1314,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             mode = PlayerDataSourceMode.DEFAULT,
             encryptedFile = false
         )
-        Log.i(
-            TAG,
-            "evt=open_source_classify category=$currentSourceCategory mode=${PlayerDataSourceMode.DEFAULT} encrypted=false start_pos=$startPosition"
-        )
+        logInfo("evt=open_source_classify category=$currentSourceCategory mode=${PlayerDataSourceMode.DEFAULT} encrypted=false start_pos=$startPosition")
         // New open session should not inherit previous seek-loading heuristics.
         loadingSessionLikelySeek = false
         loadingCandidateState = null
@@ -1523,8 +1528,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (duration > 0.0) {
             val maxSeek = maxOf(0.0, duration - 0.35)
             if (target > maxSeek) {
-                Log.i(
-                    TAG,
+                logInfo(
                     "[sync] seek target clamped: req=%.3f -> %.3f (duration=%.3f)".format(
                         target,
                         maxSeek,
@@ -1923,17 +1927,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                                             replayFrom(reopenStart)
                                         }
                                     } else {
-                                        Log.i(
-                                            TAG,
-                                            "evt=seek_post_confirm_timeout_reopen_skip reason=cooldown since_last_ms=$sinceLastReopenMs cooldown_ms=$seekPostConfirmReopenCooldownMs"
-                                        )
+                                        logInfo("evt=seek_post_confirm_timeout_reopen_skip reason=cooldown since_last_ms=$sinceLastReopenMs cooldown_ms=$seekPostConfirmReopenCooldownMs")
                                     }
                                 }
                             } else {
-                                Log.i(
-                                    TAG,
-                                    "evt=seek_post_confirm_pass target=$target pos=$position confirm_elapsed_ms=$confirmElapsedMs"
-                                )
+                                logInfo("evt=seek_post_confirm_pass target=$target pos=$position confirm_elapsed_ms=$confirmElapsedMs")
                             }
                         }
                         val requestId = pendingSeekRequestId
@@ -1976,14 +1974,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                             )
                         }
                         nativeSettleSeekSession(handle, completeByTimeout)
-                        Log.i(
-                            TAG,
-                            "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory"
-                        )
-                        Log.i(
-                            TAG,
-                            "evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryTriggeredReopen play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory"
-                        )
+                        logInfo("evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory")
+                        logInfo("evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryTriggeredReopen play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory")
                         // Seek 完成后若目标语义是继续播放，重新武装 stall 监测，
                         // 防止“状态=PLAYING 但位置不再推进”长期卡住。
                         if (playWhenReady) {
@@ -2020,10 +2012,10 @@ class HXCPlayerControl @JvmOverloads constructor(
 
                 // 透传播放完成事件（由 core 回调写入，Java 侧轮询消费）
                 if (nativeConsumePlaybackCompleted(handle) && !isReleased) {
-                    Log.i(TAG, "[播放完成] Kotlin 层：收到播放完成事件，position=${getPosition()} duration=${getDuration()} state=${getState()}")
+                    logInfo("[播放完成] Kotlin 层：收到播放完成事件，position=${getPosition()} duration=${getDuration()} state=${getState()}")
                     mainHandler.post {
                         if (completedCallback != null) {
-                            Log.i(TAG, "[播放完成] Kotlin 层：派发 onPlaybackCompleted 到应用层")
+                            logInfo("[播放完成] Kotlin 层：派发 onPlaybackCompleted 到应用层")
                             completedCallback?.onPlaybackCompleted()
                         } else {
                             Log.w(TAG, "[播放完成] Kotlin 层：completedCallback 为 null，未派发（请调用 setPlaybackCompletedCallback 注册）")
@@ -2090,10 +2082,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         if (playStallRecoverStage <= 0) {
             if ((nowMs - playStallLastRecoverAtMs) < playStallRecoverCooldownMs) {
-                Log.i(
-                    TAG,
-                    "evt=play_stall_recover_skip reason=cooldown since_last_ms=${nowMs - playStallLastRecoverAtMs}"
-                )
+                logInfo("evt=play_stall_recover_skip reason=cooldown since_last_ms=${nowMs - playStallLastRecoverAtMs}")
                 playStallCheckArmed = false
                 return
             }
@@ -2107,10 +2096,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 playStallLastRecoverAtMs = nowMs
                 manualPlayHardRecoverPending = false
                 metricsPlayStallRecoverReopenCount += 1L
-                Log.i(
-                    TAG,
-                    "evt=play_stall_recover_noop_seek_reopen base=$positionSec target=$recoverTarget delta=$reseekDelta duration=$durationSec loading=$loading state=${state.name}"
-                )
+                logInfo("evt=play_stall_recover_noop_seek_reopen base=$positionSec target=$recoverTarget delta=$reseekDelta duration=$durationSec loading=$loading state=${state.name}")
                 openExecutor.execute {
                     if (isReleased) return@execute
                     replayFrom(reopenStart)
@@ -2135,10 +2121,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             pendingSeekTriggeredReopen = false
             pendingSeekLastWatchdogLogAtMs = 0L
             loadingSessionLikelySeek = true
-            Log.i(
-                TAG,
-                "evt=play_stall_recover_seek base=$positionSec target=$recoverTarget duration=$durationSec loading=$loading state=${state.name}"
-            )
+            logInfo("evt=play_stall_recover_seek base=$positionSec target=$recoverTarget duration=$durationSec loading=$loading state=${state.name}")
             metricsPlayStallRecoverSeekCount += 1L
             nativeSeekToWithIntent(handle, recoverTarget, true)
             return
@@ -2148,18 +2131,12 @@ class HXCPlayerControl @JvmOverloads constructor(
             // 旧逻辑在这里直接 return，会导致“stall_recover 被挡住、hard_recover 又未触发”的卡死窗口。
             // 统一由 stall_recover 执行一次 reopen，并撤销 hard_recover 挂起，避免双重 reopen。
             manualPlayHardRecoverPending = false
-            Log.i(
-                TAG,
-                "evt=play_stall_recover_reopen_takeover reason=manual_hard_recover_pending base=$positionSec reopen_start=$reopenStart"
-            )
+            logInfo("evt=play_stall_recover_reopen_takeover reason=manual_hard_recover_pending base=$positionSec reopen_start=$reopenStart")
         }
         playStallCheckArmed = false
         playStallRecoverStage = 0
         playStallLastRecoverAtMs = nowMs
-        Log.i(
-            TAG,
-            "evt=play_stall_recover_reopen base=$positionSec reopen_start=$reopenStart duration=$durationSec"
-        )
+        logInfo("evt=play_stall_recover_reopen base=$positionSec reopen_start=$reopenStart duration=$durationSec")
         metricsPlayStallRecoverReopenCount += 1L
         openExecutor.execute {
             if (isReleased) return@execute
@@ -2285,10 +2262,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         if ((nowMs - manualPlayHardRecoverLastAtMs) < manualPlayHardRecoverCooldownMs) {
             manualPlayHardRecoverPending = false
-            Log.i(
-                TAG,
-                "evt=manual_play_hard_recover_skip reason=cooldown since_last_ms=${nowMs - manualPlayHardRecoverLastAtMs}"
-            )
+            logInfo("evt=manual_play_hard_recover_skip reason=cooldown since_last_ms=${nowMs - manualPlayHardRecoverLastAtMs}")
             return
         }
         if (durationSec <= 0.0 || positionSec < 0.0) {
@@ -2325,8 +2299,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!playbackMetricsLogEnabled) return
         if (metricsLastLogAtMs > 0L && (nowMs - metricsLastLogAtMs) < metricsLogIntervalMs) return
         metricsLastLogAtMs = nowMs
-        Log.i(
-            TAG,
+        logInfo(
             "evt=playback_stability_metrics " +
                 "seek_completed=$metricsSeekCompletedCount " +
                 "seek_timeout=$metricsSeekCompletedTimeoutCount " +
