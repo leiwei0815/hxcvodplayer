@@ -2973,7 +2973,10 @@ void PlayerCore::progress_timer_thread() {
     while (!abort_request_) {
         // 检查播放器状态
         PlayerState current_state = get_state();
-        bool loading_now = is_loading();
+        bool loading_now =
+                seek_loading_.load(std::memory_order_acquire) ||
+                io_loading_.load(std::memory_order_acquire) ||
+                starvation_loading_.load(std::memory_order_acquire);
         if (current_state == PlayerState::Playing ||
             current_state == PlayerState::Paused ||
             loading_now) {
