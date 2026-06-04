@@ -1462,7 +1462,22 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("seekTo")) {
             return
         }
-        val target = maxOf(0.0, position)
+        var target = maxOf(0.0, position)
+        val duration = getDuration()
+        if (duration > 0.0) {
+            val maxSeek = maxOf(0.0, duration - 0.35)
+            if (target > maxSeek) {
+                Log.i(
+                    TAG,
+                    "[sync] seek target clamped: req=%.3f -> %.3f (duration=%.3f)".format(
+                        target,
+                        maxSeek,
+                        duration
+                    )
+                )
+                target = maxSeek
+            }
+        }
         pendingSeekRequestId += 1L
         pendingSeekTargetSec = target
         pendingSeekFromSec = getPosition()
@@ -1799,14 +1814,16 @@ class HXCPlayerControl @JvmOverloads constructor(
                         pendingSeekStartAtMs = 0L
                         pendingSeekConvergedSinceMs = 0L
                         metricsSeekCompletedCount += 1L
-                        val completeByTimeout = hardTimeout || nativeConvergedButStuck
+                        // 关键语义：即便 elapsed 已到 timeout，只要位置已稳定收敛，就按“正常完成”处理，
+                        // 避免上层把它当 seek 失败路径继续触发补偿 seek，形成假性连锁 seek。
+                        val completeByTimeout = (hardTimeout || nativeConvergedButStuck) && !convergedStable
                         if (completeByTimeout) {
                             metricsSeekCompletedTimeoutCount += 1L
                         }
                         nativeSettleSeekSession(handle, completeByTimeout)
                         Log.i(
                             TAG,
-                            "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered native_converged_stuck=$nativeConvergedButStuck"
+                            "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck"
                         )
                         mainHandler.post {
                             callback?.onSeekCompleted(

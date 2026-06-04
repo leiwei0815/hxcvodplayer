@@ -467,6 +467,7 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         // 3. Now safe to stop/reset the player core.
         player_core_stop(player_core_);
     }
+    resetRenderStateForStreamSwitch();
 
     DECODEI("evt=open method=openURL decode_mode=%s",
             decode_mode_ == 1 ? "hardware" : "software");
@@ -565,6 +566,7 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
         }
         player_core_stop(player_core_);
     }
+    resetRenderStateForStreamSwitch();
     DECODEI("evt=open method=openWithCustomHTTP decode_mode=%s",
             decode_mode_ == 1 ? "hardware" : "software");
     player_core_set_decode_mode(player_core_,
@@ -647,6 +649,7 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
         }
         player_core_stop(player_core_);
     }
+    resetRenderStateForStreamSwitch();
     DECODEI("evt=open method=openWithCustomFile decode_mode=%s",
             decode_mode_ == 1 ? "hardware" : "software");
     player_core_set_decode_mode(player_core_,
@@ -753,6 +756,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         }
         player_core_stop(player_core_);
     }
+    resetRenderStateForStreamSwitch();
     bool user_pref_hw = (decode_mode_ == 1);
     // SecureHLS on some Android devices frequently fails at avcodec_open2
     // with h264_mediacodec (-22 Invalid argument). For stability, force
@@ -1797,6 +1801,33 @@ bool AndroidPlayer::initGLProgram() {
     glBindTexture(GL_TEXTURE_2D, 0);
     LOGI("GL program & textures initialized");
     return true;
+}
+
+void AndroidPlayer::resetRenderStateForStreamSwitch() {
+    std::lock_guard<std::mutex> lock(render_mutex_);
+    // Clear cached frame to avoid carrying stale chroma into next source.
+    last_frame_y_.clear();
+    last_frame_u_.clear();
+    last_frame_v_.clear();
+    last_frame_width_ = 0;
+    last_frame_height_ = 0;
+    last_frame_y_stride_ = 0;
+    last_frame_u_stride_ = 0;
+    last_frame_v_stride_ = 0;
+    last_frame_cache_ms_ = 0;
+
+    // Re-probe UV order for every newly opened stream.
+    gl_uv_swap_decided_ = false;
+    gl_uv_swap_selected_ = false;
+    gl_uv_swap_votes_ = 0;
+    gl_uv_swap_probe_budget_ = 24;
+
+    // Force render layout markers to be rebuilt from fresh frames.
+    gl_last_video_w_ = 0;
+    gl_last_video_h_ = 0;
+    gl_last_uv_interleaved_ = false;
+    gl_last_uv_swap_ = false;
+    gl_last_uv_tex_w_ = 0;
 }
 
 void AndroidPlayer::destroyGLProgram() {

@@ -212,6 +212,8 @@ private:
     bool initGLProgram();
     void destroyGLProgram();
     void redrawLastFrame();
+    // Reset render-side stream heuristics/caches on source switch.
+    void resetRenderStateForStreamSwitch();
     bool ensurePBOs(int y_w, int y_h, int uv_w, int uv_h, int uv_bpp = 1);
 
     // -----------------------------------------------------------------------
