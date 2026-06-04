@@ -2072,6 +2072,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                             }
                         }
                         val summaryReopenTriggered = summaryTriggeredReopen || timeoutTriggeredReopen
+                        val unhealthyAfterComplete = playWhenReady && (loading || state == PlayerState.LOADING || !isPlaying)
+                        if (unhealthyAfterComplete) {
+                            Log.w(
+                                TAG,
+                                "evt=seek_completed_unhealthy id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying native_seek_active=$nativeSeekActive source_category=$currentSourceCategory"
+                            )
+                        }
                         logInfo("evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory")
                         logInfo("evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryReopenTriggered play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory")
                         // Seek 完成后若目标语义是继续播放，重新武装 stall 监测，

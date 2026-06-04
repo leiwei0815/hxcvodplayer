@@ -1641,6 +1641,21 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
     int64_t settle_deadline_left_ms = settle_deadline_ms > 0 ? (settle_deadline_ms - settle_now) : -1;
     double settle_target = seek_target_sec_.load(std::memory_order_acquire);
     double settle_from = seek_from_sec_.load(std::memory_order_acquire);
+    double settle_pos_before = player_core_get_position(player_core_);
+    int settle_state_before = player_core_get_state(player_core_);
+    int settle_pwr_before = player_core_get_play_when_ready(player_core_);
+    bool settle_playing_before = player_core_is_playing(player_core_) != 0;
+    double settle_progress_ref_pos = loading_progress_last_pos_.load(std::memory_order_acquire);
+    int64_t settle_progress_last_advance_ms = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
+    int64_t settle_progress_age_ms = settle_progress_last_advance_ms > 0
+                                     ? (settle_now - settle_progress_last_advance_ms)
+                                     : -1;
+    double settle_pos_to_target = (std::isfinite(settle_pos_before) && std::isfinite(settle_target))
+                                  ? std::fabs(settle_pos_before - settle_target)
+                                  : -1.0;
+    double settle_pos_from_progress_ref = (std::isfinite(settle_pos_before) && std::isfinite(settle_progress_ref_pos))
+                                          ? (settle_pos_before - settle_progress_ref_pos)
+                                          : 0.0;
     SYNCI("evt=seek_settle_from_app_entry sid=%" PRIu64 " phase=%s by_timeout=%d target=%.3f from=%.3f gate_lower=%d gate_recovery=%d gate_audio_wait=%d gate_force_resume=%d retry=%d deadline_left_ms=%" PRId64,
           settle_sid,
           seek_phase_name(settle_phase),
@@ -1653,6 +1668,18 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
           settle_gate_force_resume ? 1 : 0,
           settle_retry,
           settle_deadline_left_ms);
+    SYNCI("evt=seek_settle_diag_pre sid=%" PRIu64 " by_timeout=%d pos=%.3f target=%.3f pos_to_target=%.3f state=%d pwr=%d playing=%d progress_ref_pos=%.3f pos_delta_ref=%.3f progress_age_ms=%" PRId64,
+          settle_sid,
+          by_timeout ? 1 : 0,
+          settle_pos_before,
+          settle_target,
+          settle_pos_to_target,
+          settle_state_before,
+          settle_pwr_before,
+          settle_playing_before ? 1 : 0,
+          settle_progress_ref_pos,
+          settle_pos_from_progress_ref,
+          settle_progress_age_ms);
 
     resetSeekFlowState(true, false, true, true);
 
@@ -1715,6 +1742,26 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
           player_core_get_state(player_core_),
           player_core_get_play_when_ready(player_core_),
           player_core_is_playing(player_core_) ? 1 : 0);
+    double settle_pos_after = player_core_get_position(player_core_);
+    int settle_state_after = player_core_get_state(player_core_);
+    int settle_pwr_after = player_core_get_play_when_ready(player_core_);
+    bool settle_playing_after = player_core_is_playing(player_core_) != 0;
+    double settle_pos_delta = (std::isfinite(settle_pos_after) && std::isfinite(settle_pos_before))
+                              ? (settle_pos_after - settle_pos_before)
+                              : 0.0;
+    SYNCI("evt=seek_settle_diag_post sid=%" PRIu64 " by_timeout=%d pos_before=%.3f pos_after=%.3f pos_delta=%.3f target=%.3f state_before=%d state_after=%d pwr_before=%d pwr_after=%d playing_before=%d playing_after=%d",
+          settle_sid,
+          by_timeout ? 1 : 0,
+          settle_pos_before,
+          settle_pos_after,
+          settle_pos_delta,
+          settle_target,
+          settle_state_before,
+          settle_state_after,
+          settle_pwr_before,
+          settle_pwr_after,
+          settle_playing_before ? 1 : 0,
+          settle_playing_after ? 1 : 0);
 }
 
 // ========== OpenGL ES YUV renderer ==========
@@ -3287,6 +3334,7 @@ void AndroidPlayer::renderLoop() {
                     // keep dropping during early window to pursue a closer landing point.
                     bool forward_soft_accept_active = false;
                     double forward_soft_accept_offset_sec = 0.0;
+                    double secure_accept_gate_max_sec_for_diag = std::numeric_limits<double>::quiet_NaN();
                     if (secure_session) {
                         double future_offset_sec = pts - seek_target_now;
                         double secure_accept_future_sec = is_backward_seek
@@ -3302,6 +3350,7 @@ void AndroidPlayer::renderLoop() {
                                     ? secure_accept_future_backward_late_sec_
                                     : secure_accept_future_forward_late_sec_;
                         }
+                        secure_accept_gate_max_sec_for_diag = secure_accept_future_sec;
                         if (is_backward_seek && large_seek_any_direction) {
                             // UX-first backward seek: earlier relaxed accept window
                             // shortens long drop loops on encrypted streams.
@@ -3708,9 +3757,22 @@ void AndroidPlayer::renderLoop() {
                             should_consume = true;
                             seek_verify_hits_.store(0, std::memory_order_release);
                             seek_lower_bound_drop_count_++;
+                            bool accept_verify_conflict =
+                                    std::isfinite(secure_accept_gate_max_sec_for_diag) &&
+                                    verify_offset_sec <= secure_accept_gate_max_sec_for_diag &&
+                                    verify_offset_sec > verify_max_offset_sec;
+                            if (accept_verify_conflict) {
+                                SYNCW_RATE(20,
+                                           "evt=seek_verify_accept_conflict pts=%.3f target=%.3f offset=%.3f accept_max=%.3f verify_max=%.3f elapsed_ms=%" PRId64 " backward=%d drop_count=%d",
+                                           pts, seek_target_now, verify_offset_sec,
+                                           secure_accept_gate_max_sec_for_diag, verify_max_offset_sec,
+                                           seek_elapsed_ms, is_backward_seek ? 1 : 0, seek_lower_bound_drop_count_);
+                            }
                             SYNCW_RATE(20,
-                                       "evt=seek_verify_drop pts=%.3f target=%.3f offset=%.3f verify_max=%.3f elapsed_ms=%" PRId64 " drop_count=%d",
+                                       "evt=seek_verify_drop pts=%.3f target=%.3f offset=%.3f verify_max=%.3f accept_max=%.3f conflict=%d elapsed_ms=%" PRId64 " drop_count=%d",
                                        pts, seek_target_now, verify_offset_sec, verify_max_offset_sec,
+                                       secure_accept_gate_max_sec_for_diag,
+                                       accept_verify_conflict ? 1 : 0,
                                        seek_elapsed_ms, seek_lower_bound_drop_count_);
                         } else {
                             int verify_hits = seek_verify_hits_.fetch_add(1, std::memory_order_acq_rel) + 1;
