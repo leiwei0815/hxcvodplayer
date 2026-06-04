@@ -4943,14 +4943,17 @@ void AndroidPlayer::renderLoop() {
                         seek_lower_bound_active_.load(std::memory_order_acquire) ||
                         seek_recovery_active_.load(std::memory_order_acquire) ||
                         seek_audio_wait_video_.load(std::memory_order_acquire);
-                bool near_end = std::isfinite(remain_now) && remain_now >= -0.2 && remain_now <= 1.2;
+                // Secure/HLS tail can legitimately land a little beyond duration due to keyframe-ahead settle.
+                // Treat small negative remain as near-end, otherwise force-complete watchdog never triggers.
+                bool near_end = std::isfinite(remain_now) && remain_now >= -3.0 && remain_now <= 1.2;
                 if ((now_empty - tail_stall_diag_last_log_ms) >= kTailStallDiagIntervalMs) {
                     tail_stall_diag_last_log_ms = now_empty;
-                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f pwr=%d seek_flow=%d loading=%d state=%d",
+                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d",
                           empty_ms,
                           pos_now,
                           dur_now,
                           remain_now,
+                          near_end ? 1 : 0,
                           play_when_ready_now ? 1 : 0,
                           seek_flow_active ? 1 : 0,
                           is_loading_.load(std::memory_order_acquire) ? 1 : 0,
