@@ -1540,6 +1540,32 @@ bool AndroidPlayer::consumePlaybackCompleted() {
 void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
     if (!player_core_) return;
 
+    uint64_t settle_sid = seek_session_active_id_.load(std::memory_order_acquire);
+    int settle_phase = seek_phase_.load(std::memory_order_acquire);
+    bool settle_gate_lower = seek_lower_bound_active_.load(std::memory_order_acquire);
+    bool settle_gate_recovery = seek_recovery_active_.load(std::memory_order_acquire);
+    bool settle_gate_audio_wait = seek_audio_wait_video_.load(std::memory_order_acquire);
+    bool settle_gate_force_resume = seek_force_resume_pending_.load(std::memory_order_acquire);
+    int settle_retry = seek_force_resume_retry_count_.load(std::memory_order_acquire);
+    int64_t settle_deadline_ms = seek_force_resume_deadline_ms_.load(std::memory_order_acquire);
+    int64_t settle_now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t settle_deadline_left_ms = settle_deadline_ms > 0 ? (settle_deadline_ms - settle_now) : -1;
+    double settle_target = seek_target_sec_.load(std::memory_order_acquire);
+    double settle_from = seek_from_sec_.load(std::memory_order_acquire);
+    SYNCI("evt=seek_settle_from_app_entry sid=%" PRIu64 " phase=%s by_timeout=%d target=%.3f from=%.3f gate_lower=%d gate_recovery=%d gate_audio_wait=%d gate_force_resume=%d retry=%d deadline_left_ms=%" PRId64,
+          settle_sid,
+          seek_phase_name(settle_phase),
+          by_timeout ? 1 : 0,
+          settle_target,
+          settle_from,
+          settle_gate_lower ? 1 : 0,
+          settle_gate_recovery ? 1 : 0,
+          settle_gate_audio_wait ? 1 : 0,
+          settle_gate_force_resume ? 1 : 0,
+          settle_retry,
+          settle_deadline_left_ms);
+
     resetSeekFlowState(true, false, true, true);
 
     bool manual_pause_blocked = false;
@@ -1556,12 +1582,14 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
     }
     seek_started_while_paused_.store(false, std::memory_order_release);
 
-    SYNCI("evt=seek_session_settled_by_app by_timeout=%d paused_origin=%d manual_pause_blocked=%d pos=%.3f state=%d",
+    SYNCI("evt=seek_session_settled_by_app by_timeout=%d paused_origin=%d manual_pause_blocked=%d pos=%.3f state=%d pwr=%d playing=%d",
           by_timeout ? 1 : 0,
           paused_origin ? 1 : 0,
           manual_pause_blocked ? 1 : 0,
           player_core_get_position(player_core_),
-          player_core_get_state(player_core_));
+          player_core_get_state(player_core_),
+          player_core_get_play_when_ready(player_core_),
+          player_core_is_playing(player_core_) ? 1 : 0);
 }
 
 // ========== OpenGL ES YUV renderer ==========
@@ -2300,6 +2328,17 @@ void AndroidPlayer::renderLoop() {
             int64_t deadline_ms = seek_force_resume_deadline_ms_.load(std::memory_order_acquire);
             int64_t next_try_ms = seek_force_resume_next_try_ms_.load(std::memory_order_acquire);
             if (deadline_ms <= 0 || now_ts >= deadline_ms) {
+                uint64_t sid_before_expire = seek_session_active_id_.load(std::memory_order_acquire);
+                int phase_before_expire = seek_phase_.load(std::memory_order_acquire);
+                int retry_before_expire = seek_force_resume_retry_count_.load(std::memory_order_acquire);
+                int pwr_before_expire = player_core_ ? player_core_get_play_when_ready(player_core_) : 0;
+                int state_before_expire = player_core_ ? player_core_get_state(player_core_) : 0;
+                double pos_before_expire = player_core_ ? player_core_get_position(player_core_) : -1.0;
+                double target_before_expire = seek_target_sec_.load(std::memory_order_acquire);
+                double from_before_expire = seek_from_sec_.load(std::memory_order_acquire);
+                bool gate_lower = seek_lower_bound_active_.load(std::memory_order_acquire);
+                bool gate_recovery = seek_recovery_active_.load(std::memory_order_acquire);
+                bool gate_audio_wait = seek_audio_wait_video_.load(std::memory_order_acquire);
                 seek_force_resume_pending_.store(false, std::memory_order_release);
                 seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
                 seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
@@ -2307,7 +2346,18 @@ void AndroidPlayer::renderLoop() {
                 seek_force_resume_nudged_.store(false, std::memory_order_release);
                 setSeekPhase(SEEK_PHASE_IDLE, "seek_force_resume_expired");
                 seek_session_active_id_.store(0, std::memory_order_release);
-                SYNCW("evt=seek_force_resume_expired");
+                SYNCW("evt=seek_force_resume_expired sid=%" PRIu64 " phase=%s retry=%d pwr=%d state=%d pos=%.3f target=%.3f from=%.3f gate_lower=%d gate_recovery=%d gate_audio_wait=%d",
+                      sid_before_expire,
+                      seek_phase_name(phase_before_expire),
+                      retry_before_expire,
+                      pwr_before_expire,
+                      state_before_expire,
+                      pos_before_expire,
+                      target_before_expire,
+                      from_before_expire,
+                      gate_lower ? 1 : 0,
+                      gate_recovery ? 1 : 0,
+                      gate_audio_wait ? 1 : 0);
                 return;
             }
             if (now_ts < next_try_ms || !player_core_ ||

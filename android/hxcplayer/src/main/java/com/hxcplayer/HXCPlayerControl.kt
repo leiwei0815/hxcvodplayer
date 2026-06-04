@@ -429,6 +429,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var pendingSeekPostConfirmTimedOut: Boolean = false
     private var pendingSeekTriggeredReopen: Boolean = false
     private var lastSeekPostConfirmReopenAtMs: Long = 0L
+    private var pendingSeekLastWatchdogLogAtMs: Long = 0L
     private var playStallCheckArmed = false
     private var playStallArmedAtMs: Long = 0L
     private var playStallBasePosSec: Double = Double.NaN
@@ -1502,6 +1503,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekHadPostConfirm = false
         pendingSeekPostConfirmTimedOut = false
         pendingSeekTriggeredReopen = false
+        pendingSeekLastWatchdogLogAtMs = 0L
         loadingSessionLikelySeek = true
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
@@ -1815,6 +1817,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                     val nativeConvergedButStuck = nativeSeekActive
                             && seekElapsedMs >= seekCompletionNativeConvergedWatchdogMs
                             && convergedStable
+                    if (seekElapsedMs >= 2400L && (now - pendingSeekLastWatchdogLogAtMs) >= 1200L) {
+                        pendingSeekLastWatchdogLogAtMs = now
+                        Log.w(
+                            TAG,
+                            "evt=seek_pending_watchdog id=$pendingSeekRequestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs loading=$loading loading_observed=$pendingSeekLoadingObserved loading_recovered=$loadingRecovered play_when_ready=$playWhenReady state=${state.name} native_seek_active=$nativeSeekActive converged_now=$convergedNow converged_stable=$convergedStable native_converged_stuck=$nativeConvergedButStuck post_confirm_active=$pendingSeekPostConfirmActive"
+                        )
+                    }
                     // Prefer native seek settle as source of truth, but bound wait time
                     // when native session remains active despite already converged position.
                     val nativeSeekSettled = !nativeSeekActive || nativeConvergedButStuck
@@ -1899,13 +1908,28 @@ class HXCPlayerControl @JvmOverloads constructor(
                         pendingSeekHadPostConfirm = false
                         pendingSeekPostConfirmTimedOut = false
                         pendingSeekTriggeredReopen = false
+                        pendingSeekLastWatchdogLogAtMs = 0L
                         metricsSeekCompletedCount += 1L
-                        // 关键语义：即便 elapsed 已到 timeout，只要位置已稳定收敛，就按“正常完成”处理，
-                        // 避免上层把它当 seek 失败路径继续触发补偿 seek，形成假性连锁 seek。
+                        // 关键语义：
+                        // 1) 位置未收敛时，hard-timeout / native-watchdog 仍按超时完成；
+                        // 2) 位置已收敛但仍长期 loading（典型：状态卡在 LOADING 且不再前进）也要按超时完成，
+                        //    以便上层进入统一恢复链路，避免“seek_summary 显示完成但界面持续 loading”。
+                        val timeoutDueToLoadingStuck = hardTimeout &&
+                                !loadingRecovered &&
+                                loading &&
+                                playWhenReady &&
+                                state == PlayerState.LOADING
                         val completeByTimeout = forceTimeoutByNoProgress
+                                || timeoutDueToLoadingStuck
                                 || ((hardTimeout || nativeConvergedButStuck) && !convergedStable)
                         if (completeByTimeout) {
                             metricsSeekCompletedTimeoutCount += 1L
+                        }
+                        if (timeoutDueToLoadingStuck) {
+                            Log.w(
+                                TAG,
+                                "evt=seek_complete_timeout_loading_stuck target=$target pos=$position elapsed_ms=$seekElapsedMs hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck loading=$loading state=${state.name}"
+                            )
                         }
                         nativeSettleSeekSession(handle, completeByTimeout)
                         Log.i(
@@ -1914,7 +1938,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                         )
                         Log.i(
                             TAG,
-                            "evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryTriggeredReopen play_when_ready=$playWhenReady state=${state.name}"
+                            "evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryTriggeredReopen play_when_ready=$playWhenReady state=${state.name}"
                         )
                         // Seek 完成后若目标语义是继续播放，重新武装 stall 监测，
                         // 防止“状态=PLAYING 但位置不再推进”长期卡住。
@@ -2065,6 +2089,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             pendingSeekHadPostConfirm = false
             pendingSeekPostConfirmTimedOut = false
             pendingSeekTriggeredReopen = false
+            pendingSeekLastWatchdogLogAtMs = 0L
             loadingSessionLikelySeek = true
             Log.i(
                 TAG,
@@ -2170,6 +2195,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekHadPostConfirm = false
         pendingSeekPostConfirmTimedOut = false
         pendingSeekTriggeredReopen = false
+        pendingSeekLastWatchdogLogAtMs = 0L
         loadingSessionLikelySeek = true
 
         Log.w(
@@ -2329,6 +2355,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekPostConfirmTimedOut = false
         pendingSeekTriggeredReopen = false
         lastSeekPostConfirmReopenAtMs = 0L
+        pendingSeekLastWatchdogLogAtMs = 0L
         playStallCheckArmed = false
         playStallArmedAtMs = 0L
         playStallBasePosSec = Double.NaN
