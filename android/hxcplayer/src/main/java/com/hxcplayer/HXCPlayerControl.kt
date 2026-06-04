@@ -1974,8 +1974,34 @@ class HXCPlayerControl @JvmOverloads constructor(
                             )
                         }
                         nativeSettleSeekSession(handle, completeByTimeout)
+                        var timeoutTriggeredReopen = false
+                        val secureSource = currentSourceCategory.startsWith("secure_")
+                        if (timeoutDueToLoadingStuck && playWhenReady && secureSource) {
+                            val sinceLastReopenMs = if (lastSeekPostConfirmReopenAtMs > 0L) {
+                                now - lastSeekPostConfirmReopenAtMs
+                            } else {
+                                Long.MAX_VALUE
+                            }
+                            if (sinceLastReopenMs >= seekPostConfirmReopenCooldownMs) {
+                                val reopenStart = maxOf(0.0, target - seekPostConfirmReopenBackoffSec)
+                                lastSeekPostConfirmReopenAtMs = now
+                                timeoutTriggeredReopen = true
+                                metricsPlayStallRecoverReopenCount += 1L
+                                Log.w(
+                                    TAG,
+                                    "evt=seek_timeout_loading_stuck_reopen target=$target reopen_start=$reopenStart elapsed_ms=$seekElapsedMs source_category=$currentSourceCategory"
+                                )
+                                openExecutor.execute {
+                                    if (isReleased) return@execute
+                                    replayFrom(reopenStart)
+                                }
+                            } else {
+                                logInfo("evt=seek_timeout_loading_stuck_reopen_skip reason=cooldown since_last_ms=$sinceLastReopenMs cooldown_ms=$seekPostConfirmReopenCooldownMs source_category=$currentSourceCategory")
+                            }
+                        }
+                        val summaryReopenTriggered = summaryTriggeredReopen || timeoutTriggeredReopen
                         logInfo("evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory")
-                        logInfo("evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryTriggeredReopen play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory")
+                        logInfo("evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryReopenTriggered play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory")
                         // Seek 完成后若目标语义是继续播放，重新武装 stall 监测，
                         // 防止“状态=PLAYING 但位置不再推进”长期卡住。
                         if (playWhenReady) {

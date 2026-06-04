@@ -341,6 +341,8 @@ private:
     std::atomic<double> secure_forward_seek_bias_sec_{0.0};
     std::atomic<int>    secure_forward_seek_bias_hits_{0};
     std::atomic<int64_t> secure_forward_seek_bias_last_update_ms_{0};
+    std::atomic<int>    secure_seek_stall_streak_{0};
+    std::atomic<int64_t> secure_seek_stall_last_ms_{0};
     // Externalized secure-seek tuning knobs (runtime adjustable via JNI).
     double              secure_drop_only_window_backward_sec_{5.0};
     double              secure_drop_only_window_forward_sec_{8.0};
