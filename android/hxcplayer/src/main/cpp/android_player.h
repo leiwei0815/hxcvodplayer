@@ -326,6 +326,9 @@ private:
     std::atomic<int>    seek_soft_rebuild_budget_left_{1};
     // Secure HLS / encrypted session: seek sync uses keyframe-ahead landing strategy.
     std::atomic<bool>   secure_session_active_{false};
+    // Source profile for seek-policy split.
+    std::atomic<bool>   source_local_active_{false};
+    std::atomic<bool>   source_encrypted_active_{false};
     // Seek recovery diagnostics and adaptive lower-bound relaxation.
     int64_t             seek_started_at_ms_{0};
     int                 seek_lower_bound_drop_count_{0};
@@ -382,6 +385,11 @@ private:
     // Ignore stale "loading=false" callbacks briefly during pre-stop/open switch.
     std::atomic<bool> suppress_transient_loading_false_{false};
     std::atomic<int64_t> suppress_transient_loading_false_until_ms_{0};
+    // After seek/app-settle, some devices keep stale loading=true while position keeps progressing.
+    // This window allows native isLoading() to mask that stale true until next real loading edge.
+    std::atomic<int64_t> suppress_stale_loading_true_until_ms_{0};
+    std::atomic<double> loading_progress_last_pos_{-1.0};
+    std::atomic<int64_t> loading_progress_last_advance_ms_{0};
     static void loadingStateCallback(bool is_loading, void* user_data);
 
     std::mutex        error_mutex_;

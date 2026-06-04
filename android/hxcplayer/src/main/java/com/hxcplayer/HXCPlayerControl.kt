@@ -468,6 +468,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastOpenUrl: String? = null
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
+    private var currentSourceCategory: String = "unknown"
     @Volatile private var decodeMode: DecodeMode = DecodeMode.HARDWARE
     private val secureHlsAuthUrl = "https://console-api.huaxiacloud.net/third_party/verify/sign"
 
@@ -733,6 +734,15 @@ class HXCPlayerControl @JvmOverloads constructor(
             lastOpenUrl = workingModel.url
             lastOpenStartPosition = maxOf(0.0, startPosition)
             lastOpenPlayModel = clonePlayModel(workingModel)
+            currentSourceCategory = resolveSourceCategory(
+                url = workingModel.url,
+                mode = workingModel.mode,
+                encryptedFile = workingModel.encryptedFile
+            )
+            Log.i(
+                TAG,
+                "evt=open_source_classify category=$currentSourceCategory mode=${workingModel.mode} encrypted=${workingModel.encryptedFile} start_pos=$lastOpenStartPosition"
+            )
             // New open session should not inherit previous seek-loading heuristics.
             loadingSessionLikelySeek = false
             loadingCandidateState = null
@@ -833,6 +843,22 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     private fun normalizeLocalPath(path: String): String {
         return if (path.startsWith("file://")) path.removePrefix("file://") else path
+    }
+
+    private fun resolveSourceCategory(url: String, mode: PlayerDataSourceMode, encryptedFile: Boolean): String {
+        val normalized = url.trim().lowercase()
+        val isLocal = looksLikeLocalPath(url)
+        val isM3u8 = normalized.contains(".m3u8")
+        return when {
+            mode == PlayerDataSourceMode.SECURE_HLS -> "secure_hls"
+            mode == PlayerDataSourceMode.CUSTOM_FILE -> "local_file_custom"
+            isLocal && isM3u8 && encryptedFile -> "local_hls_encrypted"
+            isLocal && isM3u8 -> "local_hls_plain"
+            isLocal && encryptedFile -> "local_file_encrypted"
+            isLocal -> "local_file_plain"
+            encryptedFile -> "remote_encrypted"
+            else -> "remote_plain"
+        }
     }
 
     fun setDecodeMode(mode: DecodeMode) {
@@ -1219,6 +1245,15 @@ class HXCPlayerControl @JvmOverloads constructor(
             lastOpenUrl = url
             lastOpenStartPosition = startPosition
             lastOpenPlayModel = null
+            currentSourceCategory = resolveSourceCategory(
+                url = url,
+                mode = PlayerDataSourceMode.DEFAULT,
+                encryptedFile = false
+            )
+            Log.i(
+                TAG,
+                "evt=open_source_classify category=$currentSourceCategory mode=${PlayerDataSourceMode.DEFAULT} encrypted=false start_pos=$startPosition"
+            )
             // New open session should not inherit previous seek-loading heuristics.
             loadingSessionLikelySeek = false
             loadingCandidateState = null
@@ -1266,6 +1301,15 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastOpenUrl = url
         lastOpenStartPosition = startPosition
         lastOpenPlayModel = null
+        currentSourceCategory = resolveSourceCategory(
+            url = url,
+            mode = PlayerDataSourceMode.DEFAULT,
+            encryptedFile = false
+        )
+        Log.i(
+            TAG,
+            "evt=open_source_classify category=$currentSourceCategory mode=${PlayerDataSourceMode.DEFAULT} encrypted=false start_pos=$startPosition"
+        )
         // New open session should not inherit previous seek-loading heuristics.
         loadingSessionLikelySeek = false
         loadingCandidateState = null
@@ -1821,7 +1865,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                         pendingSeekLastWatchdogLogAtMs = now
                         Log.w(
                             TAG,
-                            "evt=seek_pending_watchdog id=$pendingSeekRequestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs loading=$loading loading_observed=$pendingSeekLoadingObserved loading_recovered=$loadingRecovered play_when_ready=$playWhenReady state=${state.name} native_seek_active=$nativeSeekActive converged_now=$convergedNow converged_stable=$convergedStable native_converged_stuck=$nativeConvergedButStuck post_confirm_active=$pendingSeekPostConfirmActive"
+                            "evt=seek_pending_watchdog id=$pendingSeekRequestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs loading=$loading loading_observed=$pendingSeekLoadingObserved loading_recovered=$loadingRecovered play_when_ready=$playWhenReady state=${state.name} native_seek_active=$nativeSeekActive converged_now=$convergedNow converged_stable=$convergedStable native_converged_stuck=$nativeConvergedButStuck post_confirm_active=$pendingSeekPostConfirmActive source_category=$currentSourceCategory"
                         )
                     }
                     // Prefer native seek settle as source of truth, but bound wait time
@@ -1928,17 +1972,17 @@ class HXCPlayerControl @JvmOverloads constructor(
                         if (timeoutDueToLoadingStuck) {
                             Log.w(
                                 TAG,
-                                "evt=seek_complete_timeout_loading_stuck target=$target pos=$position elapsed_ms=$seekElapsedMs hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck loading=$loading state=${state.name}"
+                                "evt=seek_complete_timeout_loading_stuck target=$target pos=$position elapsed_ms=$seekElapsedMs hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck loading=$loading state=${state.name} source_category=$currentSourceCategory"
                             )
                         }
                         nativeSettleSeekSession(handle, completeByTimeout)
                         Log.i(
                             TAG,
-                            "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck"
+                            "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory"
                         )
                         Log.i(
                             TAG,
-                            "evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryTriggeredReopen play_when_ready=$playWhenReady state=${state.name}"
+                            "evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryTriggeredReopen play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory"
                         )
                         // Seek 完成后若目标语义是继续播放，重新武装 stall 监测，
                         // 防止“状态=PLAYING 但位置不再推进”长期卡住。
