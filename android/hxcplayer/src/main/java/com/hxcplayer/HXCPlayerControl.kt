@@ -430,6 +430,12 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var pendingSeekTriggeredReopen: Boolean = false
     private var lastSeekPostConfirmReopenAtMs: Long = 0L
     private var pendingSeekLastWatchdogLogAtMs: Long = 0L
+    private var reopenUiAnchorActive: Boolean = false
+    private var reopenUiAnchorPosSec: Double = Double.NaN
+    private var reopenUiAnchorUntilMs: Long = 0L
+    private val reopenUiAnchorMaxHoldMs = 2600L
+    private val reopenUiAnchorZeroGuardSec = 1.2
+    private val reopenUiAnchorReleaseNearSec = 1.5
     private var playStallCheckArmed = false
     private var playStallArmedAtMs: Long = 0L
     private var playStallBasePosSec: Double = Double.NaN
@@ -596,7 +602,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (handle == 0L || isReleased) return
         val loading = isLoading()
         val state = coerceStateWithLoading(getState(), loading)
-        val position = getPosition()
+        val position = applyUiPositionAnchorIfNeeded(
+            rawPositionSec = getPosition(),
+            loading = loading,
+            state = state,
+            nowMs = SystemClock.elapsedRealtime()
+        )
         val duration = getDuration()
         val now = SystemClock.elapsedRealtime()
         lastPlayerState = state
@@ -618,6 +629,60 @@ class HXCPlayerControl @JvmOverloads constructor(
         openLoadingHideProtectUntilMs = now + openLoadingHideMinDelayMs
         openLoadingHideHardDeadlineMs = now + openLoadingHideHardMaxDelayMs
         openLoadingGuardStartPosSec = getPosition()
+    }
+
+    private fun armReopenUiAnchorIfNeeded(startPositionSec: Double) {
+        if (!startPositionSec.isFinite() || startPositionSec <= reopenUiAnchorZeroGuardSec) {
+            reopenUiAnchorActive = false
+            reopenUiAnchorPosSec = Double.NaN
+            reopenUiAnchorUntilMs = 0L
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        reopenUiAnchorActive = true
+        reopenUiAnchorPosSec = startPositionSec
+        reopenUiAnchorUntilMs = now + reopenUiAnchorMaxHoldMs
+        logInfo("evt=reopen_ui_anchor_arm start=$startPositionSec hold_ms=$reopenUiAnchorMaxHoldMs")
+    }
+
+    private fun releaseReopenUiAnchor(reason: String) {
+        if (!reopenUiAnchorActive) return
+        reopenUiAnchorActive = false
+        reopenUiAnchorPosSec = Double.NaN
+        reopenUiAnchorUntilMs = 0L
+        logInfo("evt=reopen_ui_anchor_release reason=$reason")
+    }
+
+    private fun applyUiPositionAnchorIfNeeded(
+        rawPositionSec: Double,
+        loading: Boolean,
+        state: PlayerState,
+        nowMs: Long
+    ): Double {
+        if (!reopenUiAnchorActive) return rawPositionSec
+        val anchor = reopenUiAnchorPosSec
+        if (!anchor.isFinite()) {
+            releaseReopenUiAnchor("anchor_nan")
+            return rawPositionSec
+        }
+        if (nowMs >= reopenUiAnchorUntilMs) {
+            releaseReopenUiAnchor("timeout")
+            return rawPositionSec
+        }
+        if (!rawPositionSec.isFinite()) {
+            return anchor
+        }
+        val recovering = loading || state == PlayerState.OPENING || state == PlayerState.LOADING
+        if (abs(rawPositionSec - anchor) <= reopenUiAnchorReleaseNearSec || rawPositionSec > anchor) {
+            releaseReopenUiAnchor("near_anchor")
+            return rawPositionSec
+        }
+        if (recovering && rawPositionSec <= reopenUiAnchorZeroGuardSec) {
+            // Reopen path can transiently report near-zero position before secure open applies start pos.
+            // Keep UI position anchored to avoid "jump to 0 then back to target".
+            return anchor
+        }
+        return rawPositionSec
     }
 
     // ========== iOS 对齐属性（property 风格 setter/getter）==========
@@ -689,6 +754,7 @@ class HXCPlayerControl @JvmOverloads constructor(
      */
     fun replayFrom(startPositionSec: Double) {
         val safeStart = maxOf(0.0, startPositionSec)
+        armReopenUiAnchorIfNeeded(safeStart)
         val replayModel = lastOpenPlayModel
         val replayUrl = lastOpenUrl
         when {
@@ -935,23 +1001,23 @@ class HXCPlayerControl @JvmOverloads constructor(
                 audioWaitDeadlineLargeMs = 5600
             }
             SecureSeekPreset.PRECISION_STABLE_BACKWARD -> SecureSeekTuningConfig.defaultConfig().apply {
-                // 稳定优先的 backward 精准档：
-                // 1) backward 接受窗口更严格，减少“命中过早”
-                // 2) deadline 适度拉长，降低 seek 超时兜底触发概率
+                // 平衡档（偏速度）：
+                // 1) 仍保持 backward 稳定性，但适度放宽接受窗口
+                // 2) 缩短 deadline，降低长 loading 时长
                 dropOnlyWindowBackwardSec = 4.5
                 dropOnlyWindowForwardSec = 8.0
-                acceptFutureBackwardEarlySec = 2.0
-                acceptFutureForwardEarlySec = 4.0
-                acceptFutureBackwardMidSec = 5.0
-                acceptFutureForwardMidSec = 8.0
-                acceptFutureBackwardLateSec = 8.0
-                acceptFutureForwardLateSec = 14.0
-                lowerBoundDeadlineNormalMs = 3200
-                lowerBoundDeadlineLargeMs = 3800
-                recoveryDeadlineNormalMs = 6200
-                recoveryDeadlineLargeMs = 7600
-                audioWaitDeadlineNormalMs = 5200
-                audioWaitDeadlineLargeMs = 6800
+                acceptFutureBackwardEarlySec = 2.8
+                acceptFutureForwardEarlySec = 5.0
+                acceptFutureBackwardMidSec = 6.5
+                acceptFutureForwardMidSec = 10.0
+                acceptFutureBackwardLateSec = 9.5
+                acceptFutureForwardLateSec = 15.5
+                lowerBoundDeadlineNormalMs = 2600
+                lowerBoundDeadlineLargeMs = 3200
+                recoveryDeadlineNormalMs = 4800
+                recoveryDeadlineLargeMs = 6200
+                audioWaitDeadlineNormalMs = 3800
+                audioWaitDeadlineLargeMs = 5200
             }
             SecureSeekPreset.SPEED_FIRST -> SecureSeekTuningConfig.defaultConfig().apply {
                 // 更快恢复：放宽前滚/接收窗口并缩短超时等待
@@ -1041,7 +1107,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 return@postDelayed
             }
             val ok = if (retryModel != null) {
-                openWithPlayModel(retryModel)
+                openWithPlayModel(retryModel, retryStart)
             } else {
                 openURL(retryUrl!!, retryStart)
             }
@@ -1727,7 +1793,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     return@scheduleAtFixedRate
                 }
 
-                val position = getPosition()
+                val rawPosition = getPosition()
                 val duration = getDuration()
                 val coreStateRaw = nativeGetState(handle)
                 val pipelineStateRaw = nativeGetPipelineState(handle)
@@ -1737,6 +1803,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val state = coerceStateWithLoading(
                     resolveUnifiedState(coreStateRaw, pipelineStateRaw, playWhenReady, isPlaying),
                     loading
+                )
+                val now = SystemClock.elapsedRealtime()
+                val position = applyUiPositionAnchorIfNeeded(
+                    rawPositionSec = rawPosition,
+                    loading = loading,
+                    state = state,
+                    nowMs = now
                 )
 
                 if (lastPlayerState != state) {
@@ -1749,11 +1822,10 @@ class HXCPlayerControl @JvmOverloads constructor(
                     callback?.onPlayerPositionUpdated(position, duration)
                 }
 
-                val now = SystemClock.elapsedRealtime()
                 maybeRecoverPlayStall(
                     handle = handle,
                     nowMs = now,
-                    positionSec = position,
+                    positionSec = rawPosition,
                     durationSec = duration,
                     loading = loading,
                     state = state,
@@ -1762,7 +1834,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 )
                 maybeRecoverManualPlayHardStall(
                     nowMs = now,
-                    positionSec = position,
+                    positionSec = rawPosition,
                     durationSec = duration,
                     loading = loading,
                     state = state,
@@ -1772,14 +1844,14 @@ class HXCPlayerControl @JvmOverloads constructor(
                 maybeRecoverPlaybackLoop(
                     handle = handle,
                     nowMs = now,
-                    positionSec = position,
+                    positionSec = rawPosition,
                     durationSec = duration,
                     loading = loading,
                     state = state,
                     isPlayingNow = isPlaying,
                     playWhenReady = playWhenReady
                 )
-                maybeLogPlaybackMetrics(now, position, state, loading)
+                maybeLogPlaybackMetrics(now, rawPosition, state, loading)
                 if (loadingCandidateState == null || loadingCandidateState != loading) {
                     if (loading) {
                         val likelySeekByJump = !lastPositionForLoadingHeuristicSec.isNaN() &&
@@ -2399,6 +2471,9 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekTriggeredReopen = false
         lastSeekPostConfirmReopenAtMs = 0L
         pendingSeekLastWatchdogLogAtMs = 0L
+        reopenUiAnchorActive = false
+        reopenUiAnchorPosSec = Double.NaN
+        reopenUiAnchorUntilMs = 0L
         playStallCheckArmed = false
         playStallArmedAtMs = 0L
         playStallBasePosSec = Double.NaN

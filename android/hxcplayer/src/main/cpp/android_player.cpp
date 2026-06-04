@@ -1199,31 +1199,45 @@ void AndroidPlayer::seekTo(double position) {
     seek_lower_bound_drop_count_ = 0;
     secure_seek_precise_reseek_count_.store(0, std::memory_order_release);
     secure_seek_precise_reseek_cooldown_until_ms_ = 0;
-    seek_failover_budget_left_.store(local_source ? 1 : 2, std::memory_order_release);
+    int failover_budget = local_source ? 1 : 2;
+    if (encrypted_source) {
+        // Encrypted seek: prefer quick settle/recover over long repeated retries.
+        failover_budget = 1;
+    }
+    seek_failover_budget_left_.store(failover_budget, std::memory_order_release);
     seek_soft_rebuild_budget_left_.store(1, std::memory_order_release);
     seek_catchup_deadline_ms_ = now + (very_large_seek ? 1200 : 900);
     seek_lower_bound_active_.store(true, std::memory_order_release);
-    // Avoid long black/frozen waits after large forward seeks on 4K.
-    seek_lower_bound_deadline_ms_ = now + (secure_session
-                                            ? (very_large_seek ? secure_lower_bound_deadline_large_ms_
-                                                               : secure_lower_bound_deadline_normal_ms_)
-                                            : (local_source
-                                                ? (very_large_seek ? 1400 : 1100)
-                                                : (very_large_seek ? 1700 : 2200)));
+    int64_t lower_deadline_ms = (secure_session
+                                 ? (very_large_seek ? secure_lower_bound_deadline_large_ms_
+                                                    : secure_lower_bound_deadline_normal_ms_)
+                                 : (local_source
+                                    ? (very_large_seek ? 1400 : 1100)
+                                    : (very_large_seek ? 1700 : 2200)));
+    int64_t recovery_deadline_ms = (secure_session
+                                    ? (very_large_seek ? secure_recovery_deadline_large_ms_
+                                                       : secure_recovery_deadline_normal_ms_)
+                                    : (local_source
+                                       ? (very_large_seek ? 3200 : 2400)
+                                       : (very_large_seek ? 3600 : 4200)));
+    int64_t audio_wait_deadline_ms = (secure_session
+                                      ? (very_large_seek ? secure_audio_wait_deadline_large_ms_
+                                                         : secure_audio_wait_deadline_normal_ms_)
+                                      : (local_source
+                                         ? (very_large_seek ? 2600 : 1900)
+                                         : (very_large_seek ? 3400 : 3800)));
+    // Key point for encrypted large forward seek:
+    // cap converge deadlines to avoid long loading loops before failover.
+    if (secure_session && (position > seek_from + 0.5) && very_large_seek) {
+        lower_deadline_ms = std::min<int64_t>(lower_deadline_ms, 2600);
+        recovery_deadline_ms = std::min<int64_t>(recovery_deadline_ms, 4600);
+        audio_wait_deadline_ms = std::min<int64_t>(audio_wait_deadline_ms, 3600);
+    }
+    seek_lower_bound_deadline_ms_ = now + lower_deadline_ms;
     seek_recovery_active_.store(true, std::memory_order_release);
-    seek_recovery_deadline_ms_ = now + (secure_session
-                                        ? (very_large_seek ? secure_recovery_deadline_large_ms_
-                                                           : secure_recovery_deadline_normal_ms_)
-                                        : (local_source
-                                            ? (very_large_seek ? 3200 : 2400)
-                                            : (very_large_seek ? 3600 : 4200)));
+    seek_recovery_deadline_ms_ = now + recovery_deadline_ms;
     seek_audio_wait_video_.store(true, std::memory_order_release);
-    seek_audio_wait_deadline_ms_ = now + (secure_session
-                                          ? (very_large_seek ? secure_audio_wait_deadline_large_ms_
-                                                             : secure_audio_wait_deadline_normal_ms_)
-                                          : (local_source
-                                            ? (very_large_seek ? 2600 : 1900)
-                                            : (very_large_seek ? 3400 : 3800)));
+    seek_audio_wait_deadline_ms_ = now + audio_wait_deadline_ms;
     seek_resume_stable_hits_.store(0, std::memory_order_release);
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
@@ -1423,20 +1437,20 @@ void AndroidPlayer::resetSecureSeekTuning() {
     secure_drop_only_window_large_seek_bonus_sec_ = 2.0;
     secure_drop_only_window_elapsed_bonus_sec_ = 1.5;
     secure_drop_only_window_elapsed_threshold_ms_ = 1800;
-    secure_accept_future_backward_early_sec_ = 2.5;
-    secure_accept_future_forward_early_sec_ = 4.0;
-    secure_accept_future_backward_mid_sec_ = 6.0;
-    secure_accept_future_forward_mid_sec_ = 8.0;
-    secure_accept_future_backward_late_sec_ = 10.0;
-    secure_accept_future_forward_late_sec_ = 14.0;
+    secure_accept_future_backward_early_sec_ = 3.0;
+    secure_accept_future_forward_early_sec_ = 5.0;
+    secure_accept_future_backward_mid_sec_ = 7.0;
+    secure_accept_future_forward_mid_sec_ = 10.0;
+    secure_accept_future_backward_late_sec_ = 11.0;
+    secure_accept_future_forward_late_sec_ = 16.0;
     secure_accept_mid_elapsed_ms_ = 2600;
     secure_accept_late_elapsed_ms_ = 4200;
-    secure_lower_bound_deadline_normal_ms_ = 2700;
-    secure_lower_bound_deadline_large_ms_ = 3200;
-    secure_recovery_deadline_normal_ms_ = 5200;
-    secure_recovery_deadline_large_ms_ = 6400;
-    secure_audio_wait_deadline_normal_ms_ = 4400;
-    secure_audio_wait_deadline_large_ms_ = 5600;
+    secure_lower_bound_deadline_normal_ms_ = 2400;
+    secure_lower_bound_deadline_large_ms_ = 2900;
+    secure_recovery_deadline_normal_ms_ = 4600;
+    secure_recovery_deadline_large_ms_ = 5800;
+    secure_audio_wait_deadline_normal_ms_ = 3600;
+    secure_audio_wait_deadline_large_ms_ = 4700;
     secure_forward_preroll_base_sec_ = 10.0;
     secure_forward_preroll_span_gain_ = 0.010;
     secure_forward_preroll_learned_gain_ = 0.85;
@@ -2606,7 +2620,7 @@ void AndroidPlayer::renderLoop() {
             if (!core_playing_retry &&
                 pwr_retry != 0 &&
                 state_retry == PLAYER_STATE_PAUSED &&
-                retry_count >= 5) {
+                retry_count >= 4) {
                 // Hard-stop repeated paused-state retries.
                 // Keep this bounded, but do a full seek-flow reset so upper layer can recover
                 // instead of being stuck in CONVERGE + loading=true indefinitely.
@@ -4375,7 +4389,7 @@ void AndroidPlayer::renderLoop() {
                 bool secure_session_now = secure_session_active_.load(std::memory_order_acquire);
                 bool local_source_now = source_local_active_.load(std::memory_order_acquire);
                 bool encrypted_source_now = source_encrypted_active_.load(std::memory_order_acquire) || secure_session_now;
-                int64_t seek_empty_timeout_ms = is_backward_seek ? 8500 : 7600;
+                int64_t seek_empty_timeout_ms = is_backward_seek ? 7200 : 6200;
                 if (local_source_now) {
                     seek_empty_timeout_ms = is_backward_seek ? 4200 : 3600;
                     double span_now = (std::isfinite(seek_from_now) && std::isfinite(seek_target_now))
@@ -4404,13 +4418,33 @@ void AndroidPlayer::renderLoop() {
                     // Let timeout fallback trigger active recovery sooner.
                     recent_seek_progress = false;
                 }
-                if (recent_seek_progress && seek_elapsed_ms < 3000) {
-                    int64_t progress_timeout_ms = is_backward_seek ? 3200 : 3000;
+                if (recent_seek_progress && seek_elapsed_ms < 2600) {
+                    int64_t progress_timeout_ms = is_backward_seek ? 2800 : 2400;
                     seek_empty_timeout_ms = std::min(seek_empty_timeout_ms, progress_timeout_ms);
                     SYNCW_RATE(15,
                                "evt=seek_empty_timeout_hold_by_progress id=%" PRIu64 " elapsed_ms=%" PRId64 " timeout_ms=%" PRId64 " best_abs_err=%.3f backward=%d local=%d encrypted=%d",
                                sid_now, seek_elapsed_ms, seek_empty_timeout_ms, seek_progress_best_abs_err,
                                is_backward_seek ? 1 : 0, local_source_now ? 1 : 0, encrypted_source_now ? 1 : 0);
+                }
+                if (secure_session_now && !is_backward_seek) {
+                    double span_now = (std::isfinite(seek_from_now) && std::isfinite(seek_target_now))
+                                      ? std::fabs(seek_from_now - seek_target_now)
+                                      : 0.0;
+                    bool very_large_forward_span = span_now >= 120.0;
+                    bool far_from_target = std::isfinite(seek_progress_best_abs_err) && seek_progress_best_abs_err >= 10.0;
+                    bool progress_stalled =
+                            seek_progress_last_improve_ms > 0 &&
+                            (now - seek_progress_last_improve_ms) >= 1000;
+                    // For encrypted large forward seek, prolonged "slightly improving but far" should
+                    // switch to failover earlier instead of holding loading for many seconds.
+                    if (very_large_forward_span && far_from_target && seek_elapsed_ms >= 2200) {
+                        int64_t secure_large_timeout_ms = progress_stalled ? 2600 : 3200;
+                        seek_empty_timeout_ms = std::min(seek_empty_timeout_ms, secure_large_timeout_ms);
+                        SYNCW_RATE(15,
+                                   "evt=seek_empty_timeout_secure_large_forward_guard id=%" PRIu64 " elapsed_ms=%" PRId64 " timeout_ms=%" PRId64 " span=%.3f best_abs_err=%.3f stalled=%d",
+                                   sid_now, seek_elapsed_ms, seek_empty_timeout_ms, span_now, seek_progress_best_abs_err,
+                                   progress_stalled ? 1 : 0);
+                    }
                 }
                 if (seek_elapsed_ms >= seek_empty_timeout_ms) {
                     setSeekPhase(SEEK_PHASE_FAILOVER, "seek_empty_timeout");
