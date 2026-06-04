@@ -3733,6 +3733,14 @@ void AndroidPlayer::renderLoop() {
                             // 尾段 backward seek 使用更严格的收敛容忍，减少“看似完成但仍偏离目标”的假收敛。
                             verify_max_offset_sec = std::min(verify_max_offset_sec, 2.4);
                         }
+                        if (is_backward_seek &&
+                            std::isfinite(secure_accept_gate_max_sec_for_diag) &&
+                            secure_accept_gate_max_sec_for_diag > 0.0) {
+                            // Keep VERIFY tolerance aligned with ACCEPT gate on backward secure seek,
+                            // otherwise we can loop on "accept says ok but verify keeps dropping".
+                            double backward_verify_floor = std::min(6.2, std::max(2.8, secure_accept_gate_max_sec_for_diag - 0.2));
+                            verify_max_offset_sec = std::max(verify_max_offset_sec, backward_verify_floor);
+                        }
                         if (seek_elapsed_ms >= 5200 && !(is_backward_seek && near_end_seek)) {
                             verify_max_offset_sec = std::max(verify_max_offset_sec, is_backward_seek ? 4.8 : 3.0);
                         }

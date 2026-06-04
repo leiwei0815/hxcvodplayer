@@ -394,7 +394,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val seekCompletionPostConfirmWindowMs = 900L
     private val seekCompletionPostConfirmMinProgressSec = 0.12
     private val seekPostConfirmReopenBackoffSec = 0.30
-    private val seekPostConfirmReopenCooldownMs = 12000L
+    private val seekPostConfirmReopenCooldownMs = 5000L
     private var playStallRecoveryEnabled = true
     private var playLoopRecoveryEnabled = true
     private var playbackMetricsLogEnabled = true
@@ -1970,10 +1970,10 @@ class HXCPlayerControl @JvmOverloads constructor(
                             val progressedAfterConfirm = !pendingSeekPostConfirmBasePosSec.isNaN() &&
                                     (position - pendingSeekPostConfirmBasePosSec) >= seekCompletionPostConfirmMinProgressSec
                             val playingAfterConfirm = nativeIsPlaying(handle)
-                            if ((!progressedAfterConfirm || !playingAfterConfirm) && confirmElapsedMs < seekCompletionPostConfirmWindowMs) {
+                            if (!progressedAfterConfirm && confirmElapsedMs < seekCompletionPostConfirmWindowMs) {
                                 return@scheduleAtFixedRate
                             }
-                            if (!progressedAfterConfirm || !playingAfterConfirm) {
+                            if (!progressedAfterConfirm) {
                                 forceTimeoutByNoProgress = true
                                 pendingSeekPostConfirmTimedOut = true
                                 Log.w(
@@ -2073,7 +2073,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                             }
                         }
                         val summaryReopenTriggered = summaryTriggeredReopen || timeoutTriggeredReopen
-                        val unhealthyAfterComplete = playWhenReady && (loading || state == PlayerState.LOADING || !isPlaying)
+                        val unhealthyAfterComplete = playWhenReady &&
+                                (
+                                        (!loadingRecovered && (loading || state == PlayerState.LOADING))
+                                                || (!isPlaying && !loadingRecovered)
+                                        )
                         if (unhealthyAfterComplete) {
                             Log.w(
                                 TAG,
@@ -2096,11 +2100,9 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 val checkState = coerceStateWithLoading(getState(), checkLoading)
                                 val progressed = checkPos - unhealthyCheckBasePos
                                 val recovered =
-                                    checkPlayWhenReady &&
-                                            checkIsPlaying &&
-                                            !checkLoading &&
-                                            checkState != PlayerState.LOADING &&
-                                            progressed >= 0.08
+                                    (progressed >= 0.35) ||
+                                            (!checkLoading && progressed >= 0.12) ||
+                                            (checkPlayWhenReady && checkIsPlaying && progressed >= 0.05)
                                 if (recovered) {
                                     logInfo(
                                         "evt=seek_unhealthy_followup_resolved id=$unhealthyCheckRequestId pos=$checkPos progressed=$progressed loading=$checkLoading state=${checkState.name} play_when_ready=$checkPlayWhenReady is_playing=$checkIsPlaying"
@@ -2111,7 +2113,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                                         "evt=seek_unhealthy_followup_unresolved id=$unhealthyCheckRequestId pos=$checkPos progressed=$progressed loading=$checkLoading state=${checkState.name} play_when_ready=$checkPlayWhenReady is_playing=$checkIsPlaying source_category=$currentSourceCategory"
                                     )
                                     val secureSource = currentSourceCategory.startsWith("secure_")
-                                    if (checkPlayWhenReady && secureSource) {
+                                    val shouldReopenForUnresolved =
+                                        checkPlayWhenReady &&
+                                                secureSource &&
+                                                !checkIsPlaying &&
+                                                (checkLoading || checkState == PlayerState.LOADING) &&
+                                                progressed < 0.12
+                                    if (shouldReopenForUnresolved) {
                                         val followupNow = SystemClock.elapsedRealtime()
                                         val sinceLastReopenMs = if (lastSeekPostConfirmReopenAtMs > 0L) {
                                             followupNow - lastSeekPostConfirmReopenAtMs
