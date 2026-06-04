@@ -1825,6 +1825,18 @@ class HXCPlayerControl @JvmOverloads constructor(
                             TAG,
                             "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck"
                         )
+                        // Seek 完成后若目标语义是继续播放，重新武装 stall 监测，
+                        // 防止“状态=PLAYING 但位置不再推进”长期卡住。
+                        if (playWhenReady) {
+                            playStallCheckArmed = true
+                            playStallArmedAtMs = now
+                            playStallBasePosSec = position
+                            if (manualPlayHardRecoverEnabled) {
+                                manualPlayHardRecoverPending = true
+                                manualPlayHardRecoverArmedAtMs = now
+                                manualPlayHardRecoverBasePosSec = position
+                            }
+                        }
                         mainHandler.post {
                             callback?.onSeekCompleted(
                                 requestId = requestId,

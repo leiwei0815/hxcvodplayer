@@ -4213,11 +4213,6 @@ void AndroidPlayer::renderLoop() {
                     int pwr_now = player_core_ ? player_core_get_play_when_ready(player_core_) : 0;
                     int state_now = player_core_ ? player_core_get_state(player_core_) : 0;
                     double pos_now = player_core_ ? player_core_get_position(player_core_) : -1.0;
-                    if (pwr_now != 0 && state_now == PLAYER_STATE_PLAYING) {
-                        core_playing_now = true;
-                        SYNCI("evt=seek_empty_timeout_soft_resume_ok target=%.3f from=%.3f pwr=%d state=%d pos=%.3f by=state_playing",
-                              seek_target_now, seek_from_now, pwr_now, state_now, pos_now);
-                    }
                     bool soft_resume_healthy_now = false;
                     bool seek_gates_cleared_now =
                             !seek_lower_bound_active_.load(std::memory_order_acquire) &&
@@ -4226,6 +4221,32 @@ void AndroidPlayer::renderLoop() {
                     int64_t pos_progress_interval_ms_now = 0;
                     if (force_resume_last_pos_ms > 0) {
                         pos_progress_interval_ms_now = now - force_resume_last_pos_ms;
+                    }
+                    bool has_position_progress_now =
+                            std::isfinite(pos_now) && pos_now >= 0.0 &&
+                            std::isfinite(force_resume_last_pos) && force_resume_last_pos >= 0.0 &&
+                            (pos_now - force_resume_last_pos) >= 0.08 &&
+                            std::fabs(pos_now - force_resume_last_pos) <= 3.00 &&
+                            pos_progress_interval_ms_now >= 240 &&
+                            pos_progress_interval_ms_now <= 4200;
+                    SYNCW_RATE(15,
+                               "evt=seek_empty_timeout_diag target=%.3f from=%.3f pwr=%d state=%d pos=%.3f seek_progress_best_abs_err=%.3f recent_seek_progress=%d pos_progress=%d pos_progress_interval_ms=%" PRId64 " gates_cleared=%d",
+                               seek_target_now, seek_from_now, pwr_now, state_now, pos_now,
+                               seek_progress_best_abs_err,
+                               recent_seek_progress ? 1 : 0,
+                               has_position_progress_now ? 1 : 0,
+                               pos_progress_interval_ms_now,
+                               seek_gates_cleared_now ? 1 : 0);
+                    if (pwr_now != 0 && state_now == PLAYER_STATE_PLAYING && has_position_progress_now) {
+                        core_playing_now = true;
+                        SYNCI("evt=seek_empty_timeout_soft_resume_ok target=%.3f from=%.3f pwr=%d state=%d pos=%.3f by=state_playing_with_progress",
+                              seek_target_now, seek_from_now, pwr_now, state_now, pos_now);
+                    } else if (pwr_now != 0 && state_now == PLAYER_STATE_PLAYING) {
+                        // Avoid false "soft resume ok": some devices report PLAYING while position is frozen.
+                        core_playing_now = false;
+                        SYNCW_RATE(15,
+                                   "evt=seek_empty_timeout_soft_resume_reject reason=state_playing_without_progress target=%.3f from=%.3f pos=%.3f",
+                                   seek_target_now, seek_from_now, pos_now);
                     }
                     if (pwr_now != 0 &&
                         state_now == PLAYER_STATE_PAUSED &&
