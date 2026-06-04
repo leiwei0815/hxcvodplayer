@@ -370,6 +370,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val loadingShowDebounceMs = 450L
     private val loadingHideDebounceMs = 150L
+    // 播放中若位置持续前进，抑制瞬时 loading=true，避免 UI 闪一下。
+    private val loadingShowProgressSuppressWindowMs = 1200L
+    private val loadingProgressSuppressMinStepSec = 0.04
     // Seek 场景优先保证“先隐藏 loading 再恢复播放”，避免拖慢体感。
     private val seekLoadingHideDebounceMs = 0L
     private val seekLoadingReshowSuppressMs = 900L
@@ -1852,6 +1855,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                     playWhenReady = playWhenReady
                 )
                 maybeLogPlaybackMetrics(now, rawPosition, state, loading)
+                val recentForwardProgress =
+                    !lastPositionForLoadingHeuristicSec.isNaN() &&
+                            (position - lastPositionForLoadingHeuristicSec) >= loadingProgressSuppressMinStepSec
+                if (loadingSessionLikelySeek && !pendingSeekActive && playWhenReady && recentForwardProgress) {
+                    // Seek 会话结束后，若已经持续推进，清掉 seek-like 标记，避免状态长期被 LOADING 绑住。
+                    loadingSessionLikelySeek = false
+                }
                 if (loadingCandidateState == null || loadingCandidateState != loading) {
                     if (loading) {
                         val likelySeekByJump = !lastPositionForLoadingHeuristicSec.isNaN() &&
@@ -1862,6 +1872,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                     loadingCandidateSinceMs = now
                 } else {
                     var debounceMs = if (loading) loadingShowDebounceMs else loadingHideDebounceMs
+                    if (loading && !pendingSeekActive && playWhenReady && recentForwardProgress) {
+                        // 正在稳定播放推进时，忽略短暂 loading=true 抖动，防止转圈闪烁。
+                        debounceMs = maxOf(debounceMs, loadingShowProgressSuppressWindowMs)
+                        loadingCandidateSinceMs = now
+                    }
                     if (loading && now < suppressLoadingShowUntilMs) {
                         debounceMs = maxOf(debounceMs, suppressLoadingShowUntilMs - now)
                     }

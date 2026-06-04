@@ -1508,6 +1508,7 @@ bool AndroidPlayer::isLoading() const {
         seek_recovery_active_.load(std::memory_order_acquire) ||
         seek_lower_bound_active_.load(std::memory_order_acquire);
     bool play_when_ready_now = player_core_ && player_core_get_play_when_ready(player_core_) != 0;
+    bool core_playing_now = player_core_ && player_core_is_playing(player_core_) != 0;
     bool waiting_open_first_frame =
         !first_frame_rendered_.load(std::memory_order_acquire) &&
         player_core_ &&
@@ -1522,7 +1523,8 @@ bool AndroidPlayer::isLoading() const {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         int64_t suppress_until = suppress_stale_loading_true_until_ms_.load(std::memory_order_acquire);
         int64_t last_progress_ms = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
-        bool has_recent_progress = last_progress_ms > 0 && (now - last_progress_ms) <= 1600;
+        int64_t progress_hold_ms = core_playing_now ? 2600 : 1600;
+        bool has_recent_progress = last_progress_ms > 0 && (now - last_progress_ms) <= progress_hold_ms;
         if (now < suppress_until || has_recent_progress) {
             return false;
         }
@@ -1557,15 +1559,31 @@ void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
     if (!player) {
         return;
     }
+    int64_t now_ms_now = now_ms();
     if (player->suppress_transient_loading_false_.load(std::memory_order_acquire)) {
-        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
         int64_t suppress_until = player->suppress_transient_loading_false_until_ms_.load(std::memory_order_acquire);
-        if (is_loading || now_ms > suppress_until) {
+        if (is_loading || now_ms_now > suppress_until) {
             player->suppress_transient_loading_false_.store(false, std::memory_order_release);
             player->suppress_transient_loading_false_until_ms_.store(0, std::memory_order_release);
         } else {
             LOGI_RATE(60, "[state] ignore transient loading=false during open switch");
+            return;
+        }
+    }
+    if (is_loading) {
+        bool seek_loading =
+                player->seek_audio_wait_video_.load(std::memory_order_acquire) ||
+                player->seek_recovery_active_.load(std::memory_order_acquire) ||
+                player->seek_lower_bound_active_.load(std::memory_order_acquire);
+        bool play_when_ready_now = player->player_core_ && player_core_get_play_when_ready(player->player_core_) != 0;
+        bool core_playing_now = player->player_core_ && player_core_is_playing(player->player_core_) != 0;
+        int64_t last_progress_ms = player->loading_progress_last_advance_ms_.load(std::memory_order_acquire);
+        bool has_recent_progress = last_progress_ms > 0 && (now_ms_now - last_progress_ms) <= 1500;
+        if (!seek_loading && play_when_ready_now && core_playing_now && has_recent_progress) {
+            // During steady playback some pipelines spike loading=true for a short moment.
+            // Ignore this edge to avoid UI loading flash.
+            player->suppress_stale_loading_true_until_ms_.store(now_ms_now + 2200, std::memory_order_release);
+            LOGI_RATE(30, "[state] ignore transient loading=true while playing progress");
             return;
         }
     }
