@@ -2968,11 +2968,14 @@ void PlayerCore::progress_timer_thread() {
     double last_position = -1.0;
     int position_unchanged_count = 0;  // ⚠️ 位置未变化的次数
     int starvation_ticks = 0;          // 低水位+时钟停滞持续计数
+    int end_eval_diag_ticks = 0;       // 结束判定诊断节流
 
     while (!abort_request_) {
         // 检查播放器状态
         PlayerState current_state = get_state();
-        if (current_state == PlayerState::Playing || current_state == PlayerState::Paused) {
+        if (current_state == PlayerState::Playing ||
+            current_state == PlayerState::Paused ||
+            current_state == PlayerState::Loading) {
             double current_position;
             
             // ⚠️ 【关键修复】如果正在 seek，直接返回 seek 目标位置
@@ -2999,7 +3002,7 @@ void PlayerCore::progress_timer_thread() {
                 }
                 
                 // ⚠️ 检测位置是否变化
-                if (current_state == PlayerState::Playing) {  // 只在播放状态下检测
+                if (current_state == PlayerState::Playing || current_state == PlayerState::Loading) {
                     if (fabs(current_position - last_position) < 0.01) {  // 位置几乎没变化
                         position_unchanged_count++;
                     } else {
@@ -3009,7 +3012,8 @@ void PlayerCore::progress_timer_thread() {
                 
                 // 低水位 loading：播放中若队列枯竭且进度停滞，快速进入 loading（不用等读失败超时）。
                 bool queue_starved = false;
-                if (current_state == PlayerState::Playing && !seeking_.load(std::memory_order_acquire)) {
+                if ((current_state == PlayerState::Playing || current_state == PlayerState::Loading)
+                        && !seeking_.load(std::memory_order_acquire)) {
                     bool video_starved = video_stream_opened_ && video_queue_ && video_queue_->nb_remaining() <= 0;
                     bool audio_starved = audio_stream_opened_ && audio_queue_ && audio_queue_->nb_remaining() <= 0;
                     bool progress_stalled = !isnan(last_position) && fabs(current_position - last_position) < 0.01;
@@ -3029,20 +3033,33 @@ void PlayerCore::progress_timer_thread() {
                 if (!playback_completed_notified_.load(std::memory_order_acquire)) {
                     double duration = get_duration();
                     bool near_end = duration > 0 && (duration - current_position) < 1.0;  // 最后 1 秒内
-                    
-                    bool condition1 = decode_finished_.load(std::memory_order_acquire) && near_end;
-                    bool condition2 = (current_state == PlayerState::Playing) && 
-                                     (position_unchanged_count >= 3) && 
+                    bool decode_finished = decode_finished_.load(std::memory_order_acquire);
+                    bool stalled_enough = position_unchanged_count >= 3;
+                    bool eof_like_stall_without_duration =
+                            decode_finished &&
+                            duration <= 0.0 &&
+                            starvation_ticks >= 5 &&
+                            position_unchanged_count >= 5 &&
+                            current_position > 0.0;
+
+                    bool condition1 = decode_finished && near_end;
+                    bool condition2 = (current_state == PlayerState::Playing || current_state == PlayerState::Loading) &&
+                                     stalled_enough &&
                                      near_end;
-                    
-                    if (condition1 || condition2) {
+                    bool condition3 = eof_like_stall_without_duration;
+
+                    if (condition1 || condition2 || condition3) {
                         playback_completed_notified_.store(true, std::memory_order_release);  // 避免重复通知
+                        // 进入 ended 前先清掉 starvation_loading，避免对外仍维持 loading=true。
+                        set_starvation_loading(false);
                         set_pipeline_state(PipelineState::Ended);
                         refresh_effective_playing_state();
                         LOG_INFO("检测到播放完成: 当前位置=", current_position, 
                                 ", 时长=", duration, 
-                                ", decode_finished=", decode_finished_.load(),
-                                ", position_unchanged_count=", position_unchanged_count);
+                                ", decode_finished=", decode_finished,
+                                ", starvation_ticks=", starvation_ticks,
+                                ", position_unchanged_count=", position_unchanged_count,
+                                ", by_condition=", condition1 ? "decode_near_end" : (condition2 ? "stalled_near_end" : "eof_stall_no_duration"));
                         PlaybackCompletedCallback cb;
                         {
                             std::lock_guard<std::mutex> lock(callback_mutex_);
@@ -3051,11 +3068,21 @@ void PlayerCore::progress_timer_thread() {
                         if (cb) {
                             cb();
                         }
+                    } else if ((decode_finished || starvation_ticks >= 3) && (++end_eval_diag_ticks % 10 == 0)) {
+                        LOG_INFO("结束判定未满足: pos=", current_position,
+                                ", dur=", duration,
+                                ", near_end=", near_end,
+                                ", decode_finished=", decode_finished,
+                                ", starvation_ticks=", starvation_ticks,
+                                ", unchanged=", position_unchanged_count,
+                                ", state=", (int)current_state);
                     }
                 }
             }
         }
-        if (!(current_state == PlayerState::Playing || current_state == PlayerState::Paused)) {
+        if (!(current_state == PlayerState::Playing ||
+                current_state == PlayerState::Paused ||
+                current_state == PlayerState::Loading)) {
             starvation_ticks = 0;
             set_starvation_loading(false);
         }
