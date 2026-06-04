@@ -1953,7 +1953,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                             && (loadingRecovered || convergedStable || hardTimeout)
                     if (shouldComplete) {
                         var forceTimeoutByNoProgress = false
-                        val needPostConfirm = playWhenReady && convergedStable && !loadingRecovered && !hardTimeout
+                        val needPostConfirm = playWhenReady && convergedStable && !hardTimeout && (!loadingRecovered || !isPlaying)
                         if (needPostConfirm) {
                             if (!pendingSeekPostConfirmActive) {
                                 pendingSeekHadPostConfirm = true
@@ -1969,15 +1969,16 @@ class HXCPlayerControl @JvmOverloads constructor(
                             val confirmElapsedMs = now - pendingSeekPostConfirmStartAtMs
                             val progressedAfterConfirm = !pendingSeekPostConfirmBasePosSec.isNaN() &&
                                     (position - pendingSeekPostConfirmBasePosSec) >= seekCompletionPostConfirmMinProgressSec
-                            if (!progressedAfterConfirm && confirmElapsedMs < seekCompletionPostConfirmWindowMs) {
+                            val playingAfterConfirm = nativeIsPlaying(handle)
+                            if ((!progressedAfterConfirm || !playingAfterConfirm) && confirmElapsedMs < seekCompletionPostConfirmWindowMs) {
                                 return@scheduleAtFixedRate
                             }
-                            if (!progressedAfterConfirm) {
+                            if (!progressedAfterConfirm || !playingAfterConfirm) {
                                 forceTimeoutByNoProgress = true
                                 pendingSeekPostConfirmTimedOut = true
                                 Log.w(
                                     TAG,
-                                    "evt=seek_post_confirm_timeout_no_progress target=$target pos=$position elapsed_ms=$seekElapsedMs confirm_elapsed_ms=$confirmElapsedMs"
+                                    "evt=seek_post_confirm_timeout_no_progress target=$target pos=$position elapsed_ms=$seekElapsedMs confirm_elapsed_ms=$confirmElapsedMs progressed=$progressedAfterConfirm playing=$playingAfterConfirm"
                                 )
                                 if (playWhenReady) {
                                     val sinceLastReopenMs = if (lastSeekPostConfirmReopenAtMs > 0L) {
@@ -2003,7 +2004,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                                     }
                                 }
                             } else {
-                                logInfo("evt=seek_post_confirm_pass target=$target pos=$position confirm_elapsed_ms=$confirmElapsedMs")
+                                logInfo("evt=seek_post_confirm_pass target=$target pos=$position confirm_elapsed_ms=$confirmElapsedMs progressed=$progressedAfterConfirm playing=$playingAfterConfirm")
                             }
                         }
                         val requestId = pendingSeekRequestId
@@ -2109,6 +2110,30 @@ class HXCPlayerControl @JvmOverloads constructor(
                                         TAG,
                                         "evt=seek_unhealthy_followup_unresolved id=$unhealthyCheckRequestId pos=$checkPos progressed=$progressed loading=$checkLoading state=${checkState.name} play_when_ready=$checkPlayWhenReady is_playing=$checkIsPlaying source_category=$currentSourceCategory"
                                     )
+                                    val secureSource = currentSourceCategory.startsWith("secure_")
+                                    if (checkPlayWhenReady && secureSource) {
+                                        val followupNow = SystemClock.elapsedRealtime()
+                                        val sinceLastReopenMs = if (lastSeekPostConfirmReopenAtMs > 0L) {
+                                            followupNow - lastSeekPostConfirmReopenAtMs
+                                        } else {
+                                            Long.MAX_VALUE
+                                        }
+                                        if (sinceLastReopenMs >= seekPostConfirmReopenCooldownMs) {
+                                            val reopenStart = maxOf(0.0, checkPos - seekPostConfirmReopenBackoffSec)
+                                            lastSeekPostConfirmReopenAtMs = followupNow
+                                            metricsPlayStallRecoverReopenCount += 1L
+                                            Log.w(
+                                                TAG,
+                                                "evt=seek_unhealthy_followup_reopen id=$unhealthyCheckRequestId reopen_start=$reopenStart pos=$checkPos state=${checkState.name} loading=$checkLoading source_category=$currentSourceCategory"
+                                            )
+                                            openExecutor.execute {
+                                                if (isReleased) return@execute
+                                                replayFrom(reopenStart)
+                                            }
+                                        } else {
+                                            logInfo("evt=seek_unhealthy_followup_reopen_skip reason=cooldown id=$unhealthyCheckRequestId since_last_ms=$sinceLastReopenMs cooldown_ms=$seekPostConfirmReopenCooldownMs source_category=$currentSourceCategory")
+                                        }
+                                    }
                                 }
                             }, 1600L)
                         }
