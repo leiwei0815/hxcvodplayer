@@ -1780,16 +1780,36 @@ void PlayerCore::read_thread() {
             // 注意：seeking_ 标志已在 seek() 方法中设置为 true，这里不需要重复设置
             
             int64_t seek_target = static_cast<int64_t>(target_pos * AV_TIME_BASE);
+            const bool has_start_time = format_ctx_
+                                        && format_ctx_->start_time != AV_NOPTS_VALUE;
+            const int64_t format_start_time = has_start_time ? format_ctx_->start_time : 0;
+            // FFmpeg/ffplay 语义：外部使用“相对播放时间线”，内部 seek 目标需要叠加 start_time。
+            // 否则部分 HLS（尤其加密流）在 seek 到 0s 时会被判定为越界并返回失败。
+            int64_t seek_target_abs = seek_target + format_start_time;
+            if (has_start_time && seek_target_abs < format_start_time) {
+                seek_target_abs = format_start_time;
+            }
             
             LOG_INFO("开始 Seek 到: ", target_pos, " 秒");
-            int seek_ret = av_seek_frame(format_ctx_, -1, seek_target, AVSEEK_FLAG_BACKWARD);
+            int seek_ret = av_seek_frame(format_ctx_, -1, seek_target_abs, AVSEEK_FLAG_BACKWARD);
             if (seek_ret < 0) {
-                seek_ret = av_seek_frame(format_ctx_, -1, seek_target, AVSEEK_FLAG_ANY);
+                seek_ret = av_seek_frame(format_ctx_, -1, seek_target_abs, AVSEEK_FLAG_ANY);
                 LOG_WARNING("seek BACKWARD 失败，尝试 ANY，ret=", seek_ret);
+            }
+            if (seek_ret < 0 && target_pos <= 0.001 && has_start_time) {
+                // 起点兜底：某些加密 HLS 对“精确 0s”不稳定，尝试“起点后一个极小窗口”。
+                constexpr double kSeekHeadGuardSec = 0.35;
+                int64_t near_start_target = format_start_time
+                        + static_cast<int64_t>(kSeekHeadGuardSec * AV_TIME_BASE);
+                seek_ret = av_seek_frame(format_ctx_, -1, near_start_target, AVSEEK_FLAG_BACKWARD);
+                if (seek_ret < 0) {
+                    seek_ret = av_seek_frame(format_ctx_, -1, near_start_target, AVSEEK_FLAG_ANY);
+                }
+                LOG_WARNING("seek 起点兜底重试，abs=", near_start_target, " ret=", seek_ret);
             }
             if (seek_ret < 0 && video_stream_ >= 0 && format_ctx_->streams && format_ctx_->streams[video_stream_]) {
                 AVStream* seek_stream = format_ctx_->streams[video_stream_];
-                int64_t stream_target = av_rescale_q(seek_target, AV_TIME_BASE_Q, seek_stream->time_base);
+                int64_t stream_target = av_rescale_q(seek_target_abs, AV_TIME_BASE_Q, seek_stream->time_base);
                 seek_ret = av_seek_frame(format_ctx_, video_stream_, stream_target, AVSEEK_FLAG_BACKWARD);
                 if (seek_ret < 0) {
                     seek_ret = av_seek_frame(format_ctx_, video_stream_, stream_target, AVSEEK_FLAG_ANY);
