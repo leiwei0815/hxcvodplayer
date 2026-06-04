@@ -362,6 +362,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastPlayerState: PlayerState? = null
     private var lastPipelineState: PipelineState? = null
     private var lastIsPlayingState: Boolean? = null
+    private var sdkDiagVersionLogged: Boolean = false
     private var updateExecutor: ScheduledExecutorService? = null
     private var lastLoadingState: Boolean? = null
     private var loadingCandidateState: Boolean? = null
@@ -1802,6 +1803,10 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val pipelineStateRaw = nativeGetPipelineState(handle)
                 val playWhenReady = nativeGetPlayWhenReady(handle)
                 val isPlaying = nativeIsPlaying(handle)
+                if (!sdkDiagVersionLogged) {
+                    sdkDiagVersionLogged = true
+                    logInfo("evt=sdk_diag_version value=20260604_tail_stall_diag")
+                }
                 val loading = isLoading()
                 val state = coerceStateWithLoading(
                     resolveUnifiedState(coreStateRaw, pipelineStateRaw, playWhenReady, isPlaying),

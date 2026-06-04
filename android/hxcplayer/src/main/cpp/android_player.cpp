@@ -2354,6 +2354,9 @@ void AndroidPlayer::renderLoop() {
     int64_t empty_stall_recover_cooldown_until_ms = 0;
     const int64_t kEmptyStallRecoverTriggerMs = 2800;
     const int64_t kEmptyStallRecoverCooldownMs = 12000;
+    int64_t tail_stall_diag_last_log_ms = 0;
+    const int64_t kTailStallDiagIntervalMs = 2000;
+    const int64_t kTailStallForceCompleteMs = 12000;
     // Force-resume soft success detector:
     // some secure seek sessions keep core state at PAUSED while clock/frames
     // still progress toward target. Avoid retry storms in that situation.
@@ -2382,6 +2385,7 @@ void AndroidPlayer::renderLoop() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     };
+    PERFI("evt=sdk_tail_stall_diag_enabled version=20260604");
 
     while (true) {
         // --- Wait for work, surface change, or stop ---
@@ -4927,6 +4931,40 @@ void AndroidPlayer::renderLoop() {
                           player_core_get_state(player_core_),
                           player_core_get_position(player_core_));
 
+            }
+            int64_t now_empty = now_ms();
+            int64_t empty_ms = now_empty - empty_start_ms;
+            if (empty_ms >= 2000) {
+                double pos_now = player_core_get_position(player_core_);
+                double dur_now = player_core_get_duration(player_core_);
+                double remain_now = (std::isfinite(dur_now) && std::isfinite(pos_now)) ? (dur_now - pos_now) : std::numeric_limits<double>::quiet_NaN();
+                bool play_when_ready_now = player_core_get_play_when_ready(player_core_) != 0;
+                bool seek_flow_active =
+                        seek_lower_bound_active_.load(std::memory_order_acquire) ||
+                        seek_recovery_active_.load(std::memory_order_acquire) ||
+                        seek_audio_wait_video_.load(std::memory_order_acquire);
+                bool near_end = std::isfinite(remain_now) && remain_now >= -0.2 && remain_now <= 1.2;
+                if ((now_empty - tail_stall_diag_last_log_ms) >= kTailStallDiagIntervalMs) {
+                    tail_stall_diag_last_log_ms = now_empty;
+                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f pwr=%d seek_flow=%d loading=%d state=%d",
+                          empty_ms,
+                          pos_now,
+                          dur_now,
+                          remain_now,
+                          play_when_ready_now ? 1 : 0,
+                          seek_flow_active ? 1 : 0,
+                          is_loading_.load(std::memory_order_acquire) ? 1 : 0,
+                          player_core_get_state(player_core_));
+                }
+                if (near_end &&
+                    play_when_ready_now &&
+                    !seek_flow_active &&
+                    empty_ms >= kTailStallForceCompleteMs &&
+                    !has_pending_playback_completed_.load(std::memory_order_acquire)) {
+                    SYNCI("evt=tail_stall_force_complete empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f",
+                          empty_ms, pos_now, dur_now, remain_now);
+                    has_pending_playback_completed_.store(true, std::memory_order_release);
+                }
             }
             if (empty_count == 12) redrawLastFrame();
             // When the frame queue is empty the decoder is still filling it.
