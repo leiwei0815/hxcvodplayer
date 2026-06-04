@@ -391,6 +391,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val seekCompletionConvergedStableMs = 420L
     private val seekCompletionNearTargetSec = 1.5
     private val seekCompletionMovedFromOldSec = 0.9
+    private val seekCompletionPostConfirmWindowMs = 900L
+    private val seekCompletionPostConfirmMinProgressSec = 0.12
+    private val seekPostConfirmReopenBackoffSec = 0.30
+    private val seekPostConfirmReopenCooldownMs = 12000L
     private var playStallRecoveryEnabled = true
     private var playLoopRecoveryEnabled = true
     private var playbackMetricsLogEnabled = true
@@ -418,6 +422,13 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var pendingSeekLoadingObserved: Boolean = false
     private var pendingSeekActive: Boolean = false
     private var pendingSeekConvergedSinceMs: Long = 0L
+    private var pendingSeekPostConfirmActive: Boolean = false
+    private var pendingSeekPostConfirmStartAtMs: Long = 0L
+    private var pendingSeekPostConfirmBasePosSec: Double = Double.NaN
+    private var pendingSeekHadPostConfirm: Boolean = false
+    private var pendingSeekPostConfirmTimedOut: Boolean = false
+    private var pendingSeekTriggeredReopen: Boolean = false
+    private var lastSeekPostConfirmReopenAtMs: Long = 0L
     private var playStallCheckArmed = false
     private var playStallArmedAtMs: Long = 0L
     private var playStallBasePosSec: Double = Double.NaN
@@ -1485,6 +1496,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekLoadingObserved = false
         pendingSeekActive = true
         pendingSeekConvergedSinceMs = 0L
+        pendingSeekPostConfirmActive = false
+        pendingSeekPostConfirmStartAtMs = 0L
+        pendingSeekPostConfirmBasePosSec = Double.NaN
+        pendingSeekHadPostConfirm = false
+        pendingSeekPostConfirmTimedOut = false
+        pendingSeekTriggeredReopen = false
         loadingSessionLikelySeek = true
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
@@ -1806,17 +1823,87 @@ class HXCPlayerControl @JvmOverloads constructor(
                     val shouldComplete = nativeSeekSettled
                             && (loadingRecovered || convergedStable || hardTimeout)
                     if (shouldComplete) {
+                        var forceTimeoutByNoProgress = false
+                        val needPostConfirm = playWhenReady && convergedStable && !loadingRecovered && !hardTimeout
+                        if (needPostConfirm) {
+                            if (!pendingSeekPostConfirmActive) {
+                                pendingSeekHadPostConfirm = true
+                                pendingSeekPostConfirmActive = true
+                                pendingSeekPostConfirmStartAtMs = now
+                                pendingSeekPostConfirmBasePosSec = position
+                                Log.w(
+                                    TAG,
+                                    "evt=seek_post_confirm_arm target=$target pos=$position elapsed_ms=$seekElapsedMs"
+                                )
+                                return@scheduleAtFixedRate
+                            }
+                            val confirmElapsedMs = now - pendingSeekPostConfirmStartAtMs
+                            val progressedAfterConfirm = !pendingSeekPostConfirmBasePosSec.isNaN() &&
+                                    (position - pendingSeekPostConfirmBasePosSec) >= seekCompletionPostConfirmMinProgressSec
+                            if (!progressedAfterConfirm && confirmElapsedMs < seekCompletionPostConfirmWindowMs) {
+                                return@scheduleAtFixedRate
+                            }
+                            if (!progressedAfterConfirm) {
+                                forceTimeoutByNoProgress = true
+                                pendingSeekPostConfirmTimedOut = true
+                                Log.w(
+                                    TAG,
+                                    "evt=seek_post_confirm_timeout_no_progress target=$target pos=$position elapsed_ms=$seekElapsedMs confirm_elapsed_ms=$confirmElapsedMs"
+                                )
+                                if (playWhenReady) {
+                                    val sinceLastReopenMs = if (lastSeekPostConfirmReopenAtMs > 0L) {
+                                        now - lastSeekPostConfirmReopenAtMs
+                                    } else {
+                                        Long.MAX_VALUE
+                                    }
+                                    if (sinceLastReopenMs >= seekPostConfirmReopenCooldownMs) {
+                                        val reopenStart = maxOf(0.0, target - seekPostConfirmReopenBackoffSec)
+                                        lastSeekPostConfirmReopenAtMs = now
+                                        pendingSeekTriggeredReopen = true
+                                        metricsPlayStallRecoverReopenCount += 1L
+                                        Log.w(
+                                            TAG,
+                                            "evt=seek_post_confirm_timeout_reopen target=$target reopen_start=$reopenStart elapsed_ms=$seekElapsedMs"
+                                        )
+                                        openExecutor.execute {
+                                            if (isReleased) return@execute
+                                            replayFrom(reopenStart)
+                                        }
+                                    } else {
+                                        Log.i(
+                                            TAG,
+                                            "evt=seek_post_confirm_timeout_reopen_skip reason=cooldown since_last_ms=$sinceLastReopenMs cooldown_ms=$seekPostConfirmReopenCooldownMs"
+                                        )
+                                    }
+                                }
+                            } else {
+                                Log.i(
+                                    TAG,
+                                    "evt=seek_post_confirm_pass target=$target pos=$position confirm_elapsed_ms=$confirmElapsedMs"
+                                )
+                            }
+                        }
                         val requestId = pendingSeekRequestId
+                        val summaryHadPostConfirm = pendingSeekHadPostConfirm
+                        val summaryPostConfirmTimedOut = pendingSeekPostConfirmTimedOut
+                        val summaryTriggeredReopen = pendingSeekTriggeredReopen
                         pendingSeekActive = false
                         pendingSeekLoadingObserved = false
                         pendingSeekTargetSec = Double.NaN
                         pendingSeekFromSec = Double.NaN
                         pendingSeekStartAtMs = 0L
                         pendingSeekConvergedSinceMs = 0L
+                        pendingSeekPostConfirmActive = false
+                        pendingSeekPostConfirmStartAtMs = 0L
+                        pendingSeekPostConfirmBasePosSec = Double.NaN
+                        pendingSeekHadPostConfirm = false
+                        pendingSeekPostConfirmTimedOut = false
+                        pendingSeekTriggeredReopen = false
                         metricsSeekCompletedCount += 1L
                         // 关键语义：即便 elapsed 已到 timeout，只要位置已稳定收敛，就按“正常完成”处理，
                         // 避免上层把它当 seek 失败路径继续触发补偿 seek，形成假性连锁 seek。
-                        val completeByTimeout = (hardTimeout || nativeConvergedButStuck) && !convergedStable
+                        val completeByTimeout = forceTimeoutByNoProgress
+                                || ((hardTimeout || nativeConvergedButStuck) && !convergedStable)
                         if (completeByTimeout) {
                             metricsSeekCompletedTimeoutCount += 1L
                         }
@@ -1824,6 +1911,10 @@ class HXCPlayerControl @JvmOverloads constructor(
                         Log.i(
                             TAG,
                             "evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck"
+                        )
+                        Log.i(
+                            TAG,
+                            "evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryTriggeredReopen play_when_ready=$playWhenReady state=${state.name}"
                         )
                         // Seek 完成后若目标语义是继续播放，重新武装 stall 监测，
                         // 防止“状态=PLAYING 但位置不再推进”长期卡住。
@@ -1968,6 +2059,12 @@ class HXCPlayerControl @JvmOverloads constructor(
             pendingSeekLoadingObserved = false
             pendingSeekActive = true
             pendingSeekConvergedSinceMs = 0L
+            pendingSeekPostConfirmActive = false
+            pendingSeekPostConfirmStartAtMs = 0L
+            pendingSeekPostConfirmBasePosSec = Double.NaN
+            pendingSeekHadPostConfirm = false
+            pendingSeekPostConfirmTimedOut = false
+            pendingSeekTriggeredReopen = false
             loadingSessionLikelySeek = true
             Log.i(
                 TAG,
@@ -2067,6 +2164,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekLoadingObserved = false
         pendingSeekActive = true
         pendingSeekConvergedSinceMs = 0L
+        pendingSeekPostConfirmActive = false
+        pendingSeekPostConfirmStartAtMs = 0L
+        pendingSeekPostConfirmBasePosSec = Double.NaN
+        pendingSeekHadPostConfirm = false
+        pendingSeekPostConfirmTimedOut = false
+        pendingSeekTriggeredReopen = false
         loadingSessionLikelySeek = true
 
         Log.w(
@@ -2219,6 +2322,13 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekFromSec = Double.NaN
         pendingSeekStartAtMs = 0L
         pendingSeekConvergedSinceMs = 0L
+        pendingSeekPostConfirmActive = false
+        pendingSeekPostConfirmStartAtMs = 0L
+        pendingSeekPostConfirmBasePosSec = Double.NaN
+        pendingSeekHadPostConfirm = false
+        pendingSeekPostConfirmTimedOut = false
+        pendingSeekTriggeredReopen = false
+        lastSeekPostConfirmReopenAtMs = 0L
         playStallCheckArmed = false
         playStallArmedAtMs = 0L
         playStallBasePosSec = Double.NaN

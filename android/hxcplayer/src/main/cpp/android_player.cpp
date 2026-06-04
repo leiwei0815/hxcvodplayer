@@ -2322,7 +2322,18 @@ void AndroidPlayer::renderLoop() {
             int pwr_retry = player_core_get_play_when_ready(player_core_);
             int state_retry = player_core_get_state(player_core_);
             double pos_retry = player_core_get_position(player_core_);
-            if (pwr_retry != 0 && state_retry == PLAYER_STATE_PLAYING) {
+            int64_t pos_progress_interval_ms_retry = 0;
+            if (force_resume_last_pos_ms > 0) {
+                pos_progress_interval_ms_retry = now_ts - force_resume_last_pos_ms;
+            }
+            bool has_position_progress_retry =
+                    std::isfinite(pos_retry) && pos_retry >= 0.0 &&
+                    std::isfinite(force_resume_last_pos) && force_resume_last_pos >= 0.0 &&
+                    (pos_retry - force_resume_last_pos) >= 0.08 &&
+                    std::fabs(pos_retry - force_resume_last_pos) <= 3.00 &&
+                    pos_progress_interval_ms_retry >= 220 &&
+                    pos_progress_interval_ms_retry <= 4200;
+            if (pwr_retry != 0 && state_retry == PLAYER_STATE_PLAYING && has_position_progress_retry) {
                 setSeekPhase(SEEK_PHASE_RESUME, "seek_force_resume_soft_success_state_playing");
                 seek_force_resume_pending_.store(false, std::memory_order_release);
                 seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
@@ -2330,12 +2341,16 @@ void AndroidPlayer::renderLoop() {
                 seek_force_resume_retry_count_.store(0, std::memory_order_release);
                 seek_force_resume_nudged_.store(false, std::memory_order_release);
                 uint64_t sid = seek_session_active_id_.load(std::memory_order_acquire);
-                SYNCI("evt=seek_force_resume_soft_success id=%" PRIu64 " phase=%s pwr=%d state=%d pos=%.3f by=state_playing",
+                SYNCI("evt=seek_force_resume_soft_success id=%" PRIu64 " phase=%s pwr=%d state=%d pos=%.3f by=state_playing_with_progress",
                       sid, seek_phase_name(seek_phase_.load(std::memory_order_acquire)),
                       pwr_retry, state_retry, pos_retry);
                 setSeekPhase(SEEK_PHASE_IDLE, "seek_force_resume_soft_success_settled");
                 seek_session_active_id_.store(0, std::memory_order_release);
                 return;
+            } else if (pwr_retry != 0 && state_retry == PLAYER_STATE_PLAYING) {
+                SYNCW_RATE(10,
+                           "evt=seek_force_resume_soft_reject reason=state_playing_without_progress pwr=%d state=%d pos=%.3f interval_ms=%" PRId64,
+                           pwr_retry, state_retry, pos_retry, pos_progress_interval_ms_retry);
             }
             bool pos_progressing = false;
             int64_t pos_progress_interval_ms = 0;
@@ -3914,6 +3929,16 @@ void AndroidPlayer::renderLoop() {
 
                     double seek_resume_delay_threshold = likely_4k ? -0.40 : -0.65;
                     double seek_resume_max_ahead = likely_4k ? 0.45 : 0.30;
+                    double seek_abs_err = (seek_target_now >= 0.0 && std::isfinite(pts))
+                                          ? std::fabs(pts - seek_target_now)
+                                          : std::numeric_limits<double>::infinity();
+                    // 非加密流在 seek 命中后，时钟可能短时间落后导致 delay 偏大；
+                    // 若已接近目标点，不必等待严格 0.3s ahead 门槛，避免无意义长 loading。
+                    if (!secure_session_active_.load(std::memory_order_acquire)
+                        && seek_target_now >= 0.0
+                        && seek_abs_err <= 2.20) {
+                        seek_resume_max_ahead = std::max(seek_resume_max_ahead, 1.90);
+                    }
                     if (secure_session_active_.load(std::memory_order_acquire) && delay > seek_resume_max_ahead) {
                         // Secure HLS keyframe-ahead landing can legitimately exceed 0.3~0.45s
                         // until clock is re-anchored; allow bounded ahead window.
