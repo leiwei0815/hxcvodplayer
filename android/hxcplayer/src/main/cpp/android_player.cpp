@@ -1507,10 +1507,16 @@ bool AndroidPlayer::isLoading() const {
         seek_audio_wait_video_.load(std::memory_order_acquire) ||
         seek_recovery_active_.load(std::memory_order_acquire) ||
         seek_lower_bound_active_.load(std::memory_order_acquire);
+    bool play_when_ready_now = player_core_ && player_core_get_play_when_ready(player_core_) != 0;
     bool waiting_open_first_frame =
         !first_frame_rendered_.load(std::memory_order_acquire) &&
         player_core_ &&
-        player_core_get_play_when_ready(player_core_) != 0;
+        play_when_ready_now;
+    // Paused semantics: if caller explicitly does not want autoplay and no seek-gate is active,
+    // stale core_loading=true should not pin UI in loading forever.
+    if (!play_when_ready_now && !seek_loading && !waiting_open_first_frame) {
+        return false;
+    }
     if (core_loading && !seek_loading && !waiting_open_first_frame) {
         int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1694,7 +1700,9 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
     if (manual_pause_blocked || paused_origin) {
         player_core_set_play_when_ready(player_core_, 0);
         player_core_pause(player_core_);
-        suppress_stale_loading_true_until_ms_.store(0, std::memory_order_release);
+        // Pause-origin settle should suppress stale loading=true for a short window,
+        // otherwise UI can stay in loading despite explicit paused intent.
+        suppress_stale_loading_true_until_ms_.store(now + 1200, std::memory_order_release);
     } else if (by_timeout) {
         // Timeout settle should still preserve "resume intent" unless this seek originated from pause.
         // Otherwise player can be left in PAUSED + playWhenReady=1 and stay frozen indefinitely.
@@ -1712,8 +1720,41 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
               state_after,
               player_core_get_play_when_ready(player_core_));
     } else if (!by_timeout) {
-        // Seek 已收敛且业务希望继续播放时，给短窗口屏蔽偶发的 stale loading=true。
-        suppress_stale_loading_true_until_ms_.store(now + 1800, std::memory_order_release);
+        int pwr_now = player_core_get_play_when_ready(player_core_);
+        bool wants_play = pwr_now != 0;
+        bool playing_now = player_core_is_playing(player_core_) != 0;
+        int state_now = player_core_get_state(player_core_);
+        bool force_play_attempted = false;
+        bool force_play_succeeded = false;
+        if (wants_play && !playing_now) {
+            force_play_attempted = true;
+            player_core_play(player_core_);
+            playing_now = player_core_is_playing(player_core_) != 0;
+            state_now = player_core_get_state(player_core_);
+            if (!playing_now && state_now == PLAYER_STATE_PAUSED) {
+                play();
+                playing_now = player_core_is_playing(player_core_) != 0;
+                state_now = player_core_get_state(player_core_);
+            }
+            force_play_succeeded = playing_now;
+        }
+        // Seek 已收敛后，给短窗口屏蔽偶发 stale loading=true。
+        suppress_stale_loading_true_until_ms_.store(now + (force_play_succeeded ? 2200 : 1400), std::memory_order_release);
+        SYNCI("evt=seek_settle_non_timeout_resume_check wants_play=%d attempted=%d success=%d state=%d pwr=%d playing=%d",
+              wants_play ? 1 : 0,
+              force_play_attempted ? 1 : 0,
+              force_play_succeeded ? 1 : 0,
+              state_now,
+              player_core_get_play_when_ready(player_core_),
+              player_core_is_playing(player_core_) ? 1 : 0);
+        if (wants_play && !force_play_succeeded) {
+            SYNCW("evt=seek_settle_non_timeout_resume_unresolved target=%.3f from=%.3f pos=%.3f state=%d pwr=%d",
+                  settle_target,
+                  settle_from,
+                  player_core_get_position(player_core_),
+                  player_core_get_state(player_core_),
+                  player_core_get_play_when_ready(player_core_));
+        }
     }
     seek_started_while_paused_.store(false, std::memory_order_release);
     if (source_encrypted_active_.load(std::memory_order_acquire)) {
@@ -1725,11 +1766,29 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
             SYNCI("evt=secure_seek_stall_streak_update by_timeout=1 streak=%d", next);
         } else {
             int prev = secure_seek_stall_streak_.load(std::memory_order_acquire);
-            if (prev > 0) {
+            bool healthy_settle = false;
+            int settle_state_now = player_core_get_state(player_core_);
+            int settle_pwr_now = player_core_get_play_when_ready(player_core_);
+            bool settle_playing_now = player_core_is_playing(player_core_) != 0;
+            int64_t settle_last_progress_ms = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
+            bool has_recent_progress = settle_last_progress_ms > 0 && (now - settle_last_progress_ms) <= 1200;
+            if (settle_pwr_now == 0) {
+                healthy_settle = true;
+            } else if (settle_playing_now || has_recent_progress) {
+                healthy_settle = true;
+            }
+            if (prev > 0 && healthy_settle) {
                 int next = std::max(0, prev - 1);
                 secure_seek_stall_streak_.store(next, std::memory_order_release);
                 secure_seek_stall_last_ms_.store(now, std::memory_order_release);
                 SYNCI("evt=secure_seek_stall_streak_update by_timeout=0 streak=%d", next);
+            } else if (prev > 0) {
+                SYNCW("evt=secure_seek_stall_streak_hold_unhealthy streak=%d state=%d pwr=%d playing=%d recent_progress=%d",
+                      prev,
+                      settle_state_now,
+                      settle_pwr_now,
+                      settle_playing_now ? 1 : 0,
+                      has_recent_progress ? 1 : 0);
             }
         }
     }

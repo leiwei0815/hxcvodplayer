@@ -2078,6 +2078,39 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 TAG,
                                 "evt=seek_completed_unhealthy id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying native_seek_active=$nativeSeekActive source_category=$currentSourceCategory"
                             )
+                            val unhealthyCheckRequestId = requestId
+                            val unhealthyCheckBasePos = position
+                            mainHandler.postDelayed({
+                                if (isReleased) return@postDelayed
+                                // Skip if a newer seek session has already started.
+                                if (pendingSeekActive || pendingSeekRequestId != unhealthyCheckRequestId) {
+                                    return@postDelayed
+                                }
+                                val checkHandle = currentHandle()
+                                if (checkHandle == 0L) return@postDelayed
+                                val checkPos = getPosition()
+                                val checkLoading = isLoading()
+                                val checkPlayWhenReady = getPlayWhenReady()
+                                val checkIsPlaying = isPlaying()
+                                val checkState = coerceStateWithLoading(getState(), checkLoading)
+                                val progressed = checkPos - unhealthyCheckBasePos
+                                val recovered =
+                                    checkPlayWhenReady &&
+                                            checkIsPlaying &&
+                                            !checkLoading &&
+                                            checkState != PlayerState.LOADING &&
+                                            progressed >= 0.08
+                                if (recovered) {
+                                    logInfo(
+                                        "evt=seek_unhealthy_followup_resolved id=$unhealthyCheckRequestId pos=$checkPos progressed=$progressed loading=$checkLoading state=${checkState.name} play_when_ready=$checkPlayWhenReady is_playing=$checkIsPlaying"
+                                    )
+                                } else {
+                                    Log.w(
+                                        TAG,
+                                        "evt=seek_unhealthy_followup_unresolved id=$unhealthyCheckRequestId pos=$checkPos progressed=$progressed loading=$checkLoading state=${checkState.name} play_when_ready=$checkPlayWhenReady is_playing=$checkIsPlaying source_category=$currentSourceCategory"
+                                    )
+                                }
+                            }, 1600L)
                         }
                         logInfo("evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory")
                         logInfo("evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryReopenTriggered play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory")
