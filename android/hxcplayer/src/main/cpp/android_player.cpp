@@ -1559,7 +1559,8 @@ void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
     if (!player) {
         return;
     }
-    int64_t now_ms_now = now_ms();
+    int64_t now_ms_now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
     if (player->suppress_transient_loading_false_.load(std::memory_order_acquire)) {
         int64_t suppress_until = player->suppress_transient_loading_false_until_ms_.load(std::memory_order_acquire);
         if (is_loading || now_ms_now > suppress_until) {
