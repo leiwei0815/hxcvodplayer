@@ -1899,7 +1899,7 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
         if (wants_play && !force_play_succeeded) {
             int64_t settle_last_progress_ms = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
             bool has_recent_progress = settle_last_progress_ms > 0 && (now - settle_last_progress_ms) <= 1200;
-            if (has_recent_progress) {
+            if (has_recent_progress || state_now == PLAYER_STATE_PLAYING) {
                 // Deterministic convergence path:
                 // playback intent is active and timeline is moving, treat as effective resume.
                 force_play_succeeded = true;
@@ -1911,13 +1911,12 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
                       player_core_get_state(player_core_),
                       player_core_get_play_when_ready(player_core_));
             } else {
-                // If resume cannot be confirmed and no forward progress exists, explicitly
-                // fall back to paused intent to avoid staying in pwr=1 + paused gray state.
-                player_core_set_play_when_ready(player_core_, 0);
-                player_core_pause(player_core_);
-                seek_resume_on_complete_.store(false, std::memory_order_release);
-                suppress_stale_loading_true_until_ms_.store(now + 1200, std::memory_order_release);
-                SYNCW("evt=seek_settle_non_timeout_resume_fallback_paused target=%.3f from=%.3f pos=%.3f state=%d pwr=%d",
+                // Keep autoplay intent on unresolved resume path.
+                // Do NOT force paused fallback here; otherwise pause->seek(resume=1)
+                // may be downgraded to pwr=0 and become non-autoplay.
+                seek_resume_on_complete_.store(true, std::memory_order_release);
+                suppress_stale_loading_true_until_ms_.store(now + 1800, std::memory_order_release);
+                SYNCW("evt=seek_settle_non_timeout_resume_hold_intent target=%.3f from=%.3f pos=%.3f state=%d pwr=%d",
                       settle_target,
                       settle_from,
                       player_core_get_position(player_core_),
