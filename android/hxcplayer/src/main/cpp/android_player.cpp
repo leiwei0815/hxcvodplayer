@@ -1046,6 +1046,8 @@ void AndroidPlayer::pause() {
     audio_rebuffer_min_resume_at_ms_ = 0;
     audio_rebuffer_cooldown_until_ms_ = 0;
     seek_resume_on_complete_.store(false, std::memory_order_release);
+    // Keep pause semantic explicit: playWhenReady must be false after manual pause.
+    player_core_set_play_when_ready(player_core_, 0);
     resetSeekFlowState(true, true, true, false);
     consecutive_drop_count_ = 0;
     first_frame_wait_started_ms_ = 0;
@@ -1599,9 +1601,22 @@ bool AndroidPlayer::isPlaying() const {
 }
 
 void AndroidPlayer::setPlayWhenReady(bool play_when_ready) {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) return;
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
     if (!play_when_ready) {
         pending_play_after_open_.store(false, std::memory_order_release);
+        user_manual_pause_.store(true, std::memory_order_release);
+        user_manual_pause_block_until_ms_.store(now + 5000, std::memory_order_release);
+        seek_resume_on_complete_.store(false, std::memory_order_release);
+        player_core_pause(player_core_);
+        if (playItf_) {
+            setOpenSLESPlayState(SL_PLAYSTATE_PAUSED, false);
+        }
+    } else {
+        user_manual_pause_.store(false, std::memory_order_release);
+        user_manual_pause_block_until_ms_.store(0, std::memory_order_release);
     }
     player_core_set_play_when_ready(player_core_, play_when_ready ? 1 : 0);
 }
@@ -1882,12 +1897,39 @@ void AndroidPlayer::settleSeekSessionFromApp(bool by_timeout) {
               player_core_get_play_when_ready(player_core_),
               player_core_is_playing(player_core_) ? 1 : 0);
         if (wants_play && !force_play_succeeded) {
-            SYNCW("evt=seek_settle_non_timeout_resume_unresolved target=%.3f from=%.3f pos=%.3f state=%d pwr=%d",
-                  settle_target,
-                  settle_from,
-                  player_core_get_position(player_core_),
-                  player_core_get_state(player_core_),
-                  player_core_get_play_when_ready(player_core_));
+            int64_t settle_last_progress_ms = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
+            bool has_recent_progress = settle_last_progress_ms > 0 && (now - settle_last_progress_ms) <= 1200;
+            if (has_recent_progress) {
+                // Deterministic convergence path:
+                // playback intent is active and timeline is moving, treat as effective resume.
+                force_play_succeeded = true;
+                suppress_stale_loading_true_until_ms_.store(now + 2200, std::memory_order_release);
+                SYNCI("evt=seek_settle_non_timeout_resume_effective_by_progress target=%.3f from=%.3f pos=%.3f state=%d pwr=%d",
+                      settle_target,
+                      settle_from,
+                      player_core_get_position(player_core_),
+                      player_core_get_state(player_core_),
+                      player_core_get_play_when_ready(player_core_));
+            } else {
+                // If resume cannot be confirmed and no forward progress exists, explicitly
+                // fall back to paused intent to avoid staying in pwr=1 + paused gray state.
+                player_core_set_play_when_ready(player_core_, 0);
+                player_core_pause(player_core_);
+                seek_resume_on_complete_.store(false, std::memory_order_release);
+                suppress_stale_loading_true_until_ms_.store(now + 1200, std::memory_order_release);
+                SYNCW("evt=seek_settle_non_timeout_resume_fallback_paused target=%.3f from=%.3f pos=%.3f state=%d pwr=%d",
+                      settle_target,
+                      settle_from,
+                      player_core_get_position(player_core_),
+                      player_core_get_state(player_core_),
+                      player_core_get_play_when_ready(player_core_));
+                SYNCW("evt=seek_settle_non_timeout_resume_unresolved target=%.3f from=%.3f pos=%.3f state=%d pwr=%d",
+                      settle_target,
+                      settle_from,
+                      player_core_get_position(player_core_),
+                      player_core_get_state(player_core_),
+                      player_core_get_play_when_ready(player_core_));
+            }
         }
     }
     seek_started_while_paused_.store(false, std::memory_order_release);

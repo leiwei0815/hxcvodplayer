@@ -532,7 +532,7 @@ Java_com_hxcplayer_HXCPlayerControl_setLogLevel(JNIEnv *env, jclass clazz, jint 
 JNIEXPORT jint JNICALL
 Java_com_hxcplayer_HXCPlayerControl_getLogLevel(JNIEnv *env, jclass clazz) {
     jint level = static_cast<jint>(hxc_sdk_get_runtime_log_level());
-    LOGI("getLogLevel: %d", level);
+    LOGD("getLogLevel: %d", level);
     return level;
 }
 
