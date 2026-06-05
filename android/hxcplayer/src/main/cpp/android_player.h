@@ -401,6 +401,9 @@ private:
     static void errorStateCallback(int error_code, const char* error_msg, void* user_data);
 
     std::atomic<bool> has_pending_playback_completed_{false};
+    // One-shot latch: once completed is detected, block repeated force-complete
+    // injections and suppress stale loading=true until next explicit play/seek/open.
+    std::atomic<bool> playback_completed_latched_{false};
     static void playbackCompletedCallback(void* user_data);
 
     // Seek state helpers: keep session cleanup and resume-intent decision centralized.

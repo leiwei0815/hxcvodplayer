@@ -443,6 +443,8 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     }
 
     LOGI("[open] openURL start_pos=%.3f url=%s", start_position, url ? url : "(null)");
+    has_pending_playback_completed_.store(false, std::memory_order_release);
+    playback_completed_latched_.store(false, std::memory_order_release);
     bool local_source = is_likely_local_uri(url);
     source_local_active_.store(local_source, std::memory_order_release);
     source_encrypted_active_.store(false, std::memory_order_release);
@@ -564,6 +566,8 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
         return false;
     }
     LOGI("[open] openWithCustomHTTP url=%s encrypted=%d", url ? url : "(null)", encrypted_file ? 1 : 0);
+    has_pending_playback_completed_.store(false, std::memory_order_release);
+    playback_completed_latched_.store(false, std::memory_order_release);
     source_local_active_.store(false, std::memory_order_release);
     source_encrypted_active_.store(encrypted_file, std::memory_order_release);
     SYNCI("evt=open_source_profile method=openWithCustomHTTP local=%d encrypted=%d secure=%d",
@@ -653,6 +657,8 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
     }
     LOGI("[open] openWithCustomFile path=%s start=0 encrypted=%d",
          path ? path : "(null)", encrypted_file ? 1 : 0);
+    has_pending_playback_completed_.store(false, std::memory_order_release);
+    playback_completed_latched_.store(false, std::memory_order_release);
     source_local_active_.store(true, std::memory_order_release);
     source_encrypted_active_.store(encrypted_file, std::memory_order_release);
     SYNCI("evt=open_source_profile method=openWithCustomFile local=%d encrypted=%d secure=%d",
@@ -764,6 +770,8 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         return false;
     }
     LOGI("[open] openWithSecureSession start_pos=%.3f url=%s", start_position, url ? url : "(null)");
+    has_pending_playback_completed_.store(false, std::memory_order_release);
+    playback_completed_latched_.store(false, std::memory_order_release);
     source_local_active_.store(false, std::memory_order_release);
     source_encrypted_active_.store(true, std::memory_order_release);
     SYNCI("evt=open_source_profile method=openWithSecureSession local=%d encrypted=%d secure=%d",
@@ -882,6 +890,8 @@ void AndroidPlayer::play() {
     if (!player_core_) return;
     user_manual_pause_.store(false, std::memory_order_release);
     user_manual_pause_block_until_ms_.store(0, std::memory_order_release);
+    has_pending_playback_completed_.store(false, std::memory_order_release);
+    playback_completed_latched_.store(false, std::memory_order_release);
 
     int core_decode_mode = player_core_get_decode_mode(player_core_);
     LOGI("[ctrl] play: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
@@ -1021,6 +1031,7 @@ void AndroidPlayer::stop() {
     secure_forward_seek_bias_hits_.store(0, std::memory_order_release);
     secure_forward_seek_bias_last_update_ms_.store(0, std::memory_order_release);
     has_pending_playback_completed_.store(false, std::memory_order_release);
+    playback_completed_latched_.store(false, std::memory_order_release);
 
     // Stop OpenSL ES first to prevent new callbacks from being queued,
     // then acquire audio_mutex_ to wait for any running callback to finish,
@@ -1115,6 +1126,8 @@ void AndroidPlayer::seekToWithIntent(double position, bool resume_after_seek) {
 void AndroidPlayer::seekTo(double position) {
     std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) return;
+    has_pending_playback_completed_.store(false, std::memory_order_release);
+    playback_completed_latched_.store(false, std::memory_order_release);
 
     bool manual_pause_blocked = false;
     if (user_manual_pause_.load(std::memory_order_acquire)) {
@@ -1502,6 +1515,9 @@ void AndroidPlayer::setPlayWhenReady(bool play_when_ready) {
 }
 
 bool AndroidPlayer::isLoading() const {
+    if (playback_completed_latched_.load(std::memory_order_acquire)) {
+        return false;
+    }
     bool core_loading = is_loading_.load(std::memory_order_acquire);
     bool seek_loading =
         seek_audio_wait_video_.load(std::memory_order_acquire) ||
@@ -1571,6 +1587,10 @@ void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
             return;
         }
     }
+    if (is_loading && player->playback_completed_latched_.load(std::memory_order_acquire)) {
+        LOGI_RATE(20, "[state] ignore loading=true after completed latched");
+        return;
+    }
     if (is_loading) {
         bool seek_loading =
                 player->seek_audio_wait_video_.load(std::memory_order_acquire) ||
@@ -1638,6 +1658,9 @@ void AndroidPlayer::playbackCompletedCallback(void* user_data) {
     }
     LOGI("[playbackCompleted] pos=%.3f dur=%.3f state=%d",
          player->getPosition(), player->getDuration(), player->getState());
+    player->playback_completed_latched_.store(true, std::memory_order_release);
+    player->is_loading_.store(false, std::memory_order_release);
+    player->suppress_stale_loading_true_until_ms_.store(0, std::memory_order_release);
     player->has_pending_playback_completed_.store(true, std::memory_order_release);
 }
 
@@ -4963,9 +4986,12 @@ void AndroidPlayer::renderLoop() {
                     play_when_ready_now &&
                     !seek_flow_active &&
                     empty_ms >= kTailStallForceCompleteMs &&
-                    !has_pending_playback_completed_.load(std::memory_order_acquire)) {
+                    !playback_completed_latched_.load(std::memory_order_acquire)) {
                     SYNCI("evt=tail_stall_force_complete empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f",
                           empty_ms, pos_now, dur_now, remain_now);
+                    playback_completed_latched_.store(true, std::memory_order_release);
+                    is_loading_.store(false, std::memory_order_release);
+                    suppress_stale_loading_true_until_ms_.store(now_empty + 15000, std::memory_order_release);
                     has_pending_playback_completed_.store(true, std::memory_order_release);
                 }
             }
