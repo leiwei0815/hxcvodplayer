@@ -463,16 +463,11 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var metricsPlayStallRecoverReopenCount: Long = 0L
     private var metricsPlayLoopRecoverCount: Long = 0L
     private var metricsManualPlayHardRecoverCount: Long = 0L
-    // Diagnostics only (no behavior change):
-    // - resolveUnifiedState input/output branch trace
-    // - post-seek-settle 2s state window snapshots
-    private var stateResolveDiagUntilMs: Long = 0L
-    private var stateResolveDiagLastLogAtMs: Long = 0L
-    private var seekSettleWindowDiagUntilMs: Long = 0L
-    private var seekSettleWindowDiagLastLogAtMs: Long = 0L
-    private var seekSettleWindowDiagStartPosSec: Double = Double.NaN
-    private var seekSettleWindowDiagLastPosSec: Double = Double.NaN
-    private var seekSettleWindowDiagRequestId: Long = -1L
+    // Minimal diagnostics for seek-settle state mismatch (debug level only).
+    private var seekSettleDiagUntilMs: Long = 0L
+    private var seekSettleDiagRequestId: Long = -1L
+    private var seekSettleDiagLogged: Boolean = false
+    private var seekSettleDiagStartPosSec: Double = Double.NaN
     private val lifecycleLock = Any()
     // 串行化 open/reopen/stop，避免与 release 并发触发 native 资源竞态。
     private val openSerialLock = Any()
@@ -604,6 +599,14 @@ class HXCPlayerControl @JvmOverloads constructor(
     private fun logInfo(message: String) {
         if (canEmitInfoLog()) {
             Log.i(TAG, message)
+        }
+    }
+
+    private fun canEmitDebugDiagLog(): Boolean {
+        return try {
+            getLogLevel() == 0
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -1750,85 +1753,23 @@ class HXCPlayerControl @JvmOverloads constructor(
         playWhenReady: Boolean,
         isPlayingNow: Boolean
     ): PlayerState {
-        val resolvedState: PlayerState
-        val reason: String
-        when {
-            coreStateRaw == -1 || pipelineStateRaw == 5 -> {
-                resolvedState = PlayerState.ERROR
-                reason = "error_gate"
-            }
-            coreStateRaw == 4 || pipelineStateRaw == 4 -> {
-                resolvedState = PlayerState.STOPPED
-                reason = "stopped_gate"
-            }
-            coreStateRaw == 0 || pipelineStateRaw == 0 -> {
-                resolvedState = PlayerState.IDLE
-                reason = "idle_gate"
-            }
-            coreStateRaw == 1 || pipelineStateRaw == 1 -> {
-                resolvedState = PlayerState.OPENING
-                reason = "opening_gate"
-            }
+        return when {
+            coreStateRaw == -1 || pipelineStateRaw == 5 -> PlayerState.ERROR
+            coreStateRaw == 4 || pipelineStateRaw == 4 -> PlayerState.STOPPED
+            coreStateRaw == 0 || pipelineStateRaw == 0 -> PlayerState.IDLE
+            coreStateRaw == 1 || pipelineStateRaw == 1 -> PlayerState.OPENING
             // 统一状态语义：未请求播放（playWhenReady=false）时，不能对外报 PLAYING。
             // 某些机型/链路在 open 初期会短暂返回 isPlaying=true 或 coreState=PLAYING，
             // 若直接透传会导致上层出现 "PLAYING -> PAUSED -> PLAYING" 抖动与按钮错态。
-            !playWhenReady -> {
-                resolvedState = PlayerState.PAUSED
-                reason = "pwr_false_pause"
-            }
-            isPlayingNow -> {
-                resolvedState = PlayerState.PLAYING
-                reason = "is_playing_true"
-            }
-            pipelineStateRaw == 2 -> {
-                resolvedState = PlayerState.LOADING
-                reason = "pipeline_buffering"
-            }
-            coreStateRaw == 3 -> {
-                resolvedState = PlayerState.PAUSED
-                reason = "core_paused_fallback"
-            }
-            else -> {
-                resolvedState = mapPlayerState(coreStateRaw)
-                reason = "map_core_state"
-            }
+            !playWhenReady -> PlayerState.PAUSED
+            isPlayingNow -> PlayerState.PLAYING
+            pipelineStateRaw == 2 -> PlayerState.LOADING
+            coreStateRaw == 3 -> PlayerState.PAUSED
+            else -> mapPlayerState(coreStateRaw)
         }
-        maybeLogResolveStateDiag(
-            coreStateRaw = coreStateRaw,
-            pipelineStateRaw = pipelineStateRaw,
-            playWhenReady = playWhenReady,
-            isPlayingNow = isPlayingNow,
-            resolvedState = resolvedState,
-            reason = reason
-        )
-        return resolvedState
     }
 
-    private fun maybeLogResolveStateDiag(
-        coreStateRaw: Int,
-        pipelineStateRaw: Int,
-        playWhenReady: Boolean,
-        isPlayingNow: Boolean,
-        resolvedState: PlayerState,
-        reason: String
-    ) {
-        val now = SystemClock.elapsedRealtime()
-        if (now > stateResolveDiagUntilMs) {
-            return
-        }
-        if ((now - stateResolveDiagLastLogAtMs) < 200L) {
-            return
-        }
-        stateResolveDiagLastLogAtMs = now
-        logInfo(
-            "evt=state_resolve_diag " +
-                "core=$coreStateRaw pipeline=$pipelineStateRaw pwr=$playWhenReady " +
-                "playing=$isPlayingNow resolved=${resolvedState.name} reason=$reason " +
-                "window_left_ms=${stateResolveDiagUntilMs - now}"
-        )
-    }
-
-    private fun maybeLogSeekSettleWindowDiag(
+    private fun maybeLogSeekSettleKeyDiag(
         nowMs: Long,
         positionSec: Double,
         coreStateRaw: Int,
@@ -1838,36 +1779,22 @@ class HXCPlayerControl @JvmOverloads constructor(
         resolvedState: PlayerState,
         loading: Boolean
     ) {
-        if (nowMs > seekSettleWindowDiagUntilMs) {
-            if (seekSettleWindowDiagRequestId >= 0L) {
-                logInfo(
-                    "evt=seek_settle_window_diag_end id=$seekSettleWindowDiagRequestId " +
-                        "last_pos=$seekSettleWindowDiagLastPosSec"
-                )
-                seekSettleWindowDiagRequestId = -1L
-            }
-            return
-        }
-        if ((nowMs - seekSettleWindowDiagLastLogAtMs) < 200L) {
-            return
-        }
-        seekSettleWindowDiagLastLogAtMs = nowMs
-        val fromStart = if (seekSettleWindowDiagStartPosSec.isNaN()) {
-            0.0
-        } else {
-            positionSec - seekSettleWindowDiagStartPosSec
-        }
-        val fromLast = if (seekSettleWindowDiagLastPosSec.isNaN()) {
-            0.0
-        } else {
-            positionSec - seekSettleWindowDiagLastPosSec
-        }
-        seekSettleWindowDiagLastPosSec = positionSec
-        logInfo(
-            "evt=seek_settle_window_diag " +
-                "id=$seekSettleWindowDiagRequestId pos=$positionSec delta_start=$fromStart delta_last=$fromLast " +
+        if (!canEmitDebugDiagLog()) return
+        if (seekSettleDiagLogged) return
+        if (nowMs > seekSettleDiagUntilMs) return
+        if (seekSettleDiagRequestId < 0L) return
+        val progressed = if (seekSettleDiagStartPosSec.isNaN()) 0.0 else (positionSec - seekSettleDiagStartPosSec)
+        val semanticMismatch = playWhenReady &&
+                !isPlayingNow &&
+                (resolvedState == PlayerState.LOADING || resolvedState == PlayerState.PAUSED) &&
+                progressed >= 0.35
+        if (!semanticMismatch) return
+        seekSettleDiagLogged = true
+        Log.d(
+            TAG,
+            "evt=seek_settle_key_diag id=$seekSettleDiagRequestId pos=$positionSec progressed=$progressed " +
                 "core=$coreStateRaw pipeline=$pipelineStateRaw pwr=$playWhenReady playing=$isPlayingNow " +
-                "state=${resolvedState.name} loading=$loading window_left_ms=${seekSettleWindowDiagUntilMs - nowMs}"
+                "resolved=${resolvedState.name} loading=$loading"
         )
     }
 
@@ -1960,7 +1887,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     isPlayingNow = isPlaying,
                     playWhenReady = playWhenReady
                 )
-                maybeLogSeekSettleWindowDiag(
+                maybeLogSeekSettleKeyDiag(
                     nowMs = now,
                     positionSec = rawPosition,
                     coreStateRaw = coreStateRaw,
@@ -2278,21 +2205,19 @@ class HXCPlayerControl @JvmOverloads constructor(
                         }
                         logInfo("evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory")
                         logInfo("evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryReopenTriggered play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory")
-                        // Diagnostics only: observe raw state evolution for 2s after seek settle.
-                        // This helps confirm "playWhenReady=true but state/playing unresolved" root cause.
-                        val diagUntil = now + 2000L
-                        stateResolveDiagUntilMs = diagUntil
-                        stateResolveDiagLastLogAtMs = 0L
-                        seekSettleWindowDiagUntilMs = diagUntil
-                        seekSettleWindowDiagLastLogAtMs = 0L
-                        seekSettleWindowDiagStartPosSec = position
-                        seekSettleWindowDiagLastPosSec = position
-                        seekSettleWindowDiagRequestId = requestId
-                        logInfo(
-                            "evt=seek_settle_window_diag_arm " +
-                                "id=$requestId until_ms=$diagUntil pos=$position target=$target " +
-                                "state=${state.name} pwr=$playWhenReady playing=$isPlaying"
-                        )
+                        // Minimal diagnostics: arm a short post-seek window and only
+                        // emit one key mismatch log when play intent and semantic diverge.
+                        seekSettleDiagUntilMs = now + 2000L
+                        seekSettleDiagRequestId = requestId
+                        seekSettleDiagLogged = false
+                        seekSettleDiagStartPosSec = position
+                        if (canEmitDebugDiagLog()) {
+                            Log.d(
+                                TAG,
+                                "evt=seek_settle_key_diag_arm id=$requestId until_ms=$seekSettleDiagUntilMs " +
+                                    "pos=$position target=$target state=${state.name} pwr=$playWhenReady playing=$isPlaying"
+                            )
+                        }
                         // Seek 完成后若目标语义是继续播放，重新武装 stall 监测，
                         // 防止“状态=PLAYING 但位置不再推进”长期卡住。
                         if (playWhenReady) {
