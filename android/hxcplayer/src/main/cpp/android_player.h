@@ -407,6 +407,10 @@ private:
     // One-shot latch: once completed is detected, block repeated force-complete
     // injections and suppress stale loading=true until next explicit play/seek/open.
     std::atomic<bool> playback_completed_latched_{false};
+    // Open lifecycle marker: heavy demux/network open is in progress.
+    std::atomic<bool> open_in_progress_{false};
+    // If play() arrives during open lock contention, defer once until open settles.
+    std::atomic<bool> pending_play_after_open_{false};
     static void playbackCompletedCallback(void* user_data);
 
     // Seek state helpers: keep session cleanup and resume-intent decision centralized.

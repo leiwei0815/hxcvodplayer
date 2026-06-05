@@ -466,8 +466,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val lifecycleLock = Any()
     // 串行化 open/reopen/stop，避免与 release 并发触发 native 资源竞态。
     private val openSerialLock = Any()
-    // 避免异步 play 晚到覆盖 pause/stop：每次状态反向动作都会推进 token。
-    @Volatile private var playDispatchToken: Long = 0L
     @Volatile private var isReleased = false
     private var autoReopenOnRecoverableErrorEnabled: Boolean = false
     private var autoReopenMaxAttempts: Int = 1
@@ -1546,10 +1544,6 @@ class HXCPlayerControl @JvmOverloads constructor(
             return
         }
         val requestAtMs = SystemClock.elapsedRealtime()
-        val requestToken = synchronized(lifecycleLock) {
-            playDispatchToken += 1L
-            playDispatchToken
-        }
         playStallLastPlayReqAtMs = requestAtMs
         playStallCheckArmed = true
         playStallArmedAtMs = playStallLastPlayReqAtMs
@@ -1558,37 +1552,16 @@ class HXCPlayerControl @JvmOverloads constructor(
         manualPlayHardRecoverPending = true
         manualPlayHardRecoverArmedAtMs = playStallLastPlayReqAtMs
         manualPlayHardRecoverBasePosSec = playStallBasePosSec
-        // 避免主线程直接进入 nativePlay 抢 api_mutex 造成 ANR；
-        // 统一投递到 openExecutor 串行执行，与 open/reopen 路径同队列协同。
-        val targetRate = preferredPlaybackRate
-        try {
-            openExecutor.execute {
-                if (isReleased) return@execute
-                if (requestToken != playDispatchToken) return@execute
-                val latestHandle = currentHandle()
-                if (latestHandle == 0L) return@execute
-                val dispatchDelayMs = SystemClock.elapsedRealtime() - requestAtMs
-                if (dispatchDelayMs > 1200L) {
-                    logInfo("evt=play_dispatch_delayed delay_ms=$dispatchDelayMs")
-                }
-                nativePlay(latestHandle)
-                if (requestToken != playDispatchToken) return@execute
-                // 某些设备/解码链路在 pause->play 后会把速率短暂回落到 1.0，
-                // play 后立刻回放业务侧目标倍速，保证体感一致。
-                nativeSetPlaybackRate(latestHandle, targetRate)
-            }
-        } catch (_: RejectedExecutionException) {
-            logInfo("evt=play_dispatch_rejected")
-        }
+        nativePlay(handle)
+        // 某些设备/解码链路在 pause->play 后会把速率短暂回落到 1.0，
+        // play 后立刻回放业务侧目标倍速，保证体感一致。
+        nativeSetPlaybackRate(handle, preferredPlaybackRate)
     }
 
     // 暂停
     fun pause() {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        synchronized(lifecycleLock) {
-            playDispatchToken += 1L
-        }
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
         nativePause(handle)
@@ -1598,9 +1571,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun stop() {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        synchronized(lifecycleLock) {
-            playDispatchToken += 1L
-        }
         synchronized(openSerialLock) {
             if (isReleased) return
             nativeStop(handle)
@@ -1735,11 +1705,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun setPlayWhenReady(playWhenReady: Boolean) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        if (!playWhenReady) {
-            synchronized(lifecycleLock) {
-                playDispatchToken += 1L
-            }
-        }
         nativeSetPlayWhenReady(handle, playWhenReady)
     }
 
@@ -2542,7 +2507,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         synchronized(lifecycleLock) {
             if (isReleased) return
             isReleased = true
-            playDispatchToken += 1L
         }
         updateExecutor?.shutdownNow()
         // 不在主线程等待 openExecutor/锁，避免 Activity.onDestroy ANR。

@@ -257,6 +257,22 @@ int estimate_uv_swap_vote(const uint8_t* y_data,
     if (std::fabs(diff) <= eps) return 0;
     return (diff > 0.0f) ? +1 : -1;
 }
+
+// RAII guard for open lifecycle marker; guarantees cleanup on all return paths.
+struct OpenLifecycleGuard {
+    std::atomic<bool>& open_in_progress;
+    std::atomic<bool>& pending_play_after_open;
+
+    OpenLifecycleGuard(std::atomic<bool>& open_flag, std::atomic<bool>& pending_flag)
+        : open_in_progress(open_flag), pending_play_after_open(pending_flag) {
+        open_in_progress.store(true, std::memory_order_release);
+        pending_play_after_open.store(false, std::memory_order_release);
+    }
+
+    ~OpenLifecycleGuard() {
+        open_in_progress.store(false, std::memory_order_release);
+    }
+};
 }  // namespace
 
 AndroidPlayer::AndroidPlayer()
@@ -441,6 +457,7 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         LOGE("Player core not initialized");
         return false;
     }
+    OpenLifecycleGuard open_lifecycle_guard(open_in_progress_, pending_play_after_open_);
 
     LOGI("[open] openURL start_pos=%.3f url=%s", start_position, url ? url : "(null)");
     has_pending_playback_completed_.store(false, std::memory_order_release);
@@ -549,7 +566,6 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         severe_lag_audio_pause_start_ms_ = 0;
         render_cv_.notify_one(); // wake render thread -- frames may be ready
         LOGI("Video opened and paused, waiting for user to play");
-
         return true;
     } else {
         LOGE("Failed to open URL: %s (error code: %d)", url, result);
@@ -569,6 +585,7 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
         LOGE("Player core not initialized");
         return false;
     }
+    OpenLifecycleGuard open_lifecycle_guard(open_in_progress_, pending_play_after_open_);
     LOGI("[open] openWithCustomHTTP url=%s encrypted=%d", url ? url : "(null)", encrypted_file ? 1 : 0);
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
@@ -663,6 +680,7 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
         LOGE("Player core not initialized");
         return false;
     }
+    OpenLifecycleGuard open_lifecycle_guard(open_in_progress_, pending_play_after_open_);
     LOGI("[open] openWithCustomFile path=%s start=0 encrypted=%d",
          path ? path : "(null)", encrypted_file ? 1 : 0);
     has_pending_playback_completed_.store(false, std::memory_order_release);
@@ -781,6 +799,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         LOGE("Player core not initialized");
         return false;
     }
+    OpenLifecycleGuard open_lifecycle_guard(open_in_progress_, pending_play_after_open_);
     LOGI("[open] openWithSecureSession start_pos=%.3f url=%s", start_position, url ? url : "(null)");
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
@@ -902,96 +921,116 @@ bool AndroidPlayer::openWithSecureHLS(const char* url,
 }
 
 void AndroidPlayer::play() {
-    std::lock_guard<std::mutex> api_lock(api_mutex_);
-    if (!player_core_) return;
-    user_manual_pause_.store(false, std::memory_order_release);
-    user_manual_pause_block_until_ms_.store(0, std::memory_order_release);
-    has_pending_playback_completed_.store(false, std::memory_order_release);
-    playback_completed_latched_.store(false, std::memory_order_release);
+    auto do_play_locked = [this]() {
+        if (!player_core_) return;
+        pending_play_after_open_.store(false, std::memory_order_release);
+        user_manual_pause_.store(false, std::memory_order_release);
+        user_manual_pause_block_until_ms_.store(0, std::memory_order_release);
+        has_pending_playback_completed_.store(false, std::memory_order_release);
+        playback_completed_latched_.store(false, std::memory_order_release);
 
-    int core_decode_mode = player_core_get_decode_mode(player_core_);
-    LOGI("[ctrl] play: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
-    DECODEI("evt=play_start decode_mode=%s hw_active=%d",
-            core_decode_mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
-            player_core_is_video_hardware_decoding(player_core_) ? 1 : 0);
-    SYNCI("evt=play_start pos=%.3f rate=%.2f",
-          player_core_get_position(player_core_),
-          player_core_get_playback_rate(player_core_));
-    player_core_play(player_core_);
-    render_cv_.notify_one();
-    audio_rebuffer_pending_.store(false, std::memory_order_release);
-    audio_rebuffer_deadline_ms_ = 0;
-    audio_rebuffer_paused_at_ms_ = 0;
-    audio_rebuffer_min_resume_at_ms_ = 0;
-    audio_rebuffer_cooldown_until_ms_ = 0;
-    bool seek_flow_active =
-            seek_lower_bound_active_.load(std::memory_order_acquire) ||
-            seek_recovery_active_.load(std::memory_order_acquire) ||
-            seek_audio_wait_video_.load(std::memory_order_acquire) ||
-            seek_force_resume_pending_.load(std::memory_order_acquire) ||
-            seek_session_active_id_.load(std::memory_order_acquire) != 0;
-    // Keep failover lifecycle decided by real seek gates/session flags below.
-    // Forcing seek_flow_active=false in failover can prematurely clear session context.
-    bool seek_started_while_paused = seek_started_while_paused_.load(std::memory_order_acquire);
-    bool manual_play_upgrades_seek_resume = seek_flow_active && seek_started_while_paused;
-    if (manual_play_upgrades_seek_resume) {
-        // User explicitly pressed play during a paused-origin seek.
-        // Upgrade current seek intent to resume-on-complete instead of waiting for timeout paths.
-        seek_started_while_paused_.store(false, std::memory_order_release);
-        seek_started_while_paused = false;
-        player_core_set_play_when_ready(player_core_, 1);
-        SYNCI_RATE(20, "evt=seek_manual_play_upgrade sid=%" PRIu64 " phase=%s",
-                   seek_session_active_id_.load(std::memory_order_acquire),
-                   seek_phase_name(seek_phase_.load(std::memory_order_acquire)));
-    }
-    bool allow_seek_autoresume = !(seek_flow_active && seek_started_while_paused);
-    seek_resume_on_complete_.store(allow_seek_autoresume, std::memory_order_release);
-    if (!allow_seek_autoresume) {
-        SYNCI_RATE(20, "evt=seek_autoresume_suppressed_on_manual_play sid=%" PRIu64 " phase=%s",
-                   seek_session_active_id_.load(std::memory_order_acquire),
-                   seek_phase_name(seek_phase_.load(std::memory_order_acquire)));
-    }
-    if (!seek_flow_active) {
-        resetSeekFlowState(true, true, false, false);
-    } else {
-        SYNCI_RATE(30, "evt=play_keep_seek_context sid=%" PRIu64 " phase=%s",
-                   seek_session_active_id_.load(std::memory_order_acquire),
-                   seek_phase_name(seek_phase_.load(std::memory_order_acquire)));
-    }
-    consecutive_drop_count_ = 0;
-    severe_lag_start_ms_ = 0;
-    severe_lag_audio_pause_start_ms_ = 0;
-
-    if (playItf_) {
-        // For initial open: defer audio until first frame rendered to avoid
-        // "loading hidden but black screen". For resumed playback (already rendered),
-        // start audio immediately.
-        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (!first_frame_rendered_.load(std::memory_order_acquire)) {
-            audio_start_pending_.store(true, std::memory_order_release);
-            first_frame_wait_started_ms_ = now;
-            // Keep deadline as a hard safety valve, but render loop will not use it
-            // in early open phase until first-frame hard timeout is reached.
-            audio_start_deadline_ms_ = now + 2600;
-            LOGI("[ctrl] play: audio deferred until first video frame (deadline +2600ms)");
-        } else {
-            audio_start_pending_.store(false, std::memory_order_release);
-            first_frame_wait_started_ms_ = 0;
-            if (current_volume_.load(std::memory_order_relaxed) > 0.0f) {
-                SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
-                LOGI("[ctrl] play: audio immediate resume (already rendered), result=%d", r);
-            }
+        int core_decode_mode = player_core_get_decode_mode(player_core_);
+        LOGI("[ctrl] play: state=%d pos=%.3f", player_core_get_state(player_core_), player_core_get_position(player_core_));
+        DECODEI("evt=play_start decode_mode=%s hw_active=%d",
+                core_decode_mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
+                player_core_is_video_hardware_decoding(player_core_) ? 1 : 0);
+        SYNCI("evt=play_start pos=%.3f rate=%.2f",
+              player_core_get_position(player_core_),
+              player_core_get_playback_rate(player_core_));
+        player_core_play(player_core_);
+        render_cv_.notify_one();
+        audio_rebuffer_pending_.store(false, std::memory_order_release);
+        audio_rebuffer_deadline_ms_ = 0;
+        audio_rebuffer_paused_at_ms_ = 0;
+        audio_rebuffer_min_resume_at_ms_ = 0;
+        audio_rebuffer_cooldown_until_ms_ = 0;
+        bool seek_flow_active =
+                seek_lower_bound_active_.load(std::memory_order_acquire) ||
+                seek_recovery_active_.load(std::memory_order_acquire) ||
+                seek_audio_wait_video_.load(std::memory_order_acquire) ||
+                seek_force_resume_pending_.load(std::memory_order_acquire) ||
+                seek_session_active_id_.load(std::memory_order_acquire) != 0;
+        // Keep failover lifecycle decided by real seek gates/session flags below.
+        // Forcing seek_flow_active=false in failover can prematurely clear session context.
+        bool seek_started_while_paused = seek_started_while_paused_.load(std::memory_order_acquire);
+        bool manual_play_upgrades_seek_resume = seek_flow_active && seek_started_while_paused;
+        if (manual_play_upgrades_seek_resume) {
+            // User explicitly pressed play during a paused-origin seek.
+            // Upgrade current seek intent to resume-on-complete instead of waiting for timeout paths.
+            seek_started_while_paused_.store(false, std::memory_order_release);
+            seek_started_while_paused = false;
+            player_core_set_play_when_ready(player_core_, 1);
+            SYNCI_RATE(20, "evt=seek_manual_play_upgrade sid=%" PRIu64 " phase=%s",
+                       seek_session_active_id_.load(std::memory_order_acquire),
+                       seek_phase_name(seek_phase_.load(std::memory_order_acquire)));
         }
-    } else {
-        LOGD("No audio interface (audio disabled)");
+        bool allow_seek_autoresume = !(seek_flow_active && seek_started_while_paused);
+        seek_resume_on_complete_.store(allow_seek_autoresume, std::memory_order_release);
+        if (!allow_seek_autoresume) {
+            SYNCI_RATE(20, "evt=seek_autoresume_suppressed_on_manual_play sid=%" PRIu64 " phase=%s",
+                       seek_session_active_id_.load(std::memory_order_acquire),
+                       seek_phase_name(seek_phase_.load(std::memory_order_acquire)));
+        }
+        if (!seek_flow_active) {
+            resetSeekFlowState(true, true, false, false);
+        } else {
+            SYNCI_RATE(30, "evt=play_keep_seek_context sid=%" PRIu64 " phase=%s",
+                       seek_session_active_id_.load(std::memory_order_acquire),
+                       seek_phase_name(seek_phase_.load(std::memory_order_acquire)));
+        }
+        consecutive_drop_count_ = 0;
+        severe_lag_start_ms_ = 0;
+        severe_lag_audio_pause_start_ms_ = 0;
+
+        if (playItf_) {
+            // For initial open: defer audio until first frame rendered to avoid
+            // "loading hidden but black screen". For resumed playback (already rendered),
+            // start audio immediately.
+            int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (!first_frame_rendered_.load(std::memory_order_acquire)) {
+                audio_start_pending_.store(true, std::memory_order_release);
+                first_frame_wait_started_ms_ = now;
+                // Keep deadline as a hard safety valve, but render loop will not use it
+                // in early open phase until first-frame hard timeout is reached.
+                audio_start_deadline_ms_ = now + 2600;
+                LOGI("[ctrl] play: audio deferred until first video frame (deadline +2600ms)");
+            } else {
+                audio_start_pending_.store(false, std::memory_order_release);
+                first_frame_wait_started_ms_ = 0;
+                if (current_volume_.load(std::memory_order_relaxed) > 0.0f) {
+                    SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
+                    LOGI("[ctrl] play: audio immediate resume (already rendered), result=%d", r);
+                }
+            }
+        } else {
+            LOGD("No audio interface (audio disabled)");
+        }
+        LOGI("[ctrl] play: dispatched to core + audio");
+    };
+
+    std::unique_lock<std::mutex> api_lock(api_mutex_, std::try_to_lock);
+    if (!api_lock.owns_lock()) {
+        bool opening = open_in_progress_.load(std::memory_order_acquire);
+        if (opening) {
+            pending_play_after_open_.store(true, std::memory_order_release);
+            user_manual_pause_.store(false, std::memory_order_release);
+            user_manual_pause_block_until_ms_.store(0, std::memory_order_release);
+            has_pending_playback_completed_.store(false, std::memory_order_release);
+            playback_completed_latched_.store(false, std::memory_order_release);
+            LOGI("[ctrl] play deferred: open_in_progress=1");
+            render_cv_.notify_one();
+            return;
+        }
+        api_lock.lock();
     }
-    LOGI("[ctrl] play: dispatched to core + audio");
+    do_play_locked();
 }
 
 void AndroidPlayer::pause() {
     std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) return;
+    pending_play_after_open_.store(false, std::memory_order_release);
 
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1025,6 +1064,7 @@ void AndroidPlayer::pause() {
 void AndroidPlayer::stop() {
     std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) return;
+    pending_play_after_open_.store(false, std::memory_order_release);
 
     user_manual_pause_.store(false, std::memory_order_release);
     user_manual_pause_block_until_ms_.store(0, std::memory_order_release);
@@ -1531,6 +1571,9 @@ bool AndroidPlayer::isPlaying() const {
 
 void AndroidPlayer::setPlayWhenReady(bool play_when_ready) {
     if (!player_core_) return;
+    if (!play_when_ready) {
+        pending_play_after_open_.store(false, std::memory_order_release);
+    }
     player_core_set_play_when_ready(player_core_, play_when_ready ? 1 : 0);
 }
 
@@ -2480,6 +2523,15 @@ void AndroidPlayer::renderLoop() {
         }
 
         if (!surface_ready || !player_core_) continue;
+
+        // Mid-term ANR optimization:
+        // If UI requested play during long open(), execute once after open settles.
+        if (!open_in_progress_.load(std::memory_order_acquire) &&
+            pending_play_after_open_.load(std::memory_order_acquire)) {
+            LOGI("[ctrl] consume deferred play after open");
+            play();
+            continue;
+        }
 
         // Track forward progress for stale-loading suppression.
         // Some devices keep reporting loading=true after seek settle while position still advances.
