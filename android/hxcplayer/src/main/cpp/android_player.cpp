@@ -445,6 +445,10 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     LOGI("[open] openURL start_pos=%.3f url=%s", start_position, url ? url : "(null)");
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
+    open_start_position_sec_.store(start_position, std::memory_order_release);
+    open_requested_at_ms_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_release);
     bool local_source = is_likely_local_uri(url);
     source_local_active_.store(local_source, std::memory_order_release);
     source_encrypted_active_.store(false, std::memory_order_release);
@@ -568,6 +572,10 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
     LOGI("[open] openWithCustomHTTP url=%s encrypted=%d", url ? url : "(null)", encrypted_file ? 1 : 0);
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
+    open_start_position_sec_.store(0.0, std::memory_order_release);
+    open_requested_at_ms_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_release);
     source_local_active_.store(false, std::memory_order_release);
     source_encrypted_active_.store(encrypted_file, std::memory_order_release);
     SYNCI("evt=open_source_profile method=openWithCustomHTTP local=%d encrypted=%d secure=%d",
@@ -659,6 +667,10 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
          path ? path : "(null)", encrypted_file ? 1 : 0);
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
+    open_start_position_sec_.store(0.0, std::memory_order_release);
+    open_requested_at_ms_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_release);
     source_local_active_.store(true, std::memory_order_release);
     source_encrypted_active_.store(encrypted_file, std::memory_order_release);
     SYNCI("evt=open_source_profile method=openWithCustomFile local=%d encrypted=%d secure=%d",
@@ -772,6 +784,10 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     LOGI("[open] openWithSecureSession start_pos=%.3f url=%s", start_position, url ? url : "(null)");
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
+    open_start_position_sec_.store(start_position, std::memory_order_release);
+    open_requested_at_ms_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_release);
     source_local_active_.store(false, std::memory_order_release);
     source_encrypted_active_.store(true, std::memory_order_release);
     SYNCI("evt=open_source_profile method=openWithSecureSession local=%d encrypted=%d secure=%d",
@@ -1032,6 +1048,8 @@ void AndroidPlayer::stop() {
     secure_forward_seek_bias_last_update_ms_.store(0, std::memory_order_release);
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
+    open_start_position_sec_.store(-1.0, std::memory_order_release);
+    open_requested_at_ms_.store(0, std::memory_order_release);
 
     // Stop OpenSL ES first to prevent new callbacks from being queued,
     // then acquire audio_mutex_ to wait for any running callback to finish,
@@ -1128,6 +1146,8 @@ void AndroidPlayer::seekTo(double position) {
     if (!player_core_) return;
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
+    // Explicit seek overrides "open-start near tail" intent.
+    open_start_position_sec_.store(-1.0, std::memory_order_release);
 
     bool manual_pause_blocked = false;
     if (user_manual_pause_.load(std::memory_order_acquire)) {
@@ -2380,6 +2400,7 @@ void AndroidPlayer::renderLoop() {
     int64_t tail_stall_diag_last_log_ms = 0;
     const int64_t kTailStallDiagIntervalMs = 2000;
     const int64_t kTailStallForceCompleteMs = 12000;
+    const int64_t kTailStallForceCompleteFastMs = 3200;
     // Force-resume soft success detector:
     // some secure seek sessions keep core state at PAUSED while clock/frames
     // still progress toward target. Avoid retry storms in that situation.
@@ -4961,6 +4982,8 @@ void AndroidPlayer::renderLoop() {
                 double pos_now = player_core_get_position(player_core_);
                 double dur_now = player_core_get_duration(player_core_);
                 double remain_now = (std::isfinite(dur_now) && std::isfinite(pos_now)) ? (dur_now - pos_now) : std::numeric_limits<double>::quiet_NaN();
+                double open_start_pos_now = open_start_position_sec_.load(std::memory_order_acquire);
+                int64_t open_requested_at_ms_now = open_requested_at_ms_.load(std::memory_order_acquire);
                 bool play_when_ready_now = player_core_get_play_when_ready(player_core_) != 0;
                 bool seek_flow_active =
                         seek_lower_bound_active_.load(std::memory_order_acquire) ||
@@ -4969,9 +4992,20 @@ void AndroidPlayer::renderLoop() {
                 // Secure/HLS tail can legitimately land a little beyond duration due to keyframe-ahead settle.
                 // Treat small negative remain as near-end, otherwise force-complete watchdog never triggers.
                 bool near_end = std::isfinite(remain_now) && remain_now >= -3.0 && remain_now <= 1.2;
+                double tail_intent_window_sec = std::isfinite(dur_now)
+                                                ? std::max(1.6, std::min(3.2, dur_now * 0.012))
+                                                : 1.6;
+                bool open_tail_intent = std::isfinite(dur_now)
+                                        && std::isfinite(open_start_pos_now)
+                                        && open_start_pos_now >= std::max(0.0, dur_now - tail_intent_window_sec);
+                int64_t open_age_ms = open_requested_at_ms_now > 0 ? (now_empty - open_requested_at_ms_now) : -1;
+                bool recent_open_tail_intent = open_tail_intent && open_age_ms >= 0 && open_age_ms <= 20000;
+                int64_t tail_force_complete_ms = recent_open_tail_intent
+                                                 ? kTailStallForceCompleteFastMs
+                                                 : kTailStallForceCompleteMs;
                 if ((now_empty - tail_stall_diag_last_log_ms) >= kTailStallDiagIntervalMs) {
                     tail_stall_diag_last_log_ms = now_empty;
-                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d",
+                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64,
                           empty_ms,
                           pos_now,
                           dur_now,
@@ -4980,15 +5014,23 @@ void AndroidPlayer::renderLoop() {
                           play_when_ready_now ? 1 : 0,
                           seek_flow_active ? 1 : 0,
                           is_loading_.load(std::memory_order_acquire) ? 1 : 0,
-                          player_core_get_state(player_core_));
+                          player_core_get_state(player_core_),
+                          recent_open_tail_intent ? 1 : 0,
+                          tail_force_complete_ms,
+                          open_start_pos_now,
+                          open_age_ms);
                 }
                 if (near_end &&
                     play_when_ready_now &&
                     !seek_flow_active &&
-                    empty_ms >= kTailStallForceCompleteMs &&
+                    empty_ms >= tail_force_complete_ms &&
                     !playback_completed_latched_.load(std::memory_order_acquire)) {
-                    SYNCI("evt=tail_stall_force_complete empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f",
-                          empty_ms, pos_now, dur_now, remain_now);
+                    SYNCI("evt=tail_stall_force_complete empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64,
+                          empty_ms, pos_now, dur_now, remain_now,
+                          recent_open_tail_intent ? 1 : 0,
+                          tail_force_complete_ms,
+                          open_start_pos_now,
+                          open_age_ms);
                     playback_completed_latched_.store(true, std::memory_order_release);
                     is_loading_.store(false, std::memory_order_release);
                     suppress_stale_loading_true_until_ms_.store(now_empty + 15000, std::memory_order_release);

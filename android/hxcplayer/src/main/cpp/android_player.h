@@ -329,6 +329,9 @@ private:
     // Source profile for seek-policy split.
     std::atomic<bool>   source_local_active_{false};
     std::atomic<bool>   source_encrypted_active_{false};
+    // Track open intent to distinguish "start near tail" from normal playback.
+    std::atomic<double> open_start_position_sec_{-1.0};
+    std::atomic<int64_t> open_requested_at_ms_{0};
     // Seek recovery diagnostics and adaptive lower-bound relaxation.
     int64_t             seek_started_at_ms_{0};
     int                 seek_lower_bound_drop_count_{0};
