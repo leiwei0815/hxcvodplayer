@@ -1566,7 +1566,36 @@ bool AndroidPlayer::getPlayWhenReady() const {
 
 bool AndroidPlayer::isPlaying() const {
     if (!player_core_) return false;
-    return player_core_is_playing(player_core_) != 0;
+    if (player_core_is_playing(player_core_) != 0) {
+        return true;
+    }
+    // Semantic fix for secure HLS edge cases:
+    // Some streams keep core state in PAUSED/BUFFERING while frames still advance.
+    // Treat it as effective playing when:
+    // - autoplay intent is on (playWhenReady=true)
+    // - no active seek-gates
+    // - recent forward progress is observed
+    bool play_when_ready_now = player_core_get_play_when_ready(player_core_) != 0;
+    if (!play_when_ready_now) {
+        return false;
+    }
+    bool seek_gates_active =
+            seek_audio_wait_video_.load(std::memory_order_acquire) ||
+            seek_recovery_active_.load(std::memory_order_acquire) ||
+            seek_lower_bound_active_.load(std::memory_order_acquire) ||
+            seek_force_resume_pending_.load(std::memory_order_acquire);
+    if (seek_gates_active) {
+        return false;
+    }
+    int64_t now_ms_now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t last_progress_ms = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
+    bool has_recent_progress = last_progress_ms > 0 && (now_ms_now - last_progress_ms) <= 1500;
+    if (has_recent_progress) {
+        LOGI_RATE(40, "[state] effective playing by progress (core_playing=0 pwr=1)");
+        return true;
+    }
+    return false;
 }
 
 void AndroidPlayer::setPlayWhenReady(bool play_when_ready) {
