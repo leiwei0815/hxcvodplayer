@@ -480,6 +480,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var networkTotalStallMs: Long = 0L
     private var networkReconnectCount: Int = 0
     @Volatile private var preferredPlaybackRate: Float = 1.0f
+    private var semanticLastRawPosSec: Double = Double.NaN
+    private var semanticProgressLastAdvanceMs: Long = 0L
+    private var semanticOverrideLastLogAtMs: Long = 0L
     private var lastOpenUrl: String? = null
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
@@ -1753,6 +1756,9 @@ class HXCPlayerControl @JvmOverloads constructor(
         playWhenReady: Boolean,
         isPlayingNow: Boolean
     ): PlayerState {
+        val nowMs = SystemClock.elapsedRealtime()
+        val hasRecentSemanticProgress =
+            semanticProgressLastAdvanceMs > 0L && (nowMs - semanticProgressLastAdvanceMs) <= 1400L
         return when {
             coreStateRaw == -1 || pipelineStateRaw == 5 -> PlayerState.ERROR
             coreStateRaw == 4 || pipelineStateRaw == 4 -> PlayerState.STOPPED
@@ -1763,7 +1769,19 @@ class HXCPlayerControl @JvmOverloads constructor(
             // 若直接透传会导致上层出现 "PLAYING -> PAUSED -> PLAYING" 抖动与按钮错态。
             !playWhenReady -> PlayerState.PAUSED
             isPlayingNow -> PlayerState.PLAYING
+            pipelineStateRaw == 2 && hasRecentSemanticProgress -> {
+                if (canEmitDebugDiagLog() && (nowMs - semanticOverrideLastLogAtMs) >= 2000L) {
+                    semanticOverrideLastLogAtMs = nowMs
+                    Log.d(
+                        TAG,
+                        "evt=state_semantic_progress_override core=$coreStateRaw pipeline=$pipelineStateRaw " +
+                            "pwr=$playWhenReady playing=$isPlayingNow progress_age_ms=${nowMs - semanticProgressLastAdvanceMs}"
+                    )
+                }
+                PlayerState.PLAYING
+            }
             pipelineStateRaw == 2 -> PlayerState.LOADING
+            coreStateRaw == 3 && hasRecentSemanticProgress -> PlayerState.PLAYING
             coreStateRaw == 3 -> PlayerState.PAUSED
             else -> mapPlayerState(coreStateRaw)
         }
@@ -1826,6 +1844,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
 
                 val rawPosition = getPosition()
+                if (!semanticLastRawPosSec.isNaN()) {
+                    val delta = rawPosition - semanticLastRawPosSec
+                    if (delta >= 0.05 && delta <= 3.2) {
+                        semanticProgressLastAdvanceMs = SystemClock.elapsedRealtime()
+                    }
+                }
+                semanticLastRawPosSec = rawPosition
                 val duration = getDuration()
                 val coreStateRaw = nativeGetState(handle)
                 val pipelineStateRaw = nativeGetPipelineState(handle)
@@ -1833,7 +1858,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val isPlaying = nativeIsPlaying(handle)
                 if (!sdkDiagVersionLogged) {
                     sdkDiagVersionLogged = true
-                    logInfo("evt=sdk_diag_version value=20260605_tail_intent_fastcomplete")
+                    logInfo("evt=sdk_diag_version value=20260605_semantic_progress_playing_fix")
                 }
                 val loading = isLoading()
                 val state = coerceStateWithLoading(
