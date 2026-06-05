@@ -1805,7 +1805,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val isPlaying = nativeIsPlaying(handle)
                 if (!sdkDiagVersionLogged) {
                     sdkDiagVersionLogged = true
-                    logInfo("evt=sdk_diag_version value=20260604_tail_stall_diag")
+                    logInfo("evt=sdk_diag_version value=20260605_tail_intent_fastcomplete")
                 }
                 val loading = isLoading()
                 val state = coerceStateWithLoading(

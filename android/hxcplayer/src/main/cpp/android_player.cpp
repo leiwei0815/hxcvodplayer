@@ -2429,7 +2429,7 @@ void AndroidPlayer::renderLoop() {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     };
-    PERFI("evt=sdk_tail_stall_diag_enabled version=20260604");
+    PERFI("evt=sdk_tail_stall_diag_enabled version=20260605_tail_intent_fastcomplete");
 
     while (true) {
         // --- Wait for work, surface change, or stop ---
