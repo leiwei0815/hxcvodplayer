@@ -2436,7 +2436,8 @@ class HXCPlayerControl @JvmOverloads constructor(
 
                 // 透传播放完成事件（由 core 回调写入，Java 侧轮询消费）
                 if (nativeConsumePlaybackCompleted(handle) && !isReleased) {
-                    if (!shouldEmitCompletedToApp(state, playWhenReady)) {
+                    val emitCompletedToApp = shouldEmitCompletedToApp(state, playWhenReady)
+                    if (!emitCompletedToApp) {
                         if (canEmitDebugDiagLog()) {
                             Log.d(
                                 TAG,
@@ -2444,15 +2445,15 @@ class HXCPlayerControl @JvmOverloads constructor(
                                     "state=${state.name} pwr=$playWhenReady loading=$loading pos=$position duration=$duration"
                             )
                         }
-                        return@execute
-                    }
-                    logInfo("[播放完成] Kotlin 层：收到播放完成事件，position=${getPosition()} duration=${getDuration()} state=${getState()}")
-                    mainHandler.post {
-                        if (completedCallback != null) {
-                            logInfo("[播放完成] Kotlin 层：派发 onPlaybackCompleted 到应用层")
-                            completedCallback?.onPlaybackCompleted()
-                        } else {
-                            Log.w(TAG, "[播放完成] Kotlin 层：completedCallback 为 null，未派发（请调用 setPlaybackCompletedCallback 注册）")
+                    } else {
+                        logInfo("[播放完成] Kotlin 层：收到播放完成事件，position=${getPosition()} duration=${getDuration()} state=${getState()}")
+                        mainHandler.post {
+                            if (completedCallback != null) {
+                                logInfo("[播放完成] Kotlin 层：派发 onPlaybackCompleted 到应用层")
+                                completedCallback?.onPlaybackCompleted()
+                            } else {
+                                Log.w(TAG, "[播放完成] Kotlin 层：completedCallback 为 null，未派发（请调用 setPlaybackCompletedCallback 注册）")
+                            }
                         }
                     }
                 }
