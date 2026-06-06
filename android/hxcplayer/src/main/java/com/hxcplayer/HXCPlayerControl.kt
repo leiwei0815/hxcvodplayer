@@ -167,6 +167,23 @@ class HXCPlayerControl @JvmOverloads constructor(
         ERROR
     }
 
+    /**
+     * SDK 对外统一播放快照（单一真相源）。
+     *
+     * 业务层建议仅根据此快照渲染 UI，避免在 Activity 中再做状态推断。
+     */
+    data class PlaybackSnapshot(
+        val state: PlayerState,
+        val pipelineState: PipelineState,
+        val playWhenReady: Boolean,
+        val isPlaying: Boolean,
+        val isLoading: Boolean,
+        val position: Double,
+        val duration: Double,
+        val shouldShowPlayingUi: Boolean,
+        val updatedAtMs: Long
+    )
+
     /** 与 iOS 对齐的数据源模式 */
     enum class PlayerDataSourceMode {
         DEFAULT,
@@ -349,6 +366,13 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     /**
+     * 统一状态快照回调（主线程）。
+     */
+    fun interface PlaybackSnapshotCallback {
+        fun onPlaybackSnapshotChanged(snapshot: PlaybackSnapshot)
+    }
+
+    /**
      * 异步 [playWithModelAsync] / [openWithPlayModelAsync] 结果回调。
      * 使用 SAM，便于 Java 调用方避免 Kotlin `Unit` 与 Java `void` 类型不兼容。
      */
@@ -359,9 +383,11 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var nativeHandle: Long = 0
     private var callback: PlayerCallback? = null
     private var completedCallback: PlaybackCompletedCallback? = null
+    private var playbackSnapshotCallback: PlaybackSnapshotCallback? = null
     private var lastPlayerState: PlayerState? = null
     private var lastPipelineState: PipelineState? = null
     private var lastIsPlayingState: Boolean? = null
+    private var lastPlaybackSnapshot: PlaybackSnapshot? = null
     private var sdkDiagVersionLogged: Boolean = false
     private var updateExecutor: ScheduledExecutorService? = null
     private var lastLoadingState: Boolean? = null
@@ -524,6 +550,60 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     /**
+     * 设置统一状态快照回调。
+     */
+    fun setPlaybackSnapshotCallback(callback: PlaybackSnapshotCallback?) {
+        this.playbackSnapshotCallback = callback
+        callback ?: return
+        mainHandler.post {
+            if (isReleased || this.playbackSnapshotCallback !== callback) return@post
+            callback.onPlaybackSnapshotChanged(getPlaybackSnapshot())
+        }
+    }
+
+    /**
+     * 查询当前统一状态快照（线程安全，实时计算）。
+     */
+    fun getPlaybackSnapshot(): PlaybackSnapshot {
+        val handle = currentHandle()
+        val now = SystemClock.elapsedRealtime()
+        if (handle == 0L || isReleased) {
+            return PlaybackSnapshot(
+                state = PlayerState.IDLE,
+                pipelineState = PipelineState.IDLE,
+                playWhenReady = false,
+                isPlaying = false,
+                isLoading = false,
+                position = 0.0,
+                duration = 0.0,
+                shouldShowPlayingUi = false,
+                updatedAtMs = now
+            )
+        }
+        val rawPosition = nativeGetPosition(handle)
+        val duration = nativeGetDuration(handle)
+        val coreStateRaw = nativeGetState(handle)
+        val pipelineStateRaw = nativeGetPipelineState(handle)
+        val playWhenReady = nativeGetPlayWhenReady(handle)
+        val isPlaying = nativeIsPlaying(handle)
+        val loading = isLoading()
+        val resolved = coerceStateWithLoading(
+            resolveUnifiedState(coreStateRaw, pipelineStateRaw, playWhenReady, isPlaying),
+            loading
+        )
+        return buildPlaybackSnapshot(
+            state = resolved,
+            pipeline = mapPipelineState(pipelineStateRaw),
+            playWhenReady = playWhenReady,
+            isPlayingNow = isPlaying,
+            loading = loading,
+            position = rawPosition,
+            duration = duration,
+            nowMs = now
+        )
+    }
+
+    /**
      * 配置“可恢复错误后自动重开”能力（默认关闭）。
      */
     fun configureWeakNetworkRecovery(enabled: Boolean, maxAttempts: Int = 1) {
@@ -643,6 +723,20 @@ class HXCPlayerControl @JvmOverloads constructor(
         )
         val duration = getDuration()
         val now = SystemClock.elapsedRealtime()
+        val pipeline = getPipelineState()
+        val playWhenReady = getPlayWhenReady()
+        val checkIsPlaying = isPlaying()
+        val snapshot = buildPlaybackSnapshot(
+            state = state,
+            pipeline = pipeline,
+            playWhenReady = playWhenReady,
+            isPlayingNow = checkIsPlaying,
+            loading = loading,
+            position = position,
+            duration = duration,
+            nowMs = now
+        )
+        lastPlaybackSnapshot = snapshot
         lastPlayerState = state
         lastLoadingState = loading
         loadingCandidateState = loading
@@ -654,6 +748,10 @@ class HXCPlayerControl @JvmOverloads constructor(
                 target.onPlayerPositionUpdated(position, duration)
             }
             target.onPlayerLoadingChanged(loading)
+            val snapshotTarget = playbackSnapshotCallback
+            if (snapshotTarget != null) {
+                snapshotTarget.onPlaybackSnapshotChanged(snapshot)
+            }
         }
     }
 
@@ -1822,6 +1920,44 @@ class HXCPlayerControl @JvmOverloads constructor(
         return if (seekLikeLoading && state == PlayerState.PLAYING) PlayerState.LOADING else state
     }
 
+    private fun buildPlaybackSnapshot(
+        state: PlayerState,
+        pipeline: PipelineState,
+        playWhenReady: Boolean,
+        isPlayingNow: Boolean,
+        loading: Boolean,
+        position: Double,
+        duration: Double,
+        nowMs: Long
+    ): PlaybackSnapshot {
+        val shouldShowPlayingUi = when (state) {
+            PlayerState.PLAYING -> true
+            PlayerState.LOADING, PlayerState.OPENING -> playWhenReady
+            else -> false
+        }
+        return PlaybackSnapshot(
+            state = state,
+            pipelineState = pipeline,
+            playWhenReady = playWhenReady,
+            isPlaying = isPlayingNow,
+            isLoading = loading,
+            position = position,
+            duration = duration,
+            shouldShowPlayingUi = shouldShowPlayingUi,
+            updatedAtMs = nowMs
+        )
+    }
+
+    private fun hasSnapshotSemanticDiff(old: PlaybackSnapshot?, new: PlaybackSnapshot): Boolean {
+        if (old == null) return true
+        return old.state != new.state ||
+            old.pipelineState != new.pipelineState ||
+            old.playWhenReady != new.playWhenReady ||
+            old.isPlaying != new.isPlaying ||
+            old.isLoading != new.isLoading ||
+            old.shouldShowPlayingUi != new.shouldShowPlayingUi
+    }
+
     /**
      * 当前视频是否处于硬解状态（硬解失败回退软解后返回 false）。
      */
@@ -1863,15 +1999,35 @@ class HXCPlayerControl @JvmOverloads constructor(
                     state = state,
                     nowMs = now
                 )
+                val pipeline = mapPipelineState(pipelineStateRaw)
+                val snapshot = buildPlaybackSnapshot(
+                    state = state,
+                    pipeline = pipeline,
+                    playWhenReady = playWhenReady,
+                    isPlayingNow = isPlaying,
+                    loading = loading,
+                    position = position,
+                    duration = duration,
+                    nowMs = now
+                )
+                val shouldDispatchSnapshot = hasSnapshotSemanticDiff(lastPlaybackSnapshot, snapshot)
+                if (shouldDispatchSnapshot) {
+                    lastPlaybackSnapshot = snapshot
+                }
 
                 if (lastPlayerState != state) {
                     lastPlayerState = state
                     mainHandler.post { callback?.onPlayerStateChanged(state) }
                 }
-                lastPipelineState = mapPipelineState(pipelineStateRaw)
+                lastPipelineState = pipeline
                 lastIsPlayingState = isPlaying
                 if (duration > 0) {
                     callback?.onPlayerPositionUpdated(position, duration)
+                }
+                if (shouldDispatchSnapshot) {
+                    mainHandler.post {
+                        playbackSnapshotCallback?.onPlaybackSnapshotChanged(snapshot)
+                    }
                 }
 
                 maybeRecoverPlayStall(
@@ -2662,6 +2818,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastPlayerState = null
         lastPipelineState = null
         lastIsPlayingState = null
+        lastPlaybackSnapshot = null
         openExecutor.shutdown()
     }
 
