@@ -706,6 +706,16 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
     }
 
+    private fun shouldEmitCompletedToApp(
+        state: PlayerState,
+        playWhenReady: Boolean
+    ): Boolean {
+        // Mature player rule: completion is terminal and should not be emitted
+        // during OPENING/LOADING while autoplay intent is still active.
+        val inOpeningWindow = state == PlayerState.OPENING || state == PlayerState.LOADING
+        return !(inOpeningWindow && playWhenReady)
+    }
+
     /**
      * When UI page (re)binds callback (e.g. entering from floating window),
      * immediately push current player snapshot so UI buttons don't rely on stale state.
@@ -2426,6 +2436,16 @@ class HXCPlayerControl @JvmOverloads constructor(
 
                 // 透传播放完成事件（由 core 回调写入，Java 侧轮询消费）
                 if (nativeConsumePlaybackCompleted(handle) && !isReleased) {
+                    if (!shouldEmitCompletedToApp(state, playWhenReady)) {
+                        if (canEmitDebugDiagLog()) {
+                            Log.d(
+                                TAG,
+                                "evt=playback_completed_blocked_opening_window " +
+                                    "state=${state.name} pwr=$playWhenReady loading=$loading pos=$position duration=$duration"
+                            )
+                        }
+                        return@execute
+                    }
                     logInfo("[播放完成] Kotlin 层：收到播放完成事件，position=${getPosition()} duration=${getDuration()} state=${getState()}")
                     mainHandler.post {
                         if (completedCallback != null) {

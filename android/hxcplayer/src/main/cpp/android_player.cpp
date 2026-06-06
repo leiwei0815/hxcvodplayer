@@ -1757,10 +1757,37 @@ void AndroidPlayer::errorStateCallback(int error_code, const char* error_msg, vo
 
 // ========== Playback-completed callback ==========
 
+static inline bool should_block_completed_in_opening_window(bool opening_now,
+                                                            bool first_frame_ready,
+                                                            bool play_when_ready_now) {
+    // Mature player rule: completion is a terminal state, never emitted while opening
+    // or before first frame under autoplay intent.
+    return opening_now || (play_when_ready_now && !first_frame_ready);
+}
+
+static inline bool is_open_ready_for_tail_complete(bool opening_now, bool first_frame_ready) {
+    // Tail force-complete is only valid after open lifecycle is stabilized.
+    return !opening_now && first_frame_ready;
+}
+
 void AndroidPlayer::playbackCompletedCallback(void* user_data) {
     auto* player = static_cast<AndroidPlayer*>(user_data);
     if (!player) {
         LOGW("[playbackCompleted] player is null");
+        return;
+    }
+    bool opening_now = player->open_in_progress_.load(std::memory_order_acquire);
+    bool first_frame_ready = player->first_frame_rendered_.load(std::memory_order_acquire);
+    bool play_when_ready_now = player->player_core_ && player_core_get_play_when_ready(player->player_core_) != 0;
+    if (should_block_completed_in_opening_window(opening_now, first_frame_ready, play_when_ready_now)) {
+        LOGI_RATE(20,
+                  "[playbackCompleted] ignored during opening window: opening=%d first_frame_ready=%d pwr=%d pos=%.3f dur=%.3f state=%d",
+                  opening_now ? 1 : 0,
+                  first_frame_ready ? 1 : 0,
+                  play_when_ready_now ? 1 : 0,
+                  player->getPosition(),
+                  player->getDuration(),
+                  player->getState());
         return;
     }
     LOGI("[playbackCompleted] pos=%.3f dur=%.3f state=%d",
@@ -5122,12 +5149,16 @@ void AndroidPlayer::renderLoop() {
                                         && open_start_pos_now >= std::max(0.0, dur_now - tail_intent_window_sec);
                 int64_t open_age_ms = open_requested_at_ms_now > 0 ? (now_empty - open_requested_at_ms_now) : -1;
                 bool recent_open_tail_intent = open_tail_intent && open_age_ms >= 0 && open_age_ms <= 20000;
+                bool opening_now = open_in_progress_.load(std::memory_order_acquire);
+                bool first_frame_ready = first_frame_rendered_.load(std::memory_order_acquire);
+                bool open_ready_for_tail_complete =
+                        is_open_ready_for_tail_complete(opening_now, first_frame_ready);
                 int64_t tail_force_complete_ms = recent_open_tail_intent
                                                  ? kTailStallForceCompleteFastMs
                                                  : kTailStallForceCompleteMs;
                 if ((now_empty - tail_stall_diag_last_log_ms) >= kTailStallDiagIntervalMs) {
                     tail_stall_diag_last_log_ms = now_empty;
-                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64,
+                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64 " open_ready=%d",
                           empty_ms,
                           pos_now,
                           dur_now,
@@ -5140,11 +5171,13 @@ void AndroidPlayer::renderLoop() {
                           recent_open_tail_intent ? 1 : 0,
                           tail_force_complete_ms,
                           open_start_pos_now,
-                          open_age_ms);
+                          open_age_ms,
+                          open_ready_for_tail_complete ? 1 : 0);
                 }
                 if (near_end &&
                     play_when_ready_now &&
                     !seek_flow_active &&
+                    open_ready_for_tail_complete &&
                     empty_ms >= tail_force_complete_ms &&
                     !playback_completed_latched_.load(std::memory_order_acquire)) {
                     SYNCI("evt=tail_stall_force_complete empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64,
