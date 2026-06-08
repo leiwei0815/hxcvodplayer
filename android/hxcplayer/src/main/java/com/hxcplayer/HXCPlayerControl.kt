@@ -18,6 +18,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import java.net.HttpURLConnection
 import java.net.URL
 import org.json.JSONObject
@@ -394,6 +395,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var loadingCandidateState: Boolean? = null
     private var loadingCandidateSinceMs: Long = 0L
     private val openExecutor = Executors.newSingleThreadExecutor()
+    private val playbackCommandGeneration = AtomicLong(0L)
+    private val playbackCommandAppliedGeneration = AtomicLong(0L)
+    @Volatile
+    private var desiredPlayWhenReady: Boolean = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private val loadingShowDebounceMs = 450L
     private val loadingHideDebounceMs = 150L
@@ -1689,10 +1694,13 @@ class HXCPlayerControl @JvmOverloads constructor(
         manualPlayHardRecoverPending = true
         manualPlayHardRecoverArmedAtMs = playStallLastPlayReqAtMs
         manualPlayHardRecoverBasePosSec = playStallBasePosSec
-        nativePlay(handle)
-        // 某些设备/解码链路在 pause->play 后会把速率短暂回落到 1.0，
-        // play 后立刻回放业务侧目标倍速，保证体感一致。
-        nativeSetPlaybackRate(handle, preferredPlaybackRate)
+        val generation = nextPlaybackCommandGeneration(true)
+        enqueuePlaybackCommand("play", generation) { current ->
+            nativePlay(current)
+            // 某些设备/解码链路在 pause->play 后会把速率短暂回落到 1.0，
+            // play 后立刻回放业务侧目标倍速，保证体感一致。
+            nativeSetPlaybackRate(current, preferredPlaybackRate)
+        }
     }
 
     // 暂停
@@ -1701,16 +1709,19 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (handle == 0L || isReleased) return
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
-        nativePause(handle)
+        val generation = nextPlaybackCommandGeneration(false)
+        enqueuePlaybackCommand("pause", generation) { current ->
+            nativePause(current)
+        }
     }
 
     // 停止
     fun stop() {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        synchronized(openSerialLock) {
-            if (isReleased) return
-            nativeStop(handle)
+        val generation = nextPlaybackCommandGeneration(false)
+        enqueuePlaybackCommand("stop", generation, false) { current ->
+            nativeStop(current)
         }
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
@@ -1762,7 +1773,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         loadingSessionLikelySeek = true
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
-        nativeSeekToWithIntent(handle, target, resumeAfterSeek)
+        val generation = playbackCommandGeneration.get()
+        enqueuePlaybackCommand("seek_to_with_intent", generation, false) { current ->
+            nativeSeekToWithIntent(current, target, resumeAfterSeek)
+        }
     }
 
     fun getLastSeekRequestId(): Long {
@@ -1830,6 +1844,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun getPlayWhenReady(): Boolean {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return false
+        if (playbackCommandGeneration.get() != playbackCommandAppliedGeneration.get()) {
+            return desiredPlayWhenReady
+        }
         return nativeGetPlayWhenReady(handle)
     }
 
@@ -1842,7 +1859,43 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun setPlayWhenReady(playWhenReady: Boolean) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        nativeSetPlayWhenReady(handle, playWhenReady)
+        val generation = nextPlaybackCommandGeneration(playWhenReady)
+        enqueuePlaybackCommand("set_play_when_ready", generation) { current ->
+            nativeSetPlayWhenReady(current, playWhenReady)
+        }
+    }
+
+    private fun nextPlaybackCommandGeneration(targetPlayWhenReady: Boolean): Long {
+        desiredPlayWhenReady = targetPlayWhenReady
+        return playbackCommandGeneration.incrementAndGet()
+    }
+
+    private fun enqueuePlaybackCommand(
+        command: String,
+        generation: Long,
+        allowDropByNewerGeneration: Boolean = true,
+        action: (Long) -> Unit
+    ) {
+        try {
+            openExecutor.execute {
+                if (isReleased) return@execute
+                val latest = playbackCommandGeneration.get()
+                if (allowDropByNewerGeneration && generation != latest) {
+                    logInfo("evt=control_drop cmd=$command generation=$generation latest=$latest")
+                    return@execute
+                }
+                val handle = currentHandle()
+                if (handle == 0L || isReleased) return@execute
+                try {
+                    action(handle)
+                    playbackCommandAppliedGeneration.set(generation)
+                } catch (t: Throwable) {
+                    logInfo("evt=control_failed cmd=$command err=${t.message ?: "unknown"}")
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            logInfo("evt=control_rejected cmd=$command")
+        }
     }
 
     // 仅映射 core 主状态（PlayerStateC）。
@@ -2840,6 +2893,9 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastPipelineState = null
         lastIsPlayingState = null
         lastPlaybackSnapshot = null
+        desiredPlayWhenReady = false
+        val currentGeneration = playbackCommandGeneration.get()
+        playbackCommandAppliedGeneration.set(currentGeneration)
         openExecutor.shutdown()
     }
 
