@@ -17,6 +17,7 @@ class HXCDownloadRequest(
     var duration: Long = 0L
     var encrypted: Boolean = false
     var secureHeaders: String = ""
+    var child: HXCDownloadRequest? = null
 
     fun plainUrl(url: String): HXCDownloadRequest {
         this.plainUrl = url
@@ -80,6 +81,11 @@ class HXCDownloadRequest(
 
     fun secureHeaders(value: String): HXCDownloadRequest {
         secureHeaders = value
+        return this
+    }
+
+    fun child(value: HXCDownloadRequest): HXCDownloadRequest {
+        child = value
         return this
     }
 

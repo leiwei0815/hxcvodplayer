@@ -123,8 +123,17 @@ object HXCDownloadManager {
         requests.forEach { req ->
             val key = req.buildDownloadKey()
             val info = downloads[key] ?: createInfoFromRequest(req)
+            val childReq = req.child
+            val childKey = childReq?.buildDownloadKey().orEmpty()
+            if (childKey.isNotBlank()) {
+                info.childDownloadKey = childKey
+            }
             if (info.status == HXCDownloadStatus.FINISH && info.localPath.isNotBlank() && File(info.localPath).exists()) {
                 d("start ignored: task already finished, key=$key, path=${info.localPath}")
+                // 父任务已完成时，仍确保子任务能被补齐调度。
+                if (childReq != null) {
+                    startChildTaskIfNeeded(parentInfo = info, childReq = childReq)
+                }
                 return@forEach
             }
             val runningFuture = runningFutures[key]
@@ -170,6 +179,9 @@ object HXCDownloadManager {
                 }
             }
             runningFutures[key] = future
+            if (childReq != null) {
+                startChildTaskIfNeeded(parentInfo = info, childReq = childReq)
+            }
         }
     }
 
@@ -233,6 +245,10 @@ object HXCDownloadManager {
         cancelledFlags.remove(downloadKey)
         clearProgressState(downloadKey)
         val info = downloads.remove(downloadKey) ?: return
+        if (info.childDownloadKey.isNotBlank()) {
+            // 父任务删除时联动子任务，避免残留孤儿记录影响离线三分屏匹配。
+            deleteDownload(info.childDownloadKey, deleteFile)
+        }
         if (deleteFile && info.localPath.isNotBlank()) {
             kotlin.runCatching {
                 val local = File(info.localPath)
@@ -250,14 +266,22 @@ object HXCDownloadManager {
         keys.forEach { deleteDownload(it, deleteFile) }
     }
 
-    fun getAllDownloads(): List<HXCDownloadInfo> = downloads.values.toList()
+    fun getAllDownloads(): List<HXCDownloadInfo> = downloads.values.toList().map { attachChildSnapshot(it) }
 
     fun getDownloadsByStatus(status: HXCDownloadStatus): List<HXCDownloadInfo> {
         return downloads.values.filter { it.status == status }
     }
 
     fun queryByChapterAndVideo(chapterId: String, videoId: String): HXCDownloadInfo? {
-        return downloads.values.firstOrNull { it.chapterId == chapterId && it.videoId == videoId }
+        val direct = downloads.values.firstOrNull { it.chapterId == chapterId && it.videoId == videoId }
+            ?: downloads.values.firstOrNull { it.videoId == videoId }
+        val result = direct?.let { attachChildSnapshot(it) }
+        d(
+            "queryByChapterAndVideo chapterId=$chapterId, videoId=$videoId, " +
+                "hit=${direct != null}, childAttached=${result?.child != null}, " +
+                "childKey=${result?.childDownloadKey ?: ""}"
+        )
+        return result
     }
 
     private fun runDownload(info: HXCDownloadInfo, cancelFlag: AtomicBoolean) {
@@ -1190,7 +1214,51 @@ object HXCDownloadManager {
             status = HXCDownloadStatus.IDLE
             resolvedUrl = req.plainUrl
             isEncrypted = req.encrypted || (req.secureCredential != null)
+            childDownloadKey = req.child?.buildDownloadKey().orEmpty()
         }
+    }
+
+    private fun startChildTaskIfNeeded(parentInfo: HXCDownloadInfo, childReq: HXCDownloadRequest) {
+        val childKey = childReq.buildDownloadKey()
+        if (childKey.isBlank()) {
+            return
+        }
+        val existing = downloads[childKey]
+        if (existing != null) {
+            parentInfo.childDownloadKey = childKey
+            return
+        }
+        d(
+            "start child task linked, parent=${parentInfo.downloadKey}, child=$childKey, " +
+                "parentVideoId=${parentInfo.videoId}, childVideoId=${childReq.videoId}"
+        )
+        startDownload(listOf(childReq))
+    }
+
+    private fun attachChildSnapshot(source: HXCDownloadInfo): HXCDownloadInfo {
+        val copy = source.copy()
+        copy.childDownloadKey = source.childDownloadKey
+        val byLinkedKey = if (copy.childDownloadKey.isNotBlank()) downloads[copy.childDownloadKey] else null
+        val byVideoId = downloads.values.firstOrNull {
+            it.videoId == "${copy.videoId}_child" && (it.chapterId == copy.chapterId || copy.chapterId.isBlank() || it.chapterId.isBlank())
+        }
+        val child = byLinkedKey ?: byVideoId
+        if (child != null && child.downloadKey != copy.downloadKey) {
+            copy.child = child.copy().apply {
+                childDownloadKey = ""
+                child = null
+            }
+            if (copy.childDownloadKey.isBlank()) {
+                copy.childDownloadKey = child.downloadKey
+            }
+            if (!copy.videoId.endsWith("_child")) {
+                d(
+                    "attachChildSnapshot parent=${copy.downloadKey}, parentVideoId=${copy.videoId}, " +
+                        "child=${child.downloadKey}, childVideoId=${child.videoId}"
+                )
+            }
+        }
+        return copy
     }
 
     private fun applyHeaders(conn: HttpURLConnection, headers: String) {
