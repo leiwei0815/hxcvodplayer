@@ -60,7 +60,6 @@ internal class HXCDownloadStore(context: Context) {
             put("progressStage", info.progressStage)
             put("stageProgress", info.stageProgress.toDouble())
             put("overallProgress", info.overallProgress.toDouble())
-            put("childDownloadKey", info.childDownloadKey)
         }
     }
 
@@ -93,7 +92,6 @@ internal class HXCDownloadStore(context: Context) {
             progressStage = obj.optString("progressStage", "IDLE")
             stageProgress = obj.optDouble("stageProgress", progress.toDouble()).toFloat()
             overallProgress = obj.optDouble("overallProgress", progress.toDouble()).toFloat()
-            childDownloadKey = obj.optString("childDownloadKey")
         }
     }
 }

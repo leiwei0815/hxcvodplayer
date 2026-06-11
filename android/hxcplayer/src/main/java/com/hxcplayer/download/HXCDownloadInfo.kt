@@ -27,6 +27,4 @@ data class HXCDownloadInfo(
     var progressStage: String = "IDLE"
     var stageProgress: Float = 0f
     var overallProgress: Float = 0f
-    var childDownloadKey: String = ""
-    var child: HXCDownloadInfo? = null
 }
