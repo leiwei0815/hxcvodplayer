@@ -1242,19 +1242,19 @@ object HXCDownloadManager {
         val byVideoId = downloads.values.firstOrNull {
             it.videoId == "${copy.videoId}_child" && (it.chapterId == copy.chapterId || copy.chapterId.isBlank() || it.chapterId.isBlank())
         }
-        val child = byLinkedKey ?: byVideoId
-        if (child != null && child.downloadKey != copy.downloadKey) {
-            copy.child = child.copy().apply {
+        val childInfo = byLinkedKey ?: byVideoId
+        if (childInfo != null && childInfo.downloadKey != copy.downloadKey) {
+            copy.child = childInfo.copy().apply {
                 childDownloadKey = ""
                 child = null
             }
             if (copy.childDownloadKey.isBlank()) {
-                copy.childDownloadKey = child.downloadKey
+                copy.childDownloadKey = childInfo.downloadKey
             }
             if (!copy.videoId.endsWith("_child")) {
                 d(
                     "attachChildSnapshot parent=${copy.downloadKey}, parentVideoId=${copy.videoId}, " +
-                        "child=${child.downloadKey}, childVideoId=${child.videoId}"
+                        "child=${childInfo.downloadKey}, childVideoId=${childInfo.videoId}"
                 )
             }
         }
