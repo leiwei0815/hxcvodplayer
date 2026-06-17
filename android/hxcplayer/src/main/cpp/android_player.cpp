@@ -4267,13 +4267,42 @@ void AndroidPlayer::renderLoop() {
                 int64_t first_frame_max_wait_ms = likely_4k ? 3200 : 1800;
                 bool first_frame_wait_timeout = is_open_first_frame &&
                                                 first_wait_ms >= first_frame_max_wait_ms;
-                if (delay < first_frame_force_threshold && !first_frame_wait_timeout) {
+                bool audio_deferred_now = is_open_first_frame &&
+                                          audio_start_pending_.load(std::memory_order_acquire);
+                // Root fix:
+                // During open-first-frame, audio is intentionally deferred. In this stage,
+                // the running clock can drift ahead while decoder is still filling queue,
+                // making delay look "too behind" and causing long catch-up drop loops.
+                // If this lasts for a short grace window, prefer showing first frame and
+                // re-anchor clock to current PTS to break freeze/redraw loops.
+                bool force_by_deferred_audio_drift =
+                        audio_deferred_now &&
+                        delay < -0.80 &&
+                        first_wait_ms >= 450;
+                if (delay < first_frame_force_threshold &&
+                    !first_frame_wait_timeout &&
+                    !force_by_deferred_audio_drift) {
                     // Still too far behind -- drop silently and keep catching up.
                     should_consume = true;
                     LOGI_RATE(30, "[sync] %s catching up: pts=%.3f clk=%.3f delay=%.3f thr=%.3f",
                               is_open_first_frame ? "first frame" : "post-seek frame",
                               pts, clock, delay, first_frame_force_threshold);
                 } else {
+                    if (force_by_deferred_audio_drift && player_core_ &&
+                        std::isfinite(pts) && pts >= 0.0) {
+                        player_core_anchor_clock(player_core_, pts);
+                        clock = player_core_get_position(player_core_);
+                        if (audio_output_latency_sec_ > 0.0) {
+                            clock -= audio_output_latency_sec_;
+                            if (clock < 0.0) clock = 0.0;
+                        }
+                        delay = pts - clock;
+                        LOGI("[sync] first frame force by deferred-audio drift: pts=%.3f clk=%.3f delay=%.3f wait_ms=%" PRId64,
+                             pts, clock, delay, first_wait_ms);
+                        SYNCI("evt=open_first_frame_drift_compat pts=%.3f clk=%.3f delay=%.3f wait_ms=%" PRId64 " thr=%.3f audio_pending=%d",
+                              pts, clock, delay, first_wait_ms, first_frame_force_threshold,
+                              audio_deferred_now ? 1 : 0);
+                    }
                     if (first_frame_wait_timeout) {
                         // Open-first-frame hard timeout: prefer visible recovery over
                         // extended black screen, then re-anchor to current video PTS.
@@ -5168,12 +5197,14 @@ void AndroidPlayer::renderLoop() {
                 bool first_frame_ready = first_frame_rendered_.load(std::memory_order_acquire);
                 bool open_ready_for_tail_complete =
                         is_open_ready_for_tail_complete(opening_now, first_frame_ready);
+                bool audio_pending_now = audio_start_pending_.load(std::memory_order_acquire);
+                bool audio_rebuffer_now = audio_rebuffer_pending_.load(std::memory_order_acquire);
                 int64_t tail_force_complete_ms = recent_open_tail_intent
                                                  ? kTailStallForceCompleteFastMs
                                                  : kTailStallForceCompleteMs;
                 if ((now_empty - tail_stall_diag_last_log_ms) >= kTailStallDiagIntervalMs) {
                     tail_stall_diag_last_log_ms = now_empty;
-                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64 " open_ready=%d",
+                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64 " open_ready=%d first_frame=%d audio_pending=%d audio_rebuffer=%d",
                           empty_ms,
                           pos_now,
                           dur_now,
@@ -5187,7 +5218,10 @@ void AndroidPlayer::renderLoop() {
                           tail_force_complete_ms,
                           open_start_pos_now,
                           open_age_ms,
-                          open_ready_for_tail_complete ? 1 : 0);
+                          open_ready_for_tail_complete ? 1 : 0,
+                          first_frame_ready ? 1 : 0,
+                          audio_pending_now ? 1 : 0,
+                          audio_rebuffer_now ? 1 : 0);
                 }
                 if (near_end &&
                     play_when_ready_now &&
