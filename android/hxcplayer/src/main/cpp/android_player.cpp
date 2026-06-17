@@ -1720,8 +1720,22 @@ void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
         player->suppress_stale_loading_true_until_ms_.store(0, std::memory_order_release);
     }
     player->is_loading_.store(is_loading, std::memory_order_release);
-    LOGI("[state] loading=%s pos=%.3f", is_loading ? "true" : "false",
-         player->player_core_ ? player_core_get_position(player->player_core_) : 0.0);
+    double pos_now = player->player_core_ ? player_core_get_position(player->player_core_) : 0.0;
+    double prev_pos = player->state_last_reported_pos_.load(std::memory_order_acquire);
+    if (std::isfinite(prev_pos) && std::isfinite(pos_now)) {
+        double backward_delta = prev_pos - pos_now;
+        if (backward_delta >= 1.0) {
+            int64_t last_jump_log_ms = player->state_last_backward_jump_log_ms_.load(std::memory_order_acquire);
+            if (now_ms_now - last_jump_log_ms >= 1200) {
+                player->state_last_backward_jump_log_ms_.store(now_ms_now, std::memory_order_release);
+                bool seek_active = player->isSeekSessionActive();
+                LOGW("[state] position backward jump: delta=%.3f from=%.3f to=%.3f loading=%d seek_active=%d",
+                     backward_delta, prev_pos, pos_now, is_loading ? 1 : 0, seek_active ? 1 : 0);
+            }
+        }
+    }
+    player->state_last_reported_pos_.store(pos_now, std::memory_order_release);
+    LOGI("[state] loading=%s pos=%.3f", is_loading ? "true" : "false", pos_now);
 }
 
 bool AndroidPlayer::consumeLastError(int& error_code, std::string& error_message) {

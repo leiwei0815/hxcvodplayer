@@ -419,6 +419,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var loadingSessionLikelySeek: Boolean = false
     private var suppressLoadingShowUntilMs: Long = 0L
     private var lastPositionForLoadingHeuristicSec: Double = Double.NaN
+    private var lastBackwardJumpLogAtMs: Long = 0L
     private val seekCompletionTimeoutMs = 7600L
     // Native seek session occasionally stays active while position has already converged.
     // Keep SDK completion bounded to avoid long loading tail and follow-up play deadlocks.
@@ -518,14 +519,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
     private var currentSourceCategory: String = "unknown"
     @Volatile private var decodeMode: DecodeMode = DecodeMode.HARDWARE
-    @Volatile private var runtimeDecodeModeOverride: DecodeMode? = null
-    private var stallRecoverWindowStartMs: Long = 0L
-    private var stallRecoverReopenCountInWindow: Int = 0
-    private var stallDecodeFallbackApplied: Boolean = false
-    private val stallDecodeFallbackWindowMs: Long = 45000L
-    private val stallDecodeFallbackThreshold: Int = 2
-    private var stallWatchLastLogAtMs: Long = 0L
-    private val stallWatchLogIntervalMs: Long = 1200L
     private val secureHlsAuthUrl = "https://console-api.huaxiacloud.net/third_party/verify/sign"
 
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
@@ -982,7 +975,6 @@ class HXCPlayerControl @JvmOverloads constructor(
                 autoReopenAttemptCount = 0
                 networkTotalStallMs = 0L
                 networkReconnectCount = 0
-                resetStallRecoverSession()
             }
             playStallCheckArmed = false
             applyDecodeModeForHandle(handle)
@@ -1095,61 +1087,16 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     fun setDecodeMode(mode: DecodeMode) {
         decodeMode = mode
-        runtimeDecodeModeOverride = null
-        stallDecodeFallbackApplied = false
         val handle = currentHandle()
         if (handle != 0L && !isReleased) {
-            nativeSetDecodeMode(handle, if (effectiveDecodeMode() == DecodeMode.HARDWARE) 1 else 0)
+            nativeSetDecodeMode(handle, if (mode == DecodeMode.HARDWARE) 1 else 0)
         }
     }
 
     fun getDecodeMode(): DecodeMode = decodeMode
 
     private fun applyDecodeModeForHandle(handle: Long) {
-        val mode = effectiveDecodeMode()
-        nativeSetDecodeMode(handle, if (mode == DecodeMode.HARDWARE) 1 else 0)
-        logInfo(
-            "evt=decode_mode_apply requested=${decodeMode.name.lowercase()} " +
-                "effective=${mode.name.lowercase()} fallback_active=$stallDecodeFallbackApplied"
-        )
-    }
-
-    private fun effectiveDecodeMode(): DecodeMode {
-        return runtimeDecodeModeOverride ?: decodeMode
-    }
-
-    private fun resetStallRecoverSession() {
-        stallRecoverWindowStartMs = 0L
-        stallRecoverReopenCountInWindow = 0
-        stallDecodeFallbackApplied = false
-        runtimeDecodeModeOverride = null
-        stallWatchLastLogAtMs = 0L
-    }
-
-    private fun maybeApplyDecodeFallbackOnRepeatedReopen(handle: Long, nowMs: Long, reason: String) {
-        if (handle == 0L || isReleased) return
-        if (stallRecoverWindowStartMs <= 0L || (nowMs - stallRecoverWindowStartMs) > stallDecodeFallbackWindowMs) {
-            stallRecoverWindowStartMs = nowMs
-            stallRecoverReopenCountInWindow = 1
-        } else {
-            stallRecoverReopenCountInWindow += 1
-        }
-        logInfo(
-            "evt=stall_reopen_window_update reason=$reason count=$stallRecoverReopenCountInWindow " +
-                "window_ms=$stallDecodeFallbackWindowMs requested_decode=${decodeMode.name.lowercase()} " +
-                "effective_decode=${effectiveDecodeMode().name.lowercase()}"
-        )
-        if (stallDecodeFallbackApplied) return
-        if (effectiveDecodeMode() != DecodeMode.HARDWARE) return
-        if (stallRecoverReopenCountInWindow < stallDecodeFallbackThreshold) return
-        runtimeDecodeModeOverride = DecodeMode.SOFTWARE
-        stallDecodeFallbackApplied = true
-        nativeSetDecodeMode(handle, 0)
-        logInfo(
-            "evt=stall_decode_fallback_apply " +
-                "reason=$reason reopen_count=$stallRecoverReopenCountInWindow " +
-                "window_ms=$stallDecodeFallbackWindowMs source_category=$currentSourceCategory"
-        )
+        nativeSetDecodeMode(handle, if (decodeMode == DecodeMode.HARDWARE) 1 else 0)
     }
 
     /**
@@ -1536,7 +1483,6 @@ class HXCPlayerControl @JvmOverloads constructor(
                 autoReopenAttemptCount = 0
                 networkTotalStallMs = 0L
                 networkReconnectCount = 0
-                resetStallRecoverSession()
             }
             playStallCheckArmed = false
             applyDecodeModeForHandle(handle)
@@ -1590,7 +1536,6 @@ class HXCPlayerControl @JvmOverloads constructor(
             autoReopenAttemptCount = 0
             networkTotalStallMs = 0L
             networkReconnectCount = 0
-            resetStallRecoverSession()
         }
         try {
             openExecutor.execute {
@@ -1644,7 +1589,6 @@ class HXCPlayerControl @JvmOverloads constructor(
             autoReopenAttemptCount = 0
             networkTotalStallMs = 0L
             networkReconnectCount = 0
-            resetStallRecoverSession()
         }
         // 无 startPosition 的重载委托给带 startPosition 版本（传 0.0 从头开始）
         return openWithPlayModel(model, 0.0)
@@ -2161,7 +2105,6 @@ class HXCPlayerControl @JvmOverloads constructor(
                     playWhenReady = playWhenReady
                 )
                 maybeRecoverManualPlayHardStall(
-                    handle = handle,
                     nowMs = now,
                     positionSec = rawPosition,
                     durationSec = duration,
@@ -2534,6 +2477,20 @@ class HXCPlayerControl @JvmOverloads constructor(
                         }
                     }
                 }
+                if (!lastPositionForLoadingHeuristicSec.isNaN()) {
+                    val backwardJump = lastPositionForLoadingHeuristicSec - position
+                    if (!pendingSeekActive &&
+                        playWhenReady &&
+                        backwardJump >= 1.0 &&
+                        (now - lastBackwardJumpLogAtMs) >= 1200L
+                    ) {
+                        lastBackwardJumpLogAtMs = now
+                        Log.w(
+                            TAG,
+                            "evt=position_backward_jump delta=$backwardJump from=$lastPositionForLoadingHeuristicSec to=$position loading=$loading state=${state.name} native_seek_active=${nativeIsSeekSessionActive(handle)}"
+                        )
+                    }
+                }
                 lastPositionForLoadingHeuristicSec = position
 
                 // 透传播放中错误（由 core 错误回调写入，Java 侧轮询消费）
@@ -2596,12 +2553,11 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!(isPlayingNow || state == PlayerState.PLAYING || pausedButWantsPlay || loadingButWantsPlay)) {
             return
         }
-        if (durationSec <= 0.0 || positionSec < 0.0) {
+        if ((nowMs - playStallLastPlayReqAtMs) > 15000L) {
+            playStallCheckArmed = false
             return
         }
-        val remainSec = durationSec - positionSec
-        if (remainSec.isFinite() && remainSec in 0.0..1.2) {
-            // 临近尾部由 completed/near-end 逻辑接管，避免恢复链路误触发。
+        if (durationSec <= 0.0 || positionSec < 0.0) {
             return
         }
         if (!playStallBasePosSec.isFinite()) {
@@ -2611,23 +2567,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         val progressed = positionSec - playStallBasePosSec
         if (progressed >= playStallMinProgressSec) {
-            // 持续播放监测：只要进度在推进就滚动重置基线，不退出 stall 监测。
-            // 这样可覆盖“播放一段时间后才卡住”的场景（例如中后段解码/网络抖动）。
-            playStallBasePosSec = positionSec
-            playStallArmedAtMs = nowMs
-            playStallRecoverStage = 0
+            playStallCheckArmed = false
             return
         }
         val elapsedMs = nowMs - playStallArmedAtMs
-        if ((nowMs - stallWatchLastLogAtMs) >= stallWatchLogIntervalMs) {
-            stallWatchLastLogAtMs = nowMs
-            logInfo(
-                "evt=play_stall_watch " +
-                    "elapsed_ms=$elapsedMs progressed=$progressed base=$playStallBasePosSec pos=$positionSec " +
-                    "loading=$loading state=${state.name} is_playing=$isPlayingNow pwr=$playWhenReady " +
-                    "recover_stage=$playStallRecoverStage source_category=$currentSourceCategory"
-            )
-        }
         if (pausedButWantsPlay && elapsedMs < playStallPausedStateDetectDelayMs) {
             return
         }
@@ -2657,7 +2600,6 @@ class HXCPlayerControl @JvmOverloads constructor(
                 manualPlayHardRecoverPending = false
                 metricsPlayStallRecoverReopenCount += 1L
                 logInfo("evt=play_stall_recover_noop_seek_reopen base=$positionSec target=$recoverTarget delta=$reseekDelta duration=$durationSec loading=$loading state=${state.name}")
-                maybeApplyDecodeFallbackOnRepeatedReopen(handle, nowMs, "play_stall_noop_reopen")
                 openExecutor.execute {
                     if (isReleased) return@execute
                     replayFrom(reopenStart)
@@ -2699,7 +2641,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         playStallLastRecoverAtMs = nowMs
         logInfo("evt=play_stall_recover_reopen base=$positionSec reopen_start=$reopenStart duration=$durationSec")
         metricsPlayStallRecoverReopenCount += 1L
-        maybeApplyDecodeFallbackOnRepeatedReopen(handle, nowMs, "play_stall_reopen")
         openExecutor.execute {
             if (isReleased) return@execute
             replayFrom(reopenStart)
@@ -2790,7 +2731,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     private fun maybeRecoverManualPlayHardStall(
-        handle: Long,
         nowMs: Long,
         positionSec: Double,
         durationSec: Double,
@@ -2847,7 +2787,6 @@ class HXCPlayerControl @JvmOverloads constructor(
             TAG,
             "evt=manual_play_hard_recover_reopen base=$positionSec reopen_start=$reopenStart state=${state.name} loading=$loading"
         )
-        maybeApplyDecodeFallbackOnRepeatedReopen(handle, nowMs, "manual_hard_reopen")
         openExecutor.execute {
             if (isReleased) return@execute
             replayFrom(reopenStart)
@@ -2919,6 +2858,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         loadingSessionLikelySeek = false
         suppressLoadingShowUntilMs = 0L
         lastPositionForLoadingHeuristicSec = Double.NaN
+        lastBackwardJumpLogAtMs = 0L
         pendingSeekActive = false
         pendingSeekLoadingObserved = false
         pendingSeekTargetSec = Double.NaN

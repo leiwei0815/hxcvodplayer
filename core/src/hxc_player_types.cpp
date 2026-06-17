@@ -21,7 +21,11 @@ double Clock::get_clock() const {
         return pts;
     } else {
         double time = av_gettime_relative() / 1000000.0;
-        return pts_drift + time - (time - last_updated);
+        // FFplay clock model:
+        // pts_drift = pts - update_time, so current clock should be pts_drift + now.
+        // Previous formula mistakenly canceled "time", returning almost fixed pts and
+        // causing progress jitter/back-jump side effects in recovery/loading heuristics.
+        return pts_drift + time;
     }
 }
 

@@ -395,6 +395,9 @@ private:
     std::atomic<int64_t> suppress_stale_loading_true_until_ms_{0};
     std::atomic<double> loading_progress_last_pos_{-1.0};
     std::atomic<int64_t> loading_progress_last_advance_ms_{0};
+    // Diagnostic: capture position backward-jump around loading state changes.
+    std::atomic<double> state_last_reported_pos_{std::numeric_limits<double>::quiet_NaN()};
+    std::atomic<int64_t> state_last_backward_jump_log_ms_{0};
     static void loadingStateCallback(bool is_loading, void* user_data);
 
     std::mutex        error_mutex_;
