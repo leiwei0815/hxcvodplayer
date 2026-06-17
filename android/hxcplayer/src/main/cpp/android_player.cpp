@@ -1667,14 +1667,15 @@ bool AndroidPlayer::isSeekSessionActive() const {
             seek_recovery_active_.load(std::memory_order_acquire) ||
             seek_audio_wait_video_.load(std::memory_order_acquire) ||
             seek_force_resume_pending_.load(std::memory_order_acquire);
-    int seek_phase = seek_phase_.load(std::memory_order_acquire);
-    bool phase_active = seek_phase != SEEK_PHASE_IDLE;
-    // Session id is a correlation token, not an activity gate.
-    // A stale sid alone must not keep Java side waiting for seek completion.
-    if (!seek_gates_active && !phase_active) {
+    // Root fix:
+    // "seek session active" should track real gate activity, not stale phase token.
+    // We observed cases where gates were already released but phase stayed CONVERGE,
+    // causing Java watchdog/loading to wait extra seconds despite playback progress.
+    // Session id and phase are correlation metadata; gates are the real source of truth.
+    if (!seek_gates_active) {
         return false;
     }
-    return active_sid || seek_gates_active || phase_active;
+    return active_sid || seek_gates_active;
 }
 
 void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {

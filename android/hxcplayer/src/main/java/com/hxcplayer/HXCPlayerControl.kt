@@ -466,6 +466,11 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var pendingSeekTriggeredReopen: Boolean = false
     private var lastSeekPostConfirmReopenAtMs: Long = 0L
     private var pendingSeekLastWatchdogLogAtMs: Long = 0L
+    // 诊断：量化 native seek 结束到 UI loading 隐藏的间隔。
+    private var seekLoadingSyncRequestId: Long = -1L
+    private var seekNativeInactiveAtMs: Long = 0L
+    private var seekNativeInactivePosSec: Double = Double.NaN
+    private var seekLoadingSyncGapLogged: Boolean = false
     private var reopenUiAnchorActive: Boolean = false
     private var reopenUiAnchorPosSec: Double = Double.NaN
     private var reopenUiAnchorUntilMs: Long = 0L
@@ -1771,6 +1776,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekPostConfirmTimedOut = false
         pendingSeekTriggeredReopen = false
         pendingSeekLastWatchdogLogAtMs = 0L
+        seekLoadingSyncRequestId = pendingSeekRequestId
+        seekNativeInactiveAtMs = 0L
+        seekNativeInactivePosSec = Double.NaN
+        seekLoadingSyncGapLogged = false
         loadingSessionLikelySeek = true
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
@@ -2186,6 +2195,26 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 suppressLoadingShowUntilMs = now + seekLoadingReshowSuppressMs
                             }
                             loadingSessionLikelySeek = false
+                            if (!seekLoadingSyncGapLogged && seekLoadingSyncRequestId > 0L && seekNativeInactiveAtMs > 0L) {
+                                val hideGapMs = (now - seekNativeInactiveAtMs).coerceAtLeast(0L)
+                                val progressSinceInactive = if (seekNativeInactivePosSec.isNaN()) {
+                                    Double.NaN
+                                } else {
+                                    position - seekNativeInactivePosSec
+                                }
+                                val msg =
+                                    "evt=seek_loading_sync_gap id=$seekLoadingSyncRequestId " +
+                                        "native_inactive_to_loading_hide_ms=$hideGapMs " +
+                                        "native_inactive_pos=$seekNativeInactivePosSec " +
+                                        "loading_hide_pos=$position progress_since_inactive=$progressSinceInactive " +
+                                        "state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying"
+                                if (hideGapMs >= 1200L) {
+                                    Log.w(TAG, msg)
+                                } else {
+                                    logInfo(msg)
+                                }
+                                seekLoadingSyncGapLogged = true
+                            }
                         }
                         mainHandler.post {
                             callback?.onPlayerLoadingChanged(loading)
@@ -2228,6 +2257,17 @@ class HXCPlayerControl @JvmOverloads constructor(
                             && (now - pendingSeekConvergedSinceMs) >= seekCompletionConvergedStableMs
                     val loadingRecovered = pendingSeekLoadingObserved && !loading
                     val nativeSeekActive = nativeIsSeekSessionActive(handle)
+                    if (!nativeSeekActive &&
+                        seekLoadingSyncRequestId == pendingSeekRequestId &&
+                        seekNativeInactiveAtMs <= 0L
+                    ) {
+                        seekNativeInactiveAtMs = now
+                        seekNativeInactivePosSec = position
+                        logInfo(
+                            "evt=seek_native_inactive_mark id=$pendingSeekRequestId target=$target from=$from " +
+                                "pos=$position elapsed_ms=$seekElapsedMs loading=$loading state=${state.name}"
+                        )
+                    }
                     val nativeConvergedButStuck = nativeSeekActive
                             && seekElapsedMs >= seekCompletionNativeConvergedWatchdogMs
                             && convergedStable
@@ -2623,6 +2663,10 @@ class HXCPlayerControl @JvmOverloads constructor(
             pendingSeekPostConfirmTimedOut = false
             pendingSeekTriggeredReopen = false
             pendingSeekLastWatchdogLogAtMs = 0L
+            seekLoadingSyncRequestId = pendingSeekRequestId
+            seekNativeInactiveAtMs = 0L
+            seekNativeInactivePosSec = Double.NaN
+            seekLoadingSyncGapLogged = false
             loadingSessionLikelySeek = true
             logInfo("evt=play_stall_recover_seek base=$positionSec target=$recoverTarget duration=$durationSec loading=$loading state=${state.name}")
             metricsPlayStallRecoverSeekCount += 1L
@@ -2720,6 +2764,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekPostConfirmTimedOut = false
         pendingSeekTriggeredReopen = false
         pendingSeekLastWatchdogLogAtMs = 0L
+        seekLoadingSyncRequestId = pendingSeekRequestId
+        seekNativeInactiveAtMs = 0L
+        seekNativeInactivePosSec = Double.NaN
+        seekLoadingSyncGapLogged = false
         loadingSessionLikelySeek = true
 
         Log.w(
@@ -2873,6 +2921,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekTriggeredReopen = false
         lastSeekPostConfirmReopenAtMs = 0L
         pendingSeekLastWatchdogLogAtMs = 0L
+        seekLoadingSyncRequestId = -1L
+        seekNativeInactiveAtMs = 0L
+        seekNativeInactivePosSec = Double.NaN
+        seekLoadingSyncGapLogged = false
         reopenUiAnchorActive = false
         reopenUiAnchorPosSec = Double.NaN
         reopenUiAnchorUntilMs = 0L
