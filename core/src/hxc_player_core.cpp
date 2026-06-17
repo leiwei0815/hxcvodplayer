@@ -3242,9 +3242,7 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
             double incoming_audio_pts = af->pts;
             bool can_guard_discontinuity =
                     !seeking_.load(std::memory_order_acquire) &&
-                    !seek_request_.load(std::memory_order_acquire) &&
-                    play_when_ready_.load(std::memory_order_acquire) &&
-                    pipeline_state_.load(std::memory_order_acquire) == PipelineState::Ready;
+                    !seek_request_.load(std::memory_order_acquire);
             if (can_guard_discontinuity &&
                 std::isfinite(incoming_audio_pts) &&
                 std::isfinite(audio_current_pts_)) {
@@ -3252,7 +3250,9 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
                 if (backward_delta >= 1.20) {
                     LOG_WARNING("audio_pts_backward_discontinuity_guard: drop backward anchor, delta=",
                                 backward_delta, " from=", audio_current_pts_, " to=", incoming_audio_pts,
-                                " serial=", af->serial);
+                                " serial=", af->serial,
+                                " state=", static_cast<int>(state_.load(std::memory_order_acquire)),
+                                " pipeline=", static_cast<int>(pipeline_state_.load(std::memory_order_acquire)));
                     // 保持当前锚点，后续按实际输出样本推进时钟，避免位置瞬间回跳。
                     incoming_audio_pts = audio_current_pts_;
                 }
