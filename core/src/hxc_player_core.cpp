@@ -3236,8 +3236,28 @@ void PlayerCore::audio_callback_impl(uint8_t* stream, int len) {
                 return;
             }
             
-            // ⚠️ 保存当前帧的 PTS，用于后续时钟更新
-            audio_current_pts_ = af->pts;
+            // 保存当前帧 PTS 作为音频时钟锚点。
+            // Root fix: 非 seek 场景下，个别源流会出现异常时间戳回退（例如 1140s -> 1134s），
+            // 直接采用回退 PTS 会把 master clock 硬拉回，触发 loading 抖动与“区间循环”体感。
+            double incoming_audio_pts = af->pts;
+            bool can_guard_discontinuity =
+                    !seeking_.load(std::memory_order_acquire) &&
+                    !seek_request_.load(std::memory_order_acquire) &&
+                    play_when_ready_.load(std::memory_order_acquire) &&
+                    pipeline_state_.load(std::memory_order_acquire) == PipelineState::Ready;
+            if (can_guard_discontinuity &&
+                std::isfinite(incoming_audio_pts) &&
+                std::isfinite(audio_current_pts_)) {
+                double backward_delta = audio_current_pts_ - incoming_audio_pts;
+                if (backward_delta >= 1.20) {
+                    LOG_WARNING("audio_pts_backward_discontinuity_guard: drop backward anchor, delta=",
+                                backward_delta, " from=", audio_current_pts_, " to=", incoming_audio_pts,
+                                " serial=", af->serial);
+                    // 保持当前锚点，后续按实际输出样本推进时钟，避免位置瞬间回跳。
+                    incoming_audio_pts = audio_current_pts_;
+                }
+            }
+            audio_current_pts_ = incoming_audio_pts;
             audio_current_pts_drift_ = audio_current_pts_ - av_gettime_relative() / 1000000.0;
             
             // 消费队列中的帧
