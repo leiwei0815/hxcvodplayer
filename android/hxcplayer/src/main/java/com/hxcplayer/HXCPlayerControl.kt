@@ -374,6 +374,25 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     /**
+     * Java 友好的统一状态监听。业务侧可直接消费字段，无需反射读取 Kotlin data class。
+     *
+     * SDK 保证该回调与 [PlaybackSnapshotCallback] 使用同一份快照语义，并在主线程触发。
+     */
+    interface PlaybackSnapshotListener {
+        fun onPlaybackSnapshotChanged(
+            state: PlayerState,
+            pipelineState: PipelineState,
+            playWhenReady: Boolean,
+            isPlaying: Boolean,
+            isLoading: Boolean,
+            position: Double,
+            duration: Double,
+            shouldShowPlayingUi: Boolean,
+            updatedAtMs: Long
+        )
+    }
+
+    /**
      * 异步 [playWithModelAsync] / [openWithPlayModelAsync] 结果回调。
      * 使用 SAM，便于 Java 调用方避免 Kotlin `Unit` 与 Java `void` 类型不兼容。
      */
@@ -385,6 +404,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var callback: PlayerCallback? = null
     private var completedCallback: PlaybackCompletedCallback? = null
     private var playbackSnapshotCallback: PlaybackSnapshotCallback? = null
+    private var playbackSnapshotListener: PlaybackSnapshotListener? = null
     private var lastPlayerState: PlayerState? = null
     private var lastPipelineState: PipelineState? = null
     private var lastIsPlayingState: Boolean? = null
@@ -474,7 +494,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var reopenUiAnchorActive: Boolean = false
     private var reopenUiAnchorPosSec: Double = Double.NaN
     private var reopenUiAnchorUntilMs: Long = 0L
+    private var reopenUiAnchorArmedAtMs: Long = 0L
     private val reopenUiAnchorMaxHoldMs = 2600L
+    private val reopenUiAnchorMinHoldMs = 900L
     private val reopenUiAnchorZeroGuardSec = 1.2
     private val reopenUiAnchorReleaseNearSec = 1.5
     private var playStallCheckArmed = false
@@ -575,6 +597,20 @@ class HXCPlayerControl @JvmOverloads constructor(
         mainHandler.post {
             if (isReleased || this.playbackSnapshotCallback !== callback) return@post
             callback.onPlaybackSnapshotChanged(getPlaybackSnapshot())
+        }
+    }
+
+    /**
+     * 设置 Java 友好的统一状态监听。
+     *
+     * 新业务建议优先使用该接口；旧 [PlaybackSnapshotCallback] 保留兼容。
+     */
+    fun setPlaybackSnapshotListener(listener: PlaybackSnapshotListener?) {
+        this.playbackSnapshotListener = listener
+        listener ?: return
+        mainHandler.post {
+            if (isReleased || this.playbackSnapshotListener !== listener) return@post
+            dispatchPlaybackSnapshotToListener(listener, getPlaybackSnapshot())
         }
     }
 
@@ -681,6 +717,30 @@ class HXCPlayerControl @JvmOverloads constructor(
         callback?.onNetworkQoEUpdated(currentStallMs, networkTotalStallMs, networkReconnectCount)
     }
 
+    private fun dispatchPlaybackSnapshot(snapshot: PlaybackSnapshot) {
+        playbackSnapshotCallback?.onPlaybackSnapshotChanged(snapshot)
+        playbackSnapshotListener?.let { listener ->
+            dispatchPlaybackSnapshotToListener(listener, snapshot)
+        }
+    }
+
+    private fun dispatchPlaybackSnapshotToListener(
+        listener: PlaybackSnapshotListener,
+        snapshot: PlaybackSnapshot
+    ) {
+        listener.onPlaybackSnapshotChanged(
+            snapshot.state,
+            snapshot.pipelineState,
+            snapshot.playWhenReady,
+            snapshot.isPlaying,
+            snapshot.isLoading,
+            snapshot.position,
+            snapshot.duration,
+            snapshot.shouldShowPlayingUi,
+            snapshot.updatedAtMs
+        )
+    }
+
     private fun currentHandle(): Long {
         synchronized(lifecycleLock) {
             return nativeHandle
@@ -775,10 +835,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 target.onPlayerPositionUpdated(position, duration)
             }
             target.onPlayerLoadingChanged(loading)
-            val snapshotTarget = playbackSnapshotCallback
-            if (snapshotTarget != null) {
-                snapshotTarget.onPlaybackSnapshotChanged(snapshot)
-            }
+            dispatchPlaybackSnapshot(snapshot)
         }
     }
 
@@ -794,12 +851,14 @@ class HXCPlayerControl @JvmOverloads constructor(
             reopenUiAnchorActive = false
             reopenUiAnchorPosSec = Double.NaN
             reopenUiAnchorUntilMs = 0L
+            reopenUiAnchorArmedAtMs = 0L
             return
         }
         val now = SystemClock.elapsedRealtime()
         reopenUiAnchorActive = true
         reopenUiAnchorPosSec = startPositionSec
         reopenUiAnchorUntilMs = now + reopenUiAnchorMaxHoldMs
+        reopenUiAnchorArmedAtMs = now
         logInfo("evt=reopen_ui_anchor_arm start=$startPositionSec hold_ms=$reopenUiAnchorMaxHoldMs")
     }
 
@@ -808,6 +867,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         reopenUiAnchorActive = false
         reopenUiAnchorPosSec = Double.NaN
         reopenUiAnchorUntilMs = 0L
+        reopenUiAnchorArmedAtMs = 0L
         logInfo("evt=reopen_ui_anchor_release reason=$reason")
     }
 
@@ -835,6 +895,14 @@ class HXCPlayerControl @JvmOverloads constructor(
             return anchor
         }
         val recovering = loading || state == PlayerState.OPENING || state == PlayerState.LOADING
+        val holdElapsedMs = if (reopenUiAnchorArmedAtMs > 0L) {
+            nowMs - reopenUiAnchorArmedAtMs
+        } else {
+            reopenUiAnchorMaxHoldMs
+        }
+        if (holdElapsedMs < reopenUiAnchorMinHoldMs) {
+            return anchor
+        }
         if (abs(rawPositionSec - anchor) <= reopenUiAnchorReleaseNearSec || rawPositionSec > anchor) {
             releaseReopenUiAnchor("near_anchor")
             return rawPositionSec
@@ -1255,6 +1323,11 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     private fun resetPlaybackHealthStateForOpen(reason: String, startPosition: Double) {
         val now = SystemClock.elapsedRealtime()
+        val shouldPreserveReopenUiAnchor = reopenUiAnchorActive &&
+                startPosition.isFinite() &&
+                reopenUiAnchorPosSec.isFinite() &&
+                abs(reopenUiAnchorPosSec - startPosition) <= 0.25 &&
+                now <= reopenUiAnchorUntilMs
         lastLoadingState = null
         lastPlayerState = null
         lastPipelineState = null
@@ -1285,9 +1358,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         seekNativeInactivePosSec = Double.NaN
         seekLoadingSyncGapLogged = false
 
-        reopenUiAnchorActive = false
-        reopenUiAnchorPosSec = Double.NaN
-        reopenUiAnchorUntilMs = 0L
+        if (!shouldPreserveReopenUiAnchor) {
+            reopenUiAnchorActive = false
+            reopenUiAnchorPosSec = Double.NaN
+            reopenUiAnchorUntilMs = 0L
+            reopenUiAnchorArmedAtMs = 0L
+        }
         playStallCheckArmed = false
         playStallArmedAtMs = 0L
         playStallBasePosSec = Double.NaN
@@ -1309,7 +1385,8 @@ class HXCPlayerControl @JvmOverloads constructor(
 
         logInfo(
             "evt=session_state_reset reason=$reason start_pos=$startPosition " +
-                "loop_suppress_ms=$openSessionLoopSuppressMs source_category=$currentSourceCategory"
+                "loop_suppress_ms=$openSessionLoopSuppressMs source_category=$currentSourceCategory " +
+                "preserve_reopen_ui_anchor=$shouldPreserveReopenUiAnchor"
         )
     }
 
@@ -2229,7 +2306,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
                 if (shouldDispatchSnapshot) {
                     mainHandler.post {
-                        playbackSnapshotCallback?.onPlaybackSnapshotChanged(snapshot)
+                        dispatchPlaybackSnapshot(snapshot)
                     }
                 }
 
@@ -2365,21 +2442,22 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
 
                 if (pendingSeekActive) {
+                    val seekPosition = boundedRawPosition
                     if (loading) {
                         pendingSeekLoadingObserved = true
                     }
                     val seekElapsedMs = now - pendingSeekStartAtMs
                     val target = pendingSeekTargetSec
                     val from = pendingSeekFromSec
-                    val nearTarget = !target.isNaN() && abs(position - target) <= seekCompletionNearTargetSec
-                    val movedFromOldPos = !from.isNaN() && abs(position - from) >= seekCompletionMovedFromOldSec
+                    val nearTarget = !target.isNaN() && abs(seekPosition - target) <= seekCompletionNearTargetSec
+                    val movedFromOldPos = !from.isNaN() && abs(seekPosition - from) >= seekCompletionMovedFromOldSec
                     val secureForwardSeek = currentSourceCategory.startsWith("secure_") &&
                             !target.isNaN() &&
                             !from.isNaN() &&
                             target > from + 0.5
                     val secureForwardNearTarget = secureForwardSeek &&
                             !target.isNaN() &&
-                            abs(position - target) <= 0.8
+                            abs(seekPosition - target) <= 0.55
                     val convergedNow = if (secureForwardSeek) {
                         secureForwardNearTarget
                     } else {
@@ -2401,7 +2479,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                         seekNativeInactiveAtMs <= 0L
                     ) {
                         seekNativeInactiveAtMs = now
-                        seekNativeInactivePosSec = position
+                        seekNativeInactivePosSec = seekPosition
                     }
                     val nativeConvergedButStuck = nativeSeekActive
                             && seekElapsedMs >= seekCompletionNativeConvergedWatchdogMs
@@ -2412,7 +2490,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                         pendingSeekLastWatchdogLogAtMs = now
                         Log.i(
                             TAG,
-                            "evt=seek_pending_watchdog id=$pendingSeekRequestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs loading=$loading loading_observed=$pendingSeekLoadingObserved loading_recovered=$loadingRecovered play_when_ready=$playWhenReady state=${state.name} native_seek_active=$nativeSeekActive converged_now=$convergedNow converged_stable=$convergedStable native_converged_stuck=$nativeConvergedButStuck post_confirm_active=$pendingSeekPostConfirmActive source_category=$currentSourceCategory"
+                            "evt=seek_pending_watchdog id=$pendingSeekRequestId target=$target from=$from pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs loading=$loading loading_observed=$pendingSeekLoadingObserved loading_recovered=$loadingRecovered play_when_ready=$playWhenReady state=${state.name} native_seek_active=$nativeSeekActive converged_now=$convergedNow converged_stable=$convergedStable native_converged_stuck=$nativeConvergedButStuck post_confirm_active=$pendingSeekPostConfirmActive source_category=$currentSourceCategory"
                         )
                     }
                     // Prefer native seek settle as source of truth, but bound wait time
@@ -2431,8 +2509,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                         Log.w(
                             TAG,
                             "evt=seek_completion_blocked_far_secure_forward id=$pendingSeekRequestId " +
-                                "target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs " +
-                                "distance=${abs(position - target)} loading=$loading loading_recovered=$loadingRecovered " +
+                                "target=$target from=$from pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs " +
+                                "distance=${abs(seekPosition - target)} loading=$loading loading_recovered=$loadingRecovered " +
                                 "native_seek_active=$nativeSeekActive moved_from_old=$movedFromOldPos source_category=$currentSourceCategory"
                         )
                     }
@@ -2450,16 +2528,16 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 pendingSeekHadPostConfirm = true
                                 pendingSeekPostConfirmActive = true
                                 pendingSeekPostConfirmStartAtMs = now
-                                pendingSeekPostConfirmBasePosSec = position
+                                pendingSeekPostConfirmBasePosSec = seekPosition
                                 Log.i(
                                     TAG,
-                                    "evt=seek_post_confirm_arm target=$target pos=$position elapsed_ms=$seekElapsedMs"
+                                    "evt=seek_post_confirm_arm target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs"
                                 )
                                 return@scheduleAtFixedRate
                             }
                             val confirmElapsedMs = now - pendingSeekPostConfirmStartAtMs
                             val progressedAfterConfirm = !pendingSeekPostConfirmBasePosSec.isNaN() &&
-                                    (position - pendingSeekPostConfirmBasePosSec) >= seekCompletionPostConfirmMinProgressSec
+                                    (seekPosition - pendingSeekPostConfirmBasePosSec) >= seekCompletionPostConfirmMinProgressSec
                             val playingAfterConfirm = nativeIsPlaying(handle)
                             if (!progressedAfterConfirm && confirmElapsedMs < seekCompletionPostConfirmWindowMs) {
                                 return@scheduleAtFixedRate
@@ -2469,7 +2547,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 pendingSeekPostConfirmTimedOut = true
                                 Log.w(
                                     TAG,
-                                    "evt=seek_post_confirm_timeout_no_progress target=$target pos=$position elapsed_ms=$seekElapsedMs confirm_elapsed_ms=$confirmElapsedMs progressed=$progressedAfterConfirm playing=$playingAfterConfirm"
+                                    "evt=seek_post_confirm_timeout_no_progress target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs confirm_elapsed_ms=$confirmElapsedMs progressed=$progressedAfterConfirm playing=$playingAfterConfirm"
                                 )
                                 if (playWhenReady) {
                                     val sinceLastReopenMs = if (lastSeekPostConfirmReopenAtMs > 0L) {
@@ -2495,7 +2573,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                                     }
                                 }
                             } else {
-                                logInfo("evt=seek_post_confirm_pass target=$target pos=$position confirm_elapsed_ms=$confirmElapsedMs progressed=$progressedAfterConfirm playing=$playingAfterConfirm")
+                                logInfo("evt=seek_post_confirm_pass target=$target pos=$seekPosition ui_pos=$position confirm_elapsed_ms=$confirmElapsedMs progressed=$progressedAfterConfirm playing=$playingAfterConfirm")
                             }
                         }
                         val requestId = pendingSeekRequestId
@@ -2534,7 +2612,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                         if (timeoutDueToLoadingStuck) {
                             Log.w(
                                 TAG,
-                                "evt=seek_complete_timeout_loading_stuck target=$target pos=$position elapsed_ms=$seekElapsedMs hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck loading=$loading state=${state.name} source_category=$currentSourceCategory"
+                                "evt=seek_complete_timeout_loading_stuck target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck loading=$loading state=${state.name} source_category=$currentSourceCategory"
                             )
                         }
                         nativeSettleSeekSession(handle, completeByTimeout)
@@ -2571,14 +2649,14 @@ class HXCPlayerControl @JvmOverloads constructor(
                                         )
                         if (unhealthyAfterComplete) {
                             val unhealthyMsg =
-                                "evt=seek_completed_unhealthy id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying native_seek_active=$nativeSeekActive source_category=$currentSourceCategory"
+                                "evt=seek_completed_unhealthy id=$requestId target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying native_seek_active=$nativeSeekActive source_category=$currentSourceCategory"
                             if (completeByTimeout || loading) {
                                 Log.w(TAG, unhealthyMsg)
                             } else {
                                 logInfo(unhealthyMsg)
                             }
                             val unhealthyCheckRequestId = requestId
-                            val unhealthyCheckBasePos = position
+                            val unhealthyCheckBasePos = seekPosition
                             mainHandler.postDelayed({
                                 if (isReleased) return@postDelayed
                                 // Skip if a newer seek session has already started.
@@ -2639,19 +2717,19 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 }
                             }, 1600L)
                         }
-                        logInfo("evt=seek_completed id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory")
-                        logInfo("evt=seek_summary id=$requestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryReopenTriggered play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory")
+                        logInfo("evt=seek_completed id=$requestId target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory")
+                        logInfo("evt=seek_summary id=$requestId target=$target from=$from pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryReopenTriggered play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory")
                         // Minimal diagnostics: arm a short post-seek window and only
                         // emit one key mismatch log when play intent and semantic diverge.
                         seekSettleDiagUntilMs = now + 2000L
                         seekSettleDiagRequestId = requestId
                         seekSettleDiagLogged = false
-                        seekSettleDiagStartPosSec = position
+                        seekSettleDiagStartPosSec = seekPosition
                         if (canEmitDebugDiagLog()) {
                             Log.d(
                                 TAG,
                                 "evt=seek_settle_key_diag_arm id=$requestId until_ms=$seekSettleDiagUntilMs " +
-                                    "pos=$position target=$target state=${state.name} pwr=$playWhenReady playing=$isPlaying"
+                                    "pos=$seekPosition ui_pos=$position target=$target state=${state.name} pwr=$playWhenReady playing=$isPlaying"
                             )
                         }
                         // Seek 完成后若目标语义是继续播放，重新武装 stall 监测，
@@ -2659,11 +2737,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                         if (playWhenReady) {
                             playStallCheckArmed = true
                             playStallArmedAtMs = now
-                            playStallBasePosSec = position
+                            playStallBasePosSec = seekPosition
                             if (manualPlayHardRecoverEnabled) {
                                 manualPlayHardRecoverPending = true
                                 manualPlayHardRecoverArmedAtMs = now
-                                manualPlayHardRecoverBasePosSec = position
+                                manualPlayHardRecoverBasePosSec = seekPosition
                             }
                         }
                         mainHandler.post {
@@ -2758,6 +2836,13 @@ class HXCPlayerControl @JvmOverloads constructor(
             return
         }
         if (durationSec <= 0.0 || positionSec < 0.0) {
+            return
+        }
+        if ((durationSec - positionSec) <= playbackEndClampThresholdSec) {
+            playStallCheckArmed = false
+            manualPlayHardRecoverPending = false
+            playStallRecoverStage = 0
+            logInfo("evt=play_stall_recover_skip reason=near_end pos=$positionSec duration=$durationSec")
             return
         }
         if (!playStallBasePosSec.isFinite()) {

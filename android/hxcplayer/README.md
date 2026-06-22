@@ -160,6 +160,28 @@ class MyActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
 }
 ```
 
+### 推荐：统一播放快照
+
+新业务建议优先使用 `setPlaybackSnapshotListener(...)` 渲染播放 UI。该接口在主线程回调，并一次性给出 `state`、`pipelineState`、`playWhenReady`、`isPlaying`、`isLoading`、`position`、`duration`、`shouldShowPlayingUi`、`updatedAtMs`，业务层无需再通过状态回调、loading 回调、position 回调二次推断。
+
+```java
+player.setPlaybackSnapshotListener(new HXCPlayerControl.PlaybackSnapshotListener() {
+    @Override
+    public void onPlaybackSnapshotChanged(
+            HXCPlayerControl.PlayerState state,
+            HXCPlayerControl.PipelineState pipelineState,
+            boolean playWhenReady,
+            boolean isPlaying,
+            boolean isLoading,
+            double position,
+            double duration,
+            boolean shouldShowPlayingUi,
+            long updatedAtMs) {
+        // 业务层只根据该快照渲染按钮、loading、进度条和时长。
+    }
+});
+```
+
 ### License 校验说明（Android）
 
 - 调用 `openURL(...)` / `openWithPlayModel(...)` / `playURL(...)` / `playWithModel(...)` / `play()` / `seekTo(...)` / `seekToPosition(...)` 前，需先 `checkLicense(...)`

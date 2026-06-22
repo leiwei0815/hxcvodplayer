@@ -3671,8 +3671,9 @@ void AndroidPlayer::renderLoop() {
                         bool has_seek_progress = std::isfinite(seek_progress_best_abs_err) &&
                                                  seek_progress_best_abs_err < 9.5;
                         double forward_abs_offset_sec = std::fabs(future_offset_sec);
-                        double forward_soft_accept_max_sec = seek_elapsed_ms >= 5200 ? 1.20
-                                                            : (seek_elapsed_ms >= 3200 ? 0.95 : 0.75);
+                        double forward_soft_accept_max_sec = seek_elapsed_ms >= 6500 ? 0.80
+                                                            : (seek_elapsed_ms >= 4500 ? 0.65
+                                                            : (seek_elapsed_ms >= 3200 ? 0.55 : 0.45));
                         bool forward_ux_fast_accept = false;
                         bool backward_ux_fast_accept = false;
                         if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 1800) {
@@ -3962,9 +3963,9 @@ void AndroidPlayer::renderLoop() {
                         if (std::isfinite(duration_now) && duration_now > 0.0 && std::isfinite(seek_target_now)) {
                             near_end_seek = (duration_now - seek_target_now) <= 300.0;
                         }
-                        double verify_max_offset_sec = is_backward_seek ? 3.8 : 2.2;
+                        double verify_max_offset_sec = is_backward_seek ? 3.8 : 0.65;
                         if (large_seek_any_direction) {
-                            verify_max_offset_sec += is_backward_seek ? 0.6 : 0.8;
+                            verify_max_offset_sec += is_backward_seek ? 0.6 : 0.0;
                         }
                         if (is_backward_seek && near_end_seek) {
                             // 尾段 backward seek 使用更严格的收敛容忍，减少“看似完成但仍偏离目标”的假收敛。
@@ -3979,19 +3980,19 @@ void AndroidPlayer::renderLoop() {
                             verify_max_offset_sec = std::max(verify_max_offset_sec, backward_verify_floor);
                         }
                         if (seek_elapsed_ms >= 5200 && !(is_backward_seek && near_end_seek)) {
-                            verify_max_offset_sec = std::max(verify_max_offset_sec, is_backward_seek ? 4.8 : 3.0);
+                            verify_max_offset_sec = std::max(verify_max_offset_sec, is_backward_seek ? 4.8 : 1.0);
                         }
                         if (!is_backward_seek && large_seek_any_direction) {
-                            if (seek_elapsed_ms >= 3000) {
-                                verify_max_offset_sec = std::max(verify_max_offset_sec, 1.20);
+                            if (seek_elapsed_ms >= 4500) {
+                                verify_max_offset_sec = std::max(verify_max_offset_sec, 0.80);
                             }
-                            if (seek_elapsed_ms >= 5200) {
-                                verify_max_offset_sec = std::max(verify_max_offset_sec, 1.60);
+                            if (seek_elapsed_ms >= 6500) {
+                                verify_max_offset_sec = std::max(verify_max_offset_sec, 1.00);
                             }
                         }
                         if (!is_backward_seek && forward_soft_accept_active) {
                             verify_max_offset_sec = std::max(verify_max_offset_sec,
-                                                            forward_soft_accept_offset_sec + 0.4);
+                                                            forward_soft_accept_offset_sec + 0.12);
                         }
                         double verify_offset_sec = std::fabs(pts - seek_target_now);
                         int verify_need_hits = is_backward_seek ? 2 : 3;
@@ -4007,13 +4008,13 @@ void AndroidPlayer::renderLoop() {
                         if (is_backward_seek && !near_end_seek && seek_elapsed_ms >= 3200) {
                             verify_need_hits = 1;
                         }
-                        if (!is_backward_seek && seek_elapsed_ms >= 2600 && verify_offset_sec <= 0.80) {
+                        if (!is_backward_seek && seek_elapsed_ms >= 2600 && verify_offset_sec <= 0.50) {
                             verify_need_hits = 1;
                         }
-                        if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 2800 && verify_offset_sec <= 0.95) {
+                        if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 2800 && verify_offset_sec <= 0.55) {
                             verify_need_hits = 1;
                         }
-                        if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 3400 && verify_offset_sec <= 1.20) {
+                        if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 4200 && verify_offset_sec <= 0.65) {
                             verify_need_hits = 1;
                         }
                         if (seek_elapsed_ms >= 5600 && !(is_backward_seek && near_end_seek)) {
@@ -4040,15 +4041,16 @@ void AndroidPlayer::renderLoop() {
                             large_seek_any_direction &&
                             seek_elapsed_ms >= 2600 &&
                             std::isfinite(seek_progress_best_abs_err) &&
-                            seek_progress_best_abs_err < 1.40) {
-                            verify_max_offset_sec = std::max(verify_max_offset_sec, 1.20);
+                            seek_progress_best_abs_err < 0.80) {
+                            verify_max_offset_sec = std::max(verify_max_offset_sec, 0.65);
                             verify_need_hits = 1;
                         }
                         if (!is_backward_seek &&
                             large_seek_any_direction &&
                             seek_elapsed_ms >= 2200 &&
                             seek_lower_bound_drop_count_ >= 18) {
-                            double forward_verify_relax = seek_elapsed_ms >= 5200 ? 1.60 : 1.20;
+                            double forward_verify_relax = seek_elapsed_ms >= 6500 ? 1.00
+                                                          : (seek_elapsed_ms >= 4500 ? 0.80 : 0.65);
                             verify_max_offset_sec = std::max(verify_max_offset_sec, forward_verify_relax);
                             if (verify_offset_sec <= forward_verify_relax) {
                                 verify_need_hits = 1;
