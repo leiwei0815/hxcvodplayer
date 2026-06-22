@@ -2278,14 +2278,16 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 } else {
                                     position - seekNativeInactivePosSec
                                 }
-                                if (hideGapMs >= 800L) {
-                                    val msg =
-                                        "evt=seek_loading_sync_gap id=$seekLoadingSyncRequestId " +
-                                            "native_inactive_to_loading_hide_ms=$hideGapMs " +
-                                            "native_inactive_pos=$seekNativeInactivePosSec " +
-                                            "loading_hide_pos=$position progress_since_inactive=$progressSinceInactive " +
-                                            "state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying"
+                                val msg =
+                                    "evt=seek_loading_sync_gap id=$seekLoadingSyncRequestId " +
+                                        "native_inactive_to_loading_hide_ms=$hideGapMs " +
+                                        "native_inactive_pos=$seekNativeInactivePosSec " +
+                                        "loading_hide_pos=$position progress_since_inactive=$progressSinceInactive " +
+                                        "state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying"
+                                if (hideGapMs >= 1200L) {
                                     Log.w(TAG, msg)
+                                } else {
+                                    logInfo(msg)
                                 }
                                 seekLoadingSyncGapLogged = true
                             }
@@ -2341,15 +2343,17 @@ class HXCPlayerControl @JvmOverloads constructor(
                     ) {
                         seekNativeInactiveAtMs = now
                         seekNativeInactivePosSec = position
+                        logInfo(
+                            "evt=seek_native_inactive_mark id=$pendingSeekRequestId target=$target from=$from " +
+                                "pos=$position elapsed_ms=$seekElapsedMs loading=$loading state=${state.name}"
+                        )
                     }
                     val nativeConvergedButStuck = nativeSeekActive
                             && seekElapsedMs >= seekCompletionNativeConvergedWatchdogMs
                             && convergedStable
-                    if ((loading || nativeSeekActive) &&
-                        seekElapsedMs >= 3200L &&
-                        (now - pendingSeekLastWatchdogLogAtMs) >= 2000L) {
+                    if (seekElapsedMs >= 2400L && (now - pendingSeekLastWatchdogLogAtMs) >= 1200L) {
                         pendingSeekLastWatchdogLogAtMs = now
-                        Log.i(
+                        Log.w(
                             TAG,
                             "evt=seek_pending_watchdog id=$pendingSeekRequestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs loading=$loading loading_observed=$pendingSeekLoadingObserved loading_recovered=$loadingRecovered play_when_ready=$playWhenReady state=${state.name} native_seek_active=$nativeSeekActive converged_now=$convergedNow converged_stable=$convergedStable native_converged_stuck=$nativeConvergedButStuck post_confirm_active=$pendingSeekPostConfirmActive source_category=$currentSourceCategory"
                         )
@@ -2390,7 +2394,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 pendingSeekPostConfirmActive = true
                                 pendingSeekPostConfirmStartAtMs = now
                                 pendingSeekPostConfirmBasePosSec = position
-                                Log.i(
+                                Log.w(
                                     TAG,
                                     "evt=seek_post_confirm_arm target=$target pos=$position elapsed_ms=$seekElapsedMs"
                                 )
@@ -2509,13 +2513,10 @@ class HXCPlayerControl @JvmOverloads constructor(
                                                 || (!isPlaying && !loadingRecovered)
                                         )
                         if (unhealthyAfterComplete) {
-                            val unhealthyMsg =
+                            Log.w(
+                                TAG,
                                 "evt=seek_completed_unhealthy id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying native_seek_active=$nativeSeekActive source_category=$currentSourceCategory"
-                            if (completeByTimeout || loading) {
-                                Log.w(TAG, unhealthyMsg)
-                            } else {
-                                logInfo(unhealthyMsg)
-                            }
+                            )
                             val unhealthyCheckRequestId = requestId
                             val unhealthyCheckBasePos = position
                             mainHandler.postDelayed({
@@ -2620,8 +2621,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                     val backwardJump = lastPositionForLoadingHeuristicSec - position
                     if (!pendingSeekActive &&
                         playWhenReady &&
-                        backwardJump >= 2.0 &&
-                        (now - lastBackwardJumpLogAtMs) >= 2500L
+                        backwardJump >= 1.0 &&
+                        (now - lastBackwardJumpLogAtMs) >= 1200L
                     ) {
                         lastBackwardJumpLogAtMs = now
                         Log.w(
