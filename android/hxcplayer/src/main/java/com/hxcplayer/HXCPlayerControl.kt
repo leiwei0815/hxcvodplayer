@@ -528,6 +528,8 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
     private var currentSourceCategory: String = "unknown"
     @Volatile private var decodeMode: DecodeMode = DecodeMode.HARDWARE
+    private var decodeFallbackTriedForCurrentSource: Boolean = false
+    private var decodeFallbackLastAtMs: Long = 0L
     private val secureHlsAuthUrl = "https://console-api.huaxiacloud.net/third_party/verify/sign"
 
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
@@ -815,6 +817,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         state: PlayerState,
         nowMs: Long
     ): Double {
+        val seekUiPosition = resolveSeekUiPositionMask(rawPositionSec, loading, state)
+        if (seekUiPosition != null) {
+            return seekUiPosition
+        }
         if (!reopenUiAnchorActive) return rawPositionSec
         val anchor = reopenUiAnchorPosSec
         if (!anchor.isFinite()) {
@@ -839,6 +845,22 @@ class HXCPlayerControl @JvmOverloads constructor(
             return anchor
         }
         return rawPositionSec
+    }
+
+    private fun resolveSeekUiPositionMask(
+        rawPositionSec: Double,
+        loading: Boolean,
+        state: PlayerState
+    ): Double? {
+        if (!pendingSeekActive) return null
+        val target = pendingSeekTargetSec
+        if (!target.isFinite() || target < 0.0) return null
+        val seekLoadingUi = loading || state == PlayerState.LOADING || state == PlayerState.OPENING
+        if (!seekLoadingUi) return null
+
+        // Match mature players: while seek loading is visible, expose the pending seek
+        // position to UI and keep the internal clock/free-frame catchup private.
+        return target
     }
 
     // ========== iOS 对齐属性（property 风格 setter/getter）==========
@@ -975,6 +997,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 mode = workingModel.mode,
                 encryptedFile = workingModel.encryptedFile
             )
+            decodeFallbackTriedForCurrentSource = false
             logInfo("evt=open_source_classify category=$currentSourceCategory mode=${workingModel.mode} encrypted=${workingModel.encryptedFile} start_pos=$lastOpenStartPosition")
             resetPlaybackHealthStateForOpen("openWithPlayModel", lastOpenStartPosition)
             if (!autoReopenInFlight) {
@@ -1099,6 +1122,35 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     fun getDecodeMode(): DecodeMode = decodeMode
+
+    private fun maybeFallbackToSoftwareDecode(
+        reason: String,
+        nowMs: Long,
+        positionSec: Double,
+        state: PlayerState,
+        loading: Boolean,
+        isPlayingNow: Boolean
+    ): Boolean {
+        if (decodeFallbackTriedForCurrentSource) return false
+        if (decodeMode != DecodeMode.HARDWARE) return false
+        if (currentSourceCategory != "remote_plain") return false
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return false
+        if (!nativeIsHardwareDecodingActive(handle)) return false
+        val likelyFrozen = loading || state == PlayerState.LOADING || !isPlayingNow
+        if (!likelyFrozen) return false
+
+        decodeFallbackTriedForCurrentSource = true
+        decodeFallbackLastAtMs = nowMs
+        decodeMode = DecodeMode.SOFTWARE
+        nativeSetDecodeMode(handle, 0)
+        Log.w(
+            TAG,
+            "evt=decode_fallback_to_software reason=$reason source_category=$currentSourceCategory " +
+                "pos=$positionSec state=${state.name} loading=$loading is_playing=$isPlayingNow"
+        )
+        return true
+    }
 
     private fun applyDecodeModeForHandle(handle: Long) {
         nativeSetDecodeMode(handle, if (decodeMode == DecodeMode.HARDWARE) 1 else 0)
@@ -1551,6 +1603,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 mode = PlayerDataSourceMode.DEFAULT,
                 encryptedFile = false
             )
+            decodeFallbackTriedForCurrentSource = false
             logInfo("evt=open_source_classify category=$currentSourceCategory mode=${PlayerDataSourceMode.DEFAULT} encrypted=false start_pos=$startPosition")
             resetPlaybackHealthStateForOpen("openURL", startPosition)
             if (!autoReopenInFlight) {
@@ -1600,6 +1653,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             mode = PlayerDataSourceMode.DEFAULT,
             encryptedFile = false
         )
+        decodeFallbackTriedForCurrentSource = false
         logInfo("evt=open_source_classify category=$currentSourceCategory mode=${PlayerDataSourceMode.DEFAULT} encrypted=false start_pos=$startPosition")
         resetPlaybackHealthStateForOpen("openURLAsync", startPosition)
         if (!autoReopenInFlight) {
@@ -2278,16 +2332,14 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 } else {
                                     position - seekNativeInactivePosSec
                                 }
-                                val msg =
-                                    "evt=seek_loading_sync_gap id=$seekLoadingSyncRequestId " +
-                                        "native_inactive_to_loading_hide_ms=$hideGapMs " +
-                                        "native_inactive_pos=$seekNativeInactivePosSec " +
-                                        "loading_hide_pos=$position progress_since_inactive=$progressSinceInactive " +
-                                        "state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying"
-                                if (hideGapMs >= 1200L) {
+                                if (hideGapMs >= 800L) {
+                                    val msg =
+                                        "evt=seek_loading_sync_gap id=$seekLoadingSyncRequestId " +
+                                            "native_inactive_to_loading_hide_ms=$hideGapMs " +
+                                            "native_inactive_pos=$seekNativeInactivePosSec " +
+                                            "loading_hide_pos=$position progress_since_inactive=$progressSinceInactive " +
+                                            "state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying"
                                     Log.w(TAG, msg)
-                                } else {
-                                    logInfo(msg)
                                 }
                                 seekLoadingSyncGapLogged = true
                             }
@@ -2343,17 +2395,15 @@ class HXCPlayerControl @JvmOverloads constructor(
                     ) {
                         seekNativeInactiveAtMs = now
                         seekNativeInactivePosSec = position
-                        logInfo(
-                            "evt=seek_native_inactive_mark id=$pendingSeekRequestId target=$target from=$from " +
-                                "pos=$position elapsed_ms=$seekElapsedMs loading=$loading state=${state.name}"
-                        )
                     }
                     val nativeConvergedButStuck = nativeSeekActive
                             && seekElapsedMs >= seekCompletionNativeConvergedWatchdogMs
                             && convergedStable
-                    if (seekElapsedMs >= 2400L && (now - pendingSeekLastWatchdogLogAtMs) >= 1200L) {
+                    if ((loading || nativeSeekActive) &&
+                        seekElapsedMs >= 3200L &&
+                        (now - pendingSeekLastWatchdogLogAtMs) >= 2000L) {
                         pendingSeekLastWatchdogLogAtMs = now
-                        Log.w(
+                        Log.i(
                             TAG,
                             "evt=seek_pending_watchdog id=$pendingSeekRequestId target=$target from=$from pos=$position elapsed_ms=$seekElapsedMs loading=$loading loading_observed=$pendingSeekLoadingObserved loading_recovered=$loadingRecovered play_when_ready=$playWhenReady state=${state.name} native_seek_active=$nativeSeekActive converged_now=$convergedNow converged_stable=$convergedStable native_converged_stuck=$nativeConvergedButStuck post_confirm_active=$pendingSeekPostConfirmActive source_category=$currentSourceCategory"
                         )
@@ -2394,7 +2444,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 pendingSeekPostConfirmActive = true
                                 pendingSeekPostConfirmStartAtMs = now
                                 pendingSeekPostConfirmBasePosSec = position
-                                Log.w(
+                                Log.i(
                                     TAG,
                                     "evt=seek_post_confirm_arm target=$target pos=$position elapsed_ms=$seekElapsedMs"
                                 )
@@ -2513,10 +2563,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                                                 || (!isPlaying && !loadingRecovered)
                                         )
                         if (unhealthyAfterComplete) {
-                            Log.w(
-                                TAG,
+                            val unhealthyMsg =
                                 "evt=seek_completed_unhealthy id=$requestId target=$target pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying native_seek_active=$nativeSeekActive source_category=$currentSourceCategory"
-                            )
+                            if (completeByTimeout || loading) {
+                                Log.w(TAG, unhealthyMsg)
+                            } else {
+                                logInfo(unhealthyMsg)
+                            }
                             val unhealthyCheckRequestId = requestId
                             val unhealthyCheckBasePos = position
                             mainHandler.postDelayed({
@@ -2621,8 +2674,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                     val backwardJump = lastPositionForLoadingHeuristicSec - position
                     if (!pendingSeekActive &&
                         playWhenReady &&
-                        backwardJump >= 1.0 &&
-                        (now - lastBackwardJumpLogAtMs) >= 1200L
+                        backwardJump >= 2.0 &&
+                        (now - lastBackwardJumpLogAtMs) >= 2500L
                     ) {
                         lastBackwardJumpLogAtMs = now
                         Log.w(
@@ -2741,6 +2794,14 @@ class HXCPlayerControl @JvmOverloads constructor(
                 manualPlayHardRecoverPending = false
                 metricsPlayStallRecoverReopenCount += 1L
                 logInfo("evt=play_stall_recover_noop_seek_reopen base=$positionSec target=$recoverTarget delta=$reseekDelta duration=$durationSec loading=$loading state=${state.name}")
+                maybeFallbackToSoftwareDecode(
+                    reason = "play_stall_noop_reopen",
+                    nowMs = nowMs,
+                    positionSec = positionSec,
+                    state = state,
+                    loading = loading,
+                    isPlayingNow = isPlayingNow
+                )
                 openExecutor.execute {
                     if (isReleased) return@execute
                     replayFrom(reopenStart)
@@ -2787,6 +2848,14 @@ class HXCPlayerControl @JvmOverloads constructor(
         playStallLastRecoverAtMs = nowMs
         logInfo("evt=play_stall_recover_reopen base=$positionSec reopen_start=$reopenStart duration=$durationSec")
         metricsPlayStallRecoverReopenCount += 1L
+        maybeFallbackToSoftwareDecode(
+            reason = "play_stall_reopen",
+            nowMs = nowMs,
+            positionSec = positionSec,
+            state = state,
+            loading = loading,
+            isPlayingNow = isPlayingNow
+        )
         openExecutor.execute {
             if (isReleased) return@execute
             replayFrom(reopenStart)
@@ -2972,6 +3041,14 @@ class HXCPlayerControl @JvmOverloads constructor(
             TAG,
             "evt=manual_play_hard_recover_reopen base=$positionSec reopen_start=$reopenStart state=${state.name} loading=$loading"
         )
+        maybeFallbackToSoftwareDecode(
+            reason = "manual_hard_recover_reopen",
+            nowMs = nowMs,
+            positionSec = positionSec,
+            state = state,
+            loading = loading,
+            isPlayingNow = isPlayingNow
+        )
         openExecutor.execute {
             if (isReleased) return@execute
             replayFrom(reopenStart)
@@ -3092,6 +3169,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         networkReconnectCount = 0
         autoReopenAttemptCount = 0
         autoReopenInFlight = false
+        decodeFallbackTriedForCurrentSource = false
+        decodeFallbackLastAtMs = 0L
         lastOpenUrl = null
         lastOpenPlayModel = null
         lastOpenStartPosition = 0.0

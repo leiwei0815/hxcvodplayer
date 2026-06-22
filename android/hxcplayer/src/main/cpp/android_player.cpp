@@ -1734,9 +1734,9 @@ void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
     double prev_pos = player->state_last_reported_pos_.load(std::memory_order_acquire);
     if (std::isfinite(prev_pos) && std::isfinite(pos_now)) {
         double backward_delta = prev_pos - pos_now;
-        if (backward_delta >= 1.0) {
+        if (backward_delta >= 2.0) {
             int64_t last_jump_log_ms = player->state_last_backward_jump_log_ms_.load(std::memory_order_acquire);
-            if (now_ms_now - last_jump_log_ms >= 1200) {
+            if (now_ms_now - last_jump_log_ms >= 2500) {
                 player->state_last_backward_jump_log_ms_.store(now_ms_now, std::memory_order_release);
                 bool seek_active = player->isSeekSessionActive();
                 LOGW("[state] position backward jump: delta=%.3f from=%.3f to=%.3f loading=%d seek_active=%d",
@@ -2568,8 +2568,6 @@ void AndroidPlayer::renderLoop() {
     // Force-resume soft success detector:
     // some secure seek sessions keep core state at PAUSED while clock/frames
     // still progress toward target. Avoid retry storms in that situation.
-    double force_resume_last_pos = -1.0;
-    int64_t force_resume_last_pos_ms = 0;
     // Seek convergence progress tracker:
     // when abs(target-pts) keeps shrinking, avoid triggering timeout fallback
     // too early (especially large secure forward seeks).
@@ -2654,18 +2652,9 @@ void AndroidPlayer::renderLoop() {
             continue;
         }
 
-        // Track forward progress for stale-loading suppression.
-        // Some devices keep reporting loading=true after seek settle while position still advances.
-        double progress_probe_pos = player_core_get_position(player_core_);
-        int64_t progress_probe_now = now_ms();
-        double progress_prev_pos = loading_progress_last_pos_.load(std::memory_order_acquire);
-        if (std::isfinite(progress_probe_pos) && progress_probe_pos >= 0.0 &&
-            std::isfinite(progress_prev_pos) && progress_prev_pos >= 0.0 &&
-            (progress_probe_pos - progress_prev_pos) >= 0.06 &&
-            (progress_probe_pos - progress_prev_pos) <= 3.20) {
-            loading_progress_last_advance_ms_.store(progress_probe_now, std::memory_order_release);
-        }
-        loading_progress_last_pos_.store(progress_probe_pos, std::memory_order_release);
+        // Progress tracking is updated on actual rendered video frames (PTS-based),
+        // not by core clock position. Clock-only advance can be misleading on
+        // problematic streams and cause false "progress" in seek/loading recovery.
 
         auto trySeekSoftRebuild = [&](int64_t now_ts, const char* reason) -> bool {
             if (!player_core_) return false;
@@ -2882,19 +2871,16 @@ void AndroidPlayer::renderLoop() {
                            "evt=seek_force_resume_blocked_secure_forward_far target=%.3f from=%.3f pos=%.3f behind=%.3f state=%d pwr=%d",
                            target_retry, from_retry, pos_retry, target_retry - pos_retry, state_retry, pwr_retry);
             }
-            int64_t pos_progress_interval_ms_retry = 0;
-            if (force_resume_last_pos_ms > 0) {
-                pos_progress_interval_ms_retry = now_ts - force_resume_last_pos_ms;
+            int64_t rendered_progress_age_ms_retry = -1;
+            int64_t rendered_progress_last_ms_retry = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
+            if (rendered_progress_last_ms_retry > 0) {
+                rendered_progress_age_ms_retry = now_ts - rendered_progress_last_ms_retry;
             }
-            bool has_position_progress_retry =
-                    std::isfinite(pos_retry) && pos_retry >= 0.0 &&
-                    std::isfinite(force_resume_last_pos) && force_resume_last_pos >= 0.0 &&
-                    (pos_retry - force_resume_last_pos) >= 0.08 &&
-                    std::fabs(pos_retry - force_resume_last_pos) <= 3.00 &&
-                    pos_progress_interval_ms_retry >= 220 &&
-                    pos_progress_interval_ms_retry <= 4200;
+            bool has_rendered_progress_retry =
+                    rendered_progress_age_ms_retry >= 0 &&
+                    rendered_progress_age_ms_retry <= 1200;
             if (!block_secure_forward_far_resume &&
-                pwr_retry != 0 && state_retry == PLAYER_STATE_PLAYING && has_position_progress_retry) {
+                pwr_retry != 0 && state_retry == PLAYER_STATE_PLAYING && has_rendered_progress_retry) {
                 setSeekPhase(SEEK_PHASE_RESUME, "seek_force_resume_soft_success_state_playing");
                 seek_force_resume_pending_.store(false, std::memory_order_release);
                 seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
@@ -2910,26 +2896,10 @@ void AndroidPlayer::renderLoop() {
                 return;
             } else if (pwr_retry != 0 && state_retry == PLAYER_STATE_PLAYING) {
                 SYNCW_RATE(10,
-                           "evt=seek_force_resume_soft_reject reason=state_playing_without_progress pwr=%d state=%d pos=%.3f interval_ms=%" PRId64,
-                           pwr_retry, state_retry, pos_retry, pos_progress_interval_ms_retry);
+                           "evt=seek_force_resume_soft_reject reason=state_playing_without_rendered_progress pwr=%d state=%d pos=%.3f progress_age_ms=%" PRId64,
+                           pwr_retry, state_retry, pos_retry, rendered_progress_age_ms_retry);
             }
-            bool pos_progressing = false;
-            int64_t pos_progress_interval_ms = 0;
-            if (std::isfinite(pos_retry) && pos_retry >= 0.0) {
-                if (force_resume_last_pos_ms > 0) {
-                    pos_progress_interval_ms = now_ts - force_resume_last_pos_ms;
-                }
-                if (std::isfinite(force_resume_last_pos) &&
-                    force_resume_last_pos >= 0.0 &&
-                    (pos_retry - force_resume_last_pos) >= 0.10 &&
-                    std::fabs(pos_retry - force_resume_last_pos) <= 2.50 &&
-                    pos_progress_interval_ms >= 320 &&
-                    pos_progress_interval_ms <= 3200) {
-                    pos_progressing = true;
-                }
-                force_resume_last_pos = pos_retry;
-                force_resume_last_pos_ms = now_ts;
-            }
+            bool pos_progressing = has_rendered_progress_retry;
             bool seek_gates_cleared =
                     !seek_lower_bound_active_.load(std::memory_order_acquire) &&
                     !seek_recovery_active_.load(std::memory_order_acquire) &&
@@ -4291,13 +4261,42 @@ void AndroidPlayer::renderLoop() {
                 int64_t first_frame_max_wait_ms = likely_4k ? 3200 : 1800;
                 bool first_frame_wait_timeout = is_open_first_frame &&
                                                 first_wait_ms >= first_frame_max_wait_ms;
-                if (delay < first_frame_force_threshold && !first_frame_wait_timeout) {
+                bool audio_deferred_now = is_open_first_frame &&
+                                          audio_start_pending_.load(std::memory_order_acquire);
+                // Root fix:
+                // During open-first-frame, audio is intentionally deferred. In this stage,
+                // the running clock can drift ahead while decoder is still filling queue,
+                // making delay look "too behind" and causing long catch-up drop loops.
+                // If this lasts for a short grace window, prefer showing first frame and
+                // re-anchor clock to current PTS to break freeze/redraw loops.
+                bool force_by_deferred_audio_drift =
+                        audio_deferred_now &&
+                        delay < -0.80 &&
+                        first_wait_ms >= 450;
+                if (delay < first_frame_force_threshold &&
+                    !first_frame_wait_timeout &&
+                    !force_by_deferred_audio_drift) {
                     // Still too far behind -- drop silently and keep catching up.
                     should_consume = true;
                     LOGI_RATE(30, "[sync] %s catching up: pts=%.3f clk=%.3f delay=%.3f thr=%.3f",
                               is_open_first_frame ? "first frame" : "post-seek frame",
                               pts, clock, delay, first_frame_force_threshold);
                 } else {
+                    if (force_by_deferred_audio_drift && player_core_ &&
+                        std::isfinite(pts) && pts >= 0.0) {
+                        player_core_anchor_clock(player_core_, pts);
+                        clock = player_core_get_position(player_core_);
+                        if (audio_output_latency_sec_ > 0.0) {
+                            clock -= audio_output_latency_sec_;
+                            if (clock < 0.0) clock = 0.0;
+                        }
+                        delay = pts - clock;
+                        LOGI("[sync] first frame force by deferred-audio drift: pts=%.3f clk=%.3f delay=%.3f wait_ms=%" PRId64,
+                             pts, clock, delay, first_wait_ms);
+                        SYNCI("evt=open_first_frame_drift_compat pts=%.3f clk=%.3f delay=%.3f wait_ms=%" PRId64 " thr=%.3f audio_pending=%d",
+                              pts, clock, delay, first_wait_ms, first_frame_force_threshold,
+                              audio_deferred_now ? 1 : 0);
+                    }
                     if (first_frame_wait_timeout) {
                         // Open-first-frame hard timeout: prefer visible recovery over
                         // extended black screen, then re-anchor to current video PTS.
@@ -4659,6 +4658,19 @@ void AndroidPlayer::renderLoop() {
                 }
                 frame_count++;
                 last_sync_video_pts_ = pts; // track for dynamic frame-interval estimation
+                if (std::isfinite(pts) && pts >= 0.0) {
+                    double prev_progress_pts = loading_progress_last_pos_.load(std::memory_order_acquire);
+                    if (std::isfinite(prev_progress_pts) && prev_progress_pts >= 0.0) {
+                        double rendered_step = pts - prev_progress_pts;
+                        if (rendered_step >= 0.02 && rendered_step <= 3.20) {
+                            loading_progress_last_advance_ms_.store(now_ms(), std::memory_order_release);
+                        }
+                    } else {
+                        // First valid rendered frame: initialize progress anchor.
+                        loading_progress_last_advance_ms_.store(now_ms(), std::memory_order_release);
+                    }
+                    loading_progress_last_pos_.store(pts, std::memory_order_release);
+                }
                 auto t0 = now_ms();
                 int cost = renderFrame(
                     frame_data.y_data, frame_data.u_data, frame_data.v_data,
@@ -4900,53 +4912,41 @@ void AndroidPlayer::renderLoop() {
                             !seek_lower_bound_active_.load(std::memory_order_acquire) &&
                             !seek_recovery_active_.load(std::memory_order_acquire) &&
                             !seek_audio_wait_video_.load(std::memory_order_acquire);
-                    int64_t pos_progress_interval_ms_now = 0;
-                    if (force_resume_last_pos_ms > 0) {
-                        pos_progress_interval_ms_now = now - force_resume_last_pos_ms;
+                    int64_t rendered_progress_age_ms_now = -1;
+                    int64_t rendered_progress_last_ms_now = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
+                    if (rendered_progress_last_ms_now > 0) {
+                        rendered_progress_age_ms_now = now - rendered_progress_last_ms_now;
                     }
-                    bool has_position_progress_now =
-                            std::isfinite(pos_now) && pos_now >= 0.0 &&
-                            std::isfinite(force_resume_last_pos) && force_resume_last_pos >= 0.0 &&
-                            (pos_now - force_resume_last_pos) >= 0.08 &&
-                            std::fabs(pos_now - force_resume_last_pos) <= 3.00 &&
-                            pos_progress_interval_ms_now >= 240 &&
-                            pos_progress_interval_ms_now <= 4200;
+                    bool has_rendered_progress_now =
+                            rendered_progress_age_ms_now >= 0 &&
+                            rendered_progress_age_ms_now <= 1200;
                     SYNCW_RATE(15,
-                               "evt=seek_empty_timeout_diag target=%.3f from=%.3f pwr=%d state=%d pos=%.3f seek_progress_best_abs_err=%.3f recent_seek_progress=%d pos_progress=%d pos_progress_interval_ms=%" PRId64 " gates_cleared=%d local=%d encrypted=%d timeout_ms=%" PRId64,
+                               "evt=seek_empty_timeout_diag target=%.3f from=%.3f pwr=%d state=%d pos=%.3f seek_progress_best_abs_err=%.3f recent_seek_progress=%d rendered_progress=%d rendered_progress_age_ms=%" PRId64 " gates_cleared=%d local=%d encrypted=%d timeout_ms=%" PRId64,
                                seek_target_now, seek_from_now, pwr_now, state_now, pos_now,
                                seek_progress_best_abs_err,
                                recent_seek_progress ? 1 : 0,
-                               has_position_progress_now ? 1 : 0,
-                               pos_progress_interval_ms_now,
+                               has_rendered_progress_now ? 1 : 0,
+                               rendered_progress_age_ms_now,
                                seek_gates_cleared_now ? 1 : 0,
                                local_source_now ? 1 : 0,
                                encrypted_source_now ? 1 : 0,
                                seek_empty_timeout_ms);
-                    if (pwr_now != 0 && state_now == PLAYER_STATE_PLAYING && has_position_progress_now) {
+                    if (pwr_now != 0 && state_now == PLAYER_STATE_PLAYING && has_rendered_progress_now) {
                         core_playing_now = true;
-                        SYNCI("evt=seek_empty_timeout_soft_resume_ok target=%.3f from=%.3f pwr=%d state=%d pos=%.3f by=state_playing_with_progress",
+                        SYNCI("evt=seek_empty_timeout_soft_resume_ok target=%.3f from=%.3f pwr=%d state=%d pos=%.3f by=state_playing_with_rendered_progress",
                               seek_target_now, seek_from_now, pwr_now, state_now, pos_now);
                     } else if (pwr_now != 0 && state_now == PLAYER_STATE_PLAYING) {
                         // Avoid false "soft resume ok": some devices report PLAYING while position is frozen.
                         core_playing_now = false;
                         SYNCW_RATE(15,
-                                   "evt=seek_empty_timeout_soft_resume_reject reason=state_playing_without_progress target=%.3f from=%.3f pos=%.3f",
+                                   "evt=seek_empty_timeout_soft_resume_reject reason=state_playing_without_rendered_progress target=%.3f from=%.3f pos=%.3f",
                                    seek_target_now, seek_from_now, pos_now);
                     }
                     if (pwr_now != 0 &&
                         state_now == PLAYER_STATE_PAUSED &&
                         seek_gates_cleared_now &&
-                        std::isfinite(pos_now) && pos_now >= 0.0 &&
-                        std::isfinite(force_resume_last_pos) && force_resume_last_pos >= 0.0 &&
-                        (pos_now - force_resume_last_pos) >= 0.10 &&
-                        std::fabs(pos_now - force_resume_last_pos) <= 2.50 &&
-                        pos_progress_interval_ms_now >= 320 &&
-                        pos_progress_interval_ms_now <= 3200) {
+                        has_rendered_progress_now) {
                         soft_resume_healthy_now = true;
-                    }
-                    if (std::isfinite(pos_now) && pos_now >= 0.0) {
-                        force_resume_last_pos = pos_now;
-                        force_resume_last_pos_ms = now;
                     }
                     if (soft_resume_healthy_now) {
                         core_playing_now = true;
@@ -5199,12 +5199,14 @@ void AndroidPlayer::renderLoop() {
                 bool first_frame_ready = first_frame_rendered_.load(std::memory_order_acquire);
                 bool open_ready_for_tail_complete =
                         is_open_ready_for_tail_complete(opening_now, first_frame_ready);
+                bool audio_pending_now = audio_start_pending_.load(std::memory_order_acquire);
+                bool audio_rebuffer_now = audio_rebuffer_pending_.load(std::memory_order_acquire);
                 int64_t tail_force_complete_ms = recent_open_tail_intent
                                                  ? kTailStallForceCompleteFastMs
                                                  : kTailStallForceCompleteMs;
                 if ((now_empty - tail_stall_diag_last_log_ms) >= kTailStallDiagIntervalMs) {
                     tail_stall_diag_last_log_ms = now_empty;
-                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64 " open_ready=%d",
+                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64 " open_ready=%d first_frame=%d audio_pending=%d audio_rebuffer=%d",
                           empty_ms,
                           pos_now,
                           dur_now,
@@ -5218,7 +5220,10 @@ void AndroidPlayer::renderLoop() {
                           tail_force_complete_ms,
                           open_start_pos_now,
                           open_age_ms,
-                          open_ready_for_tail_complete ? 1 : 0);
+                          open_ready_for_tail_complete ? 1 : 0,
+                          first_frame_ready ? 1 : 0,
+                          audio_pending_now ? 1 : 0,
+                          audio_rebuffer_now ? 1 : 0);
                 }
                 if (near_end &&
                     play_when_ready_now &&
