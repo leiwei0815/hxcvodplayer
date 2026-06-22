@@ -14,6 +14,7 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 #include "hxc_logger.h"
 
 extern "C" {
@@ -26,6 +27,12 @@ namespace {
 // C bridge 侧 seek 音频追帧窗口：跳过明显早于目标位置的旧音频帧，
 // 让输出层更快收敛到目标点，减少 seek 后短时间错位。
 static constexpr double kBridgeSeekAudioBackwardToleranceSec = 0.35;
+static constexpr int64_t kBridgePostAnchorAudioGuardMs = 2500;
+
+static int64_t bridge_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 }
 
 // PlayerCoreHandle 结构，包含音频处理所需的状态
@@ -44,6 +51,9 @@ struct PlayerCoreHandle {
     int audio_current_channels;         // 当前音频通道数
     std::atomic<uint64_t> audio_seek_serial; // seek 代数，用于丢弃 seek 前旧回调
     int audio_buf_serial;               // 当前桥接音频缓冲对应的 serial
+    double post_anchor_audio_guard_pts; // seek 锚定后短时拒绝旧音频 PTS 回拉时钟
+    int64_t post_anchor_audio_guard_until_ms;
+    int post_anchor_audio_guard_drop_count;
     std::mutex audio_data_mutex;        // 保护音频缓冲/重采样/SoundTouch并发访问
 
     // 音频重采样器
@@ -94,6 +104,9 @@ struct PlayerCoreHandle {
         , audio_current_channels(0)
         , audio_seek_serial(0)
         , audio_buf_serial(0)
+        , post_anchor_audio_guard_pts(-1.0)
+        , post_anchor_audio_guard_until_ms(0)
+        , post_anchor_audio_guard_drop_count(0)
 #ifdef HAS_SOUNDTOUCH
         , soundtouch(nullptr)
         , soundtouch_initialized(false)
@@ -340,6 +353,9 @@ void player_core_seek(PlayerCoreHandle* handle, double pos) {
         handle->audio_current_pts = pos;
         handle->audio_buf_pts_base = pos;
         handle->audio_buf_serial = 0;
+        handle->post_anchor_audio_guard_pts = pos;
+        handle->post_anchor_audio_guard_until_ms = bridge_now_ms() + kBridgePostAnchorAudioGuardMs;
+        handle->post_anchor_audio_guard_drop_count = 0;
 #ifdef HAS_SOUNDTOUCH
         if (handle->soundtouch) {
             handle->soundtouch->clear();
@@ -587,6 +603,20 @@ int player_core_get_post_seek_warmup(PlayerCoreHandle* handle) {
 
 void player_core_anchor_clock(PlayerCoreHandle* handle, double pts) {
     if (handle && handle->core) {
+        std::lock_guard<std::mutex> audio_lock(handle->audio_data_mutex);
+        handle->audio_buf_index = 0;
+        handle->audio_buf_size = 0;
+        handle->audio_current_pts = pts;
+        handle->audio_buf_pts_base = pts;
+        handle->audio_buf_serial = 0;
+        handle->post_anchor_audio_guard_pts = pts;
+        handle->post_anchor_audio_guard_until_ms = bridge_now_ms() + kBridgePostAnchorAudioGuardMs;
+        handle->post_anchor_audio_guard_drop_count = 0;
+#ifdef HAS_SOUNDTOUCH
+        if (handle->soundtouch) {
+            handle->soundtouch->clear();
+        }
+#endif
         handle->core->anchor_clock(pts);
     }
 }
@@ -697,6 +727,30 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             return 0;
         }
         double pts = af->pts;  // ⚠️ 保存 PTS，用于后续时钟更新
+
+        if (std::isfinite(pts) && pts >= 0.0 &&
+            handle->post_anchor_audio_guard_until_ms > 0) {
+            int64_t now_ms = bridge_now_ms();
+            if (now_ms <= handle->post_anchor_audio_guard_until_ms &&
+                handle->post_anchor_audio_guard_pts >= 0.0 &&
+                pts < (handle->post_anchor_audio_guard_pts - kBridgeSeekAudioBackwardToleranceSec)) {
+                int drop_count = ++handle->post_anchor_audio_guard_drop_count;
+                if (drop_count == 1 || drop_count % 20 == 0) {
+                    LOG_WARNING("bridge_audio_post_anchor_drop pts=", pts,
+                                " anchor=", handle->post_anchor_audio_guard_pts,
+                                " guard_left_ms=", handle->post_anchor_audio_guard_until_ms - now_ms,
+                                " count=", drop_count);
+                }
+                audioQueue->next();
+                continue;
+            }
+            if (now_ms > handle->post_anchor_audio_guard_until_ms ||
+                pts >= (handle->post_anchor_audio_guard_pts - kBridgeSeekAudioBackwardToleranceSec)) {
+                handle->post_anchor_audio_guard_until_ms = 0;
+                handle->post_anchor_audio_guard_pts = -1.0;
+                handle->post_anchor_audio_guard_drop_count = 0;
+            }
+        }
 
         // Seek 后桥接层继续做一次目标前音频过滤（与 core 内部策略互补）：
         // 若当前音频帧明显早于目标位置，则直接丢弃并继续取下一帧。
