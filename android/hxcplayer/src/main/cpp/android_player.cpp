@@ -3420,6 +3420,11 @@ void AndroidPlayer::renderLoop() {
                     }
                     seek_epsilon_sec = std::max(seek_epsilon_sec, forced_eps);
                 }
+                if (secure_session && !is_backward_seek && large_seek_any_direction) {
+                    double secure_forward_max_eps = seek_elapsed_ms >= 5200 ? 1.00
+                                                  : (seek_elapsed_ms >= 3200 ? 0.80 : 0.60);
+                    seek_epsilon_sec = std::min(seek_epsilon_sec, secure_forward_max_eps);
+                }
                 double secure_future_guard_sec = is_backward_seek ? 10.0 : (very_large_seek ? 22.0 : 14.0);
                 if (seek_elapsed_ms >= 2600) {
                     secure_future_guard_sec += is_backward_seek ? 6.0 : 4.0;
@@ -3666,14 +3671,14 @@ void AndroidPlayer::renderLoop() {
                         bool has_seek_progress = std::isfinite(seek_progress_best_abs_err) &&
                                                  seek_progress_best_abs_err < 9.5;
                         double forward_abs_offset_sec = std::fabs(future_offset_sec);
-                        double forward_soft_accept_max_sec = seek_elapsed_ms >= 5200 ? 2.4
-                                                            : (seek_elapsed_ms >= 3200 ? 2.0 : 1.4);
+                        double forward_soft_accept_max_sec = seek_elapsed_ms >= 5200 ? 1.20
+                                                            : (seek_elapsed_ms >= 3200 ? 0.95 : 0.75);
                         bool forward_ux_fast_accept = false;
                         bool backward_ux_fast_accept = false;
                         if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 1800) {
-                            double ux_fast_accept_sec = (seek_elapsed_ms >= 4200) ? 2.4 : 1.6;
+                            double ux_fast_accept_sec = (seek_elapsed_ms >= 4200) ? 1.20 : 0.85;
                             if (reseek_count >= 3) {
-                                ux_fast_accept_sec += 0.4;
+                                ux_fast_accept_sec += 0.2;
                             }
                             forward_ux_fast_accept =
                                     future_offset_sec > secure_accept_future_sec &&
@@ -3850,16 +3855,16 @@ void AndroidPlayer::renderLoop() {
                         }
                         if (!is_backward_seek && large_seek_any_direction) {
                             if (seek_elapsed_ms >= 2200) {
-                                secure_completion_tol_sec = std::max(secure_completion_tol_sec, 2.2);
+                                secure_completion_tol_sec = std::max(secure_completion_tol_sec, 1.20);
                             }
                             if (seek_elapsed_ms >= 4200) {
-                                secure_completion_tol_sec = std::max(secure_completion_tol_sec, 2.8);
+                                secure_completion_tol_sec = std::max(secure_completion_tol_sec, 1.40);
                             }
                             if (seek_elapsed_ms >= 3000) {
-                                secure_completion_tol_sec = std::max(secure_completion_tol_sec, 2.5);
+                                secure_completion_tol_sec = std::max(secure_completion_tol_sec, 1.30);
                             }
                             if (seek_elapsed_ms >= 5200) {
-                                secure_completion_tol_sec = std::max(secure_completion_tol_sec, 3.2);
+                                secure_completion_tol_sec = std::max(secure_completion_tol_sec, 1.60);
                             }
                         }
                         bool forward_terminal_accept = !is_backward_seek &&
@@ -3978,10 +3983,10 @@ void AndroidPlayer::renderLoop() {
                         }
                         if (!is_backward_seek && large_seek_any_direction) {
                             if (seek_elapsed_ms >= 3000) {
-                                verify_max_offset_sec = std::max(verify_max_offset_sec, 2.2);
+                                verify_max_offset_sec = std::max(verify_max_offset_sec, 1.20);
                             }
                             if (seek_elapsed_ms >= 5200) {
-                                verify_max_offset_sec = std::max(verify_max_offset_sec, 2.8);
+                                verify_max_offset_sec = std::max(verify_max_offset_sec, 1.60);
                             }
                         }
                         if (!is_backward_seek && forward_soft_accept_active) {
@@ -4002,13 +4007,13 @@ void AndroidPlayer::renderLoop() {
                         if (is_backward_seek && !near_end_seek && seek_elapsed_ms >= 3200) {
                             verify_need_hits = 1;
                         }
-                        if (!is_backward_seek && seek_elapsed_ms >= 2600 && verify_offset_sec <= 1.4) {
+                        if (!is_backward_seek && seek_elapsed_ms >= 2600 && verify_offset_sec <= 0.80) {
                             verify_need_hits = 1;
                         }
-                        if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 2800 && verify_offset_sec <= 1.8) {
+                        if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 2800 && verify_offset_sec <= 0.95) {
                             verify_need_hits = 1;
                         }
-                        if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 3400 && verify_offset_sec <= 2.2) {
+                        if (!is_backward_seek && large_seek_any_direction && seek_elapsed_ms >= 3400 && verify_offset_sec <= 1.20) {
                             verify_need_hits = 1;
                         }
                         if (seek_elapsed_ms >= 5600 && !(is_backward_seek && near_end_seek)) {
@@ -4035,15 +4040,15 @@ void AndroidPlayer::renderLoop() {
                             large_seek_any_direction &&
                             seek_elapsed_ms >= 2600 &&
                             std::isfinite(seek_progress_best_abs_err) &&
-                            seek_progress_best_abs_err < 2.8) {
-                            verify_max_offset_sec = std::max(verify_max_offset_sec, 2.4);
+                            seek_progress_best_abs_err < 1.40) {
+                            verify_max_offset_sec = std::max(verify_max_offset_sec, 1.20);
                             verify_need_hits = 1;
                         }
                         if (!is_backward_seek &&
                             large_seek_any_direction &&
                             seek_elapsed_ms >= 2200 &&
                             seek_lower_bound_drop_count_ >= 18) {
-                            double forward_verify_relax = seek_elapsed_ms >= 5200 ? 3.0 : 2.2;
+                            double forward_verify_relax = seek_elapsed_ms >= 5200 ? 1.60 : 1.20;
                             verify_max_offset_sec = std::max(verify_max_offset_sec, forward_verify_relax);
                             if (verify_offset_sec <= forward_verify_relax) {
                                 verify_need_hits = 1;

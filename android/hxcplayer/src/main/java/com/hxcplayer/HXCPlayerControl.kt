@@ -2377,7 +2377,14 @@ class HXCPlayerControl @JvmOverloads constructor(
                             !target.isNaN() &&
                             !from.isNaN() &&
                             target > from + 0.5
-                    val convergedNow = nearTarget || (!secureForwardSeek && movedFromOldPos)
+                    val secureForwardNearTarget = secureForwardSeek &&
+                            !target.isNaN() &&
+                            abs(position - target) <= 0.8
+                    val convergedNow = if (secureForwardSeek) {
+                        secureForwardNearTarget
+                    } else {
+                        nearTarget || movedFromOldPos
+                    }
                     if (convergedNow) {
                         if (pendingSeekConvergedSinceMs <= 0L) {
                             pendingSeekConvergedSinceMs = now
@@ -2413,7 +2420,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     val nativeSeekSettled = !nativeSeekActive || nativeConvergedButStuck
                     val hardTimeout = seekElapsedMs >= seekCompletionTimeoutMs
                             && !loadingRecovered
-                    val secureForwardFarFromTarget = secureForwardSeek && !nearTarget
+                    val secureForwardFarFromTarget = secureForwardSeek && !secureForwardNearTarget
                     if (secureForwardFarFromTarget &&
                         nativeSeekSettled &&
                         !hardTimeout &&
