@@ -1721,7 +1721,15 @@ void PlayerCore::seek(double pos) {
 }
 
 double PlayerCore::get_position() const {
-    return get_master_clock();
+    double pos = get_master_clock();
+    double duration = get_duration();
+    if (!std::isfinite(pos) || pos < 0.0) {
+        return 0.0;
+    }
+    if (std::isfinite(duration) && duration > 0.0 && pos > duration) {
+        return duration;
+    }
+    return pos;
 }
 
 double PlayerCore::get_duration() const {
@@ -2990,6 +2998,12 @@ void PlayerCore::progress_timer_thread() {
                 // 获取真实播放进度（从 master clock）
                 current_position = get_master_clock();
             }
+            double duration = get_duration();
+            bool reached_or_passed_duration = false;
+            if (duration > 0.0 && !isnan(current_position) && current_position >= duration) {
+                reached_or_passed_duration = true;
+                current_position = duration;
+            }
             
             // 只在播放进度有效时触发回调
             if (!isnan(current_position) && current_position >= 0.0) {
@@ -3035,7 +3049,6 @@ void PlayerCore::progress_timer_thread() {
                 // 条件1：解码已结束 + 播放位置接近时长
                 // 条件2：播放中 + 位置连续 3 次（600ms）不变 + 位置接近时长
                 if (!playback_completed_notified_.load(std::memory_order_acquire)) {
-                    double duration = get_duration();
                     bool near_end = duration > 0 && (duration - current_position) < 1.0;  // 最后 1 秒内
                     bool decode_finished = decode_finished_.load(std::memory_order_acquire);
                     bool stalled_enough = position_unchanged_count >= 3;
@@ -3051,8 +3064,10 @@ void PlayerCore::progress_timer_thread() {
                                      stalled_enough &&
                                      near_end;
                     bool condition3 = eof_like_stall_without_duration;
+                    bool condition4 = (current_state == PlayerState::Playing || loading_now) &&
+                                      reached_or_passed_duration;
 
-                    if (condition1 || condition2 || condition3) {
+                    if (condition1 || condition2 || condition3 || condition4) {
                         playback_completed_notified_.store(true, std::memory_order_release);  // 避免重复通知
                         // 进入 ended 前先清掉 starvation_loading，避免对外仍维持 loading=true。
                         set_starvation_loading(false);
@@ -3063,7 +3078,7 @@ void PlayerCore::progress_timer_thread() {
                                 ", decode_finished=", decode_finished,
                                 ", starvation_ticks=", starvation_ticks,
                                 ", position_unchanged_count=", position_unchanged_count,
-                                ", by_condition=", condition1 ? "decode_near_end" : (condition2 ? "stalled_near_end" : "eof_stall_no_duration"));
+                                ", by_condition=", condition1 ? "decode_near_end" : (condition2 ? "stalled_near_end" : (condition3 ? "eof_stall_no_duration" : "position_reached_duration")));
                         PlaybackCompletedCallback cb;
                         {
                             std::lock_guard<std::mutex> lock(callback_mutex_);

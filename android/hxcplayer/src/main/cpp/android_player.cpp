@@ -1205,6 +1205,15 @@ void AndroidPlayer::seekTo(double position) {
         LOGI("[ctrl] seekTo: resume from ENDED pipeline before seek");
     }
 
+    double duration_now = player_core_get_duration(player_core_);
+    if (std::isfinite(duration_now) && duration_now > 0.0) {
+        double max_seek_target = std::max(0.0, duration_now - 0.35);
+        if (position > max_seek_target) {
+            SYNCI("evt=seek_target_clamp_native req=%.3f clamped=%.3f duration=%.3f",
+                  position, max_seek_target, duration_now);
+            position = max_seek_target;
+        }
+    }
     double seek_from = player_core_get_position(player_core_);
     double seek_span = std::fabs(position - seek_from);
     bool very_large_seek = seek_span > 180.0;
@@ -2848,6 +2857,20 @@ void AndroidPlayer::renderLoop() {
             int pwr_retry = player_core_get_play_when_ready(player_core_);
             int state_retry = player_core_get_state(player_core_);
             double pos_retry = player_core_get_position(player_core_);
+            double target_retry = seek_target_sec_.load(std::memory_order_acquire);
+            double from_retry = seek_from_sec_.load(std::memory_order_acquire);
+            bool block_secure_forward_far_resume =
+                    secure_session_active_.load(std::memory_order_acquire) &&
+                    std::isfinite(target_retry) &&
+                    std::isfinite(from_retry) &&
+                    std::isfinite(pos_retry) &&
+                    target_retry > from_retry + 0.5 &&
+                    (target_retry - pos_retry) > 1.5;
+            if (block_secure_forward_far_resume) {
+                SYNCW_RATE(10,
+                           "evt=seek_force_resume_blocked_secure_forward_far target=%.3f from=%.3f pos=%.3f behind=%.3f state=%d pwr=%d",
+                           target_retry, from_retry, pos_retry, target_retry - pos_retry, state_retry, pwr_retry);
+            }
             int64_t rendered_progress_age_ms_retry = -1;
             int64_t rendered_progress_last_ms_retry = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
             if (rendered_progress_last_ms_retry > 0) {
@@ -2856,7 +2879,8 @@ void AndroidPlayer::renderLoop() {
             bool has_rendered_progress_retry =
                     rendered_progress_age_ms_retry >= 0 &&
                     rendered_progress_age_ms_retry <= 1200;
-            if (pwr_retry != 0 && state_retry == PLAYER_STATE_PLAYING && has_rendered_progress_retry) {
+            if (!block_secure_forward_far_resume &&
+                pwr_retry != 0 && state_retry == PLAYER_STATE_PLAYING && has_rendered_progress_retry) {
                 setSeekPhase(SEEK_PHASE_RESUME, "seek_force_resume_soft_success_state_playing");
                 seek_force_resume_pending_.store(false, std::memory_order_release);
                 seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
@@ -2886,7 +2910,7 @@ void AndroidPlayer::renderLoop() {
                     state_retry == PLAYER_STATE_PAUSED &&
                     seek_gates_cleared &&
                     pos_progressing;
-            if (soft_resume_healthy) {
+            if (!block_secure_forward_far_resume && soft_resume_healthy) {
                 setSeekPhase(SEEK_PHASE_RESUME, "seek_force_resume_soft_success_pos_progress");
                 seek_force_resume_pending_.store(false, std::memory_order_release);
                 seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
@@ -2901,7 +2925,7 @@ void AndroidPlayer::renderLoop() {
                 seek_session_active_id_.store(0, std::memory_order_release);
                 return;
             }
-            if (core_playing_retry) {
+            if (!block_secure_forward_far_resume && core_playing_retry) {
                 setSeekPhase(SEEK_PHASE_RESUME, "seek_force_resume_core_playing");
                 seek_force_resume_pending_.store(false, std::memory_order_release);
                 seek_force_resume_deadline_ms_.store(0, std::memory_order_release);
@@ -4761,12 +4785,12 @@ void AndroidPlayer::renderLoop() {
                 bool secure_session_now = secure_session_active_.load(std::memory_order_acquire);
                 bool local_source_now = source_local_active_.load(std::memory_order_acquire);
                 bool encrypted_source_now = source_encrypted_active_.load(std::memory_order_acquire) || secure_session_now;
+                double span_now = (std::isfinite(seek_from_now) && std::isfinite(seek_target_now))
+                                  ? std::fabs(seek_from_now - seek_target_now)
+                                  : 0.0;
                 int64_t seek_empty_timeout_ms = is_backward_seek ? 7200 : 6200;
                 if (local_source_now) {
                     seek_empty_timeout_ms = is_backward_seek ? 4200 : 3600;
-                    double span_now = (std::isfinite(seek_from_now) && std::isfinite(seek_target_now))
-                                      ? std::fabs(seek_from_now - seek_target_now)
-                                      : 0.0;
                     if (span_now <= 0.8) {
                         seek_empty_timeout_ms = std::min<int64_t>(seek_empty_timeout_ms, 2600);
                     }
@@ -4799,9 +4823,6 @@ void AndroidPlayer::renderLoop() {
                                is_backward_seek ? 1 : 0, local_source_now ? 1 : 0, encrypted_source_now ? 1 : 0);
                 }
                 if (secure_session_now && !is_backward_seek) {
-                    double span_now = (std::isfinite(seek_from_now) && std::isfinite(seek_target_now))
-                                      ? std::fabs(seek_from_now - seek_target_now)
-                                      : 0.0;
                     bool very_large_forward_span = span_now >= 120.0;
                     bool far_from_target = std::isfinite(seek_progress_best_abs_err) && seek_progress_best_abs_err >= 10.0;
                     bool progress_stalled =
@@ -4816,6 +4837,16 @@ void AndroidPlayer::renderLoop() {
                                    "evt=seek_empty_timeout_secure_large_forward_guard id=%" PRIu64 " elapsed_ms=%" PRId64 " timeout_ms=%" PRId64 " span=%.3f best_abs_err=%.3f stalled=%d",
                                    sid_now, seek_elapsed_ms, seek_empty_timeout_ms, span_now, seek_progress_best_abs_err,
                                    progress_stalled ? 1 : 0);
+                    }
+                    if (very_large_forward_span &&
+                        far_from_target &&
+                        recent_seek_progress &&
+                        !progress_stalled &&
+                        seek_elapsed_ms < 9000) {
+                        seek_empty_timeout_ms = std::max<int64_t>(seek_empty_timeout_ms, 9000);
+                        SYNCW_RATE(15,
+                                   "evt=seek_empty_timeout_extend_secure_forward_precise id=%" PRIu64 " elapsed_ms=%" PRId64 " timeout_ms=%" PRId64 " span=%.3f best_abs_err=%.3f",
+                                   sid_now, seek_elapsed_ms, seek_empty_timeout_ms, span_now, seek_progress_best_abs_err);
                     }
                 }
                 if (seek_elapsed_ms >= seek_empty_timeout_ms) {
