@@ -366,10 +366,10 @@ private:
     int64_t             secure_recovery_deadline_large_ms_{6400};
     int64_t             secure_audio_wait_deadline_normal_ms_{4400};
     int64_t             secure_audio_wait_deadline_large_ms_{5600};
-    double              secure_forward_preroll_base_sec_{10.0};
-    double              secure_forward_preroll_span_gain_{0.010};
-    double              secure_forward_preroll_learned_gain_{0.85};
-    double              secure_forward_preroll_max_sec_{260.0};
+    double              secure_forward_preroll_base_sec_{4.0};
+    double              secure_forward_preroll_span_gain_{0.004};
+    double              secure_forward_preroll_learned_gain_{0.50};
+    double              secure_forward_preroll_max_sec_{10.0};
     int64_t             secure_forward_preroll_bias_expire_ms_{45000};
     // High-rate cadence: avoid long "all-drop then force old frame" behavior.
     int                 consecutive_drop_count_{0};

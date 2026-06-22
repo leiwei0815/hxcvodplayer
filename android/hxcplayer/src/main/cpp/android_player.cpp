@@ -1354,17 +1354,17 @@ void AndroidPlayer::seekTo(double position) {
             learned_hits = 0;
         }
         double span_bias_sec = std::max(0.0, seek_span) * secure_forward_preroll_span_gain_;
-        double learned_component_sec = std::min(14.0,
-                                                learned_bias_sec * (secure_forward_preroll_learned_gain_ * 0.58));
+        double learned_component_sec = std::min(4.0,
+                                                learned_bias_sec * (secure_forward_preroll_learned_gain_ * 0.35));
         double preroll_sec = secure_forward_preroll_base_sec_ + span_bias_sec + learned_component_sec;
         if (very_large_seek) {
-            preroll_sec += 4.0;
+            preroll_sec += 1.0;
         }
-        // Secure forward preroll should be conservative enough to avoid repeatedly
-        // landing into the same far-future keyframe cluster on long encrypted seeks.
-        double dynamic_preroll_cap = std::min(56.0, std::max(24.0, 12.0 + seek_span * 0.007));
+        // Keep forward seek close to target. Large preroll improves exactness but
+        // turns secure HLS seeking into seconds of catch-up frame dropping.
+        double dynamic_preroll_cap = std::min(10.0, std::max(4.0, 4.0 + seek_span * 0.004));
         preroll_sec = std::min(std::min(secure_forward_preroll_max_sec_, dynamic_preroll_cap),
-                               std::max(12.0, preroll_sec));
+                               std::max(3.0, preroll_sec));
         if (recent_secure_stall) {
             // Recent secure seek stalls imply over-aggressive preroll is hurting convergence.
             // Downscale preroll for a short window to avoid repeated long loading.
@@ -1535,10 +1535,10 @@ void AndroidPlayer::resetSecureSeekTuning() {
     secure_recovery_deadline_large_ms_ = 5800;
     secure_audio_wait_deadline_normal_ms_ = 3600;
     secure_audio_wait_deadline_large_ms_ = 4700;
-    secure_forward_preroll_base_sec_ = 10.0;
-    secure_forward_preroll_span_gain_ = 0.010;
-    secure_forward_preroll_learned_gain_ = 0.85;
-    secure_forward_preroll_max_sec_ = 260.0;
+    secure_forward_preroll_base_sec_ = 4.0;
+    secure_forward_preroll_span_gain_ = 0.004;
+    secure_forward_preroll_learned_gain_ = 0.50;
+    secure_forward_preroll_max_sec_ = 10.0;
     secure_forward_preroll_bias_expire_ms_ = 45000;
     secure_forward_seek_bias_sec_.store(0.0, std::memory_order_release);
     secure_forward_seek_bias_hits_.store(0, std::memory_order_release);
@@ -4839,13 +4839,13 @@ void AndroidPlayer::renderLoop() {
                                    progress_stalled ? 1 : 0);
                     }
                     if (very_large_forward_span &&
-                        far_from_target &&
+                        !far_from_target &&
                         recent_seek_progress &&
                         !progress_stalled &&
-                        seek_elapsed_ms < 9000) {
-                        seek_empty_timeout_ms = std::max<int64_t>(seek_empty_timeout_ms, 9000);
+                        seek_elapsed_ms < 4200) {
+                        seek_empty_timeout_ms = std::max<int64_t>(seek_empty_timeout_ms, 4200);
                         SYNCW_RATE(15,
-                                   "evt=seek_empty_timeout_extend_secure_forward_precise id=%" PRIu64 " elapsed_ms=%" PRId64 " timeout_ms=%" PRId64 " span=%.3f best_abs_err=%.3f",
+                                   "evt=seek_empty_timeout_extend_secure_forward_close id=%" PRIu64 " elapsed_ms=%" PRId64 " timeout_ms=%" PRId64 " span=%.3f best_abs_err=%.3f",
                                    sid_now, seek_elapsed_ms, seek_empty_timeout_ms, span_now, seek_progress_best_abs_err);
                     }
                 }
