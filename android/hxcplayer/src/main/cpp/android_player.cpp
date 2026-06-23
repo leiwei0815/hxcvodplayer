@@ -1261,8 +1261,13 @@ void AndroidPlayer::seekTo(double position) {
     seek_force_resume_next_try_ms_.store(0, std::memory_order_release);
     seek_force_resume_retry_count_.store(0, std::memory_order_release);
     seek_force_resume_nudged_.store(false, std::memory_order_release);
-    // 约 1 秒左右的渲染 tick 追赶窗口，避免 seek 后先看到大量旧帧。
-    seek_fast_catchup_frames_.store(very_large_seek ? 128 : 96, std::memory_order_release);
+    // Seek 后短窗口内优先快速丢弃明显早于目标的帧。SecureHLS 长 seek 需要更强 catch-up，
+    // 否则 target-preroll 会变成多秒 loading。
+    int fast_catchup_frames = very_large_seek ? 128 : 96;
+    if (secure_session && position > seek_from + 0.5 && seek_span >= 120.0) {
+        fast_catchup_frames = very_large_seek ? 260 : 180;
+    }
+    seek_fast_catchup_frames_.store(fast_catchup_frames, std::memory_order_release);
     int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     uint64_t prev_seek_sid = seek_session_active_id_.load(std::memory_order_acquire);
@@ -1290,7 +1295,11 @@ void AndroidPlayer::seekTo(double position) {
     }
     seek_failover_budget_left_.store(failover_budget, std::memory_order_release);
     seek_soft_rebuild_budget_left_.store(1, std::memory_order_release);
-    seek_catchup_deadline_ms_ = now + (very_large_seek ? 1200 : 900);
+    int64_t catchup_window_ms = very_large_seek ? 1200 : 900;
+    if (secure_session && position > seek_from + 0.5 && seek_span >= 120.0) {
+        catchup_window_ms = very_large_seek ? 2400 : 1800;
+    }
+    seek_catchup_deadline_ms_ = now + catchup_window_ms;
     seek_lower_bound_active_.store(true, std::memory_order_release);
     int64_t lower_deadline_ms = (secure_session
                                  ? (very_large_seek ? secure_lower_bound_deadline_large_ms_
@@ -1354,21 +1363,22 @@ void AndroidPlayer::seekTo(double position) {
             learned_hits = 0;
         }
         double span_bias_sec = std::max(0.0, seek_span) * secure_forward_preroll_span_gain_;
-        double learned_component_sec = std::min(4.0,
-                                                learned_bias_sec * (secure_forward_preroll_learned_gain_ * 0.35));
+        double learned_component_sec = std::min(2.0,
+                                                learned_bias_sec * (secure_forward_preroll_learned_gain_ * 0.25));
         double preroll_sec = secure_forward_preroll_base_sec_ + span_bias_sec + learned_component_sec;
         if (very_large_seek) {
-            preroll_sec += 1.0;
+            preroll_sec += 0.6;
         }
-        // Keep forward seek close to target. Large preroll improves exactness but
-        // turns secure HLS seeking into seconds of catch-up frame dropping.
-        double dynamic_preroll_cap = std::min(10.0, std::max(4.0, 4.0 + seek_span * 0.004));
+        // Keep forward seek close to target. iOS seeks directly to target and drops
+        // off-target warmup frames; Android keeps a small preroll for HLS GOP variance,
+        // but caps it tightly to avoid multi-second catch-up loading.
+        double dynamic_preroll_cap = std::min(6.8, std::max(3.5, 3.5 + seek_span * 0.0011));
         preroll_sec = std::min(std::min(secure_forward_preroll_max_sec_, dynamic_preroll_cap),
                                std::max(3.0, preroll_sec));
         if (recent_secure_stall) {
             // Recent secure seek stalls imply over-aggressive preroll is hurting convergence.
             // Downscale preroll for a short window to avoid repeated long loading.
-            double fallback_cap = secure_stall_streak >= 2 ? 8.0 : 12.0;
+            double fallback_cap = secure_stall_streak >= 2 ? 4.5 : 5.5;
             preroll_sec = std::min(preroll_sec * 0.45, fallback_cap);
             preroll_sec = std::max(0.0, preroll_sec);
             SYNCI("evt=seek_secure_preroll_degrade streak=%d span=%.3f preroll=%.3f",
@@ -1535,10 +1545,10 @@ void AndroidPlayer::resetSecureSeekTuning() {
     secure_recovery_deadline_large_ms_ = 5800;
     secure_audio_wait_deadline_normal_ms_ = 3600;
     secure_audio_wait_deadline_large_ms_ = 4700;
-    secure_forward_preroll_base_sec_ = 4.0;
-    secure_forward_preroll_span_gain_ = 0.004;
+    secure_forward_preroll_base_sec_ = 3.5;
+    secure_forward_preroll_span_gain_ = 0.0011;
     secure_forward_preroll_learned_gain_ = 0.50;
-    secure_forward_preroll_max_sec_ = 10.0;
+    secure_forward_preroll_max_sec_ = 6.8;
     secure_forward_preroll_bias_expire_ms_ = 45000;
     secure_forward_seek_bias_sec_.store(0.0, std::memory_order_release);
     secure_forward_seek_bias_hits_.store(0, std::memory_order_release);
@@ -4232,10 +4242,16 @@ void AndroidPlayer::renderLoop() {
                                      seek_just_happened_.exchange(false, std::memory_order_acq_rel);
             int seek_catchup_left = seek_fast_catchup_frames_.load(std::memory_order_acquire);
             double seek_target = seek_target_sec_.load(std::memory_order_acquire);
+            double seek_from_for_catchup = seek_from_sec_.load(std::memory_order_acquire);
+            bool secure_forward_catchup =
+                    secure_session_active_.load(std::memory_order_acquire) &&
+                    seek_target >= 0.0 &&
+                    seek_from_for_catchup >= 0.0 &&
+                    seek_target > seek_from_for_catchup + 120.0;
             bool seek_catchup_deadline_ok = seek_catchup_deadline_ms_ <= 0 || now < seek_catchup_deadline_ms_;
             bool seek_catchup_enabled = seek_catchup_left > 0
                     && seek_target >= 0.0
-                    && (playback_rate >= 1.75 || frame_data.width >= 3840)
+                    && (secure_forward_catchup || playback_rate >= 1.75 || frame_data.width >= 3840)
                     && seek_catchup_deadline_ok;
             if (!in_seek_recovery && !should_consume && seek_catchup_enabled && !std::isnan(pts) && !std::isinf(pts)) {
                 double behind_seek_target = seek_target - pts;
@@ -4245,7 +4261,7 @@ void AndroidPlayer::renderLoop() {
                     seek_drop_threshold = std::min(seek_drop_threshold, 0.50);
                 }
                 if (behind_seek_target > seek_drop_threshold) {
-                    // 关键借鉴：高倍速 seek 后先快速丢弃“明显早于目标位点”的旧帧，
+                    // 关键借鉴：seek 后先快速丢弃“明显早于目标位点”的旧帧，
                     // 降低“先回放旧画面再追上”的体感卡顿。
                     should_consume = true;
                     seek_fast_catchup_frames_.fetch_sub(1, std::memory_order_acq_rel);
