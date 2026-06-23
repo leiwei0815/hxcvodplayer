@@ -1345,7 +1345,9 @@ void AndroidPlayer::seekTo(double position) {
     if (non_secure_4k_large_seek) {
         lower_deadline_ms = very_large_seek ? 2600 : 2000;
         recovery_deadline_ms = very_large_seek ? 5200 : 4200;
-        audio_wait_deadline_ms = very_large_seek ? 4800 : 3600;
+        audio_wait_deadline_ms = (position > seek_from + 0.5)
+                                 ? (very_large_seek ? 6200 : 4800)
+                                 : (very_large_seek ? 4800 : 3600);
     }
     // Key point for encrypted large forward seek:
     // cap converge deadlines to avoid long loading loops before failover.
@@ -4988,6 +4990,24 @@ void AndroidPlayer::renderLoop() {
                                    sid_now, seek_elapsed_ms, seek_empty_timeout_ms, span_now, seek_progress_best_abs_err);
                     }
                 }
+                int64_t rendered_progress_age_ms_now = -1;
+                int64_t rendered_progress_last_ms_now = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
+                if (rendered_progress_last_ms_now > 0) {
+                    rendered_progress_age_ms_now = now - rendered_progress_last_ms_now;
+                }
+                bool has_rendered_progress_now =
+                        rendered_progress_age_ms_now >= 0 &&
+                        rendered_progress_age_ms_now <= 1200;
+                if (nonsecure_4k_large_empty && !is_backward_seek && !has_rendered_progress_now) {
+                    int64_t no_render_timeout_ms = span_now >= 180.0 ? 6800 : 5600;
+                    if (seek_elapsed_ms < no_render_timeout_ms) {
+                        seek_empty_timeout_ms = std::max<int64_t>(seek_empty_timeout_ms, no_render_timeout_ms);
+                        SYNCW_RATE(15,
+                                   "evt=seek_empty_timeout_extend_nonsecure_4k_forward_no_render elapsed_ms=%" PRId64 " timeout_ms=%" PRId64 " span=%.3f rendered_age_ms=%" PRId64 " target=%.3f from=%.3f",
+                                   seek_elapsed_ms, seek_empty_timeout_ms, span_now,
+                                   rendered_progress_age_ms_now, seek_target_now, seek_from_now);
+                    }
+                }
                 if (seek_elapsed_ms >= seek_empty_timeout_ms) {
                     setSeekPhase(SEEK_PHASE_FAILOVER, "seek_empty_timeout");
                     seek_lower_bound_active_.store(false, std::memory_order_release);
@@ -5051,14 +5071,6 @@ void AndroidPlayer::renderLoop() {
                             !seek_lower_bound_active_.load(std::memory_order_acquire) &&
                             !seek_recovery_active_.load(std::memory_order_acquire) &&
                             !seek_audio_wait_video_.load(std::memory_order_acquire);
-                    int64_t rendered_progress_age_ms_now = -1;
-                    int64_t rendered_progress_last_ms_now = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
-                    if (rendered_progress_last_ms_now > 0) {
-                        rendered_progress_age_ms_now = now - rendered_progress_last_ms_now;
-                    }
-                    bool has_rendered_progress_now =
-                            rendered_progress_age_ms_now >= 0 &&
-                            rendered_progress_age_ms_now <= 1200;
                     SYNCW_RATE(15,
                                "evt=seek_empty_timeout_diag target=%.3f from=%.3f pwr=%d state=%d pos=%.3f seek_progress_best_abs_err=%.3f recent_seek_progress=%d rendered_progress=%d rendered_progress_age_ms=%" PRId64 " gates_cleared=%d local=%d encrypted=%d timeout_ms=%" PRId64,
                                seek_target_now, seek_from_now, pwr_now, state_now, pos_now,

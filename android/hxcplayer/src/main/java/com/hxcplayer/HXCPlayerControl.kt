@@ -448,6 +448,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val seekCompletionNearTargetSec = 1.5
     private val seekCompletionMovedFromOldSec = 0.9
     private val seekCompletionPostConfirmWindowMs = 900L
+    private val seekCompletionUnhealthyPostConfirmWindowMs = 2600L
     private val seekCompletionPostConfirmMinProgressSec = 0.12
     private val seekPostConfirmReopenBackoffSec = 0.30
     private val seekPostConfirmReopenCooldownMs = 5000L
@@ -2455,6 +2456,9 @@ class HXCPlayerControl @JvmOverloads constructor(
                     val from = pendingSeekFromSec
                     val nearTarget = !target.isNaN() && abs(seekPosition - target) <= seekCompletionNearTargetSec
                     val movedFromOldPos = !from.isNaN() && abs(seekPosition - from) >= seekCompletionMovedFromOldSec
+                    val largeSeek = !target.isNaN() && !from.isNaN() && abs(target - from) >= 25.0
+                    val nonSecureSeek = !currentSourceCategory.startsWith("secure_") &&
+                            !currentSourceCategory.contains("encrypted")
                     val secureForwardSeek = currentSourceCategory.startsWith("secure_") &&
                             !target.isNaN() &&
                             !from.isNaN() &&
@@ -2464,6 +2468,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                             abs(seekPosition - target) <= 0.55
                     val convergedNow = if (secureForwardSeek) {
                         secureForwardNearTarget
+                    } else if (largeSeek && nonSecureSeek) {
+                        nearTarget
                     } else {
                         nearTarget || movedFromOldPos
                     }
@@ -2543,7 +2549,24 @@ class HXCPlayerControl @JvmOverloads constructor(
                             val progressedAfterConfirm = !pendingSeekPostConfirmBasePosSec.isNaN() &&
                                     (seekPosition - pendingSeekPostConfirmBasePosSec) >= seekCompletionPostConfirmMinProgressSec
                             val playingAfterConfirm = nativeIsPlaying(handle)
+                            val unhealthyAfterConfirm = playWhenReady &&
+                                    largeSeek &&
+                                    nonSecureSeek &&
+                                    !loadingRecovered &&
+                                    (loading || state == PlayerState.LOADING || !playingAfterConfirm)
                             if (!progressedAfterConfirm && confirmElapsedMs < seekCompletionPostConfirmWindowMs) {
+                                return@scheduleAtFixedRate
+                            }
+                            if (progressedAfterConfirm &&
+                                unhealthyAfterConfirm &&
+                                confirmElapsedMs < seekCompletionUnhealthyPostConfirmWindowMs) {
+                                if ((now - pendingSeekLastWatchdogLogAtMs) >= 1000L) {
+                                    pendingSeekLastWatchdogLogAtMs = now
+                                    Log.i(
+                                        TAG,
+                                        "evt=seek_post_confirm_hold_unhealthy target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs confirm_elapsed_ms=$confirmElapsedMs loading=$loading state=${state.name} playing=$playingAfterConfirm source_category=$currentSourceCategory"
+                                    )
+                                }
                                 return@scheduleAtFixedRate
                             }
                             if (!progressedAfterConfirm) {
