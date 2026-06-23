@@ -172,6 +172,13 @@ inline int64_t clampi64(int64_t value, int64_t min_value, int64_t max_value) {
     return std::max(min_value, std::min(max_value, value));
 }
 
+inline int normalize_audio_output_channels(int source_channels) {
+    if (source_channels <= 0) return 0;
+    // OpenSL ES buffer queue is most stable with mono/stereo across Android devices.
+    // Decode-side swr downmixes 2+ source channels (3.0, 5.1, etc.) to stereo.
+    return source_channels == 1 ? 1 : 2;
+}
+
 inline bool is_likely_local_uri(const char* url) {
     if (!url || !url[0]) return false;
     if (strncmp(url, "file://", 7) == 0) return true;
@@ -5836,7 +5843,15 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
 bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     SLresult result;
 
-    LOGI("Initializing audio output: %d Hz, %d channels", sample_rate, channels);
+    int output_channels = normalize_audio_output_channels(channels);
+    if (sample_rate <= 0 || output_channels <= 0) {
+        LOGE("Invalid audio output params: sample_rate=%d, source_channels=%d, output_channels=%d",
+             sample_rate, channels, output_channels);
+        return false;
+    }
+
+    LOGI("Initializing audio output: %d Hz, source_channels=%d, output_channels=%d",
+         sample_rate, channels, output_channels);
 
     result = slCreateEngine(&engineObject_, 0, nullptr, 0, nullptr, nullptr);
     if (result != SL_RESULT_SUCCESS) {
@@ -5897,16 +5912,15 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     }
     
     SLuint32 channel_mask;
-    if (channels == 1) {
+    if (output_channels == 1) {
         channel_mask = SL_SPEAKER_FRONT_CENTER;
     } else {
         channel_mask = SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT;
-        channels = 2; // clamp to stereo
     }
     
     SLDataFormat_PCM format_pcm = {
         SL_DATAFORMAT_PCM,
-        static_cast<SLuint32>(channels),
+        static_cast<SLuint32>(output_channels),
         sl_sample_rate,
         SL_PCMSAMPLEFORMAT_FIXED_16,
         SL_PCMSAMPLEFORMAT_FIXED_16,
@@ -5914,7 +5928,7 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
         SL_BYTEORDER_LITTLEENDIAN
     };
     
-    LOGI("Audio output config: %d Hz, %d channels, 16-bit", sample_rate, channels);
+    LOGI("Audio output config: %d Hz, %d channels, 16-bit", sample_rate, output_channels);
 
     SLDataSource audioSrc = {&loc_bufq, &format_pcm};
     
@@ -5967,20 +5981,20 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     LOGI("Volume control: core-only (OpenSL ES VolumeItf disabled)");
 
     audio_sample_rate_ = sample_rate;
-    audio_channels_    = channels;
+    audio_channels_    = output_channels;
 
     // Adaptive buffer sizing:
     // - default ~12ms to reduce callback underrun on busy devices
     // - enlarge for high-rate or 4K decode pipelines
     int target_buffer_ms = 12;
     float req_rate = requested_playback_rate_.load(std::memory_order_relaxed);
-    bool high_bandwidth_pcm = sample_rate >= 44100 && channels >= 2;
+    bool high_bandwidth_pcm = sample_rate >= 44100 && output_channels >= 2;
     if (req_rate >= 2.5f) {
         target_buffer_ms = 22;
     } else if (req_rate >= 2.0f || high_bandwidth_pcm) {
         target_buffer_ms = 18;
     }
-    audio_buffer_size_ = (sample_rate * channels * 2 * target_buffer_ms) / 1000;
+    audio_buffer_size_ = (sample_rate * output_channels * 2 * target_buffer_ms) / 1000;
     audio_buffer_size_ = (audio_buffer_size_ + 3) & ~3;  // 4-byte align
 
     if (audio_buffer_size_ > MAX_AUDIO_BUFFER_SIZE) {
@@ -5993,7 +6007,7 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
 
     LOGI("Audio buffer: %d bytes (%.1f ms)",
          audio_buffer_size_,
-         (audio_buffer_size_ * 1000.0) / (sample_rate * channels * 2));
+         (audio_buffer_size_ * 1000.0) / (sample_rate * output_channels * 2));
 
     // Estimate the hardware output queue latency (bytes already enqueued but
     // not yet heard).  The render thread subtracts this from the audio master
@@ -6001,7 +6015,7 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     // rather than "what has been submitted to the driver".  Mirrors iOS logic in
     // HXCPlayerControl.mm (_audioOutputLatencySec).
     {
-        double bytes_per_sec = (double)sample_rate * channels * 2.0; // 16-bit PCM
+        double bytes_per_sec = (double)sample_rate * output_channels * 2.0; // 16-bit PCM
         double queued_sec    = (bytes_per_sec > 0.0)
                                ? (double)audio_buffer_size_ / bytes_per_sec
                                : 0.0;
@@ -6012,7 +6026,7 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     memset(audio_buffer_, 0, audio_buffer_size_);
     (*bufferQueueItf_)->Enqueue(bufferQueueItf_, audio_buffer_, audio_buffer_size_);
 
-    LOGI("Audio output initialized successfully with %d Hz, %d channels", sample_rate, channels);
+    LOGI("Audio output initialized successfully with %d Hz, output_channels=%d", sample_rate, output_channels);
     audio_active_ = true;
     return true;
 }
@@ -6063,10 +6077,12 @@ void AndroidPlayer::ensureAudioOutputForCurrentStream() {
     }
 
     int sample_rate = player_core_get_audio_sample_rate(player_core_);
-    int channels = player_core_get_audio_channels(player_core_);
-    LOGI("Audio info: sample_rate=%d, channels=%d", sample_rate, channels);
+    int source_channels = player_core_get_audio_channels(player_core_);
+    int output_channels = normalize_audio_output_channels(source_channels);
+    LOGI("Audio info: sample_rate=%d, source_channels=%d, output_channels=%d",
+         sample_rate, source_channels, output_channels);
 
-    if (sample_rate <= 0 || channels <= 0) {
+    if (sample_rate <= 0 || output_channels <= 0) {
         if (audio_initialized_) {
             LOGI("No valid audio stream, destroying previous audio output");
             destroyAudioOutput();
@@ -6078,19 +6094,19 @@ void AndroidPlayer::ensureAudioOutputForCurrentStream() {
 
     const bool need_recreate = !audio_initialized_
                             || audio_sample_rate_ != sample_rate
-                            || audio_channels_ != channels;
+                            || audio_channels_ != output_channels;
     if (!need_recreate) {
         LOGI("Audio output already matched stream parameters");
         return;
     }
 
     if (audio_initialized_) {
-        LOGI("Audio format changed, rebuilding output: %d/%d -> %d/%d",
-             audio_sample_rate_, audio_channels_, sample_rate, channels);
+        LOGI("Audio format changed, rebuilding output: %d/%d -> %d/%d (source_channels=%d)",
+             audio_sample_rate_, audio_channels_, sample_rate, output_channels, source_channels);
         destroyAudioOutput();
     }
 
-    if (!initAudioOutput(sample_rate, channels)) {
+    if (!initAudioOutput(sample_rate, source_channels)) {
         LOGE("Failed to initialize audio output");
         audio_initialized_ = false;
         return;

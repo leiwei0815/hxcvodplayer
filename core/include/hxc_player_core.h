@@ -206,6 +206,9 @@ public:
     void update_audio_pts(double pts, int serial);
     double get_seek_target_pos() const { return seek_target_pos_.load(std::memory_order_acquire); }
     int get_post_seek_warmup_frames() const { return post_seek_warmup_frames_.load(std::memory_order_acquire); }
+    uint64_t get_audio_output_reset_serial() const {
+        return audio_output_reset_serial_.load(std::memory_order_acquire);
+    }
     
     // 事件回调
     using StateChangedCallback = std::function<void(PlayerState)>;
@@ -367,6 +370,7 @@ private:
     std::atomic<int64_t> io_last_packet_us_{0}; // 最近一次成功读取 packet 的时间（us）
     std::atomic<bool> io_watchdog_disabled_{false}; // 是否禁用阻塞读 watchdog（用于 loopback HTTP）
     int64_t io_interrupt_timeout_us_{8000000};   // 阻塞读中断阈值（us）
+    std::atomic<uint64_t> audio_output_reset_serial_{0}; // 队列/时钟软重置代数，供平台音频输出层丢弃旧缓冲
     std::atomic<bool> playback_completed_notified_;  // ⚠️ 是否已通知播放完成（避免重复通知）
     
 #ifndef NO_SDL

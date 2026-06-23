@@ -2137,12 +2137,25 @@ void PlayerCore::read_thread() {
                     if (audio_queue_) { audio_queue_->flush(); audio_queue_->restart(); }
                     if (video_decoder_) video_decoder_->flush();
                     if (audio_decoder_) audio_decoder_->flush();
+                    if (audio_stream_ >= 0) {
+                        audio_clock_.set_clock(resume_pos, 0);
+                    }
+                    if (video_stream_ >= 0) {
+                        video_clock_.set_clock(resume_pos, 0);
+                    }
+                    external_clock_.set_clock(resume_pos, 0);
+                    audio_current_pts_ = resume_pos;
+                    audio_current_pts_drift_ = resume_pos - av_gettime_relative() / 1000000.0;
+                    audio_output_reset_serial_.fetch_add(1, std::memory_order_acq_rel);
+                    post_seek_warmup_frames_.store(24, std::memory_order_release);
                     soft_reconnect_attempt_count = 0;
                     next_soft_reconnect_try_us = 0;
                     io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
                     read_error_count = 0;
                     read_error_begin = std::chrono::steady_clock::time_point{};
-                    LOG_INFO("读取线程：软重连成功，继续读取");
+                    LOG_INFO("读取线程：软重连成功，继续读取，audio_output_reset_serial=",
+                             audio_output_reset_serial_.load(std::memory_order_acquire),
+                             ", resume_pos=", resume_pos);
                     PLAYER_DELAY(50);
                     continue;
                 } else {

@@ -2217,14 +2217,18 @@ class HXCPlayerControl @JvmOverloads constructor(
         )
     }
 
-    private fun hasSnapshotSemanticDiff(old: PlaybackSnapshot?, new: PlaybackSnapshot): Boolean {
+    private fun hasSnapshotDispatchDiff(old: PlaybackSnapshot?, new: PlaybackSnapshot): Boolean {
         if (old == null) return true
-        return old.state != new.state ||
+        val semanticChanged = old.state != new.state ||
             old.pipelineState != new.pipelineState ||
             old.playWhenReady != new.playWhenReady ||
             old.isPlaying != new.isPlaying ||
             old.isLoading != new.isLoading ||
             old.shouldShowPlayingUi != new.shouldShowPlayingUi
+        if (semanticChanged) return true
+        if (abs(old.position - new.position) >= 0.25) return true
+        if (abs(old.duration - new.duration) >= 0.50) return true
+        return new.updatedAtMs - old.updatedAtMs >= 1000L
     }
 
     /**
@@ -2290,7 +2294,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     duration = duration,
                     nowMs = now
                 )
-                val shouldDispatchSnapshot = hasSnapshotSemanticDiff(lastPlaybackSnapshot, snapshot)
+                val shouldDispatchSnapshot = hasSnapshotDispatchDiff(lastPlaybackSnapshot, snapshot)
                 if (shouldDispatchSnapshot) {
                     lastPlaybackSnapshot = snapshot
                 }

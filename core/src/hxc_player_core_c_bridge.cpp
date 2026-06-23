@@ -33,6 +33,13 @@ static int64_t bridge_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+static int bridge_output_channels_for_source(int source_channels) {
+    if (source_channels <= 0) return 0;
+    // Android/iOS app playback path is device-output oriented: keep mono as mono,
+    // downmix all multi-channel layouts (3.0, 5.1, 7.1, etc.) to stereo.
+    return source_channels == 1 ? 1 : 2;
+}
 }
 
 // PlayerCoreHandle 结构，包含音频处理所需的状态
@@ -49,11 +56,14 @@ struct PlayerCoreHandle {
     double audio_buf_pts_base;          // 当前桥接缓冲起点 PTS（媒体时间）
     int audio_current_sample_rate;      // 当前音频采样率
     int audio_current_channels;         // 当前音频通道数
+    int audio_logged_source_channels;    // 上次记录的源声道数
+    int audio_logged_output_channels;    // 上次记录的输出声道数
     std::atomic<uint64_t> audio_seek_serial; // seek 代数，用于丢弃 seek 前旧回调
     int audio_buf_serial;               // 当前桥接音频缓冲对应的 serial
     double post_anchor_audio_guard_pts; // seek 锚定后短时拒绝旧音频 PTS 回拉时钟
     int64_t post_anchor_audio_guard_until_ms;
     int post_anchor_audio_guard_drop_count;
+    uint64_t last_core_audio_reset_serial;
     std::mutex audio_data_mutex;        // 保护音频缓冲/重采样/SoundTouch并发访问
 
     // 音频重采样器
@@ -102,11 +112,14 @@ struct PlayerCoreHandle {
         , audio_buf_pts_base(0.0)
         , audio_current_sample_rate(0)
         , audio_current_channels(0)
+        , audio_logged_source_channels(0)
+        , audio_logged_output_channels(0)
         , audio_seek_serial(0)
         , audio_buf_serial(0)
         , post_anchor_audio_guard_pts(-1.0)
         , post_anchor_audio_guard_until_ms(0)
         , post_anchor_audio_guard_drop_count(0)
+        , last_core_audio_reset_serial(0)
 #ifdef HAS_SOUNDTOUCH
         , soundtouch(nullptr)
         , soundtouch_initialized(false)
@@ -143,6 +156,32 @@ struct PlayerCoreHandle {
 #endif
     }
 };
+
+static void reset_bridge_audio_output_locked(PlayerCoreHandle* handle,
+                                             double anchor_pts,
+                                             const char* reason,
+                                             bool bump_serial) {
+    if (!handle) return;
+    if (bump_serial) {
+        handle->audio_seek_serial.fetch_add(1, std::memory_order_acq_rel);
+    }
+    handle->audio_buf_index = 0;
+    handle->audio_buf_size = 0;
+    handle->audio_current_pts = anchor_pts;
+    handle->audio_buf_pts_base = anchor_pts;
+    handle->audio_buf_serial = 0;
+    handle->post_anchor_audio_guard_pts = anchor_pts;
+    handle->post_anchor_audio_guard_until_ms = bridge_now_ms() + kBridgePostAnchorAudioGuardMs;
+    handle->post_anchor_audio_guard_drop_count = 0;
+#ifdef HAS_SOUNDTOUCH
+    if (handle->soundtouch) {
+        handle->soundtouch->clear();
+    }
+#endif
+    LOG_INFO("bridge_audio_output_reset reason=", (reason ? reason : "unknown"),
+             " anchor=", anchor_pts,
+             " serial=", handle->audio_seek_serial.load(std::memory_order_acquire));
+}
 
 static PlayerStateC hxc_to_c_player_state(hxcplayer::PlayerState state) {
     switch (state) {
@@ -345,22 +384,9 @@ const char* player_core_get_video_decode_diagnostic(PlayerCoreHandle* handle) {
 void player_core_seek(PlayerCoreHandle* handle, double pos) {
     if (handle && handle->core) {
         std::lock_guard<std::mutex> audio_lock(handle->audio_data_mutex);
-        handle->audio_seek_serial.fetch_add(1, std::memory_order_acq_rel);
         // iOS/macOS/Android 通过 C bridge 拉取音频数据时，先清空桥接层音频残留，
         // 避免 seek 后短暂输出旧缓冲导致主时钟回跳。
-        handle->audio_buf_index = 0;
-        handle->audio_buf_size = 0;
-        handle->audio_current_pts = pos;
-        handle->audio_buf_pts_base = pos;
-        handle->audio_buf_serial = 0;
-        handle->post_anchor_audio_guard_pts = pos;
-        handle->post_anchor_audio_guard_until_ms = bridge_now_ms() + kBridgePostAnchorAudioGuardMs;
-        handle->post_anchor_audio_guard_drop_count = 0;
-#ifdef HAS_SOUNDTOUCH
-        if (handle->soundtouch) {
-            handle->soundtouch->clear();
-        }
-#endif
+        reset_bridge_audio_output_locked(handle, pos, "seek", true);
         handle->core->seek(pos);
     }
 }
@@ -604,19 +630,7 @@ int player_core_get_post_seek_warmup(PlayerCoreHandle* handle) {
 void player_core_anchor_clock(PlayerCoreHandle* handle, double pts) {
     if (handle && handle->core) {
         std::lock_guard<std::mutex> audio_lock(handle->audio_data_mutex);
-        handle->audio_buf_index = 0;
-        handle->audio_buf_size = 0;
-        handle->audio_current_pts = pts;
-        handle->audio_buf_pts_base = pts;
-        handle->audio_buf_serial = 0;
-        handle->post_anchor_audio_guard_pts = pts;
-        handle->post_anchor_audio_guard_until_ms = bridge_now_ms() + kBridgePostAnchorAudioGuardMs;
-        handle->post_anchor_audio_guard_drop_count = 0;
-#ifdef HAS_SOUNDTOUCH
-        if (handle->soundtouch) {
-            handle->soundtouch->clear();
-        }
-#endif
+        reset_bridge_audio_output_locked(handle, pts, "anchor", false);
         handle->core->anchor_clock(pts);
     }
 }
@@ -626,6 +640,16 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         return 0;
     }
     std::lock_guard<std::mutex> audio_lock(handle->audio_data_mutex);
+
+    uint64_t core_audio_reset_serial = handle->core->get_audio_output_reset_serial();
+    if (core_audio_reset_serial != handle->last_core_audio_reset_serial) {
+        handle->last_core_audio_reset_serial = core_audio_reset_serial;
+        double anchor = handle->core->get_position();
+        if (!std::isfinite(anchor) || anchor < 0.0) {
+            anchor = 0.0;
+        }
+        reset_bridge_audio_output_locked(handle, anchor, "core_audio_reset", true);
+    }
 
     uint64_t call_seek_serial = handle->audio_seek_serial.load(std::memory_order_acquire);
     
@@ -769,22 +793,54 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         handle->audio_current_sample_rate = sample_rate;
         handle->audio_buf_serial = af->serial;
 
-        // 按当前帧的格式配置重采样器（每个新流/格式变化时重新配置）
+        // 按当前帧的格式配置重采样器（每个新流/格式变化时重新配置）。
+        // Android OpenSL ES 输出侧只承诺 mono/stereo，3.0/5.1/7.1 等源流在这里 downmix。
+        AVChannelLayout src_layout{};
+        if (frame->ch_layout.nb_channels == channels &&
+            av_channel_layout_check(&frame->ch_layout)) {
+            int copy_ret = av_channel_layout_copy(&src_layout, &frame->ch_layout);
+            if (copy_ret < 0) {
+                av_channel_layout_default(&src_layout, channels);
+                if (channels != handle->audio_logged_source_channels) {
+                    LOG_WARNING("bridge_audio_src_layout_copy_fallback channels=", channels,
+                                " ret=", copy_ret);
+                }
+            }
+        }
+        if (src_layout.nb_channels <= 0) {
+            av_channel_layout_default(&src_layout, channels);
+            if (channels != handle->audio_logged_source_channels) {
+                LOG_WARNING("bridge_audio_src_layout_fallback channels=", channels);
+            }
+        }
         AVChannelLayout dst_layout = AV_CHANNEL_LAYOUT_STEREO;
         if (channels == 1) {
             dst_layout = AV_CHANNEL_LAYOUT_MONO;
         }
-        int output_channels = dst_layout.nb_channels;
-        if (output_channels <= 0) {
-            output_channels = channels;
-        }
+        int previous_output_channels = handle->audio_current_channels;
+        int output_channels = bridge_output_channels_for_source(channels);
         handle->audio_current_channels = output_channels;
-        int cfg_ret = handle->resampler->configure(&frame->ch_layout,
+        if (channels != handle->audio_logged_source_channels ||
+            output_channels != handle->audio_logged_output_channels) {
+            LOG_INFO("bridge_audio_output_format source_channels=", channels,
+                     " output_channels=", output_channels,
+                     " downmix=", (channels > output_channels ? 1 : 0),
+                     " sample_rate=", sample_rate);
+            handle->audio_logged_source_channels = channels;
+            handle->audio_logged_output_channels = output_channels;
+        }
+#ifdef HAS_SOUNDTOUCH
+        if (previous_output_channels > 0 && previous_output_channels != output_channels) {
+            handle->soundtouch_initialized = false;
+        }
+#endif
+        int cfg_ret = handle->resampler->configure(&src_layout,
                                                    sample_fmt,
                                                    sample_rate,
                                                    &dst_layout,
                                                    AV_SAMPLE_FMT_S16,
                                                    sample_rate);
+        av_channel_layout_uninit(&src_layout);
         if (cfg_ret < 0) {
             audioQueue->next();
             return 0;
