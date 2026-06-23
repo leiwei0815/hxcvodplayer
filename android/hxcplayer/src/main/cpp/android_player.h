@@ -176,6 +176,8 @@ private:
     GLint  gl_attrib_tex_uv_;
     int    gl_last_video_w_;
     int    gl_last_video_h_;
+    std::atomic<int> seek_policy_video_w_{0};
+    std::atomic<int> seek_policy_video_h_{0};
     bool   gl_last_uv_interleaved_;
     bool   gl_last_uv_swap_;
     int    gl_last_uv_tex_w_;
@@ -283,6 +285,7 @@ private:
     // Seek 发起时的播放位置，用于识别 backward seek 并过滤未来陈旧帧。
     std::atomic<double> seek_from_sec_{-1.0};
     std::atomic<int>    seek_fast_catchup_frames_{0};
+    std::atomic<int>    seek_nonsecure_4k_reseek_count_{0};
     int64_t             seek_catchup_deadline_ms_{0};
     // Tencent-like seek lower-bound gate: drop frames older than seek target
     // until the first frame reaches target PTS.
