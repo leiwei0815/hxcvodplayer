@@ -56,9 +56,10 @@ public:
     bool openURL(const char* url);
     bool openURL(const char* url, double start_position);
     bool openWithCustomHTTP(const char* url, int timeout_ms = 30000,
-                            int max_retries = 3, bool encrypted_file = false);
+                            int max_retries = 3, bool encrypted_file = false,
+                            double start_position = 0.0);
     bool openWithCustomFile(const char* path, size_t avio_buffer_size = 64 * 1024,
-                            bool encrypted_file = false);
+                            bool encrypted_file = false, double start_position = 0.0);
     bool openWithSecureSession(const char* url,
                                double      start_position,
                                const char* auth_token,

@@ -561,7 +561,8 @@ Java_com_hxcplayer_HXCPlayerControl_getLogDirectory(JNIEnv *env, jclass clazz) {
 // 使用自定义 HTTP 模式打开
 JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomHTTP(
-        JNIEnv *env, jobject thiz, jlong handle, jstring url, jint timeout_ms, jint max_retries, jboolean encrypted_file) {
+        JNIEnv *env, jobject thiz, jlong handle, jstring url, jdouble start_position,
+        jint timeout_ms, jint max_retries, jboolean encrypted_file) {
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
     if (!player || !url) return JNI_FALSE;
 
@@ -570,9 +571,12 @@ Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomHTTP(
         if (urlStr) env->ReleaseStringUTFChars(url, urlStr);
         return JNI_FALSE;
     }
-    LOGD("nativeOpenWithCustomHTTP: %s encrypted=%d", urlStr, encrypted_file ? 1 : 0);
+    LOGD("nativeOpenWithCustomHTTP: %s start=%.3f encrypted=%d",
+         urlStr, static_cast<double>(start_position), encrypted_file ? 1 : 0);
 
-    bool result = player->openWithCustomHTTP(urlStr, timeout_ms, max_retries, encrypted_file == JNI_TRUE);
+    bool result = player->openWithCustomHTTP(urlStr, timeout_ms, max_retries,
+                                             encrypted_file == JNI_TRUE,
+                                             static_cast<double>(start_position));
 
     env->ReleaseStringUTFChars(url, urlStr);
     return result ? JNI_TRUE : JNI_FALSE;
@@ -602,7 +606,8 @@ Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithSecureHLS(
 // 使用自定义本地文件模式打开（与 DataSourceMode::CustomFile 一致）
 JNIEXPORT jboolean JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomFile(
-        JNIEnv *env, jobject thiz, jlong handle, jstring path, jint avio_buffer_size, jboolean encrypted_file) {
+        JNIEnv *env, jobject thiz, jlong handle, jstring path, jdouble start_position,
+        jint avio_buffer_size, jboolean encrypted_file) {
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
     if (!player || !path) return JNI_FALSE;
 
@@ -611,11 +616,12 @@ Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomFile(
         if (pathStr) env->ReleaseStringUTFChars(path, pathStr);
         return JNI_FALSE;
     }
-    LOGD("nativeOpenWithCustomFile: %s avio_buffer_size=%d encrypted=%d",
-         pathStr, avio_buffer_size, encrypted_file ? 1 : 0);
+    LOGD("nativeOpenWithCustomFile: %s start=%.3f avio_buffer_size=%d encrypted=%d",
+         pathStr, static_cast<double>(start_position), avio_buffer_size, encrypted_file ? 1 : 0);
 
     size_t buf = avio_buffer_size > 0 ? static_cast<size_t>(avio_buffer_size) : (64 * 1024);
-    bool result = player->openWithCustomFile(pathStr, buf, encrypted_file == JNI_TRUE);
+    bool result = player->openWithCustomFile(pathStr, buf, encrypted_file == JNI_TRUE,
+                                             static_cast<double>(start_position));
 
     env->ReleaseStringUTFChars(path, pathStr);
     return result ? JNI_TRUE : JNI_FALSE;

@@ -1080,10 +1080,23 @@ class HXCPlayerControl @JvmOverloads constructor(
                 PlayerDataSourceMode.DEFAULT ->
                     nativeOpenURLWithStartPosition(handle, workingModel.url, lastOpenStartPosition)
                 PlayerDataSourceMode.CUSTOM_HTTP -> {
-                    nativeOpenWithCustomHTTP(handle, workingModel.url, cfg.timeoutMs, cfg.maxRetries, workingModel.encryptedFile)
+                    nativeOpenWithCustomHTTP(
+                        handle,
+                        workingModel.url,
+                        lastOpenStartPosition,
+                        cfg.timeoutMs,
+                        cfg.maxRetries,
+                        workingModel.encryptedFile
+                    )
                 }
                 PlayerDataSourceMode.CUSTOM_FILE -> {
-                    nativeOpenWithCustomFile(handle, workingModel.url, cfg.avioBufferSize, workingModel.encryptedFile)
+                    nativeOpenWithCustomFile(
+                        handle,
+                        workingModel.url,
+                        lastOpenStartPosition,
+                        cfg.avioBufferSize,
+                        workingModel.encryptedFile
+                    )
                 }
                 PlayerDataSourceMode.SECURE_HLS -> {
                     val video = workingModel.video
@@ -1843,7 +1856,22 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     // 使用自定义 HTTP 模式打开（支持 Range 下载）
     // encryptedFile：是否与核心层约定一致，对文件头前 100 字节解密（默认 false）
-    fun openWithCustomHTTP(url: String, timeoutMs: Int = 30000, maxRetries: Int = 3, encryptedFile: Boolean = false): Boolean {
+    fun openWithCustomHTTP(
+        url: String,
+        timeoutMs: Int = 30000,
+        maxRetries: Int = 3,
+        encryptedFile: Boolean = false
+    ): Boolean {
+        return openWithCustomHTTP(url, timeoutMs, maxRetries, encryptedFile, 0.0)
+    }
+
+    fun openWithCustomHTTP(
+        url: String,
+        timeoutMs: Int,
+        maxRetries: Int,
+        encryptedFile: Boolean,
+        startPosition: Double
+    ): Boolean {
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开自定义 HTTP: $url")
@@ -1853,7 +1881,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             return false
         }
         applyDecodeModeForHandle(handle)
-        val result = nativeOpenWithCustomHTTP(handle, url, timeoutMs, maxRetries, encryptedFile)
+        val result = nativeOpenWithCustomHTTP(handle, url, startPosition, timeoutMs, maxRetries, encryptedFile)
         if (!result) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开自定义 HTTP: $url")
         }
@@ -1866,7 +1894,20 @@ class HXCPlayerControl @JvmOverloads constructor(
      * @param avioBufferSize AVIO 读缓冲，字节，默认 64KB；≤0 时 JNI 侧会退回 64KB
      * @param encryptedFile 是否对文件头前 100 字节按核心约定解密
      */
-    fun openWithCustomFile(path: String, avioBufferSize: Int = 64 * 1024, encryptedFile: Boolean = false): Boolean {
+    fun openWithCustomFile(
+        path: String,
+        avioBufferSize: Int = 64 * 1024,
+        encryptedFile: Boolean = false
+    ): Boolean {
+        return openWithCustomFile(path, avioBufferSize, encryptedFile, 0.0)
+    }
+
+    fun openWithCustomFile(
+        path: String,
+        avioBufferSize: Int,
+        encryptedFile: Boolean,
+        startPosition: Double
+    ): Boolean {
         val handle = currentHandle()
         if (handle == 0L || isReleased) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "播放器已释放，无法打开本地文件(CustomFile): $path")
@@ -1876,7 +1917,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             return false
         }
         applyDecodeModeForHandle(handle)
-        val result = nativeOpenWithCustomFile(handle, path, avioBufferSize, encryptedFile)
+        val result = nativeOpenWithCustomFile(handle, path, startPosition, avioBufferSize, encryptedFile)
         if (!result) {
             dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开本地文件(CustomFile): $path")
         }
@@ -3337,8 +3378,21 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeUpdateSurfaceSize(handle: Long, width: Int, height: Int)
     private external fun nativeOpenURL(handle: Long, url: String): Boolean
     private external fun nativeOpenURLWithStartPosition(handle: Long, url: String, startPosition: Double): Boolean
-    private external fun nativeOpenWithCustomHTTP(handle: Long, url: String, timeoutMs: Int, maxRetries: Int, encryptedFile: Boolean): Boolean
-    private external fun nativeOpenWithCustomFile(handle: Long, path: String, avioBufferSize: Int, encryptedFile: Boolean): Boolean
+    private external fun nativeOpenWithCustomHTTP(
+        handle: Long,
+        url: String,
+        startPosition: Double,
+        timeoutMs: Int,
+        maxRetries: Int,
+        encryptedFile: Boolean
+    ): Boolean
+    private external fun nativeOpenWithCustomFile(
+        handle: Long,
+        path: String,
+        startPosition: Double,
+        avioBufferSize: Int,
+        encryptedFile: Boolean
+    ): Boolean
     private external fun nativeOpenWithSecureSession(
         handle: Long,
         url: String,

@@ -586,17 +586,21 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     }
 }
 
-bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_retries, bool encrypted_file) {
+bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_retries,
+                                       bool encrypted_file, double start_position) {
     std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) {
         LOGE("Player core not initialized");
         return false;
     }
+    const double normalized_start_position =
+            std::isfinite(start_position) && start_position > 0.0 ? start_position : 0.0;
     OpenLifecycleGuard open_lifecycle_guard(open_in_progress_, pending_play_after_open_);
-    LOGI("[open] openWithCustomHTTP url=%s encrypted=%d", url ? url : "(null)", encrypted_file ? 1 : 0);
+    LOGI("[open] openWithCustomHTTP start_pos=%.3f url=%s encrypted=%d",
+         normalized_start_position, url ? url : "(null)", encrypted_file ? 1 : 0);
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
-    open_start_position_sec_.store(0.0, std::memory_order_release);
+    open_start_position_sec_.store(normalized_start_position, std::memory_order_release);
     open_requested_at_ms_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count(),
             std::memory_order_release);
@@ -639,7 +643,7 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
     config.avio_buffer_size = 64 * 1024;  // 64KB
     PlayerDataSourceC source{};
     source.url = url;
-    source.start_position = 0.0;
+    source.start_position = normalized_start_position;
     source.mode = PLAYER_DATA_SOURCE_MODE_CUSTOM_HTTP;
     source.encrypted_file = encrypted_file ? 1 : 0;
     source.secure_headers = nullptr;
@@ -652,10 +656,8 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
 
     if (result == 0) {
         LOGI("Custom HTTP opened successfully");
-        // Custom HTTP open path does not use start_position overload.
-        // Force reset playback anchor to stream head for replay/start-from-zero semantics.
-        player_core_seek(player_core_, 0.0);
-        player_core_anchor_clock(player_core_, 0.0);
+        player_core_seek(player_core_, normalized_start_position);
+        player_core_anchor_clock(player_core_, normalized_start_position);
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
@@ -681,18 +683,21 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
     }
 }
 
-bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size, bool encrypted_file) {
+bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size,
+                                       bool encrypted_file, double start_position) {
     std::lock_guard<std::mutex> api_lock(api_mutex_);
     if (!player_core_) {
         LOGE("Player core not initialized");
         return false;
     }
+    const double normalized_start_position =
+            std::isfinite(start_position) && start_position > 0.0 ? start_position : 0.0;
     OpenLifecycleGuard open_lifecycle_guard(open_in_progress_, pending_play_after_open_);
-    LOGI("[open] openWithCustomFile path=%s start=0 encrypted=%d",
-         path ? path : "(null)", encrypted_file ? 1 : 0);
+    LOGI("[open] openWithCustomFile path=%s start=%.3f encrypted=%d",
+         path ? path : "(null)", normalized_start_position, encrypted_file ? 1 : 0);
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
-    open_start_position_sec_.store(0.0, std::memory_order_release);
+    open_start_position_sec_.store(normalized_start_position, std::memory_order_release);
     open_requested_at_ms_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count(),
             std::memory_order_release);
@@ -736,7 +741,7 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
     config.avio_buffer_size = avio_buffer_size;
     PlayerDataSourceC source{};
     source.url = path;
-    source.start_position = 0.0;
+    source.start_position = normalized_start_position;
     source.mode = PLAYER_DATA_SOURCE_MODE_CUSTOM_FILE;
     source.encrypted_file = encrypted_file ? 1 : 0;
     source.secure_headers = nullptr;
@@ -749,10 +754,8 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
 
     if (result == 0) {
         LOGI("Custom file opened successfully");
-        // Custom file open path does not use start_position overload.
-        // Force reset playback anchor to stream head for replay/start-from-zero semantics.
-        player_core_seek(player_core_, 0.0);
-        player_core_anchor_clock(player_core_, 0.0);
+        player_core_seek(player_core_, normalized_start_position);
+        player_core_anchor_clock(player_core_, normalized_start_position);
         ensureAudioOutputForCurrentStream();
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
