@@ -537,6 +537,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var autoReopenMaxAttempts: Int = 1
     private var autoReopenAttemptCount: Int = 0
     private var autoReopenInFlight: Boolean = false
+    @Volatile private var secondarySyncMode: Boolean = false
     private var networkLoadingSinceMs: Long = 0L
     private var networkTotalStallMs: Long = 0L
     private var networkReconnectCount: Int = 0
@@ -1441,6 +1442,7 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     private fun maybeAutoReopen(errorCode: Int, recoverable: Boolean) {
         if (!recoverable) return
+        if (secondarySyncMode) return
         if (!autoReopenOnRecoverableErrorEnabled) return
         if (autoReopenInFlight) return
         if (autoReopenAttemptCount >= autoReopenMaxAttempts) return
@@ -2010,6 +2012,16 @@ class HXCPlayerControl @JvmOverloads constructor(
         nativeSetVolume(handle, volume)
     }
 
+    /**
+     * 三分屏小窗/副画面同步模式。
+     *
+     * 副播放器只跟随主播放器做画面同步，不应触发 reopen 等重恢复链路，
+     * 否则双实例 seek 时会相互抢占解码/音频资源并把全局 loading 拉长。
+     */
+    fun setSecondarySyncMode(enabled: Boolean) {
+        secondarySyncMode = enabled
+    }
+
     // 设置比例模式
     fun setAspectRatioMode(fill: Boolean) {
         val handle = currentHandle()
@@ -2454,11 +2466,17 @@ class HXCPlayerControl @JvmOverloads constructor(
                     val seekElapsedMs = now - pendingSeekStartAtMs
                     val target = pendingSeekTargetSec
                     val from = pendingSeekFromSec
-                    val nearTarget = !target.isNaN() && abs(seekPosition - target) <= seekCompletionNearTargetSec
-                    val movedFromOldPos = !from.isNaN() && abs(seekPosition - from) >= seekCompletionMovedFromOldSec
                     val largeSeek = !target.isNaN() && !from.isNaN() && abs(target - from) >= 25.0
                     val nonSecureSeek = !currentSourceCategory.startsWith("secure_") &&
                             !currentSourceCategory.contains("encrypted")
+                    val localNonSecureSeek = nonSecureSeek && currentSourceCategory.startsWith("local_")
+                    val nearTargetToleranceSec = when {
+                        largeSeek && localNonSecureSeek -> 3.2
+                        largeSeek && nonSecureSeek -> 2.2
+                        else -> seekCompletionNearTargetSec
+                    }
+                    val nearTarget = !target.isNaN() && abs(seekPosition - target) <= nearTargetToleranceSec
+                    val movedFromOldPos = !from.isNaN() && abs(seekPosition - from) >= seekCompletionMovedFromOldSec
                     val secureForwardSeek = currentSourceCategory.startsWith("secure_") &&
                             !target.isNaN() &&
                             !from.isNaN() &&
@@ -2483,6 +2501,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                     val convergedStable = pendingSeekConvergedSinceMs > 0L
                             && (now - pendingSeekConvergedSinceMs) >= seekCompletionConvergedStableMs
                     val loadingRecovered = pendingSeekLoadingObserved && !loading
+                    val progressRecovered = playWhenReady &&
+                            recentForwardProgress &&
+                            seekElapsedMs >= 600L &&
+                            (localNonSecureSeek || secondarySyncMode)
+                    val effectiveLoadingRecovered = loadingRecovered || progressRecovered
                     val nativeSeekActive = nativeIsSeekSessionActive(handle)
                     if (!nativeSeekActive &&
                         seekLoadingSyncRequestId == pendingSeekRequestId &&
@@ -2507,7 +2530,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     // when native session remains active despite already converged position.
                     val nativeSeekSettled = !nativeSeekActive || nativeConvergedButStuck
                     val hardTimeout = seekElapsedMs >= seekCompletionTimeoutMs
-                            && !loadingRecovered
+                            && !effectiveLoadingRecovered
                     val secureForwardFarFromTarget = secureForwardSeek && !secureForwardNearTarget
                     if (secureForwardFarFromTarget &&
                         nativeSeekSettled &&
@@ -2528,11 +2551,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                             (if (secureForwardFarFromTarget) {
                                 hardTimeout
                             } else {
-                                loadingRecovered || convergedStable || hardTimeout
+                                effectiveLoadingRecovered || convergedStable || hardTimeout
                             })
                     if (shouldComplete) {
                         var forceTimeoutByNoProgress = false
-                        val needPostConfirm = playWhenReady && convergedStable && !hardTimeout && (!loadingRecovered || !isPlaying)
+                        val needPostConfirm = playWhenReady && convergedStable && !hardTimeout && (!effectiveLoadingRecovered || !isPlaying)
                         if (needPostConfirm) {
                             if (!pendingSeekPostConfirmActive) {
                                 pendingSeekHadPostConfirm = true
@@ -2552,7 +2575,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                             val unhealthyAfterConfirm = playWhenReady &&
                                     largeSeek &&
                                     nonSecureSeek &&
-                                    !loadingRecovered &&
+                                    !effectiveLoadingRecovered &&
                                     (loading || state == PlayerState.LOADING || !playingAfterConfirm)
                             if (!progressedAfterConfirm && confirmElapsedMs < seekCompletionPostConfirmWindowMs) {
                                 return@scheduleAtFixedRate
@@ -2576,7 +2599,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                                     TAG,
                                     "evt=seek_post_confirm_timeout_no_progress target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs confirm_elapsed_ms=$confirmElapsedMs progressed=$progressedAfterConfirm playing=$playingAfterConfirm"
                                 )
-                                if (playWhenReady) {
+                                if (playWhenReady && !secondarySyncMode) {
                                     val sinceLastReopenMs = if (lastSeekPostConfirmReopenAtMs > 0L) {
                                         now - lastSeekPostConfirmReopenAtMs
                                     } else {
@@ -2626,7 +2649,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                         // 2) 位置已收敛但仍长期 loading（典型：状态卡在 LOADING 且不再前进）也要按超时完成，
                         //    以便上层进入统一恢复链路，避免“seek_summary 显示完成但界面持续 loading”。
                         val timeoutDueToLoadingStuck = hardTimeout &&
-                                !loadingRecovered &&
+                                !effectiveLoadingRecovered &&
                                 loading &&
                                 playWhenReady &&
                                 state == PlayerState.LOADING
@@ -2645,7 +2668,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                         nativeSettleSeekSession(handle, completeByTimeout)
                         var timeoutTriggeredReopen = false
                         val secureSource = currentSourceCategory.startsWith("secure_")
-                        if (timeoutDueToLoadingStuck && playWhenReady && secureSource) {
+                        if (timeoutDueToLoadingStuck && playWhenReady && secureSource && !secondarySyncMode) {
                             val sinceLastReopenMs = if (lastSeekPostConfirmReopenAtMs > 0L) {
                                 now - lastSeekPostConfirmReopenAtMs
                             } else {
@@ -2671,12 +2694,12 @@ class HXCPlayerControl @JvmOverloads constructor(
                         val summaryReopenTriggered = summaryTriggeredReopen || timeoutTriggeredReopen
                         val unhealthyAfterComplete = playWhenReady &&
                                 (
-                                        (!loadingRecovered && (loading || state == PlayerState.LOADING))
-                                                || (!isPlaying && !loadingRecovered)
+                                        (!effectiveLoadingRecovered && (loading || state == PlayerState.LOADING))
+                                                || (!isPlaying && !effectiveLoadingRecovered)
                                         )
                         if (unhealthyAfterComplete) {
                             val unhealthyMsg =
-                                "evt=seek_completed_unhealthy id=$requestId target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying native_seek_active=$nativeSeekActive source_category=$currentSourceCategory"
+                                "evt=seek_completed_unhealthy id=$requestId target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered progress_recovered=$progressRecovered state=${state.name} play_when_ready=$playWhenReady is_playing=$isPlaying native_seek_active=$nativeSeekActive source_category=$currentSourceCategory"
                             if (completeByTimeout || loading) {
                                 Log.w(TAG, unhealthyMsg)
                             } else {
@@ -2714,6 +2737,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                                     val secureSource = currentSourceCategory.startsWith("secure_")
                                     val shouldReopenForUnresolved =
                                         checkPlayWhenReady &&
+                                                !secondarySyncMode &&
                                                 secureSource &&
                                                 !checkIsPlaying &&
                                                 (checkLoading || checkState == PlayerState.LOADING) &&
@@ -2744,8 +2768,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 }
                             }, 1600L)
                         }
-                        logInfo("evt=seek_completed id=$requestId target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory")
-                        logInfo("evt=seek_summary id=$requestId target=$target from=$from pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryReopenTriggered play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory")
+                        logInfo("evt=seek_completed id=$requestId target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading_recovered=$loadingRecovered progress_recovered=$progressRecovered converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck source_category=$currentSourceCategory")
+                        logInfo("evt=seek_summary id=$requestId target=$target from=$from pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs by_timeout=$completeByTimeout loading=$loading loading_recovered=$loadingRecovered progress_recovered=$progressRecovered native_seek_active=$nativeSeekActive converged_stable=$convergedStable hard_timeout=$hardTimeout native_converged_stuck=$nativeConvergedButStuck timeout_due_to_loading_stuck=$timeoutDueToLoadingStuck post_confirm=$summaryHadPostConfirm post_confirm_timeout=$summaryPostConfirmTimedOut reopen_triggered=$summaryReopenTriggered play_when_ready=$playWhenReady state=${state.name} source_category=$currentSourceCategory")
                         // Minimal diagnostics: arm a short post-seek window and only
                         // emit one key mismatch log when play intent and semantic diverge.
                         seekSettleDiagUntilMs = now + 2000L
@@ -2846,6 +2870,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         isPlayingNow: Boolean,
         playWhenReady: Boolean
     ) {
+        if (secondarySyncMode) return
         if (!playStallRecoveryEnabled) return
         if (!playStallCheckArmed) return
         if (pendingSeekActive) return
@@ -2991,6 +3016,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         isPlayingNow: Boolean,
         playWhenReady: Boolean
     ) {
+        if (secondarySyncMode) return
         if (!playLoopRecoveryEnabled) return
         if (durationSec <= 0.0 || positionSec < 0.0) return
         if (nowMs < playLoopSuppressUntilMs) {
@@ -3111,6 +3137,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         isPlayingNow: Boolean,
         playWhenReady: Boolean
     ) {
+        if (secondarySyncMode) return
         if (!manualPlayHardRecoverEnabled) return
         if (!manualPlayHardRecoverPending) return
         if (pendingSeekActive) return
