@@ -750,6 +750,23 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             audioQueue->next();
             return 0;
         }
+        uint8_t** frame_planes = frame->extended_data ? frame->extended_data : frame->data;
+        int frame_plane_count = av_sample_fmt_is_planar(sample_fmt) ? channels : 1;
+        if (!frame_planes || frame_plane_count <= 0 || frame_plane_count > 8) {
+            audioQueue->next();
+            return 0;
+        }
+        bool invalid_audio_plane = false;
+        for (int i = 0; i < frame_plane_count; ++i) {
+            if (!frame_planes[i]) {
+                invalid_audio_plane = true;
+                break;
+            }
+        }
+        if (invalid_audio_plane) {
+            audioQueue->next();
+            return 0;
+        }
         double pts = af->pts;  // ⚠️ 保存 PTS，用于后续时钟更新
 
         if (std::isfinite(pts) && pts >= 0.0 &&
@@ -819,6 +836,10 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         }
         int previous_output_channels = handle->audio_current_channels;
         int output_channels = bridge_output_channels_for_source(channels);
+        if (output_channels <= 0 || output_channels != dst_layout.nb_channels) {
+            audioQueue->next();
+            return 0;
+        }
         handle->audio_current_channels = output_channels;
         if (channels != handle->audio_logged_source_channels ||
             output_channels != handle->audio_logged_output_channels) {
@@ -851,8 +872,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
 
         // 重采样（如果需要）
         if (handle->resampler->is_needed()) {
-            uint8_t** src_planes = frame->extended_data ? frame->extended_data : frame->data;
-            int ret = handle->resampler->resample(src_planes, samples, &audio_data, &audio_samples);
+            int ret = handle->resampler->resample(frame_planes, samples, &audio_data, &audio_samples);
             if (ret < 0) {
                 audioQueue->next();
                 return 0;

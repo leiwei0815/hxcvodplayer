@@ -247,6 +247,7 @@ private:
 
     bool initAudioOutput(int sample_rate, int channels);
     void destroyAudioOutput();
+    void destroyAudioOutputObjectsLocked();
     void ensureAudioOutputForCurrentStream();
     SLresult setOpenSLESPlayState(SLuint32 state, bool require_audible);
     static void audioCallback(SLAndroidSimpleBufferQueueItf bq, void* context);
@@ -256,6 +257,7 @@ private:
     uint8_t           audio_buffer_[MAX_AUDIO_BUFFER_SIZE];
     int               audio_buffer_size_;
     std::mutex        audio_mutex_;
+    std::mutex        opensl_mutex_;
     std::atomic<bool>  audio_active_{false};
     std::atomic<int>   audio_cb_in_flight_{0};
     std::atomic<float> current_volume_{1.0f}; // last value passed to setVolume()

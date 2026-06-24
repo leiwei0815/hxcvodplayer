@@ -5957,6 +5957,7 @@ int AndroidPlayer::renderFrame(void* y_data, void* u_data, void* v_data,
 // ========== OpenSL ES audio output ==========
 
 bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
+    std::lock_guard<std::mutex> opensl_lock(opensl_mutex_);
     SLresult result;
 
     int output_channels = normalize_audio_output_channels(channels);
@@ -5978,27 +5979,28 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     result = (*engineObject_)->Realize(engineObject_, SL_BOOLEAN_FALSE);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to realize engine: %d", result);
+        destroyAudioOutputObjectsLocked();
         return false;
     }
     
     result = (*engineObject_)->GetInterface(engineObject_, SL_IID_ENGINE, &engineEngine_);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to get engine interface: %d", result);
-        destroyAudioOutput();
+        destroyAudioOutputObjectsLocked();
         return false;
     }
 
     result = (*engineEngine_)->CreateOutputMix(engineEngine_, &outputMixObject_, 0, nullptr, nullptr);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to create output mix: %d", result);
-        destroyAudioOutput();
+        destroyAudioOutputObjectsLocked();
         return false;
     }
 
     result = (*outputMixObject_)->Realize(outputMixObject_, SL_BOOLEAN_FALSE);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to realize output mix: %d", result);
-        destroyAudioOutput();
+        destroyAudioOutputObjectsLocked();
         return false;
     }
     
@@ -6059,35 +6061,35 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
                                                  &audioSrc, &audioSnk, 1, ids, req);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to create audio player: %d", result);
-        destroyAudioOutput();
+        destroyAudioOutputObjectsLocked();
         return false;
     }
 
     result = (*playerObject_)->Realize(playerObject_, SL_BOOLEAN_FALSE);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to realize audio player: %d", result);
-        destroyAudioOutput();
+        destroyAudioOutputObjectsLocked();
         return false;
     }
 
     result = (*playerObject_)->GetInterface(playerObject_, SL_IID_PLAY, &playItf_);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to get play interface: %d", result);
-        destroyAudioOutput();
+        destroyAudioOutputObjectsLocked();
         return false;
     }
 
     result = (*playerObject_)->GetInterface(playerObject_, SL_IID_BUFFERQUEUE, &bufferQueueItf_);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to get buffer queue interface: %d", result);
-        destroyAudioOutput();
+        destroyAudioOutputObjectsLocked();
         return false;
     }
 
     result = (*bufferQueueItf_)->RegisterCallback(bufferQueueItf_, audioCallback, this);
     if (result != SL_RESULT_SUCCESS) {
         LOGE("Failed to register callback: %d", result);
-        destroyAudioOutput();
+        destroyAudioOutputObjectsLocked();
         return false;
     }
     
@@ -6140,27 +6142,19 @@ bool AndroidPlayer::initAudioOutput(int sample_rate, int channels) {
     }
 
     memset(audio_buffer_, 0, audio_buffer_size_);
-    (*bufferQueueItf_)->Enqueue(bufferQueueItf_, audio_buffer_, audio_buffer_size_);
+    result = (*bufferQueueItf_)->Enqueue(bufferQueueItf_, audio_buffer_, audio_buffer_size_);
+    if (result != SL_RESULT_SUCCESS) {
+        LOGE("Failed to enqueue initial audio buffer: %d", result);
+        destroyAudioOutputObjectsLocked();
+        return false;
+    }
 
     LOGI("Audio output initialized successfully with %d Hz, output_channels=%d", sample_rate, output_channels);
     audio_active_ = true;
     return true;
 }
 
-void AndroidPlayer::destroyAudioOutput() {
-    // Signal audio callback to stop accessing player_core_
-    audio_active_ = false;
-
-    // Stop playback first so no new callbacks are triggered
-    if (playItf_) {
-        setOpenSLESPlayState(SL_PLAYSTATE_STOPPED, false);
-    }
-
-    // Acquire audio_mutex_ to ensure any in-flight callback has exited its critical section
-    {
-        std::lock_guard<std::mutex> lock(audio_mutex_);
-    }
-
+void AndroidPlayer::destroyAudioOutputObjectsLocked() {
     if (playerObject_) {
         (*playerObject_)->Destroy(playerObject_);
         playerObject_ = nullptr;
@@ -6178,6 +6172,36 @@ void AndroidPlayer::destroyAudioOutput() {
         (*engineObject_)->Destroy(engineObject_);
         engineObject_ = nullptr;
         engineEngine_ = nullptr;
+    }
+}
+
+void AndroidPlayer::destroyAudioOutput() {
+    // Signal audio callback to stop accessing player_core_.
+    audio_active_ = false;
+    audio_start_pending_.store(false, std::memory_order_release);
+
+    // Stop playback first so OpenSL stops scheduling new callbacks.  Protect
+    // every OpenSL object call with opensl_mutex_; Android's OpenSL layer can
+    // abort if SetPlayState/Realize/Destroy race on different threads.
+    {
+        std::lock_guard<std::mutex> opensl_lock(opensl_mutex_);
+        if (playItf_) {
+            SLresult result = (*playItf_)->SetPlayState(playItf_, SL_PLAYSTATE_STOPPED);
+            if (result != SL_RESULT_SUCCESS) {
+                LOGW("Failed to stop audio output before destroy: %d", result);
+            }
+        }
+    }
+
+    // Ensure any in-flight callback has exited before destroying buffer queues
+    // or the player core state used by swr_convert.
+    {
+        std::lock_guard<std::mutex> lock(audio_mutex_);
+    }
+
+    {
+        std::lock_guard<std::mutex> opensl_lock(opensl_mutex_);
+        destroyAudioOutputObjectsLocked();
     }
     
     audio_initialized_ = false;
@@ -6233,7 +6257,7 @@ void AndroidPlayer::ensureAudioOutputForCurrentStream() {
 }
 
 SLresult AndroidPlayer::setOpenSLESPlayState(SLuint32 state, bool require_audible) {
-    std::lock_guard<std::mutex> lock(audio_mutex_);
+    std::lock_guard<std::mutex> opensl_lock(opensl_mutex_);
     if (!playItf_) {
         return SL_RESULT_RESOURCE_ERROR;
     }
@@ -6267,7 +6291,13 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     if (!audio_active_ || !player_core_ || audio_buffer_size_ == 0) {
         int sz = audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096;
         memset(audio_buffer_, 0, sz);
-        SLresult enqueue_ret = (*bq)->Enqueue(bq, audio_buffer_, sz);
+        SLresult enqueue_ret = SL_RESULT_RESOURCE_ERROR;
+        {
+            std::lock_guard<std::mutex> opensl_lock(opensl_mutex_);
+            if (bufferQueueItf_ && bq == bufferQueueItf_) {
+                enqueue_ret = (*bq)->Enqueue(bq, audio_buffer_, sz);
+            }
+        }
         if (enqueue_ret != SL_RESULT_SUCCESS) {
             LOGW_RATE(50, "[audio] enqueue silent buffer failed: ret=%d size=%d", enqueue_ret, sz);
         }
@@ -6311,7 +6341,13 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
         audio_partial_count_  = 0;
     }
 
-    SLresult enqueue_ret = (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
+    SLresult enqueue_ret = SL_RESULT_RESOURCE_ERROR;
+    {
+        std::lock_guard<std::mutex> opensl_lock(opensl_mutex_);
+        if (bufferQueueItf_ && bq == bufferQueueItf_) {
+            enqueue_ret = (*bq)->Enqueue(bq, audio_buffer_, audio_buffer_size_);
+        }
+    }
     if (enqueue_ret != SL_RESULT_SUCCESS) {
         LOGW_RATE(50, "[audio] enqueue output buffer failed: ret=%d size=%d", enqueue_ret, audio_buffer_size_);
     }

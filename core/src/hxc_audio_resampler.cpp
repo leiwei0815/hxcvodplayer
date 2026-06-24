@@ -39,6 +39,25 @@ AudioResampler::~AudioResampler() {
 
 int AudioResampler::configure(const AVChannelLayout* src_ch_layout, AVSampleFormat src_sample_fmt, int src_sample_rate,
                                const AVChannelLayout* dst_ch_layout, AVSampleFormat dst_sample_fmt, int dst_sample_rate) {
+    if (!src_ch_layout || !dst_ch_layout ||
+        !av_channel_layout_check(src_ch_layout) ||
+        !av_channel_layout_check(dst_ch_layout) ||
+        src_ch_layout->nb_channels <= 0 ||
+        dst_ch_layout->nb_channels <= 0 ||
+        src_sample_rate <= 0 ||
+        dst_sample_rate <= 0 ||
+        av_get_bytes_per_sample(src_sample_fmt) <= 0 ||
+        av_get_bytes_per_sample(dst_sample_fmt) <= 0) {
+        LOG_ERROR("重采样配置参数无效");
+        has_config_ = false;
+        need_resample_ = false;
+        if (swr_ctx_) {
+            swr_free(&swr_ctx_);
+            swr_ctx_ = nullptr;
+        }
+        return AVERROR(EINVAL);
+    }
+
     // 如果已经有配置，并且参数完全相同，直接复用当前重采样器
     if (has_config_) {
         bool same_fmt = (src_sample_fmt_ == src_sample_fmt) &&
@@ -119,35 +138,64 @@ int AudioResampler::configure(const AVChannelLayout* src_ch_layout, AVSampleForm
 }
 
 int AudioResampler::resample(uint8_t** src_data, int src_nb_samples, uint8_t** dst_data, int* dst_nb_samples) {
+    if (dst_data) {
+        *dst_data = nullptr;
+    }
+    if (dst_nb_samples) {
+        *dst_nb_samples = 0;
+    }
+    if (!dst_data || !dst_nb_samples) {
+        return AVERROR(EINVAL);
+    }
     if (!need_resample_ || !swr_ctx_) {
         return -1;
     }
 
     // 输入为空或首通道指针为空时直接返回，避免 swr_convert 访问非法地址
     if (!src_data || !src_data[0] || src_nb_samples <= 0) {
-        if (dst_data) {
-            *dst_data = nullptr;
-        }
-        if (dst_nb_samples) {
-            *dst_nb_samples = 0;
-        }
         return 0;
+    }
+    if (src_nb_samples > 65536 ||
+        src_sample_rate_ <= 0 ||
+        dst_sample_rate_ <= 0 ||
+        dst_channels_ <= 0 ||
+        dst_channels_ > 8 ||
+        av_get_bytes_per_sample(src_sample_fmt_) <= 0 ||
+        av_get_bytes_per_sample(dst_sample_fmt_) <= 0 ||
+        !av_channel_layout_check(&src_ch_layout_) ||
+        !av_channel_layout_check(&dst_ch_layout_)) {
+        LOG_ERROR("重采样输入状态无效");
+        return AVERROR(EINVAL);
+    }
+
+    int src_channels = src_ch_layout_.nb_channels;
+    int src_planes = av_sample_fmt_is_planar(src_sample_fmt_) ? src_channels : 1;
+    if (src_planes <= 0 || src_planes > 8) {
+        LOG_ERROR("重采样输入 plane 数无效: ", src_planes);
+        return AVERROR(EINVAL);
+    }
+    for (int i = 0; i < src_planes; ++i) {
+        if (!src_data[i]) {
+            LOG_ERROR("重采样输入 plane 为空: ", i, "/", src_planes);
+            return 0;
+        }
     }
 
     // 计算输出样本数
     int src_rate = src_sample_rate_ > 0 ? src_sample_rate_ : dst_sample_rate_;
     int dst_rate = dst_sample_rate_ > 0 ? dst_sample_rate_ : src_rate;
+    if (src_rate <= 0 || dst_rate <= 0) {
+        return AVERROR(EINVAL);
+    }
     int64_t delay = swr_get_delay(swr_ctx_, src_rate);
     int out_samples = (int)av_rescale_rnd(delay + src_nb_samples, dst_rate, src_rate, AV_ROUND_UP);
 
     if (out_samples <= 0) {
-        if (dst_data) {
-            *dst_data = nullptr;
-        }
-        if (dst_nb_samples) {
-            *dst_nb_samples = 0;
-        }
         return 0;
+    }
+    if (out_samples > 131072) {
+        LOG_ERROR("重采样输出样本数异常: ", out_samples);
+        return AVERROR(EINVAL);
     }
 
     // 分配缓冲区
@@ -185,6 +233,10 @@ int AudioResampler::resample(uint8_t** src_data, int src_nb_samples, uint8_t** d
     if (converted < 0) {
         LOG_ERROR("重采样失败");
         return converted;
+    }
+
+    if (converted <= 0) {
+        return 0;
     }
 
     *dst_data = buffer_;
