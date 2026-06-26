@@ -228,6 +228,8 @@ public:
     double get_clock() const;
     void set_clock(double pts, int serial);
     void set_clock_at(double pts, int serial, double time);
+    void pause();
+    void resume();
     void sync_clock_to_slave(Clock* slave);
 };
 

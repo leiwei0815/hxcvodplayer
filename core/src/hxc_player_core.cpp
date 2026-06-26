@@ -1568,6 +1568,9 @@ void PlayerCore::play() {
     }
 
     pause_request_ = false;
+    audio_clock_.resume();
+    video_clock_.resume();
+    external_clock_.resume();
     set_play_when_ready_internal(true);
     LOG_INFO("恢复播放/设置 playWhenReady=true ...");
 
@@ -1601,6 +1604,9 @@ void PlayerCore::pause() {
 
     pause_request_ = true;
     set_play_when_ready_internal(false);
+    audio_clock_.pause();
+    video_clock_.pause();
+    external_clock_.pause();
     LOG_INFO("暂停播放（playWhenReady=false）...");
 
     // 暂停解码器（停止解码，节省 CPU）

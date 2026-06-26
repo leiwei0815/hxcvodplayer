@@ -42,6 +42,28 @@ void Clock::set_clock_at(double pts, int serial, double time) {
     this->serial = serial;
 }
 
+void Clock::pause() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (paused) {
+        return;
+    }
+    double time = av_gettime_relative() / 1000000.0;
+    pts = pts_drift + time;
+    last_updated = time;
+    paused = true;
+}
+
+void Clock::resume() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!paused) {
+        return;
+    }
+    double time = av_gettime_relative() / 1000000.0;
+    last_updated = time;
+    pts_drift = pts - time;
+    paused = false;
+}
+
 void Clock::sync_clock_to_slave(Clock* slave) {
     double clock = get_clock();
     double slave_clock = slave->get_clock();
