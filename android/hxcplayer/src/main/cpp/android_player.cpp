@@ -1056,6 +1056,8 @@ void AndroidPlayer::pause() {
     audio_rebuffer_min_resume_at_ms_ = 0;
     audio_rebuffer_cooldown_until_ms_ = 0;
     seek_resume_on_complete_.store(false, std::memory_order_release);
+    is_loading_.store(false, std::memory_order_release);
+    suppress_stale_loading_true_until_ms_.store(now + 5000, std::memory_order_release);
     // Keep pause semantic explicit: playWhenReady must be false after manual pause.
     player_core_set_play_when_ready(player_core_, 0);
     resetSeekFlowState(true, true, true, false);
@@ -1767,6 +1769,12 @@ void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
         bool core_playing_now = player->player_core_ && player_core_is_playing(player->player_core_) != 0;
         int64_t last_progress_ms = player->loading_progress_last_advance_ms_.load(std::memory_order_acquire);
         bool has_recent_progress = last_progress_ms > 0 && (now_ms_now - last_progress_ms) <= 1500;
+        if (!seek_loading && !play_when_ready_now) {
+            // Explicit pause is a stronger semantic than stale core loading edges.
+            player->suppress_stale_loading_true_until_ms_.store(now_ms_now + 5000, std::memory_order_release);
+            LOGI_RATE(30, "[state] ignore loading=true while playWhenReady=false");
+            return;
+        }
         if (!seek_loading && play_when_ready_now && core_playing_now && has_recent_progress) {
             // During steady playback some pipelines spike loading=true for a short moment.
             // Ignore this edge to avoid UI loading flash.
@@ -5213,6 +5221,11 @@ void AndroidPlayer::renderLoop() {
             bool likely_4k = gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160;
             bool in_loading = is_loading_.load(std::memory_order_acquire);
             bool in_sync_warmup = sync_warmup_frames_.load(std::memory_order_acquire) > 0;
+            bool play_when_ready_for_empty = player_core_get_play_when_ready(player_core_) != 0;
+            if (!play_when_ready_for_empty) {
+                // Do not let a user-paused empty queue age into an immediate soft recover on play().
+                empty_start_ms = now;
+            }
             // Non-seek soft recovery:
             // Prevent long "frozen picture + audio underrun" when we are not in
             // seek-recovery but decoder queue keeps empty unexpectedly.
