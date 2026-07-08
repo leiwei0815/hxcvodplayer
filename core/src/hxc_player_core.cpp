@@ -333,6 +333,60 @@ static bool hxc_apply_codec_extradata(AVCodecParameters* par, uint8_t* data, int
     return true;
 }
 
+static std::string hxc_format_codec_tag(uint32_t tag) {
+    if (tag == 0) {
+        return "0";
+    }
+    char text[5] = {
+        static_cast<char>(tag & 0xFF),
+        static_cast<char>((tag >> 8) & 0xFF),
+        static_cast<char>((tag >> 16) & 0xFF),
+        static_cast<char>((tag >> 24) & 0xFF),
+        0
+    };
+    for (int i = 0; i < 4; ++i) {
+        if (text[i] < 32 || text[i] > 126) {
+            text[i] = '.';
+        }
+    }
+    std::ostringstream oss;
+    oss << text << "/0x" << std::hex << std::setw(8) << std::setfill('0') << tag;
+    return oss.str();
+}
+
+static enum AVCodecID hxc_infer_video_codec_from_codec_tag(uint32_t tag) {
+    switch (tag) {
+        case MKTAG('a', 'v', 'c', '1'):
+        case MKTAG('a', 'v', 'c', '3'):
+        case MKTAG('h', '2', '6', '4'):
+        case MKTAG('H', '2', '6', '4'):
+            return AV_CODEC_ID_H264;
+        case MKTAG('h', 'v', 'c', '1'):
+        case MKTAG('h', 'e', 'v', '1'):
+        case MKTAG('h', 'e', 'v', 'c'):
+        case MKTAG('H', 'E', 'V', 'C'):
+            return AV_CODEC_ID_HEVC;
+        default:
+            return AV_CODEC_ID_NONE;
+    }
+}
+
+static std::string hxc_hex_prefix(const uint8_t* data, int size, int max_bytes = 24) {
+    if (!data || size <= 0) {
+        return "";
+    }
+    const int n = std::min(size, max_bytes);
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (int i = 0; i < n; ++i) {
+        if (i > 0) {
+            oss << ' ';
+        }
+        oss << std::setw(2) << static_cast<int>(data[i]);
+    }
+    return oss.str();
+}
+
 static bool hxc_build_avcc_extradata_from_sps_pps(const uint8_t* sps,
                                                   int sps_len,
                                                   const uint8_t* pps,
@@ -496,18 +550,42 @@ static enum AVCodecID hxc_probe_video_codec_from_stream_packets(AVFormatContext*
     while (scanned < kMaxPacketsToScan) {
         const int read_ret = av_read_frame(fmt, pkt);
         if (read_ret < 0) {
+            LOG_WARNING("evt=secure_codec_probe_read_end ret=", read_ret,
+                        " err=", hxc_av_err_to_string(read_ret),
+                        " scanned=", scanned,
+                        " video_packets=", videos,
+                        " pb_error=", (fmt && fmt->pb) ? fmt->pb->error : 0);
             break;
         }
         scanned++;
         if (pkt->stream_index == video_stream_index) {
             videos++;
             inferred = hxc_infer_video_codec_from_packet_data(pkt->data, pkt->size);
+            std::vector<std::pair<const uint8_t*, int>> nals;
+            bool nals_ok = hxc_collect_h264_nal_units(pkt->data, pkt->size, nals);
+            std::ostringstream nal_types;
+            int nal_log_count = 0;
+            if (nals_ok) {
+                for (const auto& nal : nals) {
+                    if (!nal.first || nal.second < 2 || nal_log_count >= 12) {
+                        continue;
+                    }
+                    if (nal_log_count > 0) {
+                        nal_types << ",";
+                    }
+                    nal_types << (nal.first[0] & 0x1F) << "/" << ((nal.first[0] >> 1) & 0x3F);
+                    nal_log_count++;
+                }
+            }
             LOG_WARNING("evt=secure_codec_probe_packet scanned=", scanned,
                         " video_packets=", videos,
                         " size=", pkt->size,
                         " flags=", pkt->flags,
                         " pts=", pkt->pts,
                         " dts=", pkt->dts,
+                        " prefix=", hxc_hex_prefix(pkt->data, pkt->size),
+                        " nals=", nals_ok ? static_cast<int>(nals.size()) : 0,
+                        " nal_types_h264_h265=", nal_types.str(),
                         " inferred=", static_cast<int>(inferred));
             if (inferred != AV_CODEC_ID_NONE) {
                 av_packet_unref(pkt);
@@ -2169,6 +2247,7 @@ int PlayerCore::open_common_process(const std::string &filename) {
                             " type=", par ? static_cast<int>(par->codec_type) : -1,
                             " codec_id=", par ? static_cast<int>(par->codec_id) : -1,
                             " codec=", par ? avcodec_get_name(par->codec_id) : "null",
+                            " codec_tag=", par ? hxc_format_codec_tag(par->codec_tag) : "null",
                             " width=", par ? par->width : 0,
                             " height=", par ? par->height : 0,
                             " sample_rate=", par ? par->sample_rate : 0,
@@ -2180,6 +2259,16 @@ int PlayerCore::open_common_process(const std::string &filename) {
     }
     if (secure_hls_open && config_.enable_video && video_stream_ >= 0) {
         AVCodecParameters* video_par = format_ctx_->streams[video_stream_]->codecpar;
+        if (video_par && video_par->codec_id == AV_CODEC_ID_NONE) {
+            enum AVCodecID tag_inferred = hxc_infer_video_codec_from_codec_tag(video_par->codec_tag);
+            if (tag_inferred != AV_CODEC_ID_NONE) {
+                video_par->codec_id = tag_inferred;
+                LOG_WARNING("evt=secure_codec_infer_from_tag codec_id=",
+                            static_cast<int>(tag_inferred),
+                            " codec=", avcodec_get_name(tag_inferred),
+                            " codec_tag=", hxc_format_codec_tag(video_par->codec_tag));
+            }
+        }
         if (video_par && video_par->codec_id == AV_CODEC_ID_NONE) {
             int packets_scanned = 0;
             int video_packets = 0;
@@ -3193,13 +3282,14 @@ int PlayerCore::stream_component_open(int stream_index) {
     bool request_video_hw_decode =
         (is_video_stream && config_.decode_mode == DecodeMode::Hardware);
     bool suppress_secure_hw_probe_error =
-        is_video_stream && request_video_hw_decode && !secure_session_.m3u8_url.empty();
+        is_video_stream && request_video_hw_decode;
     if (is_video_stream) {
         LOG_WARNING("evt=video_stream_open_begin stream=", stream_index,
                     " request_hw=", request_video_hw_decode ? 1 : 0,
                     " secure=", !secure_session_.m3u8_url.empty() ? 1 : 0,
                     " codec_id=", codecpar->codec_id,
                     " codec=", avcodec_get_name(codecpar->codec_id),
+                    " codec_tag=", hxc_format_codec_tag(codecpar->codec_tag),
                     " width=", codecpar->width,
                     " height=", codecpar->height,
                     " profile=", codecpar->profile,

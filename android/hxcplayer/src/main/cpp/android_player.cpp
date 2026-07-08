@@ -469,6 +469,8 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     LOGI("[open] openURL start_pos=%.3f url=%s", start_position, url ? url : "(null)");
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
+    has_pending_error_.store(false, std::memory_order_release);
+    suppress_secure_hw_probe_errors_.store(false, std::memory_order_release);
     open_start_position_sec_.store(start_position, std::memory_order_release);
     open_requested_at_ms_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count(),
@@ -813,6 +815,8 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     LOGI("[open] openWithSecureSession start_pos=%.3f url=%s", start_position, url ? url : "(null)");
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
+    has_pending_error_.store(false, std::memory_order_release);
+    suppress_secure_hw_probe_errors_.store(false, std::memory_order_release);
     open_start_position_sec_.store(start_position, std::memory_order_release);
     open_requested_at_ms_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count(),
@@ -858,6 +862,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
 
     auto stop_core_after_failed_attempt = [this](const char* reason) {
         LOGW("[open] secure attempt cleanup: %s", reason ? reason : "");
+        suppress_secure_hw_probe_errors_.store(false, std::memory_order_release);
         audio_start_pending_.store(false, std::memory_order_release);
         audio_rebuffer_pending_.store(false, std::memory_order_release);
         first_frame_wait_started_ms_ = 0;
@@ -873,6 +878,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     };
 
     auto open_secure_once = [&](PlayerDecodeModeC mode, const char* reason) -> int {
+        bool suppress_probe_errors = user_pref_hw && mode == PLAYER_DECODE_MODE_HARDWARE;
         DECODEI("evt=secure_decode_policy mode=%s user_pref=%s reason=%s",
                 mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
                 user_pref_hw ? "hardware" : "software",
@@ -884,10 +890,12 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         player_core_apply_secure_playback_profile(player_core_);
         player_core_set_decode_mode(player_core_, mode);
         int ret = -1;
+        suppress_secure_hw_probe_errors_.store(suppress_probe_errors, std::memory_order_release);
         {
             std::lock_guard<std::mutex> open_guard(g_player_core_open_mutex);
             ret = player_core_open_with_mode(player_core_, &source, &config);
         }
+        suppress_secure_hw_probe_errors_.store(false, std::memory_order_release);
         bool video_opened = player_core_is_video_stream_opened(player_core_) != 0;
         bool audio_opened = player_core_is_audio_stream_opened(player_core_) != 0;
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
@@ -916,6 +924,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
                     result,
                     video_opened ? 1 : 0,
                     decode_diag ? decode_diag : "");
+            has_pending_error_.store(false, std::memory_order_release);
             stop_core_after_failed_attempt("secure_hw_failed_before_soft_retry");
             secure_effective_mode = PLAYER_DECODE_MODE_SOFTWARE;
             result = open_secure_once(secure_effective_mode, "hardware_failed_soft_retry");
@@ -1892,6 +1901,18 @@ bool AndroidPlayer::consumeLastError(int& error_code, std::string& error_message
 void AndroidPlayer::errorStateCallback(int error_code, const char* error_msg, void* user_data) {
     auto* player = static_cast<AndroidPlayer*>(user_data);
     if (!player) {
+        return;
+    }
+
+    bool suppress_secure_hw_probe =
+            player->suppress_secure_hw_probe_errors_.load(std::memory_order_acquire) &&
+            (error_code == PLAYER_ERROR_CODEC_NOT_FOUND ||
+             error_code == PLAYER_ERROR_NO_VIDEO_STREAM ||
+             error_code == PLAYER_ERROR_CODEC_OPEN_FAILED);
+    if (suppress_secure_hw_probe) {
+        DECODEI("evt=secure_hw_probe_error_callback_suppressed code=%d msg=%s",
+                error_code,
+                error_msg ? error_msg : "");
         return;
     }
 
