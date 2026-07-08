@@ -58,9 +58,11 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     if (ret < 0) {
         LOGE("JNI_OnLoad: av_jni_set_java_vm failed ret=%d", ret);
         DECODEE("evt=jni_vm_bind status=failed ret=%d", ret);
+        hxc_android_mark_jni_vm_bound(0);
     } else {
         LOGI("JNI_OnLoad: av_jni_set_java_vm success ret=%d", ret);
         DECODEI("evt=jni_vm_bind status=ok ret=%d", ret);
+        hxc_android_mark_jni_vm_bound(1);
     }
     return JNI_VERSION_1_6;
 }

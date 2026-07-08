@@ -555,6 +555,9 @@ static bool hxc_convert_annexb_extradata_blob_to_avcc(AVCodecParameters* par) {
 
 #if defined(__ANDROID__)
 static bool hxc_android_mediacodec_jni_ready() {
+    if (hxc_android_is_jni_vm_bound()) {
+        return true;
+    }
     using AvJniGetJavaVmFn = int(*)(void**, void*);
     auto* sym = dlsym(RTLD_DEFAULT, "av_jni_get_java_vm");
     if (!sym) {
@@ -2878,17 +2881,34 @@ int PlayerCore::stream_component_open(int stream_index) {
         android_device_type = hxc_platform_hw_device_type();
         android_codec_registry_summary = hxc_collect_decoder_registry_summary(
             codecpar->codec_id, android_device_type);
-        const AVCodec* hw_codec = hxc_find_android_mediacodec_decoder(
-            codecpar->codec_id,
-            &android_mediacodec_decoder_name,
-            &android_mediacodec_decoder_candidates);
-        if (hw_codec) {
-            codec = hw_codec;
-            use_android_mediacodec_decoder = true;
-            android_hw_precheck = "mediacodec_decoder_selected";
+        const AVCodec* sw_codec = codec;
+        const bool sw_supports_hw =
+            sw_codec && android_device_type != AV_HWDEVICE_TYPE_NONE &&
+            hxc_codec_supports_hw_device(sw_codec, android_device_type);
+        // OpenGL 纹理上传依赖 YUV 平面；h264_mediacodec 直出 AV_PIX_FMT_MEDIACODEC
+        // 无法走现有渲染链路，仅使用 h264/h265 + MediaCodec hwaccel（可 hwframe_transfer）。
+        if (sw_supports_hw) {
+            codec = sw_codec;
+            fallback_codec = sw_codec;
+            use_android_mediacodec_decoder = false;
+            android_hw_precheck = "hwaccel_preferred_for_gl_render";
         } else {
-            android_mediacodec_decoder_missing = true;
-            android_hw_precheck = "mediacodec_decoder_not_found";
+            const AVCodec* hw_codec = hxc_find_android_mediacodec_decoder(
+                codecpar->codec_id,
+                &android_mediacodec_decoder_name,
+                &android_mediacodec_decoder_candidates);
+            if (hw_codec) {
+                android_mediacodec_decoder_missing = false;
+                android_hw_precheck = "mediacodec_decoder_skipped_gl_incompatible";
+                LOG_WARNING("检测到 ", android_mediacodec_decoder_name,
+                            " 但与 OpenGL 渲染不兼容，跳过直解并尝试软解/hwaccel");
+            } else {
+                android_mediacodec_decoder_missing = true;
+                android_hw_precheck = "mediacodec_decoder_not_found";
+            }
+            codec = sw_codec;
+            fallback_codec = sw_codec;
+            use_android_mediacodec_decoder = false;
         }
     }
 #endif
@@ -2963,7 +2983,7 @@ int PlayerCore::stream_component_open(int stream_index) {
 #endif
         hxc_append_extradata_diag(codecpar, decode_diag);
 #if defined(__ANDROID__)
-        if (request_video_hw_decode && use_android_mediacodec_decoder) {
+        if (request_video_hw_decode) {
             if (!video_hw_extradata_prep_diag_.empty()) {
                 decode_diag += video_hw_extradata_prep_diag_;
             }
@@ -3043,9 +3063,9 @@ int PlayerCore::stream_component_open(int stream_index) {
     int open_ret = avcodec_open2(codec_ctx, codec, nullptr);
 #if defined(__ANDROID__)
     if (open_ret < 0 && request_video_hw_decode && hw_decode_enabled &&
-        use_android_mediacodec_decoder && !hw_open_probe_retried) {
+        !hw_open_probe_retried) {
         hw_open_probe_retried = true;
-        LOG_WARNING("MediaCodec 首次打开失败，尝试读取关键帧补全 extradata 后重试。ret=", open_ret);
+        LOG_WARNING("硬解首次打开失败，尝试读取关键帧补全 extradata 后重试。ret=", open_ret);
         HxcExtradataProbeResult retry_probe = hxc_probe_video_extradata_for_mediacodec(
             format_ctx_, stream_index, codecpar, prefilled_video_packets,
             config_.start_time, true);
@@ -3060,6 +3080,11 @@ int PlayerCore::stream_component_open(int stream_index) {
             emit_error(ERROR_ALLOC_CONTEXT_FAILED, "硬解重试时创建解码器上下文失败");
             LOG_ERROR("硬解重试失败：无法重新创建解码器上下文");
             return -1;
+        }
+        if (use_android_mediacodec_decoder) {
+            hw_decode_enabled = true;
+        } else {
+            hw_decode_enabled = hxc_try_enable_hw_decode(codec_ctx, codec);
         }
         open_ret = avcodec_open2(codec_ctx, codec, nullptr);
         if (open_ret == 0) {

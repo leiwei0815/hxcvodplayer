@@ -4,7 +4,9 @@
  */
 
 #include "hxc_decoder.h"
+#include "hxc_logger.h"
 #include <iostream>
+#include <cstring>
 
 extern "C" {
 #include <libavutil/time.h>
@@ -18,6 +20,16 @@ namespace {
 static bool hxc_is_hwaccel_frame_format(AVPixelFormat fmt) {
     const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(fmt);
     return desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL);
+}
+
+static bool hxc_is_mediacodec_pixel_format(AVPixelFormat fmt) {
+#ifdef AV_PIX_FMT_MEDIACODEC
+    if (fmt == AV_PIX_FMT_MEDIACODEC) {
+        return true;
+    }
+#endif
+    const char* name = av_get_pix_fmt_name(fmt);
+    return name && std::strcmp(name, "mediacodec") == 0;
 }
 }
 
@@ -57,8 +69,10 @@ int Decoder::decode_frame(AVFrame* frame) {
     auto convert_hw_frame_if_needed = [&](AVFrame* target_frame) -> int {
         // 若为硬件帧，先转成软件帧，保持后续渲染链路（YUV 读取）兼容
         // 注意：部分平台下 frame->format 可能不是 HWACCEL 标记格式，但 hw_frames_ctx 仍有效。
+        const AVPixelFormat frame_fmt = static_cast<AVPixelFormat>(target_frame->format);
         bool needs_hw_transfer = (target_frame->hw_frames_ctx != nullptr) ||
-                                 hxc_is_hwaccel_frame_format(static_cast<AVPixelFormat>(target_frame->format)) ||
+                                 hxc_is_hwaccel_frame_format(frame_fmt) ||
+                                 hxc_is_mediacodec_pixel_format(frame_fmt) ||
                                  (codec_ctx_ && codec_ctx_->hw_device_ctx != nullptr) ||
                                  (target_frame->data[0] == nullptr);
         if (!needs_hw_transfer) {
@@ -71,6 +85,11 @@ int Decoder::decode_frame(AVFrame* frame) {
         }
         int transfer_ret = av_hwframe_transfer_data(sw_frame, target_frame, 0);
         if (transfer_ret < 0) {
+            const char* fmt_name = av_get_pix_fmt_name(frame_fmt);
+            LOG_ERROR("硬件帧转 YUV 失败: fmt=", (fmt_name ? fmt_name : "unknown"),
+                      " ret=", transfer_ret,
+                      " hw_frames_ctx=", (target_frame->hw_frames_ctx ? 1 : 0),
+                      " hw_device_ctx=", (codec_ctx_ && codec_ctx_->hw_device_ctx ? 1 : 0));
             av_frame_free(&sw_frame);
             return transfer_ret;
         }

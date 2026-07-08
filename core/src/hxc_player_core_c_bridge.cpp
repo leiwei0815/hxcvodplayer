@@ -17,6 +17,18 @@
 #include <chrono>
 #include "hxc_logger.h"
 
+#if defined(__ANDROID__)
+static std::atomic<bool> g_android_jni_vm_bound{false};
+
+void hxc_android_mark_jni_vm_bound(int ok) {
+    g_android_jni_vm_bound.store(ok != 0, std::memory_order_release);
+}
+
+int hxc_android_is_jni_vm_bound(void) {
+    return g_android_jni_vm_bound.load(std::memory_order_acquire) ? 1 : 0;
+}
+#endif
+
 extern "C" {
 #include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>

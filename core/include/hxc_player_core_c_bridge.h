@@ -144,6 +144,12 @@ double player_core_get_position(PlayerCoreHandle* handle);
 int player_core_is_video_hardware_decoding(PlayerCoreHandle* handle); // 1=硬解, 0=软解/未知
 const char* player_core_get_video_decode_diagnostic(PlayerCoreHandle* handle); // 例如 requested=hardware ... final=software
 
+#if defined(__ANDROID__)
+// JNI_OnLoad 绑定 JavaVM 后由 native 层标记，供 core 判断硬解预处理是否可执行。
+void hxc_android_mark_jni_vm_bound(int ok);
+int hxc_android_is_jni_vm_bound(void);
+#endif
+
 // 控制
 void player_core_seek(PlayerCoreHandle* handle, double pos);
 void player_core_set_volume(PlayerCoreHandle* handle, float volume);
