@@ -430,6 +430,8 @@ private:
     std::atomic<bool> has_pending_error_{false};
     int               last_error_code_{0};
     std::string       last_error_message_;
+    // SecureHLS probe errors are internal and must not leak before open settles.
+    std::atomic<bool> suppress_secure_hw_probe_errors_{false};
     static void errorStateCallback(int error_code, const char* error_msg, void* user_data);
 
     std::atomic<bool> has_pending_playback_completed_{false};

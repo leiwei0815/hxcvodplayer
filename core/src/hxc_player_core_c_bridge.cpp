@@ -374,6 +374,17 @@ int player_core_is_video_hardware_decoding(PlayerCoreHandle* handle) {
     return handle->core->is_video_hardware_decoding() ? 1 : 0;
 }
 
+// Stream-open status is consumed by AndroidPlayer loading/audio gating.
+int player_core_is_video_stream_opened(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return 0;
+    return handle->core->is_video_stream_opened() ? 1 : 0;
+}
+
+int player_core_is_audio_stream_opened(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return 0;
+    return handle->core->is_audio_stream_opened() ? 1 : 0;
+}
+
 const char* player_core_get_video_decode_diagnostic(PlayerCoreHandle* handle) {
     if (!handle || !handle->core) return "";
     static thread_local std::string decode_diag;
