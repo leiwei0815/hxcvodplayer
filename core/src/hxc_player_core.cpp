@@ -500,6 +500,13 @@ static enum AVCodecID hxc_probe_video_codec_from_stream_packets(AVFormatContext*
         if (pkt->stream_index == video_stream_index) {
             videos++;
             inferred = hxc_infer_video_codec_from_packet_data(pkt->data, pkt->size);
+            LOG_WARNING("evt=secure_codec_probe_packet scanned=", scanned,
+                        " video_packets=", videos,
+                        " size=", pkt->size,
+                        " flags=", pkt->flags,
+                        " pts=", pkt->pts,
+                        " dts=", pkt->dts,
+                        " inferred=", static_cast<int>(inferred));
             if (inferred != AV_CODEC_ID_NONE) {
                 av_packet_unref(pkt);
                 break;
@@ -2094,6 +2101,31 @@ int PlayerCore::open_common_process(const std::string &filename) {
     audio_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
 
     const bool secure_hls_open = !secure_session_.m3u8_url.empty();
+    if (secure_hls_open) {
+        LOG_WARNING("evt=secure_stream_summary nb_streams=", format_ctx_ ? format_ctx_->nb_streams : 0,
+                    " best_video=", video_stream_,
+                    " best_audio=", audio_stream_,
+                    " duration=", format_ctx_ ? format_ctx_->duration : 0,
+                    " start_time=", format_ctx_ ? format_ctx_->start_time : 0,
+                    " format=", (format_ctx_ && format_ctx_->iformat && format_ctx_->iformat->name)
+                            ? format_ctx_->iformat->name : "unknown");
+        if (format_ctx_) {
+            for (unsigned int i = 0; i < format_ctx_->nb_streams; ++i) {
+                AVStream* stream = format_ctx_->streams[i];
+                AVCodecParameters* par = stream ? stream->codecpar : nullptr;
+                LOG_WARNING("evt=secure_stream_detail idx=", i,
+                            " type=", par ? static_cast<int>(par->codec_type) : -1,
+                            " codec_id=", par ? static_cast<int>(par->codec_id) : -1,
+                            " codec=", par ? avcodec_get_name(par->codec_id) : "null",
+                            " width=", par ? par->width : 0,
+                            " height=", par ? par->height : 0,
+                            " sample_rate=", par ? par->sample_rate : 0,
+                            " channels=", par ? par->ch_layout.nb_channels : 0,
+                            " extradata_size=", par ? par->extradata_size : 0,
+                            " extradata_fmt=", hxc_extradata_format_tag(par));
+            }
+        }
+    }
     if (secure_hls_open && config_.enable_video && video_stream_ >= 0) {
         AVCodecParameters* video_par = format_ctx_->streams[video_stream_]->codecpar;
         if (video_par && video_par->codec_id == AV_CODEC_ID_NONE) {
@@ -2223,11 +2255,9 @@ int PlayerCore::open_common_process(const std::string &filename) {
             emit_error(ERROR_NO_VIDEO_STREAM, "无法打开视频流");
             video_stream_opened_ = false;
             if (secure_hls_open) {
-                LOG_ERROR("SecureHLS 视频流打开失败，终止 open，避免进入纯音频黑屏播放");
-                set_state(PlayerState::Error);
-                return -1;
+                LOG_WARNING("evt=secure_video_open_failed_continue_audio reason=codec_or_video_open_failed");
             }
-            // 非加密/非 SecureHLS 保留历史行为：继续尝试打开音频流。
+            // 保留历史行为：继续尝试打开音频流。视频根因通过 secure_* 诊断日志继续定位。
         } else {
             auto open_video_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - open_video_begin).count();
@@ -2236,10 +2266,7 @@ int PlayerCore::open_common_process(const std::string &filename) {
             video_stream_opened_ = true;
         }
     } else if (secure_hls_open && config_.enable_video) {
-        LOG_ERROR("SecureHLS 未找到可用视频流，终止 open，避免进入纯音频播放");
-        emit_error(ERROR_NO_VIDEO_STREAM, "无法打开视频流");
-        set_state(PlayerState::Error);
-        return -1;
+        LOG_WARNING("evt=secure_no_video_stream_continue_audio reason=no_best_video_stream");
     }
     
     if (config_.enable_audio && audio_stream_ >= 0) {

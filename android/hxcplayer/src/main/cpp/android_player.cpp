@@ -905,6 +905,18 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         return true;
     }
     LOGE("Failed to open secure hls: %d", result);
+    audio_start_pending_.store(false, std::memory_order_release);
+    audio_rebuffer_pending_.store(false, std::memory_order_release);
+    first_frame_wait_started_ms_ = 0;
+    audio_start_deadline_ms_ = 0;
+    setOpenSLESPlayState(SL_PLAYSTATE_STOPPED, false);
+    {
+        std::lock_guard<std::mutex> lock(audio_mutex_);
+    }
+    if (player_core_) {
+        player_core_stop(player_core_);
+    }
+    resetRenderStateForStreamSwitch();
     return false;
 }
 
