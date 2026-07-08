@@ -265,6 +265,53 @@ static bool hxc_collect_h264_nal_units(const uint8_t* data,
     return !nals_out.empty();
 }
 
+static enum AVCodecID hxc_infer_video_codec_from_packet_data(const uint8_t* data, int size) {
+    std::vector<std::pair<const uint8_t*, int>> nals;
+    if (!hxc_collect_h264_nal_units(data, size, nals)) {
+        return AV_CODEC_ID_NONE;
+    }
+
+    bool h264_sps = false;
+    bool h264_pps = false;
+    bool h264_slice = false;
+    bool h265_vps = false;
+    bool h265_sps = false;
+    bool h265_pps = false;
+    bool h265_slice = false;
+    for (const auto& nal : nals) {
+        if (!nal.first || nal.second < 2) {
+            continue;
+        }
+        const int h264_type = nal.first[0] & 0x1F;
+        if (h264_type == 7) {
+            h264_sps = true;
+        } else if (h264_type == 8) {
+            h264_pps = true;
+        } else if (h264_type == 5 || h264_type == 1) {
+            h264_slice = true;
+        }
+
+        const int h265_type = (nal.first[0] >> 1) & 0x3F;
+        if (h265_type == 32) {
+            h265_vps = true;
+        } else if (h265_type == 33) {
+            h265_sps = true;
+        } else if (h265_type == 34) {
+            h265_pps = true;
+        } else if ((h265_type >= 0 && h265_type <= 9) || h265_type == 19 || h265_type == 20) {
+            h265_slice = true;
+        }
+    }
+
+    if ((h265_sps && h265_pps) || (h265_vps && h265_slice)) {
+        return AV_CODEC_ID_HEVC;
+    }
+    if ((h264_sps && h264_pps) || (h264_sps && h264_slice)) {
+        return AV_CODEC_ID_H264;
+    }
+    return AV_CODEC_ID_NONE;
+}
+
 static bool hxc_apply_codec_extradata(AVCodecParameters* par, uint8_t* data, int size) {
     if (!par || !data || size <= 0) {
         av_freep(&data);
@@ -419,6 +466,169 @@ static bool hxc_seek_format_context(AVFormatContext* fmt, int stream_index, doub
     }
     avformat_flush(fmt);
     return true;
+}
+
+static enum AVCodecID hxc_probe_video_codec_from_stream_packets(AVFormatContext* fmt,
+                                                                int video_stream_index,
+                                                                int* packets_scanned,
+                                                                int* video_packets) {
+    if (packets_scanned) {
+        *packets_scanned = 0;
+    }
+    if (video_packets) {
+        *video_packets = 0;
+    }
+    if (!fmt || video_stream_index < 0) {
+        return AV_CODEC_ID_NONE;
+    }
+
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) {
+        return AV_CODEC_ID_NONE;
+    }
+
+    enum AVCodecID inferred = AV_CODEC_ID_NONE;
+    constexpr int kMaxPacketsToScan = 160;
+    int scanned = 0;
+    int videos = 0;
+    while (scanned < kMaxPacketsToScan) {
+        const int read_ret = av_read_frame(fmt, pkt);
+        if (read_ret < 0) {
+            break;
+        }
+        scanned++;
+        if (pkt->stream_index == video_stream_index) {
+            videos++;
+            inferred = hxc_infer_video_codec_from_packet_data(pkt->data, pkt->size);
+            if (inferred != AV_CODEC_ID_NONE) {
+                av_packet_unref(pkt);
+                break;
+            }
+        }
+        av_packet_unref(pkt);
+    }
+
+    av_packet_free(&pkt);
+    if (packets_scanned) {
+        *packets_scanned = scanned;
+    }
+    if (video_packets) {
+        *video_packets = videos;
+    }
+    return inferred;
+}
+
+static bool hxc_is_hwaccel_frame_format_core(AVPixelFormat fmt) {
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(fmt);
+    if (desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+        return true;
+    }
+#ifdef AV_PIX_FMT_MEDIACODEC
+    if (fmt == AV_PIX_FMT_MEDIACODEC) {
+        return true;
+    }
+#endif
+    const char* name = av_get_pix_fmt_name(fmt);
+    return name && std::strcmp(name, "mediacodec") == 0;
+}
+
+static bool hxc_validate_hw_frame_transfer(AVCodecContext* codec_ctx,
+                                           const std::vector<AVPacket*>& packets,
+                                           std::string* failure_reason) {
+    if (!codec_ctx || packets.empty()) {
+        return true;
+    }
+
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) {
+        if (failure_reason) {
+            *failure_reason = "alloc_frame_failed";
+        }
+        return false;
+    }
+
+    bool saw_frame = false;
+    bool ok = true;
+    for (AVPacket* src_pkt : packets) {
+        if (!src_pkt) {
+            continue;
+        }
+        AVPacket* pkt = av_packet_alloc();
+        if (!pkt) {
+            ok = false;
+            if (failure_reason) {
+                *failure_reason = "alloc_packet_failed";
+            }
+            break;
+        }
+        if (av_packet_ref(pkt, src_pkt) < 0) {
+            av_packet_free(&pkt);
+            continue;
+        }
+
+        int send_ret = avcodec_send_packet(codec_ctx, pkt);
+        av_packet_free(&pkt);
+        if (send_ret < 0 && send_ret != AVERROR(EAGAIN)) {
+            ok = false;
+            if (failure_reason) {
+                *failure_reason = "send_packet_failed:" + std::to_string(send_ret);
+            }
+            break;
+        }
+
+        while (true) {
+            int recv_ret = avcodec_receive_frame(codec_ctx, frame);
+            if (recv_ret == AVERROR(EAGAIN) || recv_ret == AVERROR_EOF) {
+                break;
+            }
+            if (recv_ret < 0) {
+                ok = false;
+                if (failure_reason) {
+                    *failure_reason = "receive_frame_failed:" + std::to_string(recv_ret);
+                }
+                break;
+            }
+
+            saw_frame = true;
+            AVPixelFormat frame_fmt = static_cast<AVPixelFormat>(frame->format);
+            bool needs_transfer = frame->hw_frames_ctx != nullptr ||
+                                  hxc_is_hwaccel_frame_format_core(frame_fmt) ||
+                                  codec_ctx->hw_device_ctx != nullptr ||
+                                  frame->data[0] == nullptr;
+            if (needs_transfer) {
+                AVFrame* sw_frame = av_frame_alloc();
+                if (!sw_frame) {
+                    ok = false;
+                    if (failure_reason) {
+                        *failure_reason = "alloc_sw_frame_failed";
+                    }
+                } else {
+                    int transfer_ret = av_hwframe_transfer_data(sw_frame, frame, 0);
+                    if (transfer_ret < 0) {
+                        ok = false;
+                        if (failure_reason) {
+                            const char* fmt_name = av_get_pix_fmt_name(frame_fmt);
+                            *failure_reason = std::string("hw_transfer_failed fmt=") +
+                                              (fmt_name ? fmt_name : "unknown") +
+                                              " ret=" + std::to_string(transfer_ret);
+                        }
+                    }
+                    av_frame_free(&sw_frame);
+                }
+            }
+            av_frame_unref(frame);
+            if (!ok || saw_frame) {
+                break;
+            }
+        }
+        if (!ok || saw_frame) {
+            break;
+        }
+    }
+
+    av_frame_free(&frame);
+    avcodec_flush_buffers(codec_ctx);
+    return ok;
 }
 
 static void hxc_merge_extradata_probe_result(HxcExtradataProbeResult& dst,
@@ -1882,6 +2092,29 @@ int PlayerCore::open_common_process(const std::string &filename) {
     // 查找视频流和音频流
     video_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     audio_stream_ = av_find_best_stream(format_ctx_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+
+    const bool secure_hls_open = !secure_session_.m3u8_url.empty();
+    if (secure_hls_open && config_.enable_video && video_stream_ >= 0) {
+        AVCodecParameters* video_par = format_ctx_->streams[video_stream_]->codecpar;
+        if (video_par && video_par->codec_id == AV_CODEC_ID_NONE) {
+            int packets_scanned = 0;
+            int video_packets = 0;
+            enum AVCodecID inferred = hxc_probe_video_codec_from_stream_packets(
+                format_ctx_, video_stream_, &packets_scanned, &video_packets);
+            if (inferred != AV_CODEC_ID_NONE) {
+                video_par->codec_id = inferred;
+                LOG_WARNING("SecureHLS 视频 codec_id 缺失，已从首段包推断 codec_id=",
+                            static_cast<int>(inferred),
+                            " scanned=", packets_scanned,
+                            " video_packets=", video_packets);
+            } else {
+                LOG_ERROR("SecureHLS 视频 codec_id 缺失且无法从首段包推断，scanned=",
+                          packets_scanned,
+                          " video_packets=", video_packets);
+            }
+            hxc_seek_format_context(format_ctx_, video_stream_, 0.0);
+        }
+    }
     
     // 填充媒体信息
     media_info_.filename = filename;
@@ -1989,7 +2222,12 @@ int PlayerCore::open_common_process(const std::string &filename) {
             LOG_ERROR("无法打开视频流");
             emit_error(ERROR_NO_VIDEO_STREAM, "无法打开视频流");
             video_stream_opened_ = false;
-            // 注意：继续尝试打开音频流，不直接返回错误
+            if (secure_hls_open) {
+                LOG_ERROR("SecureHLS 视频流打开失败，终止 open，避免进入纯音频黑屏播放");
+                set_state(PlayerState::Error);
+                return -1;
+            }
+            // 非加密/非 SecureHLS 保留历史行为：继续尝试打开音频流。
         } else {
             auto open_video_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - open_video_begin).count();
@@ -1997,6 +2235,11 @@ int PlayerCore::open_common_process(const std::string &filename) {
             LOG_INFO("stream_component_open(video) 耗时: ", open_video_ms, " ms");
             video_stream_opened_ = true;
         }
+    } else if (secure_hls_open && config_.enable_video) {
+        LOG_ERROR("SecureHLS 未找到可用视频流，终止 open，避免进入纯音频播放");
+        emit_error(ERROR_NO_VIDEO_STREAM, "无法打开视频流");
+        set_state(PlayerState::Error);
+        return -1;
     }
     
     if (config_.enable_audio && audio_stream_ >= 0) {
@@ -3093,6 +3336,15 @@ int PlayerCore::stream_component_open(int stream_index) {
         }
     }
 #endif
+    if (open_ret == 0 && request_video_hw_decode && hw_decode_enabled) {
+        std::string transfer_failure;
+        if (!hxc_validate_hw_frame_transfer(codec_ctx, prefilled_video_packets, &transfer_failure)) {
+            LOG_WARNING("硬解帧转 YUV 预检失败，自动回退软解: ", transfer_failure);
+            decode_diag += " reason=hw_transfer_precheck_failed_fallback_soft";
+            decode_diag += " transfer_err=" + transfer_failure;
+            open_ret = AVERROR(EINVAL);
+        }
+    }
     if (open_ret < 0 && request_video_hw_decode && hw_decode_enabled) {
         std::string open_err = hxc_av_err_to_string(open_ret);
         LOG_WARNING("硬解打开失败，自动回退软解。ret=", open_ret);
