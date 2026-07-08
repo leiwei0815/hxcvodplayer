@@ -24,6 +24,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 #include <libavutil/time.h>
+#include <libavutil/intreadwrite.h>
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
@@ -201,13 +202,242 @@ struct HxcExtradataProbeResult {
     bool extradata_found = false;
     bool used_bsf = false;
     bool used_decoder = false;
+    bool used_manual = false;
+    bool used_head_seek = false;
 };
+
+static bool hxc_collect_h264_nal_units(const uint8_t* data,
+                                       int size,
+                                       std::vector<std::pair<const uint8_t*, int>>& nals_out) {
+    if (!data || size <= 0) {
+        return false;
+    }
+    nals_out.clear();
+
+    auto try_annexb = [&]() -> bool {
+        int i = 0;
+        while (i + 3 < size) {
+            int start = -1;
+            if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
+                start = i + 3;
+                i += 3;
+            } else if (i + 4 < size && data[i] == 0 && data[i + 1] == 0 &&
+                       data[i + 2] == 0 && data[i + 3] == 1) {
+                start = i + 4;
+                i += 4;
+            } else {
+                ++i;
+                continue;
+            }
+
+            int next = i;
+            while (next + 3 < size) {
+                if ((data[next] == 0 && data[next + 1] == 0 && data[next + 2] == 1) ||
+                    (next + 4 < size && data[next] == 0 && data[next + 1] == 0 &&
+                     data[next + 2] == 0 && data[next + 3] == 1)) {
+                    break;
+                }
+                ++next;
+            }
+            const int nal_size = (next < size ? next : size) - start;
+            if (nal_size > 0) {
+                nals_out.emplace_back(data + start, nal_size);
+            }
+            i = next;
+        }
+        return !nals_out.empty();
+    };
+
+    if (try_annexb()) {
+        return true;
+    }
+
+    int offset = 0;
+    while (offset + 4 < size) {
+        const int nal_size = AV_RB32(data + offset);
+        offset += 4;
+        if (nal_size <= 0 || offset + nal_size > size) {
+            break;
+        }
+        nals_out.emplace_back(data + offset, nal_size);
+        offset += nal_size;
+    }
+    return !nals_out.empty();
+}
+
+static bool hxc_apply_codec_extradata(AVCodecParameters* par, uint8_t* data, int size) {
+    if (!par || !data || size <= 0) {
+        av_freep(&data);
+        return false;
+    }
+    av_freep(&par->extradata);
+    par->extradata_size = 0;
+    par->extradata = static_cast<uint8_t*>(av_malloc(size + AV_INPUT_BUFFER_PADDING_SIZE));
+    if (!par->extradata) {
+        av_freep(&data);
+        return false;
+    }
+    memcpy(par->extradata, data, size);
+    par->extradata_size = size;
+    memset(par->extradata + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    av_free(data);
+    return true;
+}
+
+static bool hxc_build_avcc_extradata_from_sps_pps(const uint8_t* sps,
+                                                  int sps_len,
+                                                  const uint8_t* pps,
+                                                  int pps_len,
+                                                  uint8_t** out_data,
+                                                  int* out_size) {
+    if (!sps || sps_len < 4 || !pps || pps_len < 1 || !out_data || !out_size) {
+        return false;
+    }
+    const int total_size = 11 + sps_len + pps_len;
+    uint8_t* extradata = static_cast<uint8_t*>(av_malloc(total_size + AV_INPUT_BUFFER_PADDING_SIZE));
+    if (!extradata) {
+        return false;
+    }
+
+    int idx = 0;
+    extradata[idx++] = 1;
+    extradata[idx++] = sps[1];
+    extradata[idx++] = sps[2];
+    extradata[idx++] = sps[3];
+    extradata[idx++] = 0xFF;
+    extradata[idx++] = 0xE1;
+    extradata[idx++] = static_cast<uint8_t>((sps_len >> 8) & 0xFF);
+    extradata[idx++] = static_cast<uint8_t>(sps_len & 0xFF);
+    memcpy(extradata + idx, sps, sps_len);
+    idx += sps_len;
+    extradata[idx++] = 1;
+    extradata[idx++] = static_cast<uint8_t>((pps_len >> 8) & 0xFF);
+    extradata[idx++] = static_cast<uint8_t>(pps_len & 0xFF);
+    memcpy(extradata + idx, pps, pps_len);
+    idx += pps_len;
+
+    *out_data = extradata;
+    *out_size = idx;
+    return true;
+}
+
+static bool hxc_manual_extract_h264_extradata_from_packets(AVCodecParameters* par,
+                                                           const std::vector<AVPacket*>& packets) {
+    if (!par || par->codec_id != AV_CODEC_ID_H264) {
+        return false;
+    }
+
+    const uint8_t* sps = nullptr;
+    int sps_len = 0;
+    const uint8_t* pps = nullptr;
+    int pps_len = 0;
+
+    for (AVPacket* pkt : packets) {
+        if (!pkt || !pkt->data || pkt->size <= 0) {
+            continue;
+        }
+        if (!(pkt->flags & AV_PKT_FLAG_KEY)) {
+            continue;
+        }
+        std::vector<std::pair<const uint8_t*, int>> nals;
+        if (!hxc_collect_h264_nal_units(pkt->data, pkt->size, nals)) {
+            continue;
+        }
+        for (const auto& nal : nals) {
+            if (nal.second < 1) {
+                continue;
+            }
+            const int nal_type = nal.first[0] & 0x1F;
+            if (nal_type == 7 && !sps) {
+                sps = nal.first;
+                sps_len = nal.second;
+            } else if (nal_type == 8 && !pps) {
+                pps = nal.first;
+                pps_len = nal.second;
+            }
+        }
+        if (sps && pps) {
+            break;
+        }
+    }
+
+    for (AVPacket* pkt : packets) {
+        if (sps && pps) {
+            break;
+        }
+        if (!pkt || !pkt->data || pkt->size <= 0) {
+            continue;
+        }
+        std::vector<std::pair<const uint8_t*, int>> nals;
+        if (!hxc_collect_h264_nal_units(pkt->data, pkt->size, nals)) {
+            continue;
+        }
+        for (const auto& nal : nals) {
+            if (nal.second < 1) {
+                continue;
+            }
+            const int nal_type = nal.first[0] & 0x1F;
+            if (nal_type == 7 && !sps) {
+                sps = nal.first;
+                sps_len = nal.second;
+            } else if (nal_type == 8 && !pps) {
+                pps = nal.first;
+                pps_len = nal.second;
+            }
+        }
+        if (sps && pps) {
+            break;
+        }
+    }
+
+    if (!sps || !pps) {
+        return false;
+    }
+
+    uint8_t* avcc = nullptr;
+    int avcc_size = 0;
+    if (!hxc_build_avcc_extradata_from_sps_pps(sps, sps_len, pps, pps_len, &avcc, &avcc_size)) {
+        return false;
+    }
+    return hxc_apply_codec_extradata(par, avcc, avcc_size);
+}
+
+static bool hxc_seek_format_context(AVFormatContext* fmt, int stream_index, double seconds) {
+    if (!fmt) {
+        return false;
+    }
+    int64_t seek_target = static_cast<int64_t>(std::max(0.0, seconds) * AV_TIME_BASE);
+    int seek_ret = av_seek_frame(fmt, stream_index, seek_target, AVSEEK_FLAG_BACKWARD);
+    if (seek_ret < 0) {
+        seek_ret = av_seek_frame(fmt, -1, seek_target, AVSEEK_FLAG_BACKWARD);
+    }
+    if (seek_ret < 0) {
+        seek_ret = av_seek_frame(fmt, -1, seek_target, AVSEEK_FLAG_ANY);
+    }
+    if (seek_ret < 0) {
+        return false;
+    }
+    avformat_flush(fmt);
+    return true;
+}
+
+static void hxc_merge_extradata_probe_result(HxcExtradataProbeResult& dst,
+                                             const HxcExtradataProbeResult& src) {
+    dst.packets_scanned += src.packets_scanned;
+    dst.video_packets += src.video_packets;
+    dst.extradata_found = dst.extradata_found || src.extradata_found;
+    dst.used_bsf = dst.used_bsf || src.used_bsf;
+    dst.used_decoder = dst.used_decoder || src.used_decoder;
+    dst.used_manual = dst.used_manual || src.used_manual;
+    dst.used_head_seek = dst.used_head_seek || src.used_head_seek;
+}
 
 static HxcExtradataProbeResult hxc_probe_video_extradata(AVFormatContext* fmt,
                                                          int video_stream_index,
                                                          AVCodecParameters* par,
                                                          std::vector<AVPacket*>& prefilled_out,
-                                                         bool append_prefilled) {
+                                                         bool append_prefilled,
+                                                         bool store_prefilled) {
     HxcExtradataProbeResult result;
     if (!append_prefilled) {
         hxc_release_prefilled_packets(prefilled_out);
@@ -221,13 +451,14 @@ static HxcExtradataProbeResult hxc_probe_video_extradata(AVFormatContext* fmt,
         return result;
     }
 
-    std::vector<AVPacket*> video_packets;
-    constexpr int kMaxPacketsToScan = 80;
+    std::vector<AVPacket*> owned_video_packets;
+    constexpr int kMaxPacketsToScan = 120;
     while (result.packets_scanned < kMaxPacketsToScan) {
         if (par->extradata_size > 0 && std::strcmp(hxc_extradata_format_tag(par), "avcc") == 0) {
             result.extradata_found = true;
             break;
         }
+
         const int read_ret = av_read_frame(fmt, pkt);
         if (read_ret < 0) {
             break;
@@ -240,18 +471,28 @@ static HxcExtradataProbeResult hxc_probe_video_extradata(AVFormatContext* fmt,
         }
 
         result.video_packets++;
-        AVPacket* stored = av_packet_alloc();
-        if (stored && av_packet_ref(stored, pkt) == 0) {
-            prefilled_out.push_back(stored);
-            video_packets.push_back(stored);
-            if (hxc_bsf_extract_extradata_from_packet(par, pkt)) {
-                result.extradata_found = true;
-                result.used_bsf = true;
+        AVPacket* owned = av_packet_alloc();
+        if (!owned || av_packet_ref(owned, pkt) < 0) {
+            av_packet_free(&owned);
+            av_packet_unref(pkt);
+            continue;
+        }
+        owned_video_packets.push_back(owned);
+        if (store_prefilled) {
+            AVPacket* stored = av_packet_alloc();
+            if (stored && av_packet_ref(stored, pkt) == 0) {
+                prefilled_out.push_back(stored);
+            } else {
+                av_packet_free(&stored);
             }
-        } else {
-            av_packet_free(&stored);
+        }
+
+        if (hxc_bsf_extract_extradata_from_packet(par, pkt)) {
+            result.extradata_found = true;
+            result.used_bsf = true;
         }
         av_packet_unref(pkt);
+
         if (par->extradata_size > 0 && std::strcmp(hxc_extradata_format_tag(par), "avcc") == 0) {
             result.extradata_found = true;
             break;
@@ -260,11 +501,25 @@ static HxcExtradataProbeResult hxc_probe_video_extradata(AVFormatContext* fmt,
 
     if ((par->extradata_size <= 0 ||
          std::strcmp(hxc_extradata_format_tag(par), "avcc") != 0) &&
-        !video_packets.empty() &&
-        hxc_decoder_probe_extradata_from_packets(par, video_packets)) {
+        !owned_video_packets.empty() &&
+        hxc_decoder_probe_extradata_from_packets(par, owned_video_packets)) {
         result.extradata_found = true;
         result.used_decoder = true;
     }
+
+    if ((par->extradata_size <= 0 ||
+         std::strcmp(hxc_extradata_format_tag(par), "avcc") != 0) &&
+        !owned_video_packets.empty() &&
+        hxc_manual_extract_h264_extradata_from_packets(par, owned_video_packets)) {
+        result.extradata_found = true;
+        result.used_manual = true;
+    }
+
+    for (AVPacket* owned : owned_video_packets) {
+        av_packet_unref(owned);
+        av_packet_free(&owned);
+    }
+    owned_video_packets.clear();
 
     av_packet_free(&pkt);
     if (!result.extradata_found && par->extradata_size > 0 &&
@@ -274,13 +529,129 @@ static HxcExtradataProbeResult hxc_probe_video_extradata(AVFormatContext* fmt,
     return result;
 }
 
+static bool hxc_mediacodec_extradata_ready(const AVCodecParameters* par) {
+    return par && par->extradata_size > 0 &&
+           std::strcmp(hxc_extradata_format_tag(par), "avcc") == 0;
+}
+
+static bool hxc_convert_annexb_extradata_blob_to_avcc(AVCodecParameters* par) {
+    if (!par || par->codec_id != AV_CODEC_ID_H264) {
+        return false;
+    }
+    if (std::strcmp(hxc_extradata_format_tag(par), "annexb") != 0) {
+        return false;
+    }
+    AVPacket fake;
+    if (av_new_packet(&fake, par->extradata_size) < 0) {
+        return false;
+    }
+    memcpy(fake.data, par->extradata, par->extradata_size);
+    fake.flags |= AV_PKT_FLAG_KEY;
+    std::vector<AVPacket*> packets = {&fake};
+    const bool ok = hxc_manual_extract_h264_extradata_from_packets(par, packets);
+    av_packet_unref(&fake);
+    return ok;
+}
+
+#if defined(__ANDROID__)
+static bool hxc_android_mediacodec_jni_ready() {
+    using AvJniGetJavaVmFn = int(*)(void**, void*);
+    auto* sym = dlsym(RTLD_DEFAULT, "av_jni_get_java_vm");
+    if (!sym) {
+        return false;
+    }
+    void* vm = nullptr;
+    auto fn = reinterpret_cast<AvJniGetJavaVmFn>(sym);
+    return fn(&vm, nullptr) == 0 && vm != nullptr;
+}
+#endif
+
+static HxcExtradataProbeResult hxc_prepare_hw_extradata_from_stream_head(AVFormatContext* fmt,
+                                                                         int video_stream_index,
+                                                                         AVCodecParameters* par) {
+    HxcExtradataProbeResult result;
+    if (!fmt || !par || video_stream_index < 0) {
+        return result;
+    }
+    if (hxc_mediacodec_extradata_ready(par)) {
+        result.extradata_found = true;
+        return result;
+    }
+
+    if (hxc_convert_annexb_extradata_blob_to_avcc(par)) {
+        result.extradata_found = true;
+        result.used_manual = true;
+        return result;
+    }
+
+    if (!hxc_seek_format_context(fmt, video_stream_index, 0.0)) {
+        return result;
+    }
+
+    std::vector<AVPacket*> discard;
+    result = hxc_probe_video_extradata(fmt, video_stream_index, par, discard, false, false);
+    result.used_head_seek = true;
+    hxc_release_prefilled_packets(discard);
+
+    if (result.extradata_found && fmt->streams[video_stream_index]) {
+        avcodec_parameters_copy(fmt->streams[video_stream_index]->codecpar, par);
+    }
+    return result;
+}
+
+static HxcExtradataProbeResult hxc_probe_video_extradata_for_mediacodec(AVFormatContext* fmt,
+                                                                        int video_stream_index,
+                                                                        AVCodecParameters* par,
+                                                                        std::vector<AVPacket*>& prefilled_out,
+                                                                        double resume_start_sec,
+                                                                        bool append_prefilled) {
+    HxcExtradataProbeResult combined;
+    if (!fmt || !par || video_stream_index < 0) {
+        return combined;
+    }
+
+    if (!append_prefilled) {
+        hxc_release_prefilled_packets(prefilled_out);
+    }
+
+    if (!hxc_mediacodec_extradata_ready(par) &&
+        resume_start_sec > 0.5 &&
+        hxc_should_probe_extradata_for_mediacodec(par)) {
+        if (hxc_seek_format_context(fmt, video_stream_index, 0.0)) {
+            HxcExtradataProbeResult head_probe = hxc_probe_video_extradata(
+                fmt, video_stream_index, par, prefilled_out, true, false);
+            hxc_merge_extradata_probe_result(combined, head_probe);
+            combined.used_head_seek = true;
+            hxc_seek_format_context(fmt, -1, resume_start_sec);
+        }
+    }
+
+    if (!hxc_mediacodec_extradata_ready(par) &&
+        (hxc_should_probe_extradata_for_mediacodec(par) || prefilled_out.empty())) {
+        HxcExtradataProbeResult tail_probe = hxc_probe_video_extradata(
+            fmt, video_stream_index, par, prefilled_out, true, true);
+        hxc_merge_extradata_probe_result(combined, tail_probe);
+    } else if (prefilled_out.empty()) {
+        HxcExtradataProbeResult tail_probe = hxc_probe_video_extradata(
+            fmt, video_stream_index, par, prefilled_out, true, true);
+        hxc_merge_extradata_probe_result(combined, tail_probe);
+    }
+
+    if (!combined.extradata_found && hxc_mediacodec_extradata_ready(par)) {
+        combined.extradata_found = true;
+    }
+    return combined;
+}
+
 static std::string hxc_format_extradata_probe_diag(const HxcExtradataProbeResult& result) {
     std::ostringstream oss;
     oss << " hw_probe_scanned=" << result.packets_scanned
         << " hw_probe_video_packets=" << result.video_packets
         << " hw_probe_found=" << (result.extradata_found ? 1 : 0)
         << " hw_probe_bsf=" << (result.used_bsf ? 1 : 0)
-        << " hw_probe_decoder=" << (result.used_decoder ? 1 : 0);
+        << " hw_probe_decoder=" << (result.used_decoder ? 1 : 0)
+        << " hw_probe_manual=" << (result.used_manual ? 1 : 0)
+        << " hw_head_seek=" << (result.used_head_seek ? 1 : 0);
     return oss.str();
 }
 
@@ -770,6 +1141,8 @@ int PlayerCore::open(const std::string& filename) {
     abort_request_ = false;
     decode_finished_ = false;  // ⚠️ 重置解码结束标志
     video_hw_decode_active_.store(false, std::memory_order_release);
+    video_hw_extradata_ready_.store(false, std::memory_order_release);
+    video_hw_extradata_prep_diag_.clear();
     playback_completed_notified_.store(false, std::memory_order_release);  // ⚠️ 重置播放完成通知标志
     io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
 
@@ -1540,6 +1913,37 @@ int PlayerCore::open_common_process(const std::string &filename) {
     audio_queue_ = std::make_unique<FrameQueue<AudioFrame>>(config_.audio_queue_size);
     
     LOG_INFO("队列创建完成");
+
+#if defined(__ANDROID__)
+    video_hw_extradata_prep_diag_.clear();
+    video_hw_extradata_ready_.store(false, std::memory_order_release);
+    if (config_.enable_video && video_stream_ >= 0 &&
+        config_.decode_mode == DecodeMode::Hardware) {
+        AVCodecParameters* video_par = format_ctx_->streams[video_stream_]->codecpar;
+        const bool jni_ready = hxc_android_mediacodec_jni_ready();
+        const bool secure_hls = !secure_session_.m3u8_url.empty();
+        LOG_INFO("加密/在线硬解预处理: jni_vm_ready=", jni_ready ? 1 : 0,
+                 " secure_hls=", secure_hls ? 1 : 0,
+                 " start_time=", config_.start_time);
+        if (!jni_ready) {
+            video_hw_extradata_prep_diag_ = " hw_prep_before_seek=0 jni_vm_ready=0";
+            LOG_WARNING("MediaCodec JNI 未就绪，硬解可能回退软解");
+        } else {
+            HxcExtradataProbeResult prep = hxc_prepare_hw_extradata_from_stream_head(
+                format_ctx_, video_stream_, video_par);
+            const bool ready = hxc_mediacodec_extradata_ready(video_par);
+            video_hw_extradata_ready_.store(ready, std::memory_order_release);
+            video_hw_extradata_prep_diag_ = std::string(" hw_prep_before_seek=1 jni_vm_ready=1") +
+                                            hxc_format_extradata_probe_diag(prep) +
+                                            " extradata_size=" + std::to_string(video_par->extradata_size) +
+                                            " extradata_fmt=" + hxc_extradata_format_tag(video_par);
+            LOG_INFO("硬解 extradata 预处理: ready=", ready ? 1 : 0,
+                     ", extradata_size=", video_par->extradata_size,
+                     ", manual=", prep.used_manual ? 1 : 0,
+                     ", head_seek=", prep.used_head_seek ? 1 : 0);
+        }
+    }
+#endif
     
     // seek to start_time before launching threads (like ffplay/ijkplayer)
     if (config_.start_time > 0.0) {
@@ -2499,14 +2903,7 @@ int PlayerCore::stream_component_open(int stream_index) {
     std::vector<AVPacket*> prefilled_video_packets;
     bool hw_open_probe_retried = false;
 #if defined(__ANDROID__)
-    if (request_video_hw_decode && use_android_mediacodec_decoder &&
-        hxc_should_probe_extradata_for_mediacodec(codecpar)) {
-        HxcExtradataProbeResult pre_probe = hxc_probe_video_extradata(
-            format_ctx_, stream_index, codecpar, prefilled_video_packets, false);
-        LOG_INFO("MediaCodec 打开前 extradata 预探测: found=", pre_probe.extradata_found ? 1 : 0,
-                 ", scanned=", pre_probe.packets_scanned,
-                 ", video_packets=", pre_probe.video_packets);
-    }
+    HxcExtradataProbeResult pre_probe{};
 #endif
     
     auto alloc_codec_context = [&]() -> AVCodecContext* {
@@ -2566,8 +2963,30 @@ int PlayerCore::stream_component_open(int stream_index) {
 #endif
         hxc_append_extradata_diag(codecpar, decode_diag);
 #if defined(__ANDROID__)
-        if (request_video_hw_decode && use_android_mediacodec_decoder && !prefilled_video_packets.empty()) {
-            decode_diag += " hw_prefill_packets=" + std::to_string(prefilled_video_packets.size());
+        if (request_video_hw_decode && use_android_mediacodec_decoder) {
+            if (!video_hw_extradata_prep_diag_.empty()) {
+                decode_diag += video_hw_extradata_prep_diag_;
+            }
+            if (video_hw_extradata_ready_.load(std::memory_order_acquire)) {
+                pre_probe = hxc_probe_video_extradata(
+                    format_ctx_, stream_index, codecpar, prefilled_video_packets, false, true);
+                decode_diag += " hw_extradata_ready=1";
+            } else if (hxc_should_probe_extradata_for_mediacodec(codecpar)) {
+                pre_probe = hxc_probe_video_extradata_for_mediacodec(
+                    format_ctx_, stream_index, codecpar, prefilled_video_packets,
+                    config_.start_time, false);
+            }
+            if (pre_probe.packets_scanned > 0) {
+                decode_diag += hxc_format_extradata_probe_diag(pre_probe);
+            }
+            if (!prefilled_video_packets.empty()) {
+                decode_diag += " hw_prefill_packets=" + std::to_string(prefilled_video_packets.size());
+            }
+            LOG_INFO("MediaCodec 打开前 extradata 状态: ready=",
+                     video_hw_extradata_ready_.load(std::memory_order_acquire) ? 1 : 0,
+                     ", found=", pre_probe.extradata_found ? 1 : 0,
+                     ", scanned=", pre_probe.packets_scanned,
+                     ", video_packets=", pre_probe.video_packets);
         }
 #endif
     }
@@ -2627,8 +3046,9 @@ int PlayerCore::stream_component_open(int stream_index) {
         use_android_mediacodec_decoder && !hw_open_probe_retried) {
         hw_open_probe_retried = true;
         LOG_WARNING("MediaCodec 首次打开失败，尝试读取关键帧补全 extradata 后重试。ret=", open_ret);
-        HxcExtradataProbeResult retry_probe = hxc_probe_video_extradata(
-            format_ctx_, stream_index, codecpar, prefilled_video_packets, true);
+        HxcExtradataProbeResult retry_probe = hxc_probe_video_extradata_for_mediacodec(
+            format_ctx_, stream_index, codecpar, prefilled_video_packets,
+            config_.start_time, true);
         decode_diag += hxc_format_extradata_probe_diag(retry_probe);
         hxc_append_extradata_diag(codecpar, decode_diag);
         decode_diag += " hw_open_probe_retry=1";
