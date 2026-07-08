@@ -7,6 +7,7 @@
 #include "hxc_logger.h"
 #include <iostream>
 #include <cstring>
+#include <atomic>
 
 extern "C" {
 #include <libavutil/time.h>
@@ -83,9 +84,27 @@ int Decoder::decode_frame(AVFrame* frame) {
         if (!sw_frame) {
             return AVERROR(ENOMEM);
         }
+        const char* fmt_name = av_get_pix_fmt_name(frame_fmt);
+        static std::atomic<int> s_hw_transfer_log_count{0};
+        int log_index = s_hw_transfer_log_count.fetch_add(1, std::memory_order_relaxed);
+        bool log_sample = log_index < 16;
+        if (log_sample) {
+            LOG_WARNING("evt=decode_hw_frame_transfer_begin idx=", log_index,
+                        " fmt=", (fmt_name ? fmt_name : "unknown"),
+                        " width=", target_frame->width,
+                        " height=", target_frame->height,
+                        " hw_frames_ctx=", (target_frame->hw_frames_ctx ? 1 : 0),
+                        " hw_device_ctx=", (codec_ctx_ && codec_ctx_->hw_device_ctx ? 1 : 0),
+                        " data0=", (target_frame->data[0] ? 1 : 0));
+        }
         int transfer_ret = av_hwframe_transfer_data(sw_frame, target_frame, 0);
+        if (log_sample || transfer_ret < 0) {
+            LOG_WARNING("evt=decode_hw_frame_transfer_result idx=", log_index,
+                        " ret=", transfer_ret,
+                        " sw_fmt=", av_get_pix_fmt_name(static_cast<AVPixelFormat>(sw_frame->format))
+                                ? av_get_pix_fmt_name(static_cast<AVPixelFormat>(sw_frame->format)) : "unknown");
+        }
         if (transfer_ret < 0) {
-            const char* fmt_name = av_get_pix_fmt_name(frame_fmt);
             LOG_ERROR("硬件帧转 YUV 失败: fmt=", (fmt_name ? fmt_name : "unknown"),
                       " ret=", transfer_ret,
                       " hw_frames_ctx=", (target_frame->hw_frames_ctx ? 1 : 0),

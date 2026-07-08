@@ -142,6 +142,8 @@ int player_core_is_playing(PlayerCoreHandle* handle);          // 1=true, 0=fals
 double player_core_get_duration(PlayerCoreHandle* handle);
 double player_core_get_position(PlayerCoreHandle* handle);
 int player_core_is_video_hardware_decoding(PlayerCoreHandle* handle); // 1=硬解, 0=软解/未知
+int player_core_is_video_stream_opened(PlayerCoreHandle* handle); // 1=视频流已打开, 0=未打开
+int player_core_is_audio_stream_opened(PlayerCoreHandle* handle); // 1=音频流已打开, 0=未打开
 const char* player_core_get_video_decode_diagnostic(PlayerCoreHandle* handle); // 例如 requested=hardware ... final=software
 
 #if defined(__ANDROID__)

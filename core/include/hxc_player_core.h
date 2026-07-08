@@ -171,6 +171,8 @@ public:
     // 使 delay = 0，消除 clock 因音频暂停期间自动流逝带来的累积偏差。
     void anchor_clock(double pts);  // 重锚时钟（秒）
     bool is_video_hardware_decoding() const { return video_hw_decode_active_.load(std::memory_order_acquire); }
+    bool is_video_stream_opened() const { return video_stream_opened_; }
+    bool is_audio_stream_opened() const { return audio_stream_opened_; }
     std::string get_video_decode_diagnostic() const;
     
     // 获取帧队列（用于渲染）

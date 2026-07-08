@@ -47,6 +47,8 @@ namespace hxcplayer {
 
 namespace {
 
+static std::string hxc_av_err_to_string(int err);
+
 static bool hxc_is_http_client_error(int ret) {
     return ret == AVERROR_HTTP_BAD_REQUEST ||
            ret == AVERROR_HTTP_NOT_FOUND ||
@@ -543,6 +545,9 @@ static bool hxc_validate_hw_frame_transfer(AVCodecContext* codec_ctx,
                                            const std::vector<AVPacket*>& packets,
                                            std::string* failure_reason) {
     if (!codec_ctx || packets.empty()) {
+        LOG_WARNING("evt=hw_transfer_precheck_skip reason=",
+                    (!codec_ctx ? "null_codec_ctx" : "no_prefilled_packets"),
+                    " packets=", packets.size());
         return true;
     }
 
@@ -575,6 +580,10 @@ static bool hxc_validate_hw_frame_transfer(AVCodecContext* codec_ctx,
 
         int send_ret = avcodec_send_packet(codec_ctx, pkt);
         av_packet_free(&pkt);
+        LOG_WARNING("evt=hw_transfer_precheck_send ret=", send_ret,
+                    " err=", send_ret < 0 ? hxc_av_err_to_string(send_ret) : "ok",
+                    " pkt_size=", src_pkt->size,
+                    " pkt_flags=", src_pkt->flags);
         if (send_ret < 0 && send_ret != AVERROR(EAGAIN)) {
             ok = false;
             if (failure_reason) {
@@ -598,10 +607,19 @@ static bool hxc_validate_hw_frame_transfer(AVCodecContext* codec_ctx,
 
             saw_frame = true;
             AVPixelFormat frame_fmt = static_cast<AVPixelFormat>(frame->format);
+            const char* frame_fmt_name = av_get_pix_fmt_name(frame_fmt);
             bool needs_transfer = frame->hw_frames_ctx != nullptr ||
                                   hxc_is_hwaccel_frame_format_core(frame_fmt) ||
                                   codec_ctx->hw_device_ctx != nullptr ||
                                   frame->data[0] == nullptr;
+            LOG_WARNING("evt=hw_transfer_precheck_frame fmt=",
+                        (frame_fmt_name ? frame_fmt_name : "unknown"),
+                        " width=", frame->width,
+                        " height=", frame->height,
+                        " needs_transfer=", needs_transfer ? 1 : 0,
+                        " hw_frames_ctx=", frame->hw_frames_ctx ? 1 : 0,
+                        " hw_device_ctx=", codec_ctx->hw_device_ctx ? 1 : 0,
+                        " data0=", frame->data[0] ? 1 : 0);
             if (needs_transfer) {
                 AVFrame* sw_frame = av_frame_alloc();
                 if (!sw_frame) {
@@ -611,6 +629,10 @@ static bool hxc_validate_hw_frame_transfer(AVCodecContext* codec_ctx,
                     }
                 } else {
                     int transfer_ret = av_hwframe_transfer_data(sw_frame, frame, 0);
+                    LOG_WARNING("evt=hw_transfer_precheck_result ret=", transfer_ret,
+                                " err=", transfer_ret < 0 ? hxc_av_err_to_string(transfer_ret) : "ok",
+                                " sw_fmt=", av_get_pix_fmt_name(static_cast<AVPixelFormat>(sw_frame->format))
+                                        ? av_get_pix_fmt_name(static_cast<AVPixelFormat>(sw_frame->format)) : "unknown");
                     if (transfer_ret < 0) {
                         ok = false;
                         if (failure_reason) {
@@ -1008,8 +1030,22 @@ static enum AVPixelFormat hxc_find_hw_pix_fmt_from_codec_ctx(const AVCodecContex
 
 static enum AVPixelFormat hxc_hw_get_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
     enum AVPixelFormat hw_fmt = hxc_find_hw_pix_fmt_from_codec_ctx(ctx);
+    std::ostringstream candidates;
+    bool has_candidate = false;
+    for (const enum AVPixelFormat *p = pix_fmts; p && *p != AV_PIX_FMT_NONE; ++p) {
+        if (has_candidate) {
+            candidates << ",";
+        }
+        const char* fmt_name = av_get_pix_fmt_name(*p);
+        candidates << (fmt_name ? fmt_name : "unknown");
+        has_candidate = true;
+    }
+    const char* target_name = av_get_pix_fmt_name(hw_fmt);
+    LOG_WARNING("evt=hw_get_format target=", (target_name ? target_name : "none"),
+                " candidates=", candidates.str());
     for (const enum AVPixelFormat *p = pix_fmts; p && *p != AV_PIX_FMT_NONE; ++p) {
         if (*p == hw_fmt) {
+            LOG_WARNING("evt=hw_get_format_selected fmt=", (target_name ? target_name : "unknown"));
             return *p;
         }
     }
@@ -1022,31 +1058,47 @@ static bool hxc_codec_supports_hw_device(const AVCodec *codec, enum AVHWDeviceTy
 }
 static bool hxc_try_enable_hw_decode(AVCodecContext *codec_ctx, const AVCodec *codec) {
     if (!codec_ctx || !codec) {
+        LOG_WARNING("evt=hw_enable_skip reason=null_ctx_or_codec");
         return false;
     }
     enum AVHWDeviceType device_type = hxc_platform_hw_device_type();
+    const char* device_name = av_hwdevice_get_type_name(device_type);
+    LOG_WARNING("evt=hw_enable_begin codec=", (codec->name ? codec->name : "unknown"),
+                " codec_id=", codec->id,
+                " device=", (device_name ? device_name : "none"));
     if (device_type == AV_HWDEVICE_TYPE_NONE) {
+        LOG_WARNING("evt=hw_enable_skip reason=platform_hw_device_none");
         return false;
     }
     HxcHwCodecConfig hw_config = hxc_find_hw_codec_config(codec, device_type);
     if (!hw_config.found) {
+        LOG_WARNING("evt=hw_enable_skip reason=codec_config_not_found device=",
+                    (device_name ? device_name : "none"));
         return false;
     }
+    const char* pix_name = av_get_pix_fmt_name(hw_config.pix_fmt);
+    LOG_WARNING("evt=hw_config_found pix_fmt=", (pix_name ? pix_name : "unknown"),
+                " methods=", hw_config.methods);
     if (hw_config.methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
         AVBufferRef *hw_device_ctx = nullptr;
         int ret = av_hwdevice_ctx_create(&hw_device_ctx, device_type, nullptr, nullptr, 0);
         if (ret < 0 || !hw_device_ctx) {
-            LOG_WARNING("创建硬件解码设备失败，回退软解 ret=", ret);
+            LOG_WARNING("evt=hw_device_create_failed ret=", ret,
+                        " err=", hxc_av_err_to_string(ret));
             return false;
         }
         codec_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
         av_buffer_unref(&hw_device_ctx);
         if (!codec_ctx->hw_device_ctx) {
-            LOG_WARNING("硬件解码设备引用失败，回退软解");
+            LOG_WARNING("evt=hw_device_ref_failed");
             return false;
         }
+        LOG_WARNING("evt=hw_device_ready method=HW_DEVICE_CTX");
+    } else {
+        LOG_WARNING("evt=hw_device_ctx_not_required methods=", hw_config.methods);
     }
     codec_ctx->get_format = hxc_hw_get_format;
+    LOG_WARNING("evt=hw_enable_success get_format=1");
     return true;
 }
 
@@ -2252,10 +2304,15 @@ int PlayerCore::open_common_process(const std::string &filename) {
         auto open_video_begin = std::chrono::steady_clock::now();
         if (stream_component_open(video_stream_) < 0) {
             LOG_ERROR("无法打开视频流");
-            emit_error(ERROR_NO_VIDEO_STREAM, "无法打开视频流");
             video_stream_opened_ = false;
             if (secure_hls_open) {
                 LOG_WARNING("evt=secure_video_open_failed_continue_audio reason=codec_or_video_open_failed");
+            }
+            if (secure_hls_open && config_.decode_mode == DecodeMode::Hardware) {
+                LOG_WARNING("evt=secure_hw_probe_error_suppressed code=", ERROR_NO_VIDEO_STREAM,
+                            " msg=无法打开视频流");
+            } else {
+                emit_error(ERROR_NO_VIDEO_STREAM, "无法打开视频流");
             }
             // 保留历史行为：继续尝试打开音频流。视频根因通过 secure_* 诊断日志继续定位。
         } else {
@@ -3135,6 +3192,22 @@ int PlayerCore::stream_component_open(int stream_index) {
     bool is_video_stream = codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
     bool request_video_hw_decode =
         (is_video_stream && config_.decode_mode == DecodeMode::Hardware);
+    bool suppress_secure_hw_probe_error =
+        is_video_stream && request_video_hw_decode && !secure_session_.m3u8_url.empty();
+    if (is_video_stream) {
+        LOG_WARNING("evt=video_stream_open_begin stream=", stream_index,
+                    " request_hw=", request_video_hw_decode ? 1 : 0,
+                    " secure=", !secure_session_.m3u8_url.empty() ? 1 : 0,
+                    " codec_id=", codecpar->codec_id,
+                    " codec=", avcodec_get_name(codecpar->codec_id),
+                    " width=", codecpar->width,
+                    " height=", codecpar->height,
+                    " profile=", codecpar->profile,
+                    " level=", codecpar->level,
+                    " par_fmt=", codecpar->format,
+                    " extradata_size=", codecpar->extradata_size,
+                    " extradata_fmt=", hxc_extradata_format_tag(codecpar));
+    }
 
     // 查找解码器（默认先拿通用解码器，作为最终回退）
     const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
@@ -3155,6 +3228,13 @@ int PlayerCore::stream_component_open(int stream_index) {
         const bool sw_supports_hw =
             sw_codec && android_device_type != AV_HWDEVICE_TYPE_NONE &&
             hxc_codec_supports_hw_device(sw_codec, android_device_type);
+        LOG_WARNING("evt=android_hw_precheck codec_id=", codecpar->codec_id,
+                    " sw_codec=", (sw_codec && sw_codec->name ? sw_codec->name : "null"),
+                    " device=", (av_hwdevice_get_type_name(android_device_type)
+                            ? av_hwdevice_get_type_name(android_device_type) : "none"),
+                    " ffmcfg=", hxc_avcodec_config_has_mediacodec() ? 1 : 0,
+                    " sw_supports_hw=", sw_supports_hw ? 1 : 0,
+                    " registry=", android_codec_registry_summary);
         // OpenGL 纹理上传依赖 YUV 平面；h264_mediacodec 直出 AV_PIX_FMT_MEDIACODEC
         // 无法走现有渲染链路，仅使用 h264/h265 + MediaCodec hwaccel（可 hwframe_transfer）。
         if (sw_supports_hw) {
@@ -3186,7 +3266,27 @@ int PlayerCore::stream_component_open(int stream_index) {
         std::ostringstream oss;
         oss << "找不到解码器 codecID:" << codecpar->codec_id;
         LOG_ERROR(oss.str());
-        emit_error(ERROR_CODEC_NOT_FOUND, oss.str());
+        if (is_video_stream) {
+            std::lock_guard<std::mutex> lock(video_decode_diag_mutex_);
+            std::string diag = request_video_hw_decode ? "requested=hardware" : "requested=software";
+            diag += " final=codec_not_found";
+            diag += " codec_id=" + std::to_string(codecpar->codec_id);
+            diag += " codec_type=" + std::to_string(codecpar->codec_type);
+            diag += " width=" + std::to_string(codecpar->width);
+            diag += " height=" + std::to_string(codecpar->height);
+            diag += " format=" + std::to_string(codecpar->format);
+            hxc_append_extradata_diag(codecpar, diag);
+            if (!secure_session_.m3u8_url.empty()) {
+                diag += " source=secure_hls";
+            }
+            video_decode_diag_ = diag;
+        }
+        if (suppress_secure_hw_probe_error) {
+            LOG_WARNING("evt=secure_hw_probe_error_suppressed code=", ERROR_CODEC_NOT_FOUND,
+                        " msg=", oss.str());
+        } else {
+            emit_error(ERROR_CODEC_NOT_FOUND, oss.str());
+        }
         return -1;
     }
 
@@ -3330,7 +3430,21 @@ int PlayerCore::stream_component_open(int stream_index) {
     }
 
     // 打开解码器（若硬解打开失败，先尝试读取关键帧补全 extradata 再重试一次）
+    if (is_video_stream) {
+        LOG_WARNING("evt=avcodec_open2_begin codec=", (codec && codec->name ? codec->name : "unknown"),
+                    " request_hw=", request_video_hw_decode ? 1 : 0,
+                    " hw_enabled=", hw_decode_enabled ? 1 : 0,
+                    " thread_count=", codec_ctx->thread_count,
+                    " thread_type=", codec_ctx->thread_type,
+                    " has_hw_device_ctx=", codec_ctx->hw_device_ctx ? 1 : 0);
+    }
     int open_ret = avcodec_open2(codec_ctx, codec, nullptr);
+    if (is_video_stream) {
+        LOG_WARNING("evt=avcodec_open2_result ret=", open_ret,
+                    " err=", open_ret < 0 ? hxc_av_err_to_string(open_ret) : "ok",
+                    " request_hw=", request_video_hw_decode ? 1 : 0,
+                    " hw_enabled=", hw_decode_enabled ? 1 : 0);
+    }
 #if defined(__ANDROID__)
     if (open_ret < 0 && request_video_hw_decode && hw_decode_enabled &&
         !hw_open_probe_retried) {
@@ -3356,7 +3470,12 @@ int PlayerCore::stream_component_open(int stream_index) {
         } else {
             hw_decode_enabled = hxc_try_enable_hw_decode(codec_ctx, codec);
         }
+        LOG_WARNING("evt=avcodec_open2_retry_begin hw_enabled=", hw_decode_enabled ? 1 : 0,
+                    " has_hw_device_ctx=", codec_ctx->hw_device_ctx ? 1 : 0);
         open_ret = avcodec_open2(codec_ctx, codec, nullptr);
+        LOG_WARNING("evt=avcodec_open2_retry_result ret=", open_ret,
+                    " err=", open_ret < 0 ? hxc_av_err_to_string(open_ret) : "ok",
+                    " hw_enabled=", hw_decode_enabled ? 1 : 0);
         if (open_ret == 0) {
             decode_diag += " reason=hw_open2_ok_after_probe";
             LOG_INFO("MediaCodec 补全 extradata 后硬解打开成功");
@@ -3402,7 +3521,12 @@ int PlayerCore::stream_component_open(int stream_index) {
         // 回退到软解时同样启用多线程
         codec_ctx->thread_count = 0;
         codec_ctx->thread_type  = FF_THREAD_SLICE;
+        LOG_WARNING("evt=soft_fallback_open_begin codec=", (codec && codec->name ? codec->name : "unknown"),
+                    " thread_count=", codec_ctx->thread_count,
+                    " thread_type=", codec_ctx->thread_type);
         open_ret = avcodec_open2(codec_ctx, codec, nullptr);
+        LOG_WARNING("evt=soft_fallback_open_result ret=", open_ret,
+                    " err=", open_ret < 0 ? hxc_av_err_to_string(open_ret) : "ok");
         hw_decode_enabled = false;
     }
     if (open_ret < 0) {

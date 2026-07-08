@@ -844,21 +844,6 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     }
     resetRenderStateForStreamSwitch();
     bool user_pref_hw = (decode_mode_ == 1);
-    // SecureHLS: prefer hardware decode when user requests it; core layer falls back
-    // to software automatically if avcodec_open2 fails on this device.
-    PlayerDecodeModeC secure_effective_mode = user_pref_hw
-            ? PLAYER_DECODE_MODE_HARDWARE
-            : PLAYER_DECODE_MODE_SOFTWARE;
-    DECODEI("evt=secure_decode_policy mode=%s user_pref=%s reason=hw_first_with_soft_fallback",
-            secure_effective_mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
-            user_pref_hw ? "hardware" : "software");
-    DECODEI("evt=open method=openWithSecureSession decode_mode=%s user_pref=%s start=%.3f",
-            secure_effective_mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
-            user_pref_hw ? "hardware" : "software",
-            start_position);
-    player_core_apply_secure_playback_profile(player_core_);
-    player_core_set_decode_mode(player_core_, secure_effective_mode);
-
     PlayerDataSourceConfigC config{};
     config.timeout_ms = 30000;
     config.max_retries = 3;
@@ -871,12 +856,80 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     source.encrypted_file = 0;
     source.secure_headers = secure_headers;
 
-    int result = -1;
-    {
-        std::lock_guard<std::mutex> open_guard(g_player_core_open_mutex);
-        result = player_core_open_with_mode(player_core_, &source, &config);
+    auto stop_core_after_failed_attempt = [this](const char* reason) {
+        LOGW("[open] secure attempt cleanup: %s", reason ? reason : "");
+        audio_start_pending_.store(false, std::memory_order_release);
+        audio_rebuffer_pending_.store(false, std::memory_order_release);
+        first_frame_wait_started_ms_ = 0;
+        audio_start_deadline_ms_ = 0;
+        setOpenSLESPlayState(SL_PLAYSTATE_STOPPED, false);
+        {
+            std::lock_guard<std::mutex> lock(audio_mutex_);
+        }
+        if (player_core_) {
+            player_core_stop(player_core_);
+        }
+        resetRenderStateForStreamSwitch();
+    };
+
+    auto open_secure_once = [&](PlayerDecodeModeC mode, const char* reason) -> int {
+        DECODEI("evt=secure_decode_policy mode=%s user_pref=%s reason=%s",
+                mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
+                user_pref_hw ? "hardware" : "software",
+                reason ? reason : "");
+        DECODEI("evt=open method=openWithSecureSession decode_mode=%s user_pref=%s start=%.3f",
+                mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
+                user_pref_hw ? "hardware" : "software",
+                start_position);
+        player_core_apply_secure_playback_profile(player_core_);
+        player_core_set_decode_mode(player_core_, mode);
+        int ret = -1;
+        {
+            std::lock_guard<std::mutex> open_guard(g_player_core_open_mutex);
+            ret = player_core_open_with_mode(player_core_, &source, &config);
+        }
+        bool video_opened = player_core_is_video_stream_opened(player_core_) != 0;
+        bool audio_opened = player_core_is_audio_stream_opened(player_core_) != 0;
+        bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
+        const char* decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+        DECODEI("evt=secure_open_attempt_result mode=%s reason=%s ret=%d video_opened=%d audio_opened=%d hw_active=%d diag=%s",
+                mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
+                reason ? reason : "",
+                ret,
+                video_opened ? 1 : 0,
+                audio_opened ? 1 : 0,
+                hw_active ? 1 : 0,
+                decode_diag ? decode_diag : "");
+        return ret;
+    };
+
+    PlayerDecodeModeC secure_effective_mode = user_pref_hw
+            ? PLAYER_DECODE_MODE_HARDWARE
+            : PLAYER_DECODE_MODE_SOFTWARE;
+    int result = open_secure_once(secure_effective_mode,
+                                 user_pref_hw ? "hw_first_with_soft_fallback" : "software_requested");
+    if (user_pref_hw) {
+        bool video_opened = result == 0 && player_core_is_video_stream_opened(player_core_) != 0;
+        if (result != 0 || !video_opened) {
+            const char* decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+            DECODEI("evt=secure_hw_open_fallback_to_soft result=%d video_opened=%d diag=%s",
+                    result,
+                    video_opened ? 1 : 0,
+                    decode_diag ? decode_diag : "");
+            stop_core_after_failed_attempt("secure_hw_failed_before_soft_retry");
+            secure_effective_mode = PLAYER_DECODE_MODE_SOFTWARE;
+            result = open_secure_once(secure_effective_mode, "hardware_failed_soft_retry");
+        }
     }
     if (result == 0) {
+        bool video_opened = player_core_is_video_stream_opened(player_core_) != 0;
+        if (!video_opened) {
+            const char* decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+            LOGE("SecureHLS opened without video stream after final attempt, diag=%s",
+                 decode_diag ? decode_diag : "");
+            stop_core_after_failed_attempt("secure_final_no_video_stream");
+            return false;
+        }
         if (start_position > 0.001) {
             // Fallback guard: some secure-open paths may ignore initial start_time.
             // Apply a post-open seek to enforce first-start progress.
@@ -905,18 +958,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         return true;
     }
     LOGE("Failed to open secure hls: %d", result);
-    audio_start_pending_.store(false, std::memory_order_release);
-    audio_rebuffer_pending_.store(false, std::memory_order_release);
-    first_frame_wait_started_ms_ = 0;
-    audio_start_deadline_ms_ = 0;
-    setOpenSLESPlayState(SL_PLAYSTATE_STOPPED, false);
-    {
-        std::lock_guard<std::mutex> lock(audio_mutex_);
-    }
-    if (player_core_) {
-        player_core_stop(player_core_);
-    }
-    resetRenderStateForStreamSwitch();
+    stop_core_after_failed_attempt("secure_final_open_failed");
     return false;
 }
 
@@ -1012,12 +1054,13 @@ void AndroidPlayer::play() {
         severe_lag_audio_pause_start_ms_ = 0;
 
         if (playItf_) {
+            bool video_stream_opened = player_core_is_video_stream_opened(player_core_) != 0;
             // For initial open: defer audio until first frame rendered to avoid
             // "loading hidden but black screen". For resumed playback (already rendered),
             // start audio immediately.
             int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (!first_frame_rendered_.load(std::memory_order_acquire)) {
+            if (video_stream_opened && !first_frame_rendered_.load(std::memory_order_acquire)) {
                 audio_start_pending_.store(true, std::memory_order_release);
                 first_frame_wait_started_ms_ = now;
                 // Keep deadline as a hard safety valve, but render loop will not use it
@@ -1029,7 +1072,10 @@ void AndroidPlayer::play() {
                 first_frame_wait_started_ms_ = 0;
                 if (current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                     SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
-                    LOGI("[ctrl] play: audio immediate resume (already rendered), result=%d", r);
+                    LOGI("[ctrl] play: audio immediate resume (video_opened=%d already_rendered=%d), result=%d",
+                         video_stream_opened ? 1 : 0,
+                         first_frame_rendered_.load(std::memory_order_acquire) ? 1 : 0,
+                         r);
                 }
             }
         } else {
@@ -1712,7 +1758,9 @@ bool AndroidPlayer::isLoading() const {
         seek_lower_bound_active_.load(std::memory_order_acquire);
     bool play_when_ready_now = player_core_ && player_core_get_play_when_ready(player_core_) != 0;
     bool core_playing_now = player_core_ && player_core_is_playing(player_core_) != 0;
+    bool video_stream_opened = player_core_ && player_core_is_video_stream_opened(player_core_) != 0;
     bool waiting_open_first_frame =
+        video_stream_opened &&
         !first_frame_rendered_.load(std::memory_order_acquire) &&
         player_core_ &&
         play_when_ready_now;
