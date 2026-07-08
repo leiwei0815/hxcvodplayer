@@ -129,6 +129,13 @@ public:
     bool   consumePlaybackCompleted();
     void   settleSeekSessionFromApp(bool by_timeout);
 
+    // 音频健康监测与恢复（供业务层/JNI 查询与触发）
+    void   getAudioHealthMetrics(int64_t* silent_for_ms,
+                                 int* underrun_recent,
+                                 int* opensl_state,
+                                 int* recover_attempts);
+    bool   recoverAudioOutput();
+
 private:
     // -----------------------------------------------------------------------
     // Core
@@ -370,8 +377,8 @@ private:
     int64_t             secure_lower_bound_deadline_large_ms_{3200};
     int64_t             secure_recovery_deadline_normal_ms_{5200};
     int64_t             secure_recovery_deadline_large_ms_{6400};
-    int64_t             secure_audio_wait_deadline_normal_ms_{4400};
-    int64_t             secure_audio_wait_deadline_large_ms_{5600};
+    int64_t             secure_audio_wait_deadline_normal_ms_{3500};
+    int64_t             secure_audio_wait_deadline_large_ms_{4800};
     double              secure_forward_preroll_base_sec_{3.5};
     double              secure_forward_preroll_span_gain_{0.0011};
     double              secure_forward_preroll_learned_gain_{0.50};
@@ -388,6 +395,19 @@ private:
     int               audio_cb_count_{0};
     int               audio_underrun_count_{0};
     int               audio_partial_count_{0};
+    // 音频健康看门狗：检测 OpenSL 暂停或 underrun 导致的长时间无声。
+    std::atomic<int64_t> last_effective_audio_output_ms_{0};
+    std::atomic<int>     audio_health_recover_attempts_{0};
+    std::atomic<int64_t> last_audio_health_check_ms_{0};
+    std::atomic<int>     recent_audio_underrun_total_{0};
+    static constexpr int64_t kAudioSilentThresholdMs = 2500;
+    static constexpr int   kAudioRecoverMaxAttempts = 3;
+
+    int    queryOpenSLESPlayState();
+    SLresult setOpenSLESPlayStateWithRetry(SLuint32 state, bool require_audible, int max_retries = 3);
+    bool   forceResumeAudioOutput(int64_t now, double anchor_pts, const char* reason);
+    void   checkAndRecoverAudioHealth(int64_t now);
+    void   rebuildAudioOutputFromStream();
 
     // -----------------------------------------------------------------------
     // Event forwarding (core callbacks -> JNI poll)

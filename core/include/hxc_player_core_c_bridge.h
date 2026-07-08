@@ -153,6 +153,9 @@ void player_core_set_play_when_ready(PlayerCoreHandle* handle, int play_when_rea
 void player_core_set_decode_mode(PlayerCoreHandle* handle, PlayerDecodeModeC mode);
 PlayerDecodeModeC player_core_get_decode_mode(PlayerCoreHandle* handle);
 
+// SecureHLS 播放调优：增大帧队列，减轻软解场景 starvation/underrun。
+void player_core_apply_secure_playback_profile(PlayerCoreHandle* handle);
+
 // 视频显示模式
 void player_core_set_aspect_ratio_mode(PlayerCoreHandle* handle, AspectRatioModeC mode);
 AspectRatioModeC player_core_get_aspect_ratio_mode(PlayerCoreHandle* handle);

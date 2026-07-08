@@ -449,6 +449,14 @@ PlayerDecodeModeC player_core_get_decode_mode(PlayerCoreHandle* handle) {
                : PLAYER_DECODE_MODE_SOFTWARE;
 }
 
+void player_core_apply_secure_playback_profile(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return;
+    auto config = handle->core->get_config();
+    config.video_queue_size = 15;
+    config.audio_queue_size = 24;
+    handle->core->set_config(config);
+}
+
 int player_core_get_video_frame(PlayerCoreHandle* handle, VideoFrameDataC* frame_data) {
     if (!handle || !handle->core || !frame_data) {
         return -1;

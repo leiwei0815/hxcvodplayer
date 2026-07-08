@@ -627,4 +627,36 @@ Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomFile(
     return result ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jlongArray JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeGetAudioHealthMetrics(JNIEnv* env, jobject thiz, jlong handle) {
+    (void)thiz;
+    jlong values[4] = {0, 0, 0, 0};
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        int64_t silent_ms = 0;
+        int underrun = 0;
+        int opensl_state = 0;
+        int recover_attempts = 0;
+        player->getAudioHealthMetrics(&silent_ms, &underrun, &opensl_state, &recover_attempts);
+        values[0] = static_cast<jlong>(silent_ms);
+        values[1] = static_cast<jlong>(underrun);
+        values[2] = static_cast<jlong>(opensl_state);
+        values[3] = static_cast<jlong>(recover_attempts);
+    }
+    jlongArray result = env->NewLongArray(4);
+    if (result) {
+        env->SetLongArrayRegion(result, 0, 4, values);
+    }
+    return result;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeRecoverAudioOutput(JNIEnv* env, jobject thiz, jlong handle) {
+    (void)env;
+    (void)thiz;
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return JNI_FALSE;
+    return player->recoverAudioOutput() ? JNI_TRUE : JNI_FALSE;
+}
+
 } // extern "C"

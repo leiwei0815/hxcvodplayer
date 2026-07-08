@@ -690,7 +690,9 @@ int PlayerCore::open(const std::string& filename) {
     }
     
     // 🔧 设置缓冲区大小（对于网络流很重要）
-    av_dict_set(&options, "buffer_size", "1024000", 0);  // 1MB 缓冲
+    // SecureHLS 使用更大网络缓冲，减轻弱网/软解场景下的 io_loading 抖动。
+    const bool secure_hls_open = !secure_session_.m3u8_url.empty();
+    av_dict_set(&options, "buffer_size", secure_hls_open ? "3145728" : "1024000", 0);
     
     // 🔧 设置分析时长（快速开始播放）
     av_dict_set(&options, "analyzeduration", "5000000", 0);  // 5秒
@@ -2716,6 +2718,7 @@ void PlayerCore::video_thread() {
                 if (in_seek_window) {
                     seeking_.store(false, std::memory_order_release);
                     set_seek_loading(false);
+                    seek_target_pos_.store(0.0, std::memory_order_release);
                     post_seek_warmup_frames_.store(40, std::memory_order_release);
                     LOG_INFO("视频线程：检测到 seek 后有效首帧，结束 seeking。target=",
                              target, ", pts=", pts);
@@ -2926,6 +2929,8 @@ void PlayerCore::audio_thread() {
             if (in_seek_window) {
                 seeking_.store(false, std::memory_order_release);
                 set_seek_loading(false);
+                // 清除 seek 目标，避免 bridge 层持续过滤后续正常音频帧导致无声。
+                seek_target_pos_.store(0.0, std::memory_order_release);
                 // seek 结束后给 video_thread 40 帧的 warmup 窗口（对齐 iOS syncWarmupFramesRemaining）
                 post_seek_warmup_frames_.store(40, std::memory_order_release);
                 LOG_INFO("audio_thread: seek done, target=", target, " audio_pts=", pts);

@@ -199,6 +199,14 @@ class HXCPlayerControl @JvmOverloads constructor(
         HARDWARE
     }
 
+    /** 音频输出健康指标（供业务层监测无声并触发恢复）。 */
+    data class AudioHealthMetrics(
+        val silentForMs: Long = 0L,
+        val underrunRecent: Int = 0,
+        val openslState: Int = 0,
+        val recoverAttempts: Int = 0
+    )
+
     /** 对齐 iOS 的视频模型（fileId + sign + secretId + timestamp） */
     class PlayerVideo {
         var videoId: String = ""
@@ -2053,6 +2061,26 @@ class HXCPlayerControl @JvmOverloads constructor(
         nativeSetVolume(handle, volume)
     }
 
+    /** 查询音频输出健康状态（无声监测）。 */
+    fun getAudioHealthMetrics(): AudioHealthMetrics {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return AudioHealthMetrics()
+        val raw = nativeGetAudioHealthMetrics(handle) ?: return AudioHealthMetrics()
+        return AudioHealthMetrics(
+            silentForMs = raw.getOrElse(0) { 0L },
+            underrunRecent = raw.getOrElse(1) { 0L }.toInt(),
+            openslState = raw.getOrElse(2) { 0L }.toInt(),
+            recoverAttempts = raw.getOrElse(3) { 0L }.toInt()
+        )
+    }
+
+    /** 尝试恢复音频输出（无需退出重进）。 */
+    fun recoverAudioOutput(): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return false
+        return nativeRecoverAudioOutput(handle)
+    }
+
     /**
      * 三分屏小窗/副画面同步模式。
      *
@@ -3449,6 +3477,8 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeConsumeLastError(handle: Long, outCode: IntArray): String?
     private external fun nativeConsumePlaybackCompleted(handle: Long): Boolean
     private external fun nativeSettleSeekSession(handle: Long, byTimeout: Boolean)
+    private external fun nativeGetAudioHealthMetrics(handle: Long): LongArray?
+    private external fun nativeRecoverAudioOutput(handle: Long): Boolean
 
     // 获取当前是否处于加载中（可用于主动查询 UI 状态）
     fun isLoading(): Boolean {
