@@ -2,11 +2,11 @@ name: Build Android SDK
 
 on:
   push:
-    branches: [ main, master, develop, mian-android, main-android, main-android-end ]
+    branches: [ main, master, develop, mian-android, main-android-hls, main-android-end ]
     tags:
       - 'v*'
   pull_request:
-    branches: [ main, master, main-android, main-android-end ]
+    branches: [ main, master, main-android-hls, main-android-end ]
   workflow_dispatch:
     inputs:
       build_type:

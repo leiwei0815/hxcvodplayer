@@ -469,6 +469,8 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
     LOGI("[open] openURL start_pos=%.3f url=%s", start_position, url ? url : "(null)");
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
+    has_pending_error_.store(false, std::memory_order_release);
+    suppress_secure_hw_probe_errors_.store(false, std::memory_order_release);
     open_start_position_sec_.store(start_position, std::memory_order_release);
     open_requested_at_ms_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count(),
@@ -813,6 +815,8 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     LOGI("[open] openWithSecureSession start_pos=%.3f url=%s", start_position, url ? url : "(null)");
     has_pending_playback_completed_.store(false, std::memory_order_release);
     playback_completed_latched_.store(false, std::memory_order_release);
+    has_pending_error_.store(false, std::memory_order_release);
+    suppress_secure_hw_probe_errors_.store(false, std::memory_order_release);
     open_start_position_sec_.store(start_position, std::memory_order_release);
     open_requested_at_ms_.store(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count(),
@@ -844,21 +848,6 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     }
     resetRenderStateForStreamSwitch();
     bool user_pref_hw = (decode_mode_ == 1);
-    // SecureHLS: prefer hardware decode when user requests it; core layer falls back
-    // to software automatically if avcodec_open2 fails on this device.
-    PlayerDecodeModeC secure_effective_mode = user_pref_hw
-            ? PLAYER_DECODE_MODE_HARDWARE
-            : PLAYER_DECODE_MODE_SOFTWARE;
-    DECODEI("evt=secure_decode_policy mode=%s user_pref=%s reason=hw_first_with_soft_fallback",
-            secure_effective_mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
-            user_pref_hw ? "hardware" : "software");
-    DECODEI("evt=open method=openWithSecureSession decode_mode=%s user_pref=%s start=%.3f",
-            secure_effective_mode == PLAYER_DECODE_MODE_HARDWARE ? "hardware" : "software",
-            user_pref_hw ? "hardware" : "software",
-            start_position);
-    player_core_apply_secure_playback_profile(player_core_);
-    player_core_set_decode_mode(player_core_, secure_effective_mode);
-
     PlayerDataSourceConfigC config{};
     config.timeout_ms = 30000;
     config.max_retries = 3;
@@ -871,12 +860,59 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
     source.encrypted_file = 0;
     source.secure_headers = secure_headers;
 
+    auto stop_core_after_failed_open = [this](const char* reason) {
+        LOGW("[open] secure attempt cleanup: %s", reason ? reason : "");
+        suppress_secure_hw_probe_errors_.store(false, std::memory_order_release);
+        audio_start_pending_.store(false, std::memory_order_release);
+        audio_rebuffer_pending_.store(false, std::memory_order_release);
+        first_frame_wait_started_ms_ = 0;
+        audio_start_deadline_ms_ = 0;
+        setOpenSLESPlayState(SL_PLAYSTATE_STOPPED, false);
+        {
+            std::lock_guard<std::mutex> lock(audio_mutex_);
+        }
+        if (player_core_) {
+            player_core_stop(player_core_);
+        }
+        resetRenderStateForStreamSwitch();
+    };
+
+    // SecureHLS stability policy: use software decode directly. Current FFmpeg/MediaCodec
+    // path still fails codec probing on some encrypted streams (codecID=0), and the
+    // hardware probe adds open latency before falling back to the same software path.
+    PlayerDecodeModeC secure_effective_mode = PLAYER_DECODE_MODE_SOFTWARE;
+    DECODEI("evt=secure_decode_policy mode=fixed_software user_pref=%s reason=secure_hls_stability",
+            user_pref_hw ? "hardware" : "software");
+    DECODEI("evt=open method=openWithSecureSession decode_mode=software user_pref=%s start=%.3f",
+            user_pref_hw ? "hardware" : "software",
+            start_position);
+    player_core_apply_secure_playback_profile(player_core_);
+    player_core_set_decode_mode(player_core_, secure_effective_mode);
+
     int result = -1;
     {
         std::lock_guard<std::mutex> open_guard(g_player_core_open_mutex);
         result = player_core_open_with_mode(player_core_, &source, &config);
     }
+    bool attempt_video_opened = result == 0 && player_core_is_video_stream_opened(player_core_) != 0;
+    bool attempt_audio_opened = result == 0 && player_core_is_audio_stream_opened(player_core_) != 0;
+    bool attempt_hw_active = result == 0 && player_core_is_video_hardware_decoding(player_core_) != 0;
+    const char* attempt_decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+    DECODEI("evt=secure_open_attempt_result mode=software reason=secure_hls_fixed_software ret=%d video_opened=%d audio_opened=%d hw_active=%d diag=%s",
+            result,
+            attempt_video_opened ? 1 : 0,
+            attempt_audio_opened ? 1 : 0,
+            attempt_hw_active ? 1 : 0,
+            attempt_decode_diag ? attempt_decode_diag : "");
     if (result == 0) {
+        bool video_opened = player_core_is_video_stream_opened(player_core_) != 0;
+        if (!video_opened) {
+            const char* decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+            LOGE("SecureHLS opened without video stream after final attempt, diag=%s",
+                 decode_diag ? decode_diag : "");
+            stop_core_after_failed_open("secure_final_no_video_stream");
+            return false;
+        }
         if (start_position > 0.001) {
             // Fallback guard: some secure-open paths may ignore initial start_time.
             // Apply a post-open seek to enforce first-start progress.
@@ -905,6 +941,7 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         return true;
     }
     LOGE("Failed to open secure hls: %d", result);
+    stop_core_after_failed_open("secure_final_open_failed");
     return false;
 }
 
@@ -1000,12 +1037,13 @@ void AndroidPlayer::play() {
         severe_lag_audio_pause_start_ms_ = 0;
 
         if (playItf_) {
+            bool video_stream_opened = player_core_is_video_stream_opened(player_core_) != 0;
             // For initial open: defer audio until first frame rendered to avoid
             // "loading hidden but black screen". For resumed playback (already rendered),
             // start audio immediately.
             int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (!first_frame_rendered_.load(std::memory_order_acquire)) {
+            if (video_stream_opened && !first_frame_rendered_.load(std::memory_order_acquire)) {
                 audio_start_pending_.store(true, std::memory_order_release);
                 first_frame_wait_started_ms_ = now;
                 // Keep deadline as a hard safety valve, but render loop will not use it
@@ -1017,7 +1055,10 @@ void AndroidPlayer::play() {
                 first_frame_wait_started_ms_ = 0;
                 if (current_volume_.load(std::memory_order_relaxed) > 0.0f) {
                     SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
-                    LOGI("[ctrl] play: audio immediate resume (already rendered), result=%d", r);
+                    LOGI("[ctrl] play: audio immediate resume (video_opened=%d already_rendered=%d), result=%d",
+                         video_stream_opened ? 1 : 0,
+                         first_frame_rendered_.load(std::memory_order_acquire) ? 1 : 0,
+                         r);
                 }
             }
         } else {
@@ -1700,7 +1741,13 @@ bool AndroidPlayer::isLoading() const {
         seek_lower_bound_active_.load(std::memory_order_acquire);
     bool play_when_ready_now = player_core_ && player_core_get_play_when_ready(player_core_) != 0;
     bool core_playing_now = player_core_ && player_core_is_playing(player_core_) != 0;
+    bool video_stream_opened = player_core_ && player_core_is_video_stream_opened(player_core_) != 0;
+    bool sw_decode_secure =
+        secure_session_active_.load(std::memory_order_acquire) &&
+        player_core_ &&
+        player_core_is_video_hardware_decoding(player_core_) == 0;
     bool waiting_open_first_frame =
+        video_stream_opened &&
         !first_frame_rendered_.load(std::memory_order_acquire) &&
         player_core_ &&
         play_when_ready_now;
@@ -1714,7 +1761,7 @@ bool AndroidPlayer::isLoading() const {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         int64_t suppress_until = suppress_stale_loading_true_until_ms_.load(std::memory_order_acquire);
         int64_t last_progress_ms = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
-        int64_t progress_hold_ms = core_playing_now ? 2600 : 1600;
+        int64_t progress_hold_ms = core_playing_now ? 2600 : (sw_decode_secure ? 3000 : 1600);
         bool has_recent_progress = last_progress_ms > 0 && (now - last_progress_ms) <= progress_hold_ms;
         if (now < suppress_until || has_recent_progress) {
             return false;
@@ -1775,18 +1822,23 @@ void AndroidPlayer::loadingStateCallback(bool is_loading, void* user_data) {
         bool play_when_ready_now = player->player_core_ && player_core_get_play_when_ready(player->player_core_) != 0;
         bool core_playing_now = player->player_core_ && player_core_is_playing(player->player_core_) != 0;
         int64_t last_progress_ms = player->loading_progress_last_advance_ms_.load(std::memory_order_acquire);
-        bool has_recent_progress = last_progress_ms > 0 && (now_ms_now - last_progress_ms) <= 1500;
+        bool sw_decode_secure =
+                player->secure_session_active_.load(std::memory_order_acquire) &&
+                player->player_core_ &&
+                player_core_is_video_hardware_decoding(player->player_core_) == 0;
+        int64_t progress_window_ms = sw_decode_secure ? 3000 : 1500;
+        bool has_recent_progress = last_progress_ms > 0 && (now_ms_now - last_progress_ms) <= progress_window_ms;
         if (!seek_loading && !play_when_ready_now) {
             // Explicit pause is a stronger semantic than stale core loading edges.
             player->suppress_stale_loading_true_until_ms_.store(now_ms_now + 5000, std::memory_order_release);
             LOGI_RATE(30, "[state] ignore loading=true while playWhenReady=false");
             return;
         }
-        if (!seek_loading && play_when_ready_now && core_playing_now && has_recent_progress) {
+        if (!seek_loading && play_when_ready_now && (core_playing_now || has_recent_progress) && has_recent_progress) {
             // During steady playback some pipelines spike loading=true for a short moment.
             // Ignore this edge to avoid UI loading flash.
-            player->suppress_stale_loading_true_until_ms_.store(now_ms_now + 2200, std::memory_order_release);
-            LOGI_RATE(30, "[state] ignore transient loading=true while playing progress");
+            player->suppress_stale_loading_true_until_ms_.store(now_ms_now + (sw_decode_secure ? 3200 : 2200), std::memory_order_release);
+            LOGI_RATE(30, "[state] ignore transient loading=true while effective progress");
             return;
         }
     }
@@ -1832,6 +1884,18 @@ bool AndroidPlayer::consumeLastError(int& error_code, std::string& error_message
 void AndroidPlayer::errorStateCallback(int error_code, const char* error_msg, void* user_data) {
     auto* player = static_cast<AndroidPlayer*>(user_data);
     if (!player) {
+        return;
+    }
+
+    bool suppress_secure_hw_probe =
+            player->suppress_secure_hw_probe_errors_.load(std::memory_order_acquire) &&
+            (error_code == PLAYER_ERROR_CODEC_NOT_FOUND ||
+             error_code == PLAYER_ERROR_NO_VIDEO_STREAM ||
+             error_code == PLAYER_ERROR_CODEC_OPEN_FAILED);
+    if (suppress_secure_hw_probe) {
+        DECODEI("evt=secure_hw_probe_error_callback_suppressed code=%d msg=%s",
+                error_code,
+                error_msg ? error_msg : "");
         return;
     }
 
@@ -6354,7 +6418,10 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
     if (!player_core_) return;
     if (current_volume_.load(std::memory_order_relaxed) <= 0.0f) return;
     if (!player_core_get_play_when_ready(player_core_)) return;
-    if (!player_core_is_playing(player_core_) && !is_loading_.load(std::memory_order_acquire)) return;
+    bool core_playing = player_core_is_playing(player_core_) != 0;
+    int64_t last_progress_ms = loading_progress_last_advance_ms_.load(std::memory_order_acquire);
+    bool progress_active = last_progress_ms > 0 && (now - last_progress_ms) <= 2500;
+    if (!core_playing && !progress_active && !is_loading_.load(std::memory_order_acquire)) return;
     // 首帧前故意延迟音频启动；此阶段 OpenSL 可能为 PAUSED，不应误判为无声故障。
     if (audio_start_pending_.load(std::memory_order_acquire)) return;
     if (!first_frame_rendered_.load(std::memory_order_acquire)) return;
