@@ -1530,6 +1530,8 @@ void AndroidPlayer::setPlaybackRate(float rate) {
 
 void AndroidPlayer::setVolume(float volume) {
     if (!player_core_) return;
+    if (volume < 0.0f) volume = 0.0f;
+    if (volume > 1.0f) volume = 1.0f;
     float prev = current_volume_.exchange(volume, std::memory_order_relaxed);
     LOGD("Set volume: %f (core only)", volume);
     // Volume is applied inside the core; we do not use OpenSL ES VolumeItf

@@ -695,6 +695,17 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             
             memcpy(buffer, handle->audio_buf + handle->audio_buf_index, len1);
             handle->audio_buf_index += len1;
+
+            int volume = handle->core->get_volume();
+            if (volume <= 0) {
+                memset(buffer, 0, len1);
+            } else if (volume < 100) {
+                int16_t* samples = reinterpret_cast<int16_t*>(buffer);
+                int sample_count = len1 / static_cast<int>(sizeof(int16_t));
+                for (int i = 0; i < sample_count; ++i) {
+                    samples[i] = static_cast<int16_t>((static_cast<int32_t>(samples[i]) * volume) / 100);
+                }
+            }
             
             // 在数据被复制给平台层后，基于“当前缓冲起点 + 已输出偏移”更新音频时钟。
             if (handle->audio_current_sample_rate > 0 && handle->audio_current_channels > 0) {
