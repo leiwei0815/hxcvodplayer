@@ -397,6 +397,8 @@ private:
     int               audio_partial_count_{0};
     // 音频健康看门狗：检测 OpenSL 暂停或 underrun 导致的长时间无声。
     std::atomic<int64_t> last_effective_audio_output_ms_{0};
+    std::atomic<int64_t> audio_underrun_streak_started_ms_{0};
+    std::atomic<int64_t> last_audio_underrun_ms_{0};
     std::atomic<int>     audio_health_recover_attempts_{0};
     std::atomic<int64_t> last_audio_health_check_ms_{0};
     std::atomic<int>     recent_audio_underrun_total_{0};

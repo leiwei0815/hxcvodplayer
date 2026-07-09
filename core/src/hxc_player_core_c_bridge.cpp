@@ -463,8 +463,8 @@ PlayerDecodeModeC player_core_get_decode_mode(PlayerCoreHandle* handle) {
 void player_core_apply_secure_playback_profile(PlayerCoreHandle* handle) {
     if (!handle || !handle->core) return;
     auto config = handle->core->get_config();
-    config.video_queue_size = 15;
-    config.audio_queue_size = 24;
+    config.video_queue_size = 18;
+    config.audio_queue_size = 32;
     handle->core->set_config(config);
 }
 
