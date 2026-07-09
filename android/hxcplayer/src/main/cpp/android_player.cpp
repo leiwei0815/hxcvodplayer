@@ -6426,9 +6426,11 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
     if (audio_start_pending_.load(std::memory_order_acquire)) return;
     if (!first_frame_rendered_.load(std::memory_order_acquire)) return;
     if (open_in_progress_.load(std::memory_order_acquire)) return;
-    if (seek_audio_wait_video_.load(std::memory_order_acquire) &&
-        seek_audio_wait_deadline_ms_ > 0 &&
-        now < seek_audio_wait_deadline_ms_) {
+    bool seek_audio_wait_active = seek_audio_wait_video_.load(std::memory_order_acquire);
+    bool seek_audio_wait_expired =
+            seek_audio_wait_active &&
+            (seek_audio_wait_deadline_ms_ <= 0 || now >= seek_audio_wait_deadline_ms_);
+    if (seek_audio_wait_active && !seek_audio_wait_expired) {
         return;
     }
 
@@ -6436,17 +6438,34 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
     int64_t last_audio_ms = last_effective_audio_output_ms_.load(std::memory_order_acquire);
     bool silent_too_long = last_audio_ms > 0 && (now - last_audio_ms) >= kAudioSilentThresholdMs;
     bool opensl_not_playing = opensl_state == 2 || opensl_state == 3;
-    bool rebuffer_stuck = audio_rebuffer_pending_.load(std::memory_order_acquire) &&
-                          audio_rebuffer_deadline_ms_ > 0 &&
-                          now >= audio_rebuffer_deadline_ms_;
+    bool rebuffer_pending = audio_rebuffer_pending_.load(std::memory_order_acquire);
+    bool rebuffer_deadline_expired = rebuffer_pending &&
+                                     audio_rebuffer_deadline_ms_ > 0 &&
+                                     now >= audio_rebuffer_deadline_ms_;
+    bool rebuffer_lost_deadline = rebuffer_pending &&
+                                  audio_rebuffer_deadline_ms_ <= 0 &&
+                                  audio_rebuffer_paused_at_ms_ > 0 &&
+                                  (now - audio_rebuffer_paused_at_ms_) >= 3200;
+    bool rebuffer_stuck = rebuffer_deadline_expired || rebuffer_lost_deadline;
 
-    if (!silent_too_long && !opensl_not_playing && !rebuffer_stuck) {
+    if (!silent_too_long && !opensl_not_playing && !rebuffer_stuck && !seek_audio_wait_expired) {
         return;
     }
 
     int attempt = audio_health_recover_attempts_.fetch_add(1, std::memory_order_acq_rel) + 1;
     double anchor = player_core_get_position(player_core_);
     if (!std::isfinite(anchor) || anchor < 0.0) anchor = 0.0;
+
+    LOGW_RATE(8,
+              "evt=audio_health_recover_trigger attempt=%d silent=%d opensl_state=%d rebuffer_stuck=%d seek_wait_expired=%d progress_active=%d core_playing=%d anchor=%.3f",
+              attempt,
+              silent_too_long ? 1 : 0,
+              opensl_state,
+              rebuffer_stuck ? 1 : 0,
+              seek_audio_wait_expired ? 1 : 0,
+              progress_active ? 1 : 0,
+              core_playing ? 1 : 0,
+              anchor);
 
     if (attempt <= 2) {
         forceResumeAudioOutput(now, anchor, "audio_health_watchdog");
