@@ -1670,6 +1670,20 @@ double AndroidPlayer::getPosition() const {
     return player_core_get_position(player_core_);
 }
 
+int AndroidPlayer::getVideoWidth() const {
+    if (!player_core_) return 0;
+    return player_core_get_video_width(player_core_);
+}
+
+int AndroidPlayer::getVideoHeight() const {
+    if (!player_core_) return 0;
+    return player_core_get_video_height(player_core_);
+}
+
+bool AndroidPlayer::hasRenderedFirstFrame() const {
+    return first_frame_rendered_.load(std::memory_order_acquire);
+}
+
 int AndroidPlayer::getState() const {
     if (!player_core_) return 0; // IDLE
     return (int)player_core_get_state(player_core_);

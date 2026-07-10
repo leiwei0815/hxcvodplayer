@@ -260,6 +260,46 @@ object HXCDownloadManager {
         return downloads.values.firstOrNull { it.chapterId == chapterId && it.videoId == videoId }
     }
 
+    /**
+     * 获取完成下载任务的可播放本地路径。
+     *
+     * - MP4 返回下载完成的本地文件。
+     * - M3U8 返回 SDK 生成的本地 index.m3u8。
+     * - 未完成、路径为空或文件不存在时返回 null。
+     *
+     * @param asFileUri true 时返回 file:// URI；false 时返回绝对路径。
+     */
+    @JvmOverloads
+    fun getPlayablePath(info: HXCDownloadInfo?, asFileUri: Boolean = false): String? {
+        if (info == null || info.status != HXCDownloadStatus.FINISH || info.localPath.isBlank()) {
+            return null
+        }
+        val file = File(info.localPath)
+        if (!file.exists()) return null
+        return if (asFileUri) file.toURI().toString() else file.absolutePath
+    }
+
+    /**
+     * 通过 downloadKey 获取完成任务的可播放本地路径。
+     */
+    @JvmOverloads
+    fun getPlayablePath(downloadKey: String, asFileUri: Boolean = false): String? {
+        if (downloadKey.isBlank()) return null
+        return getPlayablePath(downloads[downloadKey], asFileUri)
+    }
+
+    /**
+     * 按章节和视频 ID 查询完成任务的可播放本地路径。
+     */
+    @JvmOverloads
+    fun getPlayablePathByChapterAndVideo(
+        chapterId: String,
+        videoId: String,
+        asFileUri: Boolean = false
+    ): String? {
+        return getPlayablePath(queryByChapterAndVideo(chapterId, videoId), asFileUri)
+    }
+
     private fun runDownload(info: HXCDownloadInfo, cancelFlag: AtomicBoolean) {
         val key = info.downloadKey
         val dir = config.downloadRootDir ?: File(appContext.filesDir, "hxc_downloads")

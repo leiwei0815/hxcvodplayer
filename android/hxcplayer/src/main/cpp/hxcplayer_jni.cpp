@@ -360,6 +360,36 @@ Java_com_hxcplayer_HXCPlayerControl_nativeGetPosition(
     return 0.0;
 }
 
+JNIEXPORT jint JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeGetVideoWidth(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        return player->getVideoWidth();
+    }
+    return 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeGetVideoHeight(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        return player->getVideoHeight();
+    }
+    return 0;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeHasRenderedFirstFrame(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        return player->hasRenderedFirstFrame() ? JNI_TRUE : JNI_FALSE;
+    }
+    return JNI_FALSE;
+}
+
 // 获取状态
 JNIEXPORT jint JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeGetState(

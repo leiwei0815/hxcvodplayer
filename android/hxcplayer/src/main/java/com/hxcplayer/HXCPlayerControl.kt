@@ -207,6 +207,15 @@ class HXCPlayerControl @JvmOverloads constructor(
         val recoverAttempts: Int = 0
     )
 
+    /** 当前视频尺寸。宽高为 0 表示暂未解析到视频轨道尺寸。 */
+    data class VideoSize(
+        val width: Int = 0,
+        val height: Int = 0
+    ) {
+        val isValid: Boolean
+            get() = width > 0 && height > 0
+    }
+
     /** 对齐 iOS 的视频模型（fileId + sign + secretId + timestamp） */
     class PlayerVideo {
         var videoId: String = ""
@@ -364,6 +373,10 @@ class HXCPlayerControl @JvmOverloads constructor(
             elapsedMs: Long,
             byTimeout: Boolean
         ) {}
+        // 首帧真正渲染到输出 Surface 后触发。默认空实现，兼容旧接入方。
+        fun onRenderedFirstFrame() {}
+        // 视频轨道尺寸变化。默认空实现，适合 UI 做比例、占位图和横竖屏适配。
+        fun onVideoSizeChanged(width: Int, height: Int) {}
     }
 
     /**
@@ -562,6 +575,8 @@ class HXCPlayerControl @JvmOverloads constructor(
     @Volatile private var decodeMode: DecodeMode = DecodeMode.HARDWARE
     private var decodeFallbackTriedForCurrentSource: Boolean = false
     private var decodeFallbackLastAtMs: Long = 0L
+    private var renderedFirstFrameNotified: Boolean = false
+    private var lastVideoSize: VideoSize = VideoSize()
     private val secureHlsAuthUrl = "https://console-api.huaxiacloud.net/third_party/verify/sign"
 
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
@@ -588,6 +603,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun setCallback(callback: PlayerCallback) {
         this.callback = callback
         dispatchCurrentStateSnapshot(callback)
+        dispatchCurrentMediaMetadata(callback)
     }
 
     /**
@@ -725,6 +741,24 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     private fun notifyNetworkQoE(currentStallMs: Long) {
         callback?.onNetworkQoEUpdated(currentStallMs, networkTotalStallMs, networkReconnectCount)
+    }
+
+    private fun dispatchCurrentMediaMetadata(target: PlayerCallback) {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        val videoSize = getVideoSize()
+        if (videoSize.isValid) {
+            lastVideoSize = videoSize
+            mainHandler.post {
+                if (!isReleased) target.onVideoSizeChanged(videoSize.width, videoSize.height)
+            }
+        }
+        if (nativeHasRenderedFirstFrame(handle)) {
+            renderedFirstFrameNotified = true
+            mainHandler.post {
+                if (!isReleased) target.onRenderedFirstFrame()
+            }
+        }
     }
 
     private fun dispatchPlaybackSnapshot(snapshot: PlaybackSnapshot) {
@@ -1356,6 +1390,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastPipelineState = null
         lastIsPlayingState = null
         lastPlaybackSnapshot = null
+        renderedFirstFrameNotified = false
+        lastVideoSize = VideoSize()
         loadingSessionLikelySeek = false
         loadingCandidateState = null
         loadingCandidateSinceMs = 0L
@@ -2112,6 +2148,23 @@ class HXCPlayerControl @JvmOverloads constructor(
         return nativeGetPosition(handle)
     }
 
+    /** 获取当前视频尺寸。未打开或尚未解析到视频轨道时返回 0x0。 */
+    fun getVideoSize(): VideoSize {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return VideoSize()
+        return VideoSize(
+            width = nativeGetVideoWidth(handle).coerceAtLeast(0),
+            height = nativeGetVideoHeight(handle).coerceAtLeast(0)
+        )
+    }
+
+    /** 当前播放会话是否已经渲染首帧。 */
+    fun hasRenderedFirstFrame(): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return false
+        return nativeHasRenderedFirstFrame(handle)
+    }
+
     // 获取状态
     fun getState(): PlayerState {
         val handle = currentHandle()
@@ -2330,6 +2383,27 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val handle = currentHandle()
                 if (handle == 0L || isReleased) {
                     return@scheduleAtFixedRate
+                }
+
+                val firstFrameRendered = nativeHasRenderedFirstFrame(handle)
+                if (firstFrameRendered && !renderedFirstFrameNotified) {
+                    renderedFirstFrameNotified = true
+                    mainHandler.post {
+                        if (!isReleased) callback?.onRenderedFirstFrame()
+                    }
+                } else if (!firstFrameRendered) {
+                    renderedFirstFrameNotified = false
+                }
+
+                val videoSize = VideoSize(
+                    width = nativeGetVideoWidth(handle).coerceAtLeast(0),
+                    height = nativeGetVideoHeight(handle).coerceAtLeast(0)
+                )
+                if (videoSize.isValid && videoSize != lastVideoSize) {
+                    lastVideoSize = videoSize
+                    mainHandler.post {
+                        if (!isReleased) callback?.onVideoSizeChanged(videoSize.width, videoSize.height)
+                    }
                 }
 
                 val rawPosition = getPosition()
@@ -3466,6 +3540,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeResetSecureSeekTuning(handle: Long)
     private external fun nativeGetDuration(handle: Long): Double
     private external fun nativeGetPosition(handle: Long): Double
+    private external fun nativeGetVideoWidth(handle: Long): Int
+    private external fun nativeGetVideoHeight(handle: Long): Int
+    private external fun nativeHasRenderedFirstFrame(handle: Long): Boolean
     private external fun nativeGetState(handle: Long): Int
     private external fun nativeGetPipelineState(handle: Long): Int
     private external fun nativeGetPlayWhenReady(handle: Long): Boolean
