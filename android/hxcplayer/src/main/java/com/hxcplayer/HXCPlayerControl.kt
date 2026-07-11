@@ -182,6 +182,11 @@ class HXCPlayerControl @JvmOverloads constructor(
         val position: Double,
         val duration: Double,
         val shouldShowPlayingUi: Boolean,
+        val audioOutputState: AudioOutputState = AudioOutputState.IDLE,
+        val silentForMs: Long = 0L,
+        val openslState: Int = 0,
+        val underrunRecent: Int = 0,
+        val recoverAttempts: Int = 0,
         val updatedAtMs: Long
     )
 
@@ -204,7 +209,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         val silentForMs: Long = 0L,
         val underrunRecent: Int = 0,
         val openslState: Int = 0,
-        val recoverAttempts: Int = 0
+        val recoverAttempts: Int = 0,
+        val audioOutputState: AudioOutputState = AudioOutputState.IDLE
     )
 
     /** 对齐 iOS 的视频模型（fileId + sign + secretId + timestamp） */
@@ -640,6 +646,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                 position = 0.0,
                 duration = 0.0,
                 shouldShowPlayingUi = false,
+                audioOutputState = AudioOutputState.IDLE,
+                silentForMs = 0L,
+                openslState = 0,
+                underrunRecent = 0,
+                recoverAttempts = 0,
                 updatedAtMs = now
             )
         }
@@ -650,6 +661,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         val playWhenReady = nativeGetPlayWhenReady(handle)
         val isPlaying = nativeIsPlaying(handle)
         val loading = isLoading()
+        val audioMetrics = getAudioHealthMetrics()
         val resolved = coerceStateWithLoading(
             resolveUnifiedState(coreStateRaw, pipelineStateRaw, playWhenReady, isPlaying),
             loading
@@ -662,6 +674,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             loading = loading,
             position = rawPosition,
             duration = duration,
+            audioMetrics = audioMetrics,
             nowMs = now
         )
     }
@@ -823,6 +836,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         val pipeline = getPipelineState()
         val playWhenReady = getPlayWhenReady()
         val checkIsPlaying = isPlaying()
+        val audioMetrics = getAudioHealthMetrics()
         val snapshot = buildPlaybackSnapshot(
             state = state,
             pipeline = pipeline,
@@ -831,6 +845,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             loading = loading,
             position = position,
             duration = duration,
+            audioMetrics = audioMetrics,
             nowMs = now
         )
         lastPlaybackSnapshot = snapshot
@@ -2061,6 +2076,13 @@ class HXCPlayerControl @JvmOverloads constructor(
         nativeSetVolume(handle, volume)
     }
 
+    // 设置 App 级静音；不改变播放器基础增益，实际音量仍由系统媒体音量控制。
+    fun setMuted(muted: Boolean) {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        nativeSetMuted(handle, muted)
+    }
+
     /** 查询音频输出健康状态（无声监测）。 */
     fun getAudioHealthMetrics(): AudioHealthMetrics {
         val handle = currentHandle()
@@ -2070,7 +2092,8 @@ class HXCPlayerControl @JvmOverloads constructor(
             silentForMs = raw.getOrElse(0) { 0L },
             underrunRecent = raw.getOrElse(1) { 0L }.toInt(),
             openslState = raw.getOrElse(2) { 0L }.toInt(),
-            recoverAttempts = raw.getOrElse(3) { 0L }.toInt()
+            recoverAttempts = raw.getOrElse(3) { 0L }.toInt(),
+            audioOutputState = AudioOutputState.fromNativeCode(raw.getOrElse(4) { 0L }.toInt())
         )
     }
 
@@ -2279,13 +2302,17 @@ class HXCPlayerControl @JvmOverloads constructor(
         loading: Boolean,
         position: Double,
         duration: Double,
+        audioMetrics: AudioHealthMetrics,
         nowMs: Long
     ): PlaybackSnapshot {
-        val shouldShowPlayingUi = when (state) {
+        val videoShowsPlayingUi = when (state) {
             PlayerState.PLAYING -> true
             PlayerState.LOADING, PlayerState.OPENING -> playWhenReady
             else -> false
         }
+        val audioAllowsPlayingUi = audioMetrics.audioOutputState != AudioOutputState.STALLED &&
+            audioMetrics.audioOutputState != AudioOutputState.ERROR
+        val shouldShowPlayingUi = videoShowsPlayingUi && audioAllowsPlayingUi
         return PlaybackSnapshot(
             state = state,
             pipelineState = pipeline,
@@ -2295,6 +2322,11 @@ class HXCPlayerControl @JvmOverloads constructor(
             position = position,
             duration = duration,
             shouldShowPlayingUi = shouldShowPlayingUi,
+            audioOutputState = audioMetrics.audioOutputState,
+            silentForMs = audioMetrics.silentForMs,
+            openslState = audioMetrics.openslState,
+            underrunRecent = audioMetrics.underrunRecent,
+            recoverAttempts = audioMetrics.recoverAttempts,
             updatedAtMs = nowMs
         )
     }
@@ -2306,8 +2338,13 @@ class HXCPlayerControl @JvmOverloads constructor(
             old.playWhenReady != new.playWhenReady ||
             old.isPlaying != new.isPlaying ||
             old.isLoading != new.isLoading ||
-            old.shouldShowPlayingUi != new.shouldShowPlayingUi
+            old.shouldShowPlayingUi != new.shouldShowPlayingUi ||
+            old.audioOutputState != new.audioOutputState ||
+            old.openslState != new.openslState ||
+            old.underrunRecent != new.underrunRecent ||
+            old.recoverAttempts != new.recoverAttempts
         if (semanticChanged) return true
+        if (abs(old.silentForMs - new.silentForMs) >= 1000L) return true
         if (abs(old.position - new.position) >= 0.25) return true
         if (abs(old.duration - new.duration) >= 0.50) return true
         return new.updatedAtMs - old.updatedAtMs >= 1000L
@@ -2366,6 +2403,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     )
                 }
                 val pipeline = mapPipelineState(pipelineStateRaw)
+                val audioMetrics = getAudioHealthMetrics()
                 val snapshot = buildPlaybackSnapshot(
                     state = state,
                     pipeline = pipeline,
@@ -2374,6 +2412,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     loading = loading,
                     position = position,
                     duration = duration,
+                    audioMetrics = audioMetrics,
                     nowMs = now
                 )
                 val shouldDispatchSnapshot = hasSnapshotDispatchDiff(lastPlaybackSnapshot, snapshot)
@@ -3444,6 +3483,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeSeekToWithIntent(handle: Long, position: Double, resumeAfterSeek: Boolean)
     private external fun nativeSetPlaybackRate(handle: Long, rate: Float)
     private external fun nativeSetVolume(handle: Long, volume: Float)
+    private external fun nativeSetMuted(handle: Long, muted: Boolean)
     private external fun nativeSetAspectRatioMode(handle: Long, mode: Int)
     private external fun nativeSetDecodeMode(handle: Long, mode: Int)
     private external fun nativeSetSecureSeekTuning(

@@ -272,6 +272,16 @@ Java_com_hxcplayer_HXCPlayerControl_nativeSetVolume(
     }
 }
 
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeSetMuted(
+        JNIEnv *env, jobject thiz, jlong handle, jboolean muted) {
+    LOGD("nativeSetMuted: %d", muted ? 1 : 0);
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        player->setMuted(muted == JNI_TRUE);
+    }
+}
+
 // 设置比例模式
 JNIEXPORT void JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeSetAspectRatioMode(
@@ -630,22 +640,24 @@ Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomFile(
 JNIEXPORT jlongArray JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeGetAudioHealthMetrics(JNIEnv* env, jobject thiz, jlong handle) {
     (void)thiz;
-    jlong values[4] = {0, 0, 0, 0};
+    jlong values[5] = {0, 0, 0, 0, 0};
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
     if (player) {
         int64_t silent_ms = 0;
         int underrun = 0;
         int opensl_state = 0;
         int recover_attempts = 0;
-        player->getAudioHealthMetrics(&silent_ms, &underrun, &opensl_state, &recover_attempts);
+        int audio_output_state = 0;
+        player->getAudioHealthMetrics(&silent_ms, &underrun, &opensl_state, &recover_attempts, &audio_output_state);
         values[0] = static_cast<jlong>(silent_ms);
         values[1] = static_cast<jlong>(underrun);
         values[2] = static_cast<jlong>(opensl_state);
         values[3] = static_cast<jlong>(recover_attempts);
+        values[4] = static_cast<jlong>(audio_output_state);
     }
-    jlongArray result = env->NewLongArray(4);
+    jlongArray result = env->NewLongArray(5);
     if (result) {
-        env->SetLongArrayRegion(result, 0, 4, values);
+        env->SetLongArrayRegion(result, 0, 5, values);
     }
     return result;
 }

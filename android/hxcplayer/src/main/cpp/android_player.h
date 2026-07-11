@@ -95,6 +95,7 @@ public:
     void   seekToWithIntent(double position, bool resume_after_seek);
     void   setPlaybackRate(float rate);
     void   setVolume(float volume);
+    void   setMuted(bool muted);
     void   setAspectRatioMode(int mode);   // 0=FIT, 1=FILL
     void   setDecodeMode(int mode);        // 0=software, 1=hardware
     void   setSecureSeekTuning(double drop_only_window_backward_sec,
@@ -133,7 +134,8 @@ public:
     void   getAudioHealthMetrics(int64_t* silent_for_ms,
                                  int* underrun_recent,
                                  int* opensl_state,
-                                 int* recover_attempts);
+                                 int* recover_attempts,
+                                 int* audio_output_state);
     bool   recoverAudioOutput();
 
 private:
@@ -257,6 +259,7 @@ private:
     void destroyAudioOutput();
     void destroyAudioOutputObjectsLocked();
     void ensureAudioOutputForCurrentStream();
+    bool isAudioOutputEnabled() const;
     SLresult setOpenSLESPlayState(SLuint32 state, bool require_audible);
     static void audioCallback(SLAndroidSimpleBufferQueueItf bq, void* context);
     void onAudioData(SLAndroidSimpleBufferQueueItf bq);
@@ -269,6 +272,7 @@ private:
     std::atomic<bool>  audio_active_{false};
     std::atomic<int>   audio_cb_in_flight_{0};
     std::atomic<float> current_volume_{1.0f}; // last value passed to setVolume()
+    std::atomic<bool>  muted_{false};
     std::atomic<float> requested_playback_rate_{1.0f}; // rate requested by upper layer
     std::atomic<bool> seek_just_happened_{false};
     // When true: audio start is deferred until the first video frame is rendered
@@ -406,6 +410,7 @@ private:
     static constexpr int   kAudioRecoverMaxAttempts = 3;
 
     int    queryOpenSLESPlayState();
+    int    resolveAudioOutputState(int64_t now, int opensl_state);
     SLresult setOpenSLESPlayStateWithRetry(SLuint32 state, bool require_audible, int max_retries = 3);
     bool   forceResumeAudioOutput(int64_t now, double anchor_pts, const char* reason);
     void   checkAndRecoverAudioHealth(int64_t now);

@@ -1,7 +1,9 @@
 package com.hxcplayer.test
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -208,11 +210,14 @@ class MainActivity : AppCompatActivity(), HXCPlayerControl.PlayerCallback {
             }
         })
         
-        // 音量条
+        // 系统媒体音量条：不修改播放器内部增益。
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        binding.volumeBar.max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        binding.volumeBar.progress = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
         binding.volumeBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
                 if (fromUser) {
-                    player.setVolume(progress / 100.0f)
+                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, progress, 0)
                 }
             }
             

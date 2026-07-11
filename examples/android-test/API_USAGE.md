@@ -67,8 +67,9 @@ player.seekTo(60.0)
 // 设置播放速度（0.5x ~ 2.0x）
 player.setPlaybackRate(1.5f)  // 1.5倍速
 
-// 设置音量（0.0 ~ 1.0）
-player.setVolume(0.8f)
+// App 静音开关；实际音量大小交给 Android 系统媒体音量控制
+player.setMuted(true)
+player.setMuted(false)
 
 // 设置显示模式
 player.setAspectRatioMode(true)   // Fill 模式（裁剪填充）
@@ -131,7 +132,7 @@ override fun onDestroy() {
 | 暂停 | `[player pause]` | `player.pause()` |
 | 跳转 | `[player seekToPosition:60.0]` | `player.seekTo(60.0)` |
 | 设置速度 | `player.playbackRate = 1.5` | `player.setPlaybackRate(1.5f)` |
-| 设置音量 | `player.volume = 0.8` | `player.setVolume(0.8f)` |
+| 静音开关 | `player.muted = true` | `player.setMuted(true)` |
 | 设置模式 | `player.aspectRatioMode = ...` | `player.setAspectRatioMode(...)` |
 
 ## 布局示例
