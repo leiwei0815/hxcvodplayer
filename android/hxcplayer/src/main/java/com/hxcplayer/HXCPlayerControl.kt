@@ -2111,6 +2111,13 @@ class HXCPlayerControl @JvmOverloads constructor(
         return nativeRebuildAudioOutput(handle)
     }
 
+    /** 音频路由变化（耳机/蓝牙/扬声器切换）后主动踢醒或重建 Android 音频输出。 */
+    fun handleAudioRouteChanged(reason: String = "audio_route_changed"): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return false
+        return nativeHandleAudioRouteChanged(handle, reason)
+    }
+
     /**
      * 最强兜底：保留当前播放位置重新打开当前数据源，效果接近退出重进播放页。
      *
@@ -3578,6 +3585,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeGetAudioHealthMetrics(handle: Long): LongArray?
     private external fun nativeRecoverAudioOutput(handle: Long): Boolean
     private external fun nativeRebuildAudioOutput(handle: Long): Boolean
+    private external fun nativeHandleAudioRouteChanged(handle: Long, reason: String): Boolean
 
     // 获取当前是否处于加载中（可用于主动查询 UI 状态）
     fun isLoading(): Boolean {

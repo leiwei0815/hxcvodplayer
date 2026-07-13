@@ -138,6 +138,7 @@ public:
                                  int* audio_output_state);
     bool   recoverAudioOutput();
     bool   rebuildAudioOutput();
+    bool   handleAudioRouteChanged(const char* reason);
 
 private:
     // -----------------------------------------------------------------------
@@ -260,6 +261,8 @@ private:
     void destroyAudioOutput();
     void destroyAudioOutputObjectsLocked();
     void ensureAudioOutputForCurrentStream();
+    bool primeAudioBufferQueue(const char* reason, bool clear_queue);
+    bool recreateAudioOutputForCurrentStream(const char* reason);
     bool isAudioOutputEnabled() const;
     SLresult setOpenSLESPlayState(SLuint32 state, bool require_audible);
     static void audioCallback(SLAndroidSimpleBufferQueueItf bq, void* context);
@@ -407,7 +410,13 @@ private:
     std::atomic<int>     audio_health_recover_attempts_{0};
     std::atomic<int64_t> last_audio_health_check_ms_{0};
     std::atomic<int>     recent_audio_underrun_total_{0};
+    std::atomic<int64_t> last_audio_callback_ms_{0};
+    std::atomic<int64_t> last_audio_prime_ms_{0};
+    std::atomic<int64_t> audio_av_split_started_ms_{0};
+    std::atomic<bool>    audio_av_split_forced_pause_{false};
     static constexpr int64_t kAudioSilentThresholdMs = 2500;
+    static constexpr int64_t kAudioCallbackStallMs = 1800;
+    static constexpr int64_t kAudioAvSplitPauseMs = 6500;
     static constexpr int   kAudioRecoverMaxAttempts = 3;
 
     int    queryOpenSLESPlayState();
@@ -416,7 +425,8 @@ private:
     bool   forceResumeAudioOutput(int64_t now, double anchor_pts, const char* reason);
     bool   enforceAudioPauseDeadlines(int64_t now, const char* source);
     void   checkAndRecoverAudioHealth(int64_t now);
-    void   rebuildAudioOutputFromStream();
+    void   rebuildAudioOutputFromStream(bool force_recreate, const char* reason);
+    void   pausePlaybackForAudioSplit(int64_t now, double anchor_pts, const char* reason);
 
     // -----------------------------------------------------------------------
     // Event forwarding (core callbacks -> JNI poll)

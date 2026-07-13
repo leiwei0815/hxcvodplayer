@@ -680,4 +680,17 @@ Java_com_hxcplayer_HXCPlayerControl_nativeRebuildAudioOutput(JNIEnv* env, jobjec
     return player->rebuildAudioOutput() ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeHandleAudioRouteChanged(JNIEnv* env, jobject thiz, jlong handle, jstring reason) {
+    (void)thiz;
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return JNI_FALSE;
+    const char* reason_str = reason ? env->GetStringUTFChars(reason, nullptr) : nullptr;
+    bool result = player->handleAudioRouteChanged(reason_str ? reason_str : "audio_route_changed");
+    if (reason_str) {
+        env->ReleaseStringUTFChars(reason, reason_str);
+    }
+    return result ? JNI_TRUE : JNI_FALSE;
+}
+
 } // extern "C"

@@ -555,6 +555,8 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         audio_rebuffer_cooldown_until_ms_ = 0;
         audio_underrun_streak_started_ms_.store(0, std::memory_order_release);
         last_audio_underrun_ms_.store(0, std::memory_order_release);
+        audio_av_split_started_ms_.store(0, std::memory_order_release);
+        audio_av_split_forced_pause_.store(false, std::memory_order_release);
         seek_target_sec_.store(-1.0, std::memory_order_release);
         seek_from_sec_.store(-1.0, std::memory_order_release);
         seek_fast_catchup_frames_.store(0, std::memory_order_release);
@@ -679,6 +681,8 @@ bool AndroidPlayer::openWithCustomHTTP(const char* url, int timeout_ms, int max_
         secure_forward_seek_bias_sec_.store(0.0, std::memory_order_release);
         secure_forward_seek_bias_hits_.store(0, std::memory_order_release);
         secure_forward_seek_bias_last_update_ms_.store(0, std::memory_order_release);
+        audio_av_split_started_ms_.store(0, std::memory_order_release);
+        audio_av_split_forced_pause_.store(false, std::memory_order_release);
         render_cv_.notify_one();
         return true;
     } else {
@@ -777,6 +781,8 @@ bool AndroidPlayer::openWithCustomFile(const char* path, size_t avio_buffer_size
         secure_forward_seek_bias_sec_.store(0.0, std::memory_order_release);
         secure_forward_seek_bias_hits_.store(0, std::memory_order_release);
         secure_forward_seek_bias_last_update_ms_.store(0, std::memory_order_release);
+        audio_av_split_started_ms_.store(0, std::memory_order_release);
+        audio_av_split_forced_pause_.store(false, std::memory_order_release);
         render_cv_.notify_one();
         return true;
     } else {
@@ -869,6 +875,8 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         audio_rebuffer_pending_.store(false, std::memory_order_release);
         audio_underrun_streak_started_ms_.store(0, std::memory_order_release);
         last_audio_underrun_ms_.store(0, std::memory_order_release);
+        audio_av_split_started_ms_.store(0, std::memory_order_release);
+        audio_av_split_forced_pause_.store(false, std::memory_order_release);
         first_frame_wait_started_ms_ = 0;
         audio_start_deadline_ms_ = 0;
         setOpenSLESPlayState(SL_PLAYSTATE_STOPPED, false);
@@ -941,6 +949,8 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         secure_forward_seek_bias_sec_.store(0.0, std::memory_order_release);
         secure_forward_seek_bias_hits_.store(0, std::memory_order_release);
         secure_forward_seek_bias_last_update_ms_.store(0, std::memory_order_release);
+        audio_av_split_started_ms_.store(0, std::memory_order_release);
+        audio_av_split_forced_pause_.store(false, std::memory_order_release);
         render_cv_.notify_one();
         return true;
     }
@@ -1002,6 +1012,8 @@ void AndroidPlayer::play() {
         audio_rebuffer_paused_at_ms_ = 0;
         audio_rebuffer_min_resume_at_ms_ = 0;
         audio_rebuffer_cooldown_until_ms_ = 0;
+        audio_av_split_started_ms_.store(0, std::memory_order_release);
+        audio_av_split_forced_pause_.store(false, std::memory_order_release);
         bool seek_flow_active =
                 seek_lower_bound_active_.load(std::memory_order_acquire) ||
                 seek_recovery_active_.load(std::memory_order_acquire) ||
@@ -1058,7 +1070,8 @@ void AndroidPlayer::play() {
                 audio_start_pending_.store(false, std::memory_order_release);
                 first_frame_wait_started_ms_ = 0;
                 if (isAudioOutputEnabled()) {
-                    SLresult r = setOpenSLESPlayState(SL_PLAYSTATE_PLAYING, true);
+                    primeAudioBufferQueue("play_immediate_resume", true);
+                    SLresult r = setOpenSLESPlayStateWithRetry(SL_PLAYSTATE_PLAYING, true);
                     LOGI("[ctrl] play: audio immediate resume (video_opened=%d already_rendered=%d), result=%d",
                          video_stream_opened ? 1 : 0,
                          first_frame_rendered_.load(std::memory_order_acquire) ? 1 : 0,
@@ -1109,6 +1122,8 @@ void AndroidPlayer::pause() {
     audio_rebuffer_cooldown_until_ms_ = 0;
     audio_underrun_streak_started_ms_.store(0, std::memory_order_release);
     last_audio_underrun_ms_.store(0, std::memory_order_release);
+    audio_av_split_started_ms_.store(0, std::memory_order_release);
+    audio_av_split_forced_pause_.store(false, std::memory_order_release);
     seek_resume_on_complete_.store(false, std::memory_order_release);
     is_loading_.store(false, std::memory_order_release);
     suppress_stale_loading_true_until_ms_.store(now + 5000, std::memory_order_release);
@@ -1145,6 +1160,8 @@ void AndroidPlayer::stop() {
     audio_rebuffer_cooldown_until_ms_ = 0;
     audio_underrun_streak_started_ms_.store(0, std::memory_order_release);
     last_audio_underrun_ms_.store(0, std::memory_order_release);
+    audio_av_split_started_ms_.store(0, std::memory_order_release);
+    audio_av_split_forced_pause_.store(false, std::memory_order_release);
     seek_resume_on_complete_.store(false, std::memory_order_release);
     resetSeekFlowState(true, true, false, false);
     consecutive_drop_count_ = 0;
@@ -1785,6 +1802,9 @@ bool AndroidPlayer::isLoading() const {
         !first_frame_rendered_.load(std::memory_order_acquire) &&
         player_core_ &&
         play_when_ready_now;
+    if (audio_av_split_forced_pause_.load(std::memory_order_acquire) && core_loading) {
+        return true;
+    }
     // Paused semantics: if caller explicitly does not want autoplay and no seek-gate is active,
     // stale core_loading=true should not pin UI in loading forever.
     if (!play_when_ready_now && !seek_loading && !waiting_open_first_frame) {
@@ -6397,6 +6417,69 @@ void AndroidPlayer::ensureAudioOutputForCurrentStream() {
     LOGI("Audio output initialized with stream parameters");
 }
 
+bool AndroidPlayer::primeAudioBufferQueue(const char* reason, bool clear_queue) {
+    if (!bufferQueueItf_ || audio_buffer_size_ <= 0) {
+        LOGW("evt=audio_prime_skip reason=%s detail=no_buffer_queue size=%d",
+             reason ? reason : "", audio_buffer_size_);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> audio_lock(audio_mutex_);
+    memset(audio_buffer_, 0, audio_buffer_size_);
+
+    SLresult clear_ret = SL_RESULT_SUCCESS;
+    SLresult enqueue_ret = SL_RESULT_RESOURCE_ERROR;
+    {
+        std::lock_guard<std::mutex> opensl_lock(opensl_mutex_);
+        if (!bufferQueueItf_) {
+            return false;
+        }
+        if (clear_queue) {
+            clear_ret = (*bufferQueueItf_)->Clear(bufferQueueItf_);
+        }
+        enqueue_ret = (*bufferQueueItf_)->Enqueue(bufferQueueItf_, audio_buffer_, audio_buffer_size_);
+    }
+
+    bool ok = (!clear_queue || clear_ret == SL_RESULT_SUCCESS) && enqueue_ret == SL_RESULT_SUCCESS;
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (ok) {
+        last_audio_prime_ms_.store(now, std::memory_order_release);
+    }
+    LOGW("evt=audio_prime_queue reason=%s clear=%d clear_ret=%d enqueue_ret=%d size=%d ok=%d",
+         reason ? reason : "", clear_queue ? 1 : 0, clear_ret, enqueue_ret,
+         audio_buffer_size_, ok ? 1 : 0);
+    return ok;
+}
+
+bool AndroidPlayer::recreateAudioOutputForCurrentStream(const char* reason) {
+    if (!player_core_) {
+        return false;
+    }
+
+    int sample_rate = player_core_get_audio_sample_rate(player_core_);
+    int source_channels = player_core_get_audio_channels(player_core_);
+    int output_channels = normalize_audio_output_channels(source_channels);
+    if (sample_rate <= 0 || output_channels <= 0) {
+        LOGW("evt=audio_recreate_skip reason=%s sample_rate=%d source_channels=%d output_channels=%d",
+             reason ? reason : "", sample_rate, source_channels, output_channels);
+        return false;
+    }
+
+    LOGW("evt=audio_recreate_output reason=%s sample_rate=%d source_channels=%d output_channels=%d",
+         reason ? reason : "", sample_rate, source_channels, output_channels);
+    destroyAudioOutput();
+    if (!initAudioOutput(sample_rate, source_channels)) {
+        audio_initialized_ = false;
+        return false;
+    }
+    audio_initialized_ = true;
+    if (isAudioOutputEnabled()) {
+        setOpenSLESPlayStateWithRetry(SL_PLAYSTATE_PLAYING, true);
+    }
+    return true;
+}
+
 SLresult AndroidPlayer::setOpenSLESPlayState(SLuint32 state, bool require_audible) {
     std::lock_guard<std::mutex> opensl_lock(opensl_mutex_);
     if (!playItf_) {
@@ -6483,7 +6566,6 @@ int AndroidPlayer::resolveAudioOutputState(int64_t now, int opensl_state) {
 }
 
 bool AndroidPlayer::forceResumeAudioOutput(int64_t now, double anchor_pts, const char* reason) {
-    (void)now;
     audio_rebuffer_pending_.store(false, std::memory_order_release);
     audio_rebuffer_deadline_ms_ = 0;
     audio_rebuffer_paused_at_ms_ = 0;
@@ -6514,8 +6596,16 @@ bool AndroidPlayer::forceResumeAudioOutput(int64_t now, double anchor_pts, const
              reason ? reason : "", anchor_pts);
         return false;
     }
+    int opensl_state = queryOpenSLESPlayState();
+    int64_t last_callback_ms = last_audio_callback_ms_.load(std::memory_order_acquire);
+    bool callback_stalled = last_callback_ms <= 0 || (now - last_callback_ms) >= kAudioCallbackStallMs;
+    bool primed = false;
+    if (opensl_state != 1 || callback_stalled) {
+        primed = primeAudioBufferQueue(reason, true);
+    }
     SLresult r = setOpenSLESPlayStateWithRetry(SL_PLAYSTATE_PLAYING, true);
-    LOGW("evt=audio_force_resume reason=%s result=%d anchor=%.3f", reason ? reason : "", r, anchor_pts);
+    LOGW("evt=audio_force_resume reason=%s result=%d anchor=%.3f opensl_before=%d callback_stalled=%d primed=%d",
+         reason ? reason : "", r, anchor_pts, opensl_state, callback_stalled ? 1 : 0, primed ? 1 : 0);
     return r == SL_RESULT_SUCCESS;
 }
 
@@ -6608,7 +6698,9 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
 
     int opensl_state = queryOpenSLESPlayState();
     int64_t last_audio_ms = last_effective_audio_output_ms_.load(std::memory_order_acquire);
+    int64_t last_callback_ms = last_audio_callback_ms_.load(std::memory_order_acquire);
     bool silent_too_long = last_audio_ms > 0 && (now - last_audio_ms) >= kAudioSilentThresholdMs;
+    bool callback_stalled = last_callback_ms > 0 && (now - last_callback_ms) >= kAudioCallbackStallMs;
     bool secure_audio_underrun_stuck = false;
     if (secure_session_active_.load(std::memory_order_acquire)) {
         int64_t underrun_started_ms = audio_underrun_streak_started_ms_.load(std::memory_order_acquire);
@@ -6626,9 +6718,24 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
                                   audio_rebuffer_paused_at_ms_ > 0 &&
                                   (now - audio_rebuffer_paused_at_ms_) >= 3200;
     bool rebuffer_stuck = rebuffer_deadline_expired || rebuffer_lost_deadline;
+    bool network_source = !source_local_active_.load(std::memory_order_acquire);
+    bool audio_unhealthy = silent_too_long || callback_stalled || secure_audio_underrun_stuck ||
+                           opensl_not_playing || rebuffer_stuck || seek_audio_wait_expired;
+    bool av_split_progressing = network_source && progress_active && audio_unhealthy &&
+                                !seek_audio_wait_active &&
+                                !user_manual_pause_.load(std::memory_order_acquire);
+    int64_t av_split_started = audio_av_split_started_ms_.load(std::memory_order_acquire);
+    if (av_split_progressing) {
+        int64_t expected_zero = 0;
+        audio_av_split_started_ms_.compare_exchange_strong(
+                expected_zero, now, std::memory_order_acq_rel);
+        av_split_started = audio_av_split_started_ms_.load(std::memory_order_acquire);
+    } else {
+        audio_av_split_started_ms_.store(0, std::memory_order_release);
+    }
+    int64_t av_split_ms = av_split_started > 0 ? (now - av_split_started) : 0;
 
-    if (!silent_too_long && !secure_audio_underrun_stuck && !opensl_not_playing &&
-        !rebuffer_stuck && !seek_audio_wait_expired) {
+    if (!audio_unhealthy) {
         return;
     }
 
@@ -6637,16 +6744,24 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
     if (!std::isfinite(anchor) || anchor < 0.0) anchor = 0.0;
 
     LOGW_RATE(8,
-              "evt=audio_health_recover_trigger attempt=%d silent=%d secure_underrun=%d opensl_state=%d rebuffer_stuck=%d seek_wait_expired=%d progress_active=%d core_playing=%d anchor=%.3f",
+              "evt=audio_health_recover_trigger attempt=%d silent=%d callback_stalled=%d secure_underrun=%d opensl_state=%d rebuffer_stuck=%d seek_wait_expired=%d progress_active=%d av_split=%d av_split_ms=%" PRId64 " core_playing=%d anchor=%.3f",
               attempt,
               silent_too_long ? 1 : 0,
+              callback_stalled ? 1 : 0,
               secure_audio_underrun_stuck ? 1 : 0,
               opensl_state,
               rebuffer_stuck ? 1 : 0,
               seek_audio_wait_expired ? 1 : 0,
               progress_active ? 1 : 0,
+              av_split_progressing ? 1 : 0,
+              av_split_ms,
               core_playing ? 1 : 0,
               anchor);
+
+    if (av_split_progressing && av_split_ms >= kAudioAvSplitPauseMs) {
+        pausePlaybackForAudioSplit(now, anchor, "audio_video_split_network");
+        return;
+    }
 
     if (attempt <= 2) {
         forceResumeAudioOutput(now, anchor, "audio_health_watchdog");
@@ -6655,15 +6770,52 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
 
     if (attempt == kAudioRecoverMaxAttempts) {
         LOGW("evt=audio_health_rebuild attempt=%d anchor=%.3f", attempt, anchor);
-        rebuildAudioOutputFromStream();
-        audio_health_recover_attempts_.store(0, std::memory_order_release);
-        last_effective_audio_output_ms_.store(now, std::memory_order_release);
+        rebuildAudioOutputFromStream(true, "audio_health_watchdog");
+        if (av_split_progressing && av_split_ms >= (kAudioAvSplitPauseMs / 2)) {
+            pausePlaybackForAudioSplit(now, anchor, "audio_video_split_after_rebuild");
+        } else {
+            audio_health_recover_attempts_.store(0, std::memory_order_release);
+        }
     }
 }
 
-void AndroidPlayer::rebuildAudioOutputFromStream() {
+void AndroidPlayer::pausePlaybackForAudioSplit(int64_t now, double anchor_pts, const char* reason) {
+    (void)now;
     if (!player_core_) return;
-    ensureAudioOutputForCurrentStream();
+    audio_av_split_started_ms_.store(0, std::memory_order_release);
+    audio_health_recover_attempts_.store(0, std::memory_order_release);
+    audio_rebuffer_pending_.store(false, std::memory_order_release);
+    audio_rebuffer_deadline_ms_ = 0;
+    audio_rebuffer_paused_at_ms_ = 0;
+    audio_rebuffer_min_resume_at_ms_ = 0;
+    audio_rebuffer_cooldown_until_ms_ = 0;
+    seek_audio_wait_video_.store(false, std::memory_order_release);
+    seek_audio_wait_deadline_ms_ = 0;
+    if (std::isfinite(anchor_pts) && anchor_pts >= 0.0) {
+        player_core_anchor_clock(player_core_, anchor_pts);
+    }
+    audio_av_split_forced_pause_.store(true, std::memory_order_release);
+    player_core_set_play_when_ready(player_core_, 0);
+    if (playItf_) {
+        setOpenSLESPlayState(SL_PLAYSTATE_PAUSED, false);
+    }
+    is_loading_.store(true, std::memory_order_release);
+    suppress_stale_loading_true_until_ms_.store(0, std::memory_order_release);
+    LOGW("evt=audio_video_split_pause reason=%s anchor=%.3f source_local=%d secure=%d opensl_state=%d",
+         reason ? reason : "", anchor_pts,
+         source_local_active_.load(std::memory_order_acquire) ? 1 : 0,
+         secure_session_active_.load(std::memory_order_acquire) ? 1 : 0,
+         queryOpenSLESPlayState());
+}
+
+void AndroidPlayer::rebuildAudioOutputFromStream(bool force_recreate, const char* reason) {
+    if (!player_core_) return;
+    if (force_recreate) {
+        recreateAudioOutputForCurrentStream(reason);
+    } else {
+        ensureAudioOutputForCurrentStream();
+        primeAudioBufferQueue(reason, false);
+    }
     if (playItf_ && isAudioOutputEnabled()) {
         setOpenSLESPlayStateWithRetry(SL_PLAYSTATE_PLAYING, true);
     }
@@ -6703,7 +6855,7 @@ bool AndroidPlayer::recoverAudioOutput() {
     bool ok = enforceAudioPauseDeadlines(now, "manual_recover") ||
               forceResumeAudioOutput(now, anchor, "manual_recover");
     if (!ok) {
-        rebuildAudioOutputFromStream();
+        rebuildAudioOutputFromStream(true, "manual_recover");
         ok = queryOpenSLESPlayState() == 1;
     }
     LOGW("evt=audio_manual_recover result=%d opensl_state=%d anchor=%.3f", ok ? 1 : 0, queryOpenSLESPlayState(), anchor);
@@ -6724,12 +6876,36 @@ bool AndroidPlayer::rebuildAudioOutput() {
     audio_start_pending_.store(false, std::memory_order_release);
     audio_start_deadline_ms_ = 0;
     audio_underrun_streak_started_ms_.store(0, std::memory_order_release);
-    rebuildAudioOutputFromStream();
+    rebuildAudioOutputFromStream(true, "manual_rebuild_audio");
     bool ok = queryOpenSLESPlayState() == 1;
     if (!ok && playItf_ && isAudioOutputEnabled()) {
         ok = forceResumeAudioOutput(now, anchor, "manual_rebuild_audio") || queryOpenSLESPlayState() == 1;
     }
     LOGW("evt=audio_manual_rebuild result=%d opensl_state=%d anchor=%.3f", ok ? 1 : 0, queryOpenSLESPlayState(), anchor);
+    return ok;
+}
+
+bool AndroidPlayer::handleAudioRouteChanged(const char* reason) {
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    double anchor = player_core_ ? player_core_get_position(player_core_) : 0.0;
+    if (!std::isfinite(anchor) || anchor < 0.0) anchor = 0.0;
+    if (!player_core_ || !isAudioOutputEnabled()) {
+        LOGW("evt=audio_route_recover_skip reason=%s detail=inactive_or_muted anchor=%.3f",
+             reason ? reason : "", anchor);
+        return false;
+    }
+
+    bool primed = primeAudioBufferQueue(reason, true);
+    bool resumed = forceResumeAudioOutput(now, anchor, reason);
+    bool ok = primed || resumed;
+    if (!ok || queryOpenSLESPlayState() != 1) {
+        rebuildAudioOutputFromStream(true, reason ? reason : "audio_route_changed");
+        ok = queryOpenSLESPlayState() == 1;
+    }
+    LOGW("evt=audio_route_recover reason=%s primed=%d resumed=%d result=%d opensl_state=%d anchor=%.3f",
+         reason ? reason : "", primed ? 1 : 0, resumed ? 1 : 0, ok ? 1 : 0,
+         queryOpenSLESPlayState(), anchor);
     return ok;
 }
 
@@ -6753,6 +6929,9 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     // destroyAudioOutput/openURL acquire the same lock before tearing down core/OpenSL,
     // so this prevents enqueue-on-destroy races.
     std::lock_guard<std::mutex> lock(audio_mutex_);
+    int64_t audio_now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    last_audio_callback_ms_.store(audio_now_ms, std::memory_order_release);
 
     if (!audio_active_ || !player_core_ || audio_buffer_size_ == 0) {
         int sz = audio_buffer_size_ > 0 ? audio_buffer_size_ : 4096;
@@ -6786,8 +6965,6 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     }
 
     audio_cb_count_++;
-    int64_t audio_now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
     if (total_bytes_read > 0) {
         audio_underrun_streak_started_ms_.store(0, std::memory_order_release);
         if (total_bytes_read < audio_buffer_size_) {
@@ -6818,6 +6995,8 @@ void AndroidPlayer::onAudioData(SLAndroidSimpleBufferQueueItf bq) {
     if (total_bytes_read > 0) {
         last_effective_audio_output_ms_.store(audio_now_ms, std::memory_order_release);
         audio_health_recover_attempts_.store(0, std::memory_order_release);
+        audio_av_split_started_ms_.store(0, std::memory_order_release);
+        audio_av_split_forced_pause_.store(false, std::memory_order_release);
     }
 
     SLresult enqueue_ret = SL_RESULT_RESOURCE_ERROR;
