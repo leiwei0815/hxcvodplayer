@@ -671,4 +671,13 @@ Java_com_hxcplayer_HXCPlayerControl_nativeRecoverAudioOutput(JNIEnv* env, jobjec
     return player->recoverAudioOutput() ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeRebuildAudioOutput(JNIEnv* env, jobject thiz, jlong handle) {
+    (void)env;
+    (void)thiz;
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return JNI_FALSE;
+    return player->rebuildAudioOutput() ? JNI_TRUE : JNI_FALSE;
+}
+
 } // extern "C"

@@ -137,6 +137,7 @@ public:
                                  int* recover_attempts,
                                  int* audio_output_state);
     bool   recoverAudioOutput();
+    bool   rebuildAudioOutput();
 
 private:
     // -----------------------------------------------------------------------
@@ -413,6 +414,7 @@ private:
     int    resolveAudioOutputState(int64_t now, int opensl_state);
     SLresult setOpenSLESPlayStateWithRetry(SLuint32 state, bool require_audible, int max_retries = 3);
     bool   forceResumeAudioOutput(int64_t now, double anchor_pts, const char* reason);
+    bool   enforceAudioPauseDeadlines(int64_t now, const char* source);
     void   checkAndRecoverAudioHealth(int64_t now);
     void   rebuildAudioOutputFromStream();
 

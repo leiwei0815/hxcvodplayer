@@ -2104,6 +2104,64 @@ class HXCPlayerControl @JvmOverloads constructor(
         return nativeRecoverAudioOutput(handle)
     }
 
+    /** 明确重建 OpenSL 音频输出，适用于软恢复后仍处于 PAUSED/欠载/卡滞的场景。 */
+    fun rebuildAudioOutput(): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return false
+        return nativeRebuildAudioOutput(handle)
+    }
+
+    /**
+     * 最强兜底：保留当前播放位置重新打开当前数据源，效果接近退出重进播放页。
+     *
+     * 该方法异步执行，避免网络/鉴权打开过程阻塞 UI 线程；结果通过 [callback] 回到主线程。
+     */
+    @JvmOverloads
+    fun recoverPlaybackKeepingPosition(callback: PlayModelAsyncCallback? = null): Boolean {
+        if (isReleased) {
+            callback?.let { cb -> mainHandler.post { cb.onResult(false) } }
+            return false
+        }
+        val retryModel = lastOpenPlayModel?.let { clonePlayModel(it) }
+        val retryUrl = lastOpenUrl
+        if (retryModel == null && retryUrl.isNullOrBlank()) {
+            callback?.let { cb -> mainHandler.post { cb.onResult(false) } }
+            return false
+        }
+
+        val duration = getDuration()
+        val current = getPosition().takeIf { it.isFinite() && it > 0.0 } ?: lastOpenStartPosition
+        val maxStart = if (duration.isFinite() && duration > 0.35) duration - 0.35 else Double.MAX_VALUE
+        val start = maxOf(0.0, minOf(current, maxStart))
+        logInfo("evt=audio_hard_recover_reopen start_pos=$start source_category=$currentSourceCategory")
+
+        return try {
+            openExecutor.execute {
+                if (isReleased) {
+                    mainHandler.post { callback?.onResult(false) }
+                    return@execute
+                }
+                val opened = if (retryModel != null) {
+                    openWithPlayModel(retryModel, start)
+                } else {
+                    openURL(retryUrl!!, start)
+                }
+                if (opened && !isReleased && autoPlayer) {
+                    play()
+                }
+                mainHandler.post {
+                    if (!isReleased) {
+                        callback?.onResult(opened)
+                    }
+                }
+            }
+            true
+        } catch (_: RejectedExecutionException) {
+            callback?.let { cb -> mainHandler.post { cb.onResult(false) } }
+            false
+        }
+    }
+
     /**
      * 三分屏小窗/副画面同步模式。
      *
@@ -3519,6 +3577,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeSettleSeekSession(handle: Long, byTimeout: Boolean)
     private external fun nativeGetAudioHealthMetrics(handle: Long): LongArray?
     private external fun nativeRecoverAudioOutput(handle: Long): Boolean
+    private external fun nativeRebuildAudioOutput(handle: Long): Boolean
 
     // 获取当前是否处于加载中（可用于主动查询 UI 状态）
     fun isLoading(): Boolean {

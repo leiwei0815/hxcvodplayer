@@ -1324,6 +1324,16 @@ int PlayerCore::open_common_process(const std::string &filename) {
     
     // ⚠️ 必须先创建队列，再启动解码线程！
     // 创建数据包队列
+    LOG_INFO("audio_pipeline_open filename=", filename,
+             " streams=", format_ctx_ ? format_ctx_->nb_streams : 0,
+             " video_stream=", video_stream_,
+             " audio_stream=", audio_stream_,
+             " audio_codec=", media_info_.audio_codec,
+             " audio_sample_rate=", media_info_.audio_sample_rate,
+             " audio_channels=", media_info_.audio_channels,
+             " duration_us=", media_info_.duration,
+             " bitrate=", media_info_.bitrate);
+
     video_packet_queue_ = std::make_unique<PacketQueue>();
     audio_packet_queue_ = std::make_unique<PacketQueue>();
     subtitle_packet_queue_ = std::make_unique<PacketQueue>();
@@ -1785,6 +1795,9 @@ void PlayerCore::read_thread() {
     int soft_reconnect_attempt_count = 0;
     int64_t next_soft_reconnect_try_us = 0;
     bool pending_disconnect_error_after_drain = false;
+    int audio_packet_count = 0;
+    int video_packet_count = 0;
+    auto last_audio_pipeline_read_diag = std::chrono::steady_clock::now();
     
     while (!abort_request_) {
         // 处理 seek
@@ -2227,11 +2240,25 @@ void PlayerCore::read_thread() {
         if (pkt->stream_index == video_stream_ && video_stream_opened_ && video_packet_queue_) {
             video_packet_queue_->put(pkt);
             packet_count++;
+            video_packet_count++;
 //            if (packet_count % 100 == 0) {
 //                LOG_INFO("已读取 ", packet_count, " 个视频包");
 //            }
         } else if (pkt->stream_index == audio_stream_ && audio_stream_opened_ && audio_packet_queue_) {
             audio_packet_queue_->put(pkt);
+            audio_packet_count++;
+            auto diag_now = std::chrono::steady_clock::now();
+            auto diag_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    diag_now - last_audio_pipeline_read_diag).count();
+            if (audio_packet_count == 1 || audio_packet_count % 100 == 0 || diag_elapsed_ms >= 10000) {
+                last_audio_pipeline_read_diag = diag_now;
+                LOG_INFO("audio_pipeline_read packets audio=", audio_packet_count,
+                         " video=", video_packet_count,
+                         " audio_queue_packets=", audio_packet_queue_->get_nb_packets(),
+                         " video_queue_packets=", video_packet_queue_ ? video_packet_queue_->get_nb_packets() : 0,
+                         " pkt_size=", pkt->size,
+                         " pkt_pts=", pkt->pts);
+            }
         } else {
             av_packet_unref(pkt);
         }
@@ -2813,6 +2840,8 @@ void PlayerCore::audio_thread() {
     
     int frame_count = 0;
     int error_count = 0;
+    double last_audio_decode_pts = NAN;
+    auto last_audio_pipeline_decode_diag = std::chrono::steady_clock::now();
     
     LOG_INFO("[音频线程] 进入主循环, audio_decoder_ exists=", (audio_decoder_ != nullptr), ", audio_packet_queue_ exists=", (audio_packet_queue_ != nullptr));
     
@@ -2975,6 +3004,20 @@ void PlayerCore::audio_thread() {
         
         // 推入队列
         audio_queue_->push();
+        last_audio_decode_pts = pts;
+        auto decode_diag_now = std::chrono::steady_clock::now();
+        auto decode_diag_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                decode_diag_now - last_audio_pipeline_decode_diag).count();
+        if (frame_count == 1 || frame_count % 100 == 0 || decode_diag_elapsed_ms >= 10000) {
+            last_audio_pipeline_decode_diag = decode_diag_now;
+            LOG_INFO("audio_pipeline_decode frames=", frame_count,
+                     " last_pts=", last_audio_decode_pts,
+                     " queue_frames=", audio_queue_ ? audio_queue_->nb_remaining() : -1,
+                     " packet_serial=", audio_packet_queue_ ? audio_packet_queue_->get_serial() : -1,
+                     " sample_rate=", frame->sample_rate,
+                     " channels=", frame->ch_layout.nb_channels,
+                     " nb_samples=", frame->nb_samples);
+        }
         if (!first_audio_frame_ready_.exchange(true, std::memory_order_acq_rel)) {
             LOG_INFO("音频首帧已就绪");
             update_pipeline_state_from_runtime();
