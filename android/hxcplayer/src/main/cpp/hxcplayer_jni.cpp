@@ -693,4 +693,22 @@ Java_com_hxcplayer_HXCPlayerControl_nativeHandleAudioRouteChanged(JNIEnv* env, j
     return result ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeSetSystemMusicVolumeZero(JNIEnv* env, jobject thiz, jlong handle, jboolean volume_zero) {
+    (void)env;
+    (void)thiz;
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return;
+    player->setSystemMusicVolumeZero(volume_zero == JNI_TRUE);
+}
+
+JNIEXPORT jdouble JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeConsumeVideoStallRecoverPosition(JNIEnv* env, jobject thiz, jlong handle) {
+    (void)env;
+    (void)thiz;
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return -1.0;
+    return player->consumeVideoStallRecoverPosition();
+}
+
 } // extern "C"

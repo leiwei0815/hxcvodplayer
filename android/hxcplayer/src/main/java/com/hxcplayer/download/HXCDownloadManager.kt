@@ -60,6 +60,7 @@ object HXCDownloadManager {
         fun hasRange(): Boolean = rangeStart >= 0L && rangeEnd >= rangeStart
         fun expectedLength(): Long = if (hasRange()) rangeEnd - rangeStart + 1 else -1L
         fun needsDecrypt(): Boolean = decryptKeyFile != null && target.name.endsWith(".ts")
+        fun isMediaSegment(): Boolean = target.name.endsWith(".ts")
     }
 
     private data class M3u8BuildArtifacts(
@@ -794,13 +795,14 @@ object HXCDownloadManager {
     }
 
     private fun downloadSimpleFile(url: String, target: File, headers: String) {
-        downloadSimpleFile(url, target, headers, null)
+        downloadSimpleFile(url, target, headers, expectedLength = -1L, onProgress = null)
     }
 
     private fun downloadSimpleFile(
         url: String,
         target: File,
         headers: String,
+        expectedLength: Long = -1L,
         onProgress: ((downloaded: Long, total: Long) -> Unit)?
     ) {
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
@@ -816,26 +818,8 @@ object HXCDownloadManager {
             throw HXCDownloadHttpException(code, "m3u8_resource")
         }
         val total = conn.contentLengthLong.coerceAtLeast(0L)
-        var downloaded = 0L
-        var lastEmitAt = 0L
-        target.outputStream().use { out ->
-            conn.inputStream.use { input ->
-                val buf = ByteArray(8 * 1024)
-                while (true) {
-                    val len = input.read(buf)
-                    if (len <= 0) break
-                    out.write(buf, 0, len)
-                    downloaded += len
-                    if (onProgress != null) {
-                        val now = System.currentTimeMillis()
-                        if (downloaded >= total || now - lastEmitAt >= 150L) {
-                            lastEmitAt = now
-                            onProgress.invoke(downloaded, total)
-                        }
-                    }
-                }
-            }
-        }
+        val expected = expectedLength.takeIf { it > 0L } ?: total.takeIf { it > 0L } ?: -1L
+        writeConnectionBodyAtomically(conn, target, expected, onProgress)
         conn.disconnect()
     }
 
@@ -845,7 +829,8 @@ object HXCDownloadManager {
         onProgress: ((downloaded: Long, total: Long) -> Unit)?
     ) {
         if (!task.hasRange()) {
-            downloadSimpleFile(task.url, task.target, headers, onProgress)
+            downloadSimpleFile(task.url, task.target, headers, onProgress = onProgress)
+            validateDownloadedResource(task)
             return
         }
         val rangeHeader = "bytes=${task.rangeStart}-${task.rangeEnd}"
@@ -858,12 +843,42 @@ object HXCDownloadManager {
         }
         conn.connect()
         val code = conn.responseCode
-        if (code in 200..299 || code == 206) {
+        if (code == HttpURLConnection.HTTP_PARTIAL) {
             val expectedFromRange = task.expectedLength()
             val total = if (expectedFromRange > 0L) expectedFromRange else conn.contentLengthLong.coerceAtLeast(0L)
-            var downloaded = 0L
-            var lastEmitAt = 0L
-            task.target.outputStream().use { out ->
+            writeConnectionBodyAtomically(conn, task.target, total, onProgress)
+            conn.disconnect()
+            validateDownloadedResource(task)
+            return
+        }
+        conn.disconnect()
+        if (task.target.exists()) {
+            task.target.delete()
+        }
+        if (task.rawUrl != task.url) {
+            downloadSimpleFile(task.rawUrl, task.target, headers, expectedLength = task.expectedLength(), onProgress = onProgress)
+            validateDownloadedResource(task)
+            return
+        }
+        throw HXCDownloadHttpException(code, "m3u8_resource_range", "download ts failed: HTTP $code, range=$rangeHeader")
+    }
+
+    private fun writeConnectionBodyAtomically(
+        conn: HttpURLConnection,
+        target: File,
+        expectedLength: Long,
+        onProgress: ((downloaded: Long, total: Long) -> Unit)?
+    ) {
+        val parent = target.parentFile
+        if (parent != null && !parent.exists()) {
+            parent.mkdirs()
+        }
+        val tmp = File(target.parentFile ?: File("."), "${target.name}.tmp")
+        if (tmp.exists()) tmp.delete()
+        var downloaded = 0L
+        var lastEmitAt = 0L
+        try {
+            tmp.outputStream().use { out ->
                 conn.inputStream.use { input ->
                     val buf = ByteArray(8 * 1024)
                     while (true) {
@@ -873,26 +888,45 @@ object HXCDownloadManager {
                         downloaded += len
                         if (onProgress != null) {
                             val now = System.currentTimeMillis()
-                            if (downloaded >= total || now - lastEmitAt >= 150L) {
+                            if ((expectedLength > 0L && downloaded >= expectedLength) || now - lastEmitAt >= 150L) {
                                 lastEmitAt = now
-                                onProgress.invoke(downloaded, total)
+                                onProgress.invoke(downloaded, expectedLength)
                             }
                         }
                     }
+                    out.flush()
                 }
             }
-            conn.disconnect()
-            return
+            if (expectedLength > 0L && downloaded != expectedLength) {
+                throw java.io.IOException(
+                    "resource length mismatch: expected=$expectedLength, actual=$downloaded, file=${target.name}"
+                )
+            }
+            if (target.exists() && !target.delete()) {
+                throw IllegalStateException("delete old resource failed: ${target.absolutePath}")
+            }
+            if (!tmp.renameTo(target)) {
+                tmp.copyTo(target, overwrite = true)
+                tmp.delete()
+            }
+        } catch (t: Throwable) {
+            tmp.delete()
+            throw t
         }
-        conn.disconnect()
-        if (task.target.exists()) {
+    }
+
+    private fun validateDownloadedResource(task: M3u8ResourceTask) {
+        if (!isResourceComplete(task)) {
             task.target.delete()
+            throw java.io.IOException("resource incomplete after download: ${task.target.name}")
         }
-        if (task.rawUrl != task.url) {
-            downloadSimpleFile(task.rawUrl, task.target, headers, onProgress)
+        if (!task.isMediaSegment() || task.needsDecrypt()) {
             return
         }
-        throw HXCDownloadHttpException(code, "m3u8_resource_range", "download ts failed: HTTP $code, range=$rangeHeader")
+        if (!isLikelyPlayableMediaSegment(task.target)) {
+            task.target.delete()
+            throw java.io.IOException("invalid media segment after download: ${task.target.name}")
+        }
     }
 
     private fun downloadTaskResourceWithRetry(
@@ -1009,7 +1043,11 @@ object HXCDownloadManager {
     private fun isResourceComplete(task: M3u8ResourceTask): Boolean {
         if (!task.target.exists() || task.target.length() <= 0L) return false
         val expected = task.expectedLength()
-        return expected <= 0L || task.target.length() == expected
+        if (expected > 0L && task.target.length() != expected) return false
+        if (task.isMediaSegment() && !task.needsDecrypt()) {
+            return isLikelyPlayableMediaSegment(task.target)
+        }
+        return true
     }
 
     private fun extractUriAttr(line: String): String? {
@@ -1110,11 +1148,18 @@ object HXCDownloadManager {
 
     private fun looksLikeClearTs(bytes: ByteArray): Boolean {
         if (bytes.size < 188 * 2) return false
-        if (bytes[0] != 0x47.toByte()) return false
-        val second = 188
-        val third = 376
-        return second < bytes.size && bytes[second] == 0x47.toByte()
-            && third < bytes.size && bytes[third] == 0x47.toByte()
+        val maxOffset = minOf(187, bytes.size - 188 * 2)
+        for (offset in 0..maxOffset) {
+            val second = offset + 188
+            val third = offset + 376
+            if (bytes[offset] == 0x47.toByte() &&
+                second < bytes.size && bytes[second] == 0x47.toByte() &&
+                third < bytes.size && bytes[third] == 0x47.toByte()
+            ) {
+                return true
+            }
+        }
+        return false
     }
 
     private fun isLikelyClearTsFile(file: File): Boolean {
@@ -1127,6 +1172,41 @@ object HXCDownloadManager {
                 looksLikeClearTs(probe)
             }
         }.getOrDefault(false)
+    }
+
+    private fun isLikelyPlayableMediaSegment(file: File): Boolean {
+        if (!file.exists() || file.length() <= 0L) return false
+        if (isLikelyClearTsFile(file)) return true
+        return runCatching {
+            file.inputStream().use { input ->
+                val probe = ByteArray(minOf(file.length(), 64 * 1024L).toInt())
+                val read = input.read(probe)
+                read > 0 && looksLikeFragmentedMp4(probe.copyOf(read))
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun looksLikeFragmentedMp4(bytes: ByteArray): Boolean {
+        var offset = 0
+        var sawMediaBox = false
+        while (offset + 8 <= bytes.size && offset < 64 * 1024) {
+            val size = readUInt32(bytes, offset)
+            if (size < 8L || offset + size > bytes.size) break
+            val type = String(bytes, offset + 4, 4, Charsets.US_ASCII)
+            if (type == "ftyp" || type == "styp" || type == "moof" || type == "mdat") {
+                sawMediaBox = true
+            }
+            if (sawMediaBox && (type == "moof" || type == "mdat")) return true
+            offset += size.toInt()
+        }
+        return sawMediaBox
+    }
+
+    private fun readUInt32(bytes: ByteArray, offset: Int): Long {
+        return ((bytes[offset].toLong() and 0xFF) shl 24) or
+            ((bytes[offset + 1].toLong() and 0xFF) shl 16) or
+            ((bytes[offset + 2].toLong() and 0xFF) shl 8) or
+            (bytes[offset + 3].toLong() and 0xFF)
     }
 
     private fun parseByteRange(line: String, prevEnd: Long): Pair<Long, Long> {

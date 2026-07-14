@@ -139,6 +139,8 @@ public:
     bool   recoverAudioOutput();
     bool   rebuildAudioOutput();
     bool   handleAudioRouteChanged(const char* reason);
+    void   setSystemMusicVolumeZero(bool volume_zero);
+    double consumeVideoStallRecoverPosition();
 
 private:
     // -----------------------------------------------------------------------
@@ -414,9 +416,16 @@ private:
     std::atomic<int64_t> last_audio_prime_ms_{0};
     std::atomic<int64_t> audio_av_split_started_ms_{0};
     std::atomic<bool>    audio_av_split_forced_pause_{false};
+    std::atomic<bool>    system_music_volume_zero_{false};
+    std::atomic<int64_t> video_empty_stall_started_ms_{0};
+    std::atomic<bool>    video_empty_stall_forced_pause_{false};
+    std::atomic<bool>    pending_video_stall_reopen_{false};
+    std::atomic<double>  pending_video_stall_reopen_pos_{-1.0};
     static constexpr int64_t kAudioSilentThresholdMs = 2500;
     static constexpr int64_t kAudioCallbackStallMs = 1800;
     static constexpr int64_t kAudioAvSplitPauseMs = 6500;
+    static constexpr int64_t kVideoEmptyStallPauseMs = 6000;
+    static constexpr int64_t kVideoEmptyStallReopenMs = 9000;
     static constexpr int   kAudioRecoverMaxAttempts = 3;
 
     int    queryOpenSLESPlayState();
@@ -425,8 +434,10 @@ private:
     bool   forceResumeAudioOutput(int64_t now, double anchor_pts, const char* reason);
     bool   enforceAudioPauseDeadlines(int64_t now, const char* source);
     void   checkAndRecoverAudioHealth(int64_t now);
+    void   resetAudioHealthStateForOpen(const char* reason);
     void   rebuildAudioOutputFromStream(bool force_recreate, const char* reason);
     void   pausePlaybackForAudioSplit(int64_t now, double anchor_pts, const char* reason);
+    void   resetVideoEmptyStallRecovery(const char* reason);
 
     // -----------------------------------------------------------------------
     // Event forwarding (core callbacks -> JNI poll)
