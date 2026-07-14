@@ -6879,13 +6879,11 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
         return;
     }
 
-    int attempt = audio_health_recover_attempts_.fetch_add(1, std::memory_order_acq_rel) + 1;
     double anchor = player_core_get_position(player_core_);
     if (!std::isfinite(anchor) || anchor < 0.0) anchor = 0.0;
 
     LOGW_RATE(8,
-              "evt=audio_health_recover_trigger attempt=%d silent=%d callback_stalled=%d secure_underrun=%d opensl_state=%d rebuffer_stuck=%d seek_wait_expired=%d progress_active=%d av_split=%d av_split_ms=%" PRId64 " core_playing=%d anchor=%.3f",
-              attempt,
+              "evt=audio_health_watchdog_observe silent=%d callback_stalled=%d secure_underrun=%d opensl_state=%d rebuffer_stuck=%d seek_wait_expired=%d progress_active=%d av_split=%d av_split_ms=%" PRId64 " core_playing=%d anchor=%.3f action=none",
               silent_too_long ? 1 : 0,
               callback_stalled ? 1 : 0,
               secure_audio_underrun_stuck ? 1 : 0,
@@ -6898,28 +6896,8 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
               core_playing ? 1 : 0,
               anchor);
     const char* core_diag = player_core_get_runtime_diagnostic(player_core_);
-    SYNCW("evt=audio_health_core_diag attempt=%d anchor=%.3f diag=%s",
-          attempt, anchor, core_diag ? core_diag : "");
-
-    if (av_split_progressing && av_split_ms >= kAudioAvSplitPauseMs) {
-        pausePlaybackForAudioSplit(now, anchor, "audio_video_split_progressing");
-        return;
-    }
-
-    if (attempt <= 2) {
-        forceResumeAudioOutput(now, anchor, "audio_health_watchdog");
-        return;
-    }
-
-    if (attempt == kAudioRecoverMaxAttempts) {
-        LOGW("evt=audio_health_rebuild attempt=%d anchor=%.3f", attempt, anchor);
-        rebuildAudioOutputFromStream(true, "audio_health_watchdog");
-        if (av_split_progressing && av_split_ms >= (kAudioAvSplitPauseMs / 2)) {
-            pausePlaybackForAudioSplit(now, anchor, "audio_video_split_after_rebuild");
-        } else {
-            audio_health_recover_attempts_.store(0, std::memory_order_release);
-        }
-    }
+    SYNCW("evt=audio_health_core_diag anchor=%.3f action=none diag=%s",
+          anchor, core_diag ? core_diag : "");
 }
 
 void AndroidPlayer::pausePlaybackForAudioSplit(int64_t now, double anchor_pts, const char* reason) {

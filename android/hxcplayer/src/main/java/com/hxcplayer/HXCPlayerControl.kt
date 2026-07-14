@@ -533,8 +533,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var playLoopWindowStartMs: Long = 0L
     private var playLoopLastRecoverAtMs: Long = 0L
     private var playLoopSuppressUntilMs: Long = 0L
-    private var audioHealthLastRecoverAtMs: Long = 0L
-    private var audioHealthLastHardRecoverAtMs: Long = 0L
     private var audioHealthOpenSuppressUntilMs: Long = 0L
     private var audioHealthPausedStateSinceMs: Long = 0L
     private var audioHealthLastPausedState: AudioOutputState = AudioOutputState.IDLE
@@ -543,8 +541,6 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var stablePlaybackPositionSec: Double = Double.NaN
     private var stablePlaybackPositionAtMs: Long = 0L
     private var stablePlaybackObservedSinceOpen: Boolean = false
-    private var localHlsGapSkipCount: Int = 0
-    private var localHlsGapSkipLastAtMs: Long = 0L
     private var appMuted: Boolean = false
     private var metricsLastLogAtMs: Long = 0L
     private val metricsLogIntervalMs: Long = 30000L
@@ -557,17 +553,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var videoEmptyStallLastReopenAtMs: Long = 0L
     private var videoEmptyStallDelayedReopenScheduled: Boolean = false
     private val videoEmptyStallReopenCooldownMs: Long = 15000L
-    private val audioHealthRecoverCooldownMs: Long = 8000L
-    private val audioHealthHardRecoverCooldownMs: Long = 30000L
     private val audioHealthPausedStateRecoverMs: Long = 4500L
     private val audioHealthSilentRecoverThresholdMs: Long = 3500L
-    private val audioHealthHardRecoverThresholdMs: Long = 15000L
     private val audioHealthOpenSuppressMs: Long = 5000L
     private val stablePlaybackPositionMaxAgeMs: Long = 120000L
-    private val localHlsGapSkipMinSilentMs: Long = 4500L
-    private val localHlsGapSkipCooldownMs: Long = 9000L
-    private val localHlsGapSkipForwardSec: Double = 3.0
-    private val localHlsGapSkipMaxPerOpen: Int = 3
     private val abnormalForwardSeekSec: Double = 3.0
     private val audioHealthLogIntervalMs: Long = 2500L
     // Minimal diagnostics for seek-settle state mismatch (debug level only).
@@ -1457,8 +1446,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         playLoopSuppressUntilMs = now + openSessionLoopSuppressMs
         videoEmptyStallLastReopenAtMs = 0L
         videoEmptyStallDelayedReopenScheduled = false
-        audioHealthLastRecoverAtMs = 0L
-        audioHealthLastHardRecoverAtMs = 0L
         audioHealthOpenSuppressUntilMs = now + maxOf(openSessionLoopSuppressMs, audioHealthOpenSuppressMs)
         audioHealthPausedStateSinceMs = 0L
         audioHealthLastPausedState = AudioOutputState.IDLE
@@ -1471,8 +1458,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         stablePlaybackPositionAtMs = if (stablePlaybackPositionSec.isFinite()) now else 0L
         stablePlaybackObservedSinceOpen = false
-        localHlsGapSkipCount = 0
-        localHlsGapSkipLastAtMs = 0L
         staleIoControlledReopenInFlight = false
 
         logInfo(
@@ -3916,44 +3901,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         return false
     }
 
-    private fun maybeSkipLocalHlsGap(
-        nowMs: Long,
-        positionSec: Double,
-        durationSec: Double,
-        state: PlayerState,
-        isPlayingNow: Boolean,
-        playWhenReady: Boolean,
-        audioMetrics: AudioHealthMetrics
-    ): Boolean {
-        if (!currentSourceCategory.startsWith("local_hls")) return false
-        if (!playWhenReady || !isPlayingNow || state != PlayerState.PLAYING) return false
-        if (pendingSeekActive || secondarySyncMode) return false
-        if (!positionSec.isFinite() || positionSec < 0.0) return false
-        if (!durationSec.isFinite() || durationSec <= 0.0) return false
-        if ((durationSec - positionSec) <= (localHlsGapSkipForwardSec + playbackEndClampThresholdSec)) return false
-        if (audioMetrics.openslState != 1) return false
-        if (audioMetrics.underrunRecent <= 0) return false
-        if (audioMetrics.silentForMs < localHlsGapSkipMinSilentMs) return false
-        if (localHlsGapSkipCount >= localHlsGapSkipMaxPerOpen) return false
-        if (localHlsGapSkipLastAtMs > 0L && (nowMs - localHlsGapSkipLastAtMs) < localHlsGapSkipCooldownMs) {
-            return false
-        }
-
-        val target = minOf(durationSec - playbackEndClampThresholdSec, positionSec + localHlsGapSkipForwardSec)
-        localHlsGapSkipCount += 1
-        localHlsGapSkipLastAtMs = nowMs
-        audioHealthRecoverStage = 0
-        audioHealthLastRecoverAtMs = nowMs
-        Log.w(
-            TAG,
-            "evt=local_hls_gap_skip_seek from=$positionSec target=$target silent_ms=${audioMetrics.silentForMs} " +
-                "underrun=${audioMetrics.underrunRecent} count=$localHlsGapSkipCount/$localHlsGapSkipMaxPerOpen " +
-                "source_category=$currentSourceCategory"
-        )
-        seekToWithIntent(target, true)
-        return true
-    }
-
     private fun maybeRecoverAudioHealth(
         nowMs: Long,
         positionSec: Double,
@@ -4033,7 +3980,6 @@ class HXCPlayerControl @JvmOverloads constructor(
 
         if (!unhealthy) {
             audioHealthRecoverStage = 0
-            localHlsGapSkipCount = 0
             return
         }
         if (pendingSeekActive && !hardAudioError) {
@@ -4050,63 +3996,9 @@ class HXCPlayerControl @JvmOverloads constructor(
                     "source_category=$currentSourceCategory"
             )
         }
-        if (maybeSkipLocalHlsGap(
-                nowMs = nowMs,
-                positionSec = positionSec,
-                durationSec = durationSec,
-                state = state,
-                isPlayingNow = isPlayingNow,
-                playWhenReady = playWhenReady,
-                audioMetrics = audioMetrics
-            )
-        ) {
-            return
-        }
-        if ((nowMs - audioHealthLastRecoverAtMs) < audioHealthRecoverCooldownMs) {
-            return
-        }
-
-        audioHealthLastRecoverAtMs = nowMs
-        audioHealthRecoverStage += 1
-        val recoverResult = recoverAudioOutput()
-        val afterRecover = getAudioHealthMetrics()
-        val rebuildNeeded = !recoverResult || isAudioHealthStillUnhealthy(afterRecover)
-        var rebuildResult = false
-        if (rebuildNeeded) {
-            rebuildResult = rebuildAudioOutput()
-        }
-        val afterRebuild = if (rebuildNeeded) getAudioHealthMetrics() else afterRecover
-        Log.w(
-            TAG,
-            "evt=audio_health_watchdog_recover stage=$audioHealthRecoverStage recover=$recoverResult " +
-                "rebuild=$rebuildResult before_state=$audioState after_state=${afterRebuild.audioOutputState} " +
-                "silent_ms=${afterRebuild.silentForMs} opensl=${afterRebuild.openslState} " +
-                "underrun=${afterRebuild.underrunRecent} pos=$positionSec loading=$loading"
-        )
-
-        val hardRecoverAllowed = !secondarySyncMode &&
-            !pendingSeekActive &&
-            audioMetrics.silentForMs >= audioHealthHardRecoverThresholdMs &&
-            (nowMs - audioHealthLastHardRecoverAtMs) >= audioHealthHardRecoverCooldownMs
-        if (hardRecoverAllowed && isAudioHealthStillUnhealthy(afterRebuild)) {
-            audioHealthLastHardRecoverAtMs = nowMs
-            val recoverBase = resolveHardRecoverStartPosition(durationSec)
-            val recovered = controlledReopenForStaleIo(
-                reason = "audio_health_watchdog",
-                basePositionSec = recoverBase,
-                durationSec = durationSec
-            ) || recoverAbnormalPlaybackByForwardSeek(
-                reason = "audio_health_watchdog",
-                basePositionSec = recoverBase,
-                durationSec = durationSec
-            )
-            Log.w(
-                TAG,
-                "evt=audio_health_watchdog_forward_seek recovered=$recovered pos=$positionSec " +
-                    "audio_state=${afterRebuild.audioOutputState} silent_ms=${afterRebuild.silentForMs} " +
-                    "source_category=$currentSourceCategory"
-            )
-        }
+        // Root cause for the reported freeze/no-audio case is stale local HLS input, not OpenSL.
+        // Keep this watchdog as diagnostics only; recovery is handled by video/stale-IO paths.
+        audioHealthRecoverStage = 0
     }
 
     private fun resetAudioHealthWatchdog(reason: String) {
@@ -4122,16 +4014,6 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (canEmitDebugDiagLog()) {
             Log.d(TAG, "evt=audio_health_watchdog_reset reason=$reason")
         }
-    }
-
-    private fun isAudioHealthStillUnhealthy(metrics: AudioHealthMetrics): Boolean {
-        return metrics.audioOutputState == AudioOutputState.PAUSED_SEEK ||
-            metrics.audioOutputState == AudioOutputState.PAUSED_REBUFFER ||
-            metrics.audioOutputState == AudioOutputState.STALLED ||
-            metrics.audioOutputState == AudioOutputState.ERROR ||
-            metrics.openslState == 2 ||
-            metrics.openslState == 3 ||
-            metrics.silentForMs >= audioHealthSilentRecoverThresholdMs
     }
 
     private fun isSystemMusicVolumeZero(): Boolean {
