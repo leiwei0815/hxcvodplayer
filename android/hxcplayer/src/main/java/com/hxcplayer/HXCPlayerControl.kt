@@ -1,6 +1,7 @@
 package com.hxcplayer
 
 import android.content.Context
+import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -468,6 +469,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val seekPostConfirmReopenCooldownMs = 5000L
     private var playStallRecoveryEnabled = true
     private var playLoopRecoveryEnabled = true
+    private var audioHealthWatchdogEnabled = true
     private var playbackMetricsLogEnabled = true
     private var manualPlayHardRecoverEnabled = true
     private var playStallDetectDelayMs = 1700L
@@ -530,6 +532,13 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var playLoopWindowStartMs: Long = 0L
     private var playLoopLastRecoverAtMs: Long = 0L
     private var playLoopSuppressUntilMs: Long = 0L
+    private var audioHealthLastRecoverAtMs: Long = 0L
+    private var audioHealthLastHardRecoverAtMs: Long = 0L
+    private var audioHealthPausedStateSinceMs: Long = 0L
+    private var audioHealthLastPausedState: AudioOutputState = AudioOutputState.IDLE
+    private var audioHealthLastLogAtMs: Long = 0L
+    private var audioHealthRecoverStage: Int = 0
+    private var appMuted: Boolean = false
     private var metricsLastLogAtMs: Long = 0L
     private val metricsLogIntervalMs: Long = 30000L
     private var metricsSeekCompletedCount: Long = 0L
@@ -538,6 +547,12 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var metricsPlayStallRecoverReopenCount: Long = 0L
     private var metricsPlayLoopRecoverCount: Long = 0L
     private var metricsManualPlayHardRecoverCount: Long = 0L
+    private val audioHealthRecoverCooldownMs: Long = 8000L
+    private val audioHealthHardRecoverCooldownMs: Long = 30000L
+    private val audioHealthPausedStateRecoverMs: Long = 4500L
+    private val audioHealthSilentRecoverThresholdMs: Long = 3500L
+    private val audioHealthHardRecoverThresholdMs: Long = 15000L
+    private val audioHealthLogIntervalMs: Long = 2500L
     // Minimal diagnostics for seek-settle state mismatch (debug level only).
     private var seekSettleDiagUntilMs: Long = 0L
     private var seekSettleDiagRequestId: Long = -1L
@@ -1420,6 +1435,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         playLoopWindowStartMs = 0L
         playLoopLastRecoverAtMs = 0L
         playLoopSuppressUntilMs = now + openSessionLoopSuppressMs
+        audioHealthLastRecoverAtMs = 0L
+        audioHealthLastHardRecoverAtMs = 0L
+        audioHealthPausedStateSinceMs = 0L
+        audioHealthLastPausedState = AudioOutputState.IDLE
+        audioHealthLastLogAtMs = 0L
+        audioHealthRecoverStage = 0
 
         logInfo(
             "evt=session_state_reset reason=$reason start_pos=$startPosition " +
@@ -2080,6 +2101,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun setMuted(muted: Boolean) {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
+        appMuted = muted
         nativeSetMuted(handle, muted)
     }
 
@@ -2528,6 +2550,15 @@ class HXCPlayerControl @JvmOverloads constructor(
                     state = state,
                     isPlayingNow = isPlaying,
                     playWhenReady = playWhenReady
+                )
+                maybeRecoverAudioHealth(
+                    nowMs = now,
+                    positionSec = boundedRawPosition,
+                    loading = loading,
+                    state = state,
+                    isPlayingNow = isPlaying,
+                    playWhenReady = playWhenReady,
+                    audioMetrics = audioMetrics
                 )
                 maybeLogSeekSettleKeyDiag(
                     nowMs = now,
@@ -3372,6 +3403,142 @@ class HXCPlayerControl @JvmOverloads constructor(
             if (isReleased) return@execute
             replayFrom(reopenStart)
         }
+    }
+
+    private fun maybeRecoverAudioHealth(
+        nowMs: Long,
+        positionSec: Double,
+        loading: Boolean,
+        state: PlayerState,
+        isPlayingNow: Boolean,
+        playWhenReady: Boolean,
+        audioMetrics: AudioHealthMetrics
+    ) {
+        if (!audioHealthWatchdogEnabled) return
+        if (secondarySyncMode) return
+        if (appMuted) return
+        if (!playWhenReady) {
+            resetAudioHealthWatchdog("play_when_ready_false")
+            return
+        }
+        if (state == PlayerState.IDLE || state == PlayerState.STOPPED || state == PlayerState.ERROR) {
+            resetAudioHealthWatchdog("inactive_state_${state.name}")
+            return
+        }
+        if (isSystemMusicVolumeZero()) {
+            if ((nowMs - audioHealthLastLogAtMs) >= audioHealthLogIntervalMs) {
+                audioHealthLastLogAtMs = nowMs
+                logInfo("evt=audio_health_watchdog_skip reason=system_volume_zero state=${state.name}")
+            }
+            return
+        }
+
+        val audioState = audioMetrics.audioOutputState
+        val pausedState = audioState == AudioOutputState.PAUSED_SEEK ||
+            audioState == AudioOutputState.PAUSED_REBUFFER
+        if (pausedState) {
+            if (audioHealthLastPausedState != audioState) {
+                audioHealthLastPausedState = audioState
+                audioHealthPausedStateSinceMs = nowMs
+            }
+        } else {
+            audioHealthLastPausedState = audioState
+            audioHealthPausedStateSinceMs = 0L
+        }
+
+        val pausedTooLong = pausedState &&
+            audioHealthPausedStateSinceMs > 0L &&
+            (nowMs - audioHealthPausedStateSinceMs) >= audioHealthPausedStateRecoverMs
+        val silentTooLong = audioMetrics.silentForMs >= audioHealthSilentRecoverThresholdMs
+        val openslNotPlaying = audioMetrics.openslState == 2 || audioMetrics.openslState == 3
+        val hardAudioError = audioState == AudioOutputState.STALLED || audioState == AudioOutputState.ERROR
+        val unhealthy = hardAudioError || silentTooLong || openslNotPlaying || pausedTooLong
+
+        if (!unhealthy) {
+            audioHealthRecoverStage = 0
+            return
+        }
+        if (pendingSeekActive && !hardAudioError) {
+            return
+        }
+        if ((nowMs - audioHealthLastLogAtMs) >= audioHealthLogIntervalMs) {
+            audioHealthLastLogAtMs = nowMs
+            Log.w(
+                TAG,
+                "evt=audio_health_watchdog_detect state=${state.name} loading=$loading playing=$isPlayingNow " +
+                    "pos=$positionSec audio_state=$audioState silent_ms=${audioMetrics.silentForMs} " +
+                    "opensl=${audioMetrics.openslState} underrun=${audioMetrics.underrunRecent} " +
+                    "recover_attempts=${audioMetrics.recoverAttempts} paused_too_long=$pausedTooLong " +
+                    "source_category=$currentSourceCategory"
+            )
+        }
+        if ((nowMs - audioHealthLastRecoverAtMs) < audioHealthRecoverCooldownMs) {
+            return
+        }
+
+        audioHealthLastRecoverAtMs = nowMs
+        audioHealthRecoverStage += 1
+        val recoverResult = recoverAudioOutput()
+        val afterRecover = getAudioHealthMetrics()
+        val rebuildNeeded = !recoverResult || isAudioHealthStillUnhealthy(afterRecover)
+        var rebuildResult = false
+        if (rebuildNeeded) {
+            rebuildResult = rebuildAudioOutput()
+        }
+        val afterRebuild = if (rebuildNeeded) getAudioHealthMetrics() else afterRecover
+        Log.w(
+            TAG,
+            "evt=audio_health_watchdog_recover stage=$audioHealthRecoverStage recover=$recoverResult " +
+                "rebuild=$rebuildResult before_state=$audioState after_state=${afterRebuild.audioOutputState} " +
+                "silent_ms=${afterRebuild.silentForMs} opensl=${afterRebuild.openslState} " +
+                "underrun=${afterRebuild.underrunRecent} pos=$positionSec loading=$loading"
+        )
+
+        val hardRecoverAllowed = !secondarySyncMode &&
+            !pendingSeekActive &&
+            audioMetrics.silentForMs >= audioHealthHardRecoverThresholdMs &&
+            (nowMs - audioHealthLastHardRecoverAtMs) >= audioHealthHardRecoverCooldownMs
+        if (hardRecoverAllowed && isAudioHealthStillUnhealthy(afterRebuild)) {
+            audioHealthLastHardRecoverAtMs = nowMs
+            val scheduled = recoverPlaybackKeepingPosition()
+            Log.w(
+                TAG,
+                "evt=audio_health_watchdog_hard_reopen scheduled=$scheduled pos=$positionSec " +
+                    "audio_state=${afterRebuild.audioOutputState} silent_ms=${afterRebuild.silentForMs} " +
+                    "source_category=$currentSourceCategory"
+            )
+        }
+    }
+
+    private fun resetAudioHealthWatchdog(reason: String) {
+        if (audioHealthRecoverStage == 0 &&
+            audioHealthPausedStateSinceMs == 0L &&
+            audioHealthLastPausedState == AudioOutputState.IDLE
+        ) {
+            return
+        }
+        audioHealthRecoverStage = 0
+        audioHealthPausedStateSinceMs = 0L
+        audioHealthLastPausedState = AudioOutputState.IDLE
+        if (canEmitDebugDiagLog()) {
+            Log.d(TAG, "evt=audio_health_watchdog_reset reason=$reason")
+        }
+    }
+
+    private fun isAudioHealthStillUnhealthy(metrics: AudioHealthMetrics): Boolean {
+        return metrics.audioOutputState == AudioOutputState.PAUSED_SEEK ||
+            metrics.audioOutputState == AudioOutputState.PAUSED_REBUFFER ||
+            metrics.audioOutputState == AudioOutputState.STALLED ||
+            metrics.audioOutputState == AudioOutputState.ERROR ||
+            metrics.openslState == 2 ||
+            metrics.openslState == 3 ||
+            metrics.silentForMs >= audioHealthSilentRecoverThresholdMs
+    }
+
+    private fun isSystemMusicVolumeZero(): Boolean {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return false
+        val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        return maxVolume > 0 && audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) <= 0
     }
 
     private fun maybeLogPlaybackMetrics(

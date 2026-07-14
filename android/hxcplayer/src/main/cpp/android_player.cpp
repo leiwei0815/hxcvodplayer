@@ -6718,10 +6718,9 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
                                   audio_rebuffer_paused_at_ms_ > 0 &&
                                   (now - audio_rebuffer_paused_at_ms_) >= 3200;
     bool rebuffer_stuck = rebuffer_deadline_expired || rebuffer_lost_deadline;
-    bool network_source = !source_local_active_.load(std::memory_order_acquire);
     bool audio_unhealthy = silent_too_long || callback_stalled || secure_audio_underrun_stuck ||
                            opensl_not_playing || rebuffer_stuck || seek_audio_wait_expired;
-    bool av_split_progressing = network_source && progress_active && audio_unhealthy &&
+    bool av_split_progressing = progress_active && audio_unhealthy &&
                                 !seek_audio_wait_active &&
                                 !user_manual_pause_.load(std::memory_order_acquire);
     int64_t av_split_started = audio_av_split_started_ms_.load(std::memory_order_acquire);
@@ -6759,7 +6758,7 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
               anchor);
 
     if (av_split_progressing && av_split_ms >= kAudioAvSplitPauseMs) {
-        pausePlaybackForAudioSplit(now, anchor, "audio_video_split_network");
+        pausePlaybackForAudioSplit(now, anchor, "audio_video_split_progressing");
         return;
     }
 
