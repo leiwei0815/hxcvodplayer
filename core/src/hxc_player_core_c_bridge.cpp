@@ -411,6 +411,16 @@ const char* player_core_get_runtime_diagnostic(PlayerCoreHandle* handle) {
     return runtime_diag.c_str();
 }
 
+int player_core_is_io_stale_for_playback(PlayerCoreHandle* handle, int64_t stale_threshold_ms, int64_t* stale_for_ms) {
+    if (!handle || !handle->core) {
+        if (stale_for_ms) {
+            *stale_for_ms = -1;
+        }
+        return 0;
+    }
+    return handle->core->is_io_stale_for_playback(stale_threshold_ms, stale_for_ms) ? 1 : 0;
+}
+
 void player_core_seek(PlayerCoreHandle* handle, double pos) {
     if (handle && handle->core) {
         std::lock_guard<std::mutex> audio_lock(handle->audio_data_mutex);

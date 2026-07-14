@@ -486,6 +486,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var playLoopRecoverCooldownMs = 15000L
     private var playLoopRecoverBackoffSec = 0.20
     private var manualPlayHardRecoverDelayMs = 3200L
+    private var manualPlayQuickStaleCheckMs = 900L
     private var manualPlayHardRecoverCooldownMs = 8000L
     private var manualPlayHardRecoverMinProgressSec = 0.10
     private var pendingSeekRequestId: Long = 0L
@@ -582,6 +583,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var autoReopenMaxAttempts: Int = 1
     private var autoReopenAttemptCount: Int = 0
     private var autoReopenInFlight: Boolean = false
+    private var staleIoControlledReopenInFlight: Boolean = false
+    private var staleIoControlledReopenLastAtMs: Long = 0L
+    private val staleIoControlledReopenCooldownMs: Long = 30000L
     @Volatile private var secondarySyncMode: Boolean = false
     private var networkLoadingSinceMs: Long = 0L
     private var networkTotalStallMs: Long = 0L
@@ -1469,6 +1473,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         stablePlaybackObservedSinceOpen = false
         localHlsGapSkipCount = 0
         localHlsGapSkipLastAtMs = 0L
+        staleIoControlledReopenInFlight = false
 
         logInfo(
             "evt=session_state_reset reason=$reason start_pos=$startPosition " +
@@ -2012,12 +2017,56 @@ class HXCPlayerControl @JvmOverloads constructor(
         manualPlayHardRecoverPending = true
         manualPlayHardRecoverArmedAtMs = playStallLastPlayReqAtMs
         manualPlayHardRecoverBasePosSec = playStallBasePosSec
+        val durationAtPlay = getDuration()
+        val loadingAtPlay = isLoading()
+        val stateAtPlay = getState()
+        Log.w(
+            TAG,
+            "evt=manual_play_request pos=$playStallBasePosSec duration=$durationAtPlay " +
+                "state=${stateAtPlay.name} loading=$loadingAtPlay source_category=$currentSourceCategory " +
+                "recover_delay_ms=$manualPlayHardRecoverDelayMs"
+        )
         val generation = nextPlaybackCommandGeneration(true)
         enqueuePlaybackCommand("play", generation) { current ->
             nativePlay(current)
             // 某些设备/解码链路在 pause->play 后会把速率短暂回落到 1.0，
             // play 后立刻回放业务侧目标倍速，保证体感一致。
             nativeSetPlaybackRate(current, preferredPlaybackRate)
+        }
+        if (loadingAtPlay || stateAtPlay == PlayerState.LOADING || stateAtPlay == PlayerState.PAUSED) {
+            mainHandler.postDelayed({
+                if (isReleased || secondarySyncMode) return@postDelayed
+                if (playbackCommandGeneration.get() != generation) return@postDelayed
+                val checkHandle = currentHandle()
+                if (checkHandle == 0L) return@postDelayed
+                val checkPos = getPosition()
+                val checkDuration = getDuration()
+                val checkLoading = isLoading()
+                val checkState = getState()
+                val checkPlayWhenReady = getPlayWhenReady()
+                val checkIsPlaying = isPlaying()
+                val progressed = checkPos - playStallBasePosSec
+                val stillStuck =
+                    checkPlayWhenReady &&
+                        (checkLoading || checkState == PlayerState.LOADING || checkState == PlayerState.PAUSED || !checkIsPlaying) &&
+                        progressed < manualPlayHardRecoverMinProgressSec
+                if (!stillStuck) {
+                    logInfo(
+                        "evt=manual_play_quick_stale_check_resolved pos=$checkPos progressed=$progressed " +
+                            "state=${checkState.name} loading=$checkLoading is_playing=$checkIsPlaying"
+                    )
+                    return@postDelayed
+                }
+                Log.w(
+                    TAG,
+                    "evt=manual_play_quick_stale_check_unresolved base=$playStallBasePosSec pos=$checkPos " +
+                        "progressed=$progressed duration=$checkDuration state=${checkState.name} loading=$checkLoading " +
+                        "is_playing=$checkIsPlaying source_category=$currentSourceCategory"
+                )
+                if (!controlledReopenForStaleIo("manual_play_quick_stale", maxOf(0.0, checkPos), checkDuration)) {
+                    recoverAbnormalPlaybackByForwardSeek("manual_play_quick_stale", maxOf(0.0, checkPos), checkDuration)
+                }
+            }, manualPlayQuickStaleCheckMs)
         }
     }
 
@@ -2200,7 +2249,9 @@ class HXCPlayerControl @JvmOverloads constructor(
                     videoEmptyStallDelayedReopenScheduled = false
                     videoEmptyStallLastReopenAtMs = SystemClock.elapsedRealtime()
                     Log.w(TAG, "evt=video_empty_stall_forward_seek_delayed_fire base=$recoverBase")
-                    recoverAbnormalPlaybackByForwardSeek("video_empty_stall_delayed", recoverBase, durationSec)
+                    if (!controlledReopenForStaleIo("video_empty_stall_delayed", recoverBase, durationSec)) {
+                        recoverAbnormalPlaybackByForwardSeek("video_empty_stall_delayed", recoverBase, durationSec)
+                    }
                 }, cooldownLeftMs)
             }
             return
@@ -2214,7 +2265,9 @@ class HXCPlayerControl @JvmOverloads constructor(
             "evt=video_empty_stall_forward_seek base=$recoverBase pos=$positionSec native_pos=$nativeRecoverPos " +
                 "duration=$durationSec state=${state.name} loading=$loading source_category=$currentSourceCategory"
         )
-        recoverAbnormalPlaybackByForwardSeek("video_empty_stall", recoverBase, durationSec)
+        if (!controlledReopenForStaleIo("video_empty_stall", recoverBase, durationSec)) {
+            recoverAbnormalPlaybackByForwardSeek("video_empty_stall", recoverBase, durationSec)
+        }
     }
 
     /**
@@ -2911,11 +2964,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                                             TAG,
                                             "evt=seek_post_confirm_timeout_forward_seek target=$target elapsed_ms=$seekElapsedMs"
                                         )
-                                        recoverAbnormalPlaybackByForwardSeek(
-                                            reason = "seek_post_confirm_timeout",
-                                            basePositionSec = target,
-                                            durationSec = duration
-                                        )
+                                        if (!controlledReopenForStaleIo("seek_post_confirm_timeout", target, duration)) {
+                                            recoverAbnormalPlaybackByForwardSeek(
+                                                reason = "seek_post_confirm_timeout",
+                                                basePositionSec = target,
+                                                durationSec = duration
+                                            )
+                                        }
                                     } else {
                                         logInfo("evt=seek_post_confirm_timeout_forward_seek_skip reason=cooldown since_last_ms=$sinceLastReopenMs cooldown_ms=$seekPostConfirmReopenCooldownMs")
                                     }
@@ -2980,11 +3035,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                                     TAG,
                                     "evt=seek_timeout_loading_stuck_forward_seek target=$target elapsed_ms=$seekElapsedMs source_category=$currentSourceCategory"
                                 )
-                                recoverAbnormalPlaybackByForwardSeek(
-                                    reason = "seek_timeout_loading_stuck",
-                                    basePositionSec = target,
-                                    durationSec = duration
-                                )
+                                if (!controlledReopenForStaleIo("seek_timeout_loading_stuck", target, duration)) {
+                                    recoverAbnormalPlaybackByForwardSeek(
+                                        reason = "seek_timeout_loading_stuck",
+                                        basePositionSec = target,
+                                        durationSec = duration
+                                    )
+                                }
                             } else {
                                 logInfo("evt=seek_timeout_loading_stuck_forward_seek_skip reason=cooldown since_last_ms=$sinceLastReopenMs cooldown_ms=$seekPostConfirmReopenCooldownMs source_category=$currentSourceCategory")
                             }
@@ -3054,11 +3111,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                                                 TAG,
                                                 "evt=seek_unhealthy_followup_forward_seek id=$unhealthyCheckRequestId pos=$checkPos state=${checkState.name} loading=$checkLoading source_category=$currentSourceCategory"
                                             )
-                                            recoverAbnormalPlaybackByForwardSeek(
-                                                reason = "seek_unhealthy_followup",
-                                                basePositionSec = checkPos,
-                                                durationSec = duration
-                                            )
+                                            if (!controlledReopenForStaleIo("seek_unhealthy_followup", checkPos, duration)) {
+                                                recoverAbnormalPlaybackByForwardSeek(
+                                                    reason = "seek_unhealthy_followup",
+                                                    basePositionSec = checkPos,
+                                                    durationSec = duration
+                                                )
+                                            }
                                         } else {
                                             logInfo("evt=seek_unhealthy_followup_forward_seek_skip reason=cooldown id=$unhealthyCheckRequestId since_last_ms=$sinceLastReopenMs cooldown_ms=$seekPostConfirmReopenCooldownMs source_category=$currentSourceCategory")
                                         }
@@ -3243,7 +3302,9 @@ class HXCPlayerControl @JvmOverloads constructor(
                     loading = loading,
                     isPlayingNow = isPlayingNow
                 )
-                recoverAbnormalPlaybackByForwardSeek("play_stall_noop", positionSec, durationSec)
+                if (!controlledReopenForStaleIo("play_stall_noop", positionSec, durationSec)) {
+                    recoverAbnormalPlaybackByForwardSeek("play_stall_noop", positionSec, durationSec)
+                }
                 return
             }
             playStallRecoverStage = 1
@@ -3292,7 +3353,9 @@ class HXCPlayerControl @JvmOverloads constructor(
             loading = loading,
             isPlayingNow = isPlayingNow
         )
-        recoverAbnormalPlaybackByForwardSeek("play_stall", positionSec, durationSec)
+        if (!controlledReopenForStaleIo("play_stall", positionSec, durationSec)) {
+            recoverAbnormalPlaybackByForwardSeek("play_stall", positionSec, durationSec)
+        }
     }
 
     private fun maybeRecoverPlaybackLoop(
@@ -3482,7 +3545,9 @@ class HXCPlayerControl @JvmOverloads constructor(
             loading = loading,
             isPlayingNow = isPlayingNow
         )
-        recoverAbnormalPlaybackByForwardSeek("manual_play_hard_recover", positionSec, durationSec)
+        if (!controlledReopenForStaleIo("manual_play_hard_recover", positionSec, durationSec)) {
+            recoverAbnormalPlaybackByForwardSeek("manual_play_hard_recover", positionSec, durationSec)
+        }
     }
 
     private fun updateStablePlaybackPosition(
@@ -3556,10 +3621,25 @@ class HXCPlayerControl @JvmOverloads constructor(
         durationSec: Double,
         forwardSec: Double = abnormalForwardSeekSec
     ): Boolean {
-        if (isReleased || secondarySyncMode) return false
-        if (!basePositionSec.isFinite() || basePositionSec < 0.0) return false
-        if (!durationSec.isFinite() || durationSec <= 0.0) return false
-        if ((durationSec - basePositionSec) <= (forwardSec + playbackEndClampThresholdSec)) return false
+        if (isReleased || secondarySyncMode) {
+            logInfo("evt=abnormal_forward_seek_skip reason=inactive source=$reason released=$isReleased secondary=$secondarySyncMode")
+            return false
+        }
+        if (!basePositionSec.isFinite() || basePositionSec < 0.0) {
+            logInfo("evt=abnormal_forward_seek_skip reason=bad_base source=$reason base=$basePositionSec duration=$durationSec")
+            return false
+        }
+        if (!durationSec.isFinite() || durationSec <= 0.0) {
+            logInfo("evt=abnormal_forward_seek_skip reason=bad_duration source=$reason base=$basePositionSec duration=$durationSec")
+            return false
+        }
+        if ((durationSec - basePositionSec) <= (forwardSec + playbackEndClampThresholdSec)) {
+            logInfo(
+                "evt=abnormal_forward_seek_skip reason=near_end source=$reason base=$basePositionSec " +
+                    "duration=$durationSec forward=$forwardSec threshold=$playbackEndClampThresholdSec"
+            )
+            return false
+        }
 
         val target = minOf(durationSec - playbackEndClampThresholdSec, basePositionSec + forwardSec)
         audioHealthRecoverStage = 0
@@ -3576,6 +3656,103 @@ class HXCPlayerControl @JvmOverloads constructor(
                 "duration=$durationSec source_category=$currentSourceCategory"
         )
         seekToWithIntent(target, true)
+        return true
+    }
+
+    private fun controlledReopenForStaleIo(
+        reason: String,
+        basePositionSec: Double,
+        durationSec: Double,
+        forwardSec: Double = abnormalForwardSeekSec
+    ): Boolean {
+        if (isReleased || secondarySyncMode) {
+            logInfo("evt=stale_io_controlled_reopen_skip reason=inactive source=$reason released=$isReleased secondary=$secondarySyncMode")
+            return false
+        }
+        if (!basePositionSec.isFinite() || basePositionSec < 0.0) {
+            logInfo("evt=stale_io_controlled_reopen_skip reason=bad_base source=$reason base=$basePositionSec duration=$durationSec")
+            return false
+        }
+        if (!durationSec.isFinite() || durationSec <= 0.0) {
+            logInfo("evt=stale_io_controlled_reopen_skip reason=bad_duration source=$reason base=$basePositionSec duration=$durationSec")
+            return false
+        }
+        if (!currentSourceCategory.startsWith("secure_") && !currentSourceCategory.startsWith("local_hls")) {
+            logInfo(
+                "evt=stale_io_controlled_reopen_skip reason=unsupported_source source=$reason " +
+                    "source_category=$currentSourceCategory base=$basePositionSec duration=$durationSec"
+            )
+            return false
+        }
+        val retryModel = lastOpenPlayModel?.let { clonePlayModel(it) }
+        val retryUrl = lastOpenUrl
+        if (retryModel == null && retryUrl.isNullOrBlank()) {
+            logInfo("evt=stale_io_controlled_reopen_skip reason=no_retry_source source=$reason source_category=$currentSourceCategory")
+            return false
+        }
+        if (staleIoControlledReopenInFlight || autoReopenInFlight) {
+            logInfo(
+                "evt=stale_io_controlled_reopen_skip reason=in_flight source=$reason " +
+                    "stale_inflight=$staleIoControlledReopenInFlight auto_inflight=$autoReopenInFlight"
+            )
+            return false
+        }
+
+        val nowMs = SystemClock.elapsedRealtime()
+        if (staleIoControlledReopenLastAtMs > 0L &&
+            (nowMs - staleIoControlledReopenLastAtMs) < staleIoControlledReopenCooldownMs) {
+            logInfo(
+                "evt=stale_io_controlled_reopen_skip reason=cooldown source=$reason " +
+                    "since_last_ms=${nowMs - staleIoControlledReopenLastAtMs} cooldown_ms=$staleIoControlledReopenCooldownMs"
+            )
+            return false
+        }
+
+        val maxStart = durationSec - playbackEndClampThresholdSec
+        if (maxStart <= reopenUiAnchorZeroGuardSec) {
+            logInfo("evt=stale_io_controlled_reopen_skip reason=near_start_or_short_duration source=$reason max_start=$maxStart duration=$durationSec")
+            return false
+        }
+        val start = minOf(maxStart, maxOf(reopenUiAnchorZeroGuardSec, basePositionSec + forwardSec))
+        staleIoControlledReopenInFlight = true
+        staleIoControlledReopenLastAtMs = nowMs
+        networkReconnectCount += 1
+        notifyNetworkQoE(0L)
+        armReopenUiAnchorIfNeeded(start)
+        audioHealthRecoverStage = 0
+        audioHealthPausedStateSinceMs = 0L
+        audioHealthLastPausedState = AudioOutputState.IDLE
+        manualPlayHardRecoverPending = false
+        playStallCheckArmed = false
+        playStallRecoverStage = 0
+        videoEmptyStallDelayedReopenScheduled = false
+        Log.w(
+            TAG,
+            "evt=stale_io_controlled_reopen reason=$reason start=$start base=$basePositionSec " +
+                "duration=$durationSec source_category=$currentSourceCategory"
+        )
+
+        mainHandler.post {
+            if (isReleased) {
+                staleIoControlledReopenInFlight = false
+                return@post
+            }
+            val opened = if (retryModel != null) {
+                openWithPlayModel(retryModel, start)
+            } else {
+                openURL(retryUrl!!, start)
+            }
+            if (opened && !isReleased) {
+                play()
+            } else {
+                Log.w(
+                    TAG,
+                    "evt=stale_io_controlled_reopen_open_result opened=$opened reason=$reason " +
+                        "start=$start released=$isReleased source_category=$currentSourceCategory"
+                )
+            }
+            staleIoControlledReopenInFlight = false
+        }
         return true
     }
 
@@ -3753,9 +3930,14 @@ class HXCPlayerControl @JvmOverloads constructor(
             (nowMs - audioHealthLastHardRecoverAtMs) >= audioHealthHardRecoverCooldownMs
         if (hardRecoverAllowed && isAudioHealthStillUnhealthy(afterRebuild)) {
             audioHealthLastHardRecoverAtMs = nowMs
-            val recovered = recoverAbnormalPlaybackByForwardSeek(
+            val recoverBase = resolveHardRecoverStartPosition(durationSec)
+            val recovered = controlledReopenForStaleIo(
                 reason = "audio_health_watchdog",
-                basePositionSec = resolveHardRecoverStartPosition(durationSec),
+                basePositionSec = recoverBase,
+                durationSec = durationSec
+            ) || recoverAbnormalPlaybackByForwardSeek(
+                reason = "audio_health_watchdog",
+                basePositionSec = recoverBase,
                 durationSec = durationSec
             )
             Log.w(

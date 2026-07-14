@@ -426,6 +426,7 @@ private:
     static constexpr int64_t kAudioAvSplitPauseMs = 6500;
     static constexpr int64_t kVideoEmptyStallPauseMs = 6000;
     static constexpr int64_t kVideoEmptyStallReopenMs = 9000;
+    static constexpr int64_t kCoreIoStaleRecoverMs = 8000;
     static constexpr int   kAudioRecoverMaxAttempts = 3;
 
     int    queryOpenSLESPlayState();

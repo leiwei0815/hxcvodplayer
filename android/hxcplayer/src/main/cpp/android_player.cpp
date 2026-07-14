@@ -5544,12 +5544,16 @@ void AndroidPlayer::renderLoop() {
                         is_open_ready_for_tail_complete(opening_now, first_frame_ready);
                 bool audio_pending_now = audio_start_pending_.load(std::memory_order_acquire);
                 bool audio_rebuffer_now = audio_rebuffer_pending_.load(std::memory_order_acquire);
+                int64_t core_io_stale_ms = -1;
+                bool core_stale_io =
+                        player_core_is_io_stale_for_playback(
+                                player_core_, kCoreIoStaleRecoverMs, &core_io_stale_ms) != 0;
                 int64_t tail_force_complete_ms = recent_open_tail_intent
                                                  ? kTailStallForceCompleteFastMs
                                                  : kTailStallForceCompleteMs;
                 if ((now_empty - tail_stall_diag_last_log_ms) >= kTailStallDiagIntervalMs) {
                     tail_stall_diag_last_log_ms = now_empty;
-                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64 " open_ready=%d first_frame=%d audio_pending=%d audio_rebuffer=%d",
+                    SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64 " open_ready=%d first_frame=%d audio_pending=%d audio_rebuffer=%d stale_io=%d stale_ms=%" PRId64,
                           empty_ms,
                           pos_now,
                           dur_now,
@@ -5566,7 +5570,9 @@ void AndroidPlayer::renderLoop() {
                           open_ready_for_tail_complete ? 1 : 0,
                           first_frame_ready ? 1 : 0,
                           audio_pending_now ? 1 : 0,
-                          audio_rebuffer_now ? 1 : 0);
+                          audio_rebuffer_now ? 1 : 0,
+                          core_stale_io ? 1 : 0,
+                          core_io_stale_ms);
                     const char* core_diag = player_core_get_runtime_diagnostic(player_core_);
                     SYNCI("evt=tail_stall_core_diag empty_ms=%" PRId64 " diag=%s",
                           empty_ms, core_diag ? core_diag : "");
@@ -5582,7 +5588,7 @@ void AndroidPlayer::renderLoop() {
                         !playback_completed_latched_.load(std::memory_order_acquire) &&
                         (video_stall_already_paused ||
                          (play_when_ready_now &&
-                          !is_loading_.load(std::memory_order_acquire) &&
+                          (!is_loading_.load(std::memory_order_acquire) || core_stale_io) &&
                           player_core_get_state(player_core_) == PLAYER_STATE_PLAYING));
                 if (non_tail_playing_empty_stall) {
                     int64_t expected_zero = 0;
@@ -5601,14 +5607,28 @@ void AndroidPlayer::renderLoop() {
                         audio_rebuffer_deadline_ms_ = 0;
                         audio_rebuffer_paused_at_ms_ = 0;
                         audio_rebuffer_min_resume_at_ms_ = 0;
-                        SYNCW("evt=video_empty_stall_forced_pause empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f state=%d source_local=%d encrypted=%d",
+                        SYNCW("evt=video_empty_stall_forced_pause empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f state=%d source_local=%d encrypted=%d stale_io=%d stale_ms=%" PRId64,
                               empty_ms,
                               pos_now,
                               dur_now,
                               remain_now,
                               player_core_get_state(player_core_),
                               source_local_active_.load(std::memory_order_acquire) ? 1 : 0,
-                              source_encrypted_active_.load(std::memory_order_acquire) ? 1 : 0);
+                              source_encrypted_active_.load(std::memory_order_acquire) ? 1 : 0,
+                              core_stale_io ? 1 : 0,
+                              core_io_stale_ms);
+                        if (!pending_video_stall_reopen_.load(std::memory_order_acquire)) {
+                            double max_recover_pos = (std::isfinite(dur_now) && dur_now > 0.35)
+                                                    ? std::max(0.0, dur_now - 0.35)
+                                                    : std::numeric_limits<double>::max();
+                            double recover_pos = std::isfinite(pos_now) && pos_now > 0.0 ? pos_now : 0.0;
+                            recover_pos = std::max(0.0, std::min(max_recover_pos, recover_pos));
+                            pending_video_stall_reopen_pos_.store(recover_pos, std::memory_order_release);
+                            pending_video_stall_reopen_.store(true, std::memory_order_release);
+                            SYNCW("evt=video_empty_stall_request_forward_seek reason=%s empty_ms=%" PRId64 " recover_pos=%.3f dur=%.3f remain=%.3f stale_ms=%" PRId64,
+                                  core_stale_io ? "stale_io_forced_pause" : "forced_pause",
+                                  empty_ms, recover_pos, dur_now, remain_now, core_io_stale_ms);
+                        }
                     }
                     if (stall_ms >= (kVideoEmptyStallReopenMs - kVideoEmptyStallPauseMs) &&
                         !pending_video_stall_reopen_.load(std::memory_order_acquire)) {
@@ -5619,8 +5639,9 @@ void AndroidPlayer::renderLoop() {
                         reopen_pos = std::max(0.0, std::min(max_reopen_pos, reopen_pos));
                         pending_video_stall_reopen_pos_.store(reopen_pos, std::memory_order_release);
                         pending_video_stall_reopen_.store(true, std::memory_order_release);
-                        SYNCW("evt=video_empty_stall_request_forward_seek empty_ms=%" PRId64 " stall_ms=%" PRId64 " recover_pos=%.3f dur=%.3f remain=%.3f",
-                              empty_ms, stall_ms, reopen_pos, dur_now, remain_now);
+                        SYNCW("evt=video_empty_stall_request_forward_seek reason=%s empty_ms=%" PRId64 " stall_ms=%" PRId64 " recover_pos=%.3f dur=%.3f remain=%.3f stale_ms=%" PRId64,
+                              core_stale_io ? "stale_io" : "empty_stall",
+                              empty_ms, stall_ms, reopen_pos, dur_now, remain_now, core_io_stale_ms);
                     }
                 } else if (!video_empty_stall_forced_pause_.load(std::memory_order_acquire) &&
                            video_empty_stall_started_ms_.load(std::memory_order_acquire) != 0) {

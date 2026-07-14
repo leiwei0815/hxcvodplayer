@@ -176,6 +176,7 @@ public:
     bool is_audio_stream_opened() const { return audio_stream_opened_; }
     std::string get_video_decode_diagnostic() const;
     std::string get_runtime_diagnostic() const;
+    bool is_io_stale_for_playback(int64_t stale_threshold_ms, int64_t* stale_for_ms = nullptr) const;
     
     // 获取帧队列（用于渲染）
     FrameQueue<VideoFrame>* get_video_queue() { return video_queue_.get(); }

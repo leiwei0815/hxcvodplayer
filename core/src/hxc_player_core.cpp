@@ -426,6 +426,46 @@ std::string PlayerCore::get_video_decode_diagnostic() const {
     return video_decode_diag_;
 }
 
+bool PlayerCore::is_io_stale_for_playback(int64_t stale_threshold_ms, int64_t* stale_for_ms) const {
+    const int64_t now_us = av_gettime_relative();
+    const int64_t last_packet_us = io_last_packet_us_.load(std::memory_order_acquire);
+    const int64_t stale_ms = last_packet_us > 0 ? (now_us - last_packet_us) / 1000 : -1;
+    if (stale_for_ms) {
+        *stale_for_ms = stale_ms;
+    }
+    if (stale_threshold_ms <= 0 || stale_ms < stale_threshold_ms) {
+        return false;
+    }
+    if (!play_when_ready_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (seek_request_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const bool video_empty = !video_stream_opened_ ||
+                             !video_packet_queue_ ||
+                             video_packet_queue_->get_nb_packets() <= 0;
+    const bool audio_empty = !audio_stream_opened_ ||
+                             !audio_packet_queue_ ||
+                             audio_packet_queue_->get_nb_packets() <= 0;
+    const bool video_frames_empty = !video_stream_opened_ ||
+                                    !video_queue_ ||
+                                    video_queue_->nb_remaining() <= 0;
+    const bool audio_frames_empty = !audio_stream_opened_ ||
+                                    !audio_queue_ ||
+                                    audio_queue_->nb_remaining() <= 0;
+    if (!(video_empty && audio_empty && video_frames_empty && audio_frames_empty)) {
+        return false;
+    }
+    const double pos = get_position();
+    const double duration = get_duration();
+    const bool near_end = std::isfinite(pos) &&
+                          std::isfinite(duration) &&
+                          duration > 0.0 &&
+                          (duration - pos) <= 1.2;
+    return !near_end;
+}
+
 std::string PlayerCore::get_runtime_diagnostic() const {
     const int64_t now_us = av_gettime_relative();
     const int64_t last_packet_us = io_last_packet_us_.load(std::memory_order_acquire);
@@ -434,6 +474,8 @@ std::string PlayerCore::get_runtime_diagnostic() const {
     const int64_t last_audio_packet_us = io_last_audio_packet_us_.load(std::memory_order_acquire);
     const int64_t last_video_packet_age_ms = last_video_packet_us > 0 ? (now_us - last_video_packet_us) / 1000 : -1;
     const int64_t last_audio_packet_age_ms = last_audio_packet_us > 0 ? (now_us - last_audio_packet_us) / 1000 : -1;
+    int64_t io_stale_ms = -1;
+    const bool stale_io = is_io_stale_for_playback(8000, &io_stale_ms);
 
     std::ostringstream oss;
     oss << "state=" << static_cast<int>(state_.load(std::memory_order_acquire))
@@ -445,6 +487,8 @@ std::string PlayerCore::get_runtime_diagnostic() const {
         << " seek_loading=" << (seek_loading_.load(std::memory_order_acquire) ? 1 : 0)
         << " io_loading=" << (io_loading_.load(std::memory_order_acquire) ? 1 : 0)
         << " starvation_loading=" << (starvation_loading_.load(std::memory_order_acquire) ? 1 : 0)
+        << " stale_io=" << (stale_io ? 1 : 0)
+        << " io_stale_ms=" << io_stale_ms
         << " decode_finished=" << (decode_finished_.load(std::memory_order_acquire) ? 1 : 0)
         << " video_open=" << (video_stream_opened_ ? 1 : 0)
         << " audio_open=" << (audio_stream_opened_ ? 1 : 0)
@@ -2103,12 +2147,19 @@ void PlayerCore::read_thread() {
                 io_error = format_ctx_->pb->error;
             }
             const bool network_like_input = hxc_is_network_like_url(format_ctx_ ? format_ctx_->url : nullptr);
+            const bool secure_hls_input = !secure_session_.request_headers.empty();
             const bool eof_signal = (ret == AVERROR_EOF) || (format_ctx_->pb && avio_feof(format_ctx_->pb));
             const bool has_io_error = (io_error != 0);
+            const double eof_pos = get_master_clock();
+            const double eof_duration = get_duration();
+            const bool eof_near_end = std::isfinite(eof_pos) &&
+                                      std::isfinite(eof_duration) &&
+                                      eof_duration > 0.0 &&
+                                      (eof_duration - eof_pos) <= 1.2;
 
-            // 网络流出现 TLS/IO 错误时，FFmpeg 可能同时给出 EOF 信号；此时不能按“正常读完文件”处理，
-            // 否则会误进入“等待 seek/终止”分支，看起来像卡住。
-            if (eof_signal && !(network_like_input && has_io_error)) {
+            // 网络/SecureHLS 中途 EOF 不能按“文件结束”等待 seek，否则读线程会永久不再产出 packet。
+            // 只有真正接近尾部时才进入 EOF 等待；远离尾部按可恢复断流走软重连。
+            if (eof_signal && !((network_like_input || secure_hls_input) && !eof_near_end)) {
                 // 文件结束，发送结束包给解码器
                 LOG_INFO("读取线程：文件读取结束");
                 if (video_stream_ >= 0 && video_stream_opened_ && video_packet_queue_) {
@@ -2133,11 +2184,19 @@ void PlayerCore::read_thread() {
                 // 如果是 seek，则继续循环（seek 会在循环开头处理）
                 LOG_INFO("读取线程：检测到 seek 请求，继续读取");
                 continue;
+            } else if (eof_signal) {
+                LOG_WARNING("读取线程：网络/SecureHLS 远离尾部收到 EOF，按可恢复断流处理。pos=",
+                            eof_pos, ", duration=", eof_duration,
+                            ", network=", network_like_input ? 1 : 0,
+                            ", secure=", secure_hls_input ? 1 : 0,
+                            ", io_error=", io_error);
             }
 
             int effective_ret = (ret != 0) ? ret : io_error;
             if (ret == AVERROR_EOF && has_io_error) {
                 effective_ret = io_error;
+            } else if (eof_signal && (network_like_input || secure_hls_input) && !eof_near_end) {
+                effective_ret = AVERROR(ETIMEDOUT);
             }
 
             // watchdog 中断会返回 AVERROR_EXIT（Immediate exit requested）。
