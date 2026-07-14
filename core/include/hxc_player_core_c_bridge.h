@@ -145,6 +145,7 @@ int player_core_is_video_hardware_decoding(PlayerCoreHandle* handle); // 1=硬�
 int player_core_is_video_stream_opened(PlayerCoreHandle* handle); // 1=视频流组件已打开, 0=未打开
 int player_core_is_audio_stream_opened(PlayerCoreHandle* handle); // 1=音频流组件已打开, 0=未打开
 const char* player_core_get_video_decode_diagnostic(PlayerCoreHandle* handle); // 例如 requested=hardware ... final=software
+const char* player_core_get_runtime_diagnostic(PlayerCoreHandle* handle); // 运行时读包/队列/解码诊断
 
 // 控制
 void player_core_seek(PlayerCoreHandle* handle, double pos);

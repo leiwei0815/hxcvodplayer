@@ -404,6 +404,13 @@ const char* player_core_get_video_decode_diagnostic(PlayerCoreHandle* handle) {
     return decode_diag.c_str();
 }
 
+const char* player_core_get_runtime_diagnostic(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return "";
+    static thread_local std::string runtime_diag;
+    runtime_diag = handle->core->get_runtime_diagnostic();
+    return runtime_diag.c_str();
+}
+
 void player_core_seek(PlayerCoreHandle* handle, double pos) {
     if (handle && handle->core) {
         std::lock_guard<std::mutex> audio_lock(handle->audio_data_mutex);

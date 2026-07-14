@@ -175,6 +175,7 @@ public:
     bool is_video_stream_opened() const { return video_stream_opened_; }
     bool is_audio_stream_opened() const { return audio_stream_opened_; }
     std::string get_video_decode_diagnostic() const;
+    std::string get_runtime_diagnostic() const;
     
     // 获取帧队列（用于渲染）
     FrameQueue<VideoFrame>* get_video_queue() { return video_queue_.get(); }
@@ -371,6 +372,25 @@ private:
     mutable std::mutex video_decode_diag_mutex_;
     std::string video_decode_diag_;
     std::atomic<int64_t> io_last_packet_us_{0}; // 最近一次成功读取 packet 的时间（us）
+    std::atomic<int> io_last_packet_stream_index_{-1}; // 最近一次成功读取 packet 的 stream
+    std::atomic<int> io_last_packet_size_{0};
+    std::atomic<double> io_last_packet_pts_sec_{-1.0};
+    std::atomic<double> io_last_packet_dts_sec_{-1.0};
+    std::atomic<int64_t> io_last_video_packet_us_{0};
+    std::atomic<int64_t> io_last_audio_packet_us_{0};
+    std::atomic<double> io_last_video_packet_pts_sec_{-1.0};
+    std::atomic<double> io_last_audio_packet_pts_sec_{-1.0};
+    std::atomic<int64_t> io_video_packet_count_{0};
+    std::atomic<int64_t> io_audio_packet_count_{0};
+    std::atomic<int64_t> io_other_packet_count_{0};
+    std::atomic<int> video_decode_last_ret_{0};
+    std::atomic<int> audio_decode_last_ret_{0};
+    std::atomic<int> video_decode_error_streak_{0};
+    std::atomic<int> audio_decode_error_streak_{0};
+    std::atomic<int64_t> video_decoded_frame_count_{0};
+    std::atomic<int64_t> audio_decoded_frame_count_{0};
+    std::atomic<double> video_last_frame_pts_sec_{-1.0};
+    std::atomic<double> audio_last_frame_pts_sec_{-1.0};
     std::atomic<bool> io_watchdog_disabled_{false}; // 是否禁用阻塞读 watchdog（用于 loopback HTTP）
     int64_t io_interrupt_timeout_us_{8000000};   // 阻塞读中断阈值（us）
     std::atomic<uint64_t> audio_output_reset_serial_{0}; // 队列/时钟软重置代数，供平台音频输出层丢弃旧缓冲

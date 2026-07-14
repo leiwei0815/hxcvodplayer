@@ -5476,6 +5476,9 @@ void AndroidPlayer::renderLoop() {
                               " hold_ms=%" PRId64 " fallback_ms=%" PRId64 " rate=%.2f last_video_w=%d last_video_h=%d",
                               empty_ms, rebuffer_trigger_ms, rebuffer_min_hold_ms, rebuffer_fallback_ms,
                               playback_rate, gl_last_video_w_, gl_last_video_h_);
+                        const char* core_diag = player_core_get_runtime_diagnostic(player_core_);
+                        SYNCW("evt=starvation_core_diag source=video_starvation_pause_audio empty_ms=%" PRId64 " diag=%s",
+                              empty_ms, core_diag ? core_diag : "");
                     }
                 }
             }
@@ -5564,6 +5567,9 @@ void AndroidPlayer::renderLoop() {
                           first_frame_ready ? 1 : 0,
                           audio_pending_now ? 1 : 0,
                           audio_rebuffer_now ? 1 : 0);
+                    const char* core_diag = player_core_get_runtime_diagnostic(player_core_);
+                    SYNCI("evt=tail_stall_core_diag empty_ms=%" PRId64 " diag=%s",
+                          empty_ms, core_diag ? core_diag : "");
                 }
                 bool video_stall_already_paused =
                         video_empty_stall_forced_pause_.load(std::memory_order_acquire);
@@ -6865,6 +6871,9 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
               av_split_ms,
               core_playing ? 1 : 0,
               anchor);
+    const char* core_diag = player_core_get_runtime_diagnostic(player_core_);
+    SYNCW("evt=audio_health_core_diag attempt=%d anchor=%.3f diag=%s",
+          attempt, anchor, core_diag ? core_diag : "");
 
     if (av_split_progressing && av_split_ms >= kAudioAvSplitPauseMs) {
         pausePlaybackForAudioSplit(now, anchor, "audio_video_split_progressing");
