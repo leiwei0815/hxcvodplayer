@@ -6896,8 +6896,8 @@ void AndroidPlayer::checkAndRecoverAudioHealth(int64_t now) {
               core_playing ? 1 : 0,
               anchor);
     const char* core_diag = player_core_get_runtime_diagnostic(player_core_);
-    SYNCW("evt=audio_health_core_diag anchor=%.3f action=none diag=%s",
-          anchor, core_diag ? core_diag : "");
+    SYNCW_RATE(8, "evt=audio_health_core_diag anchor=%.3f action=none diag=%s",
+               anchor, core_diag ? core_diag : "");
 }
 
 void AndroidPlayer::pausePlaybackForAudioSplit(int64_t now, double anchor_pts, const char* reason) {

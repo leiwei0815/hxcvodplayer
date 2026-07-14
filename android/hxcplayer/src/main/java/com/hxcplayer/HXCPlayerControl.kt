@@ -2005,8 +2005,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         val durationAtPlay = getDuration()
         val loadingAtPlay = isLoading()
         val stateAtPlay = getState()
-        Log.w(
-            TAG,
+        logInfo(
             "evt=manual_play_request pos=$playStallBasePosSec duration=$durationAtPlay " +
                 "state=${stateAtPlay.name} loading=$loadingAtPlay source_category=$currentSourceCategory " +
                 "recover_delay_ms=$manualPlayHardRecoverDelayMs"
@@ -2857,8 +2856,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                         seekElapsedMs >= 3200L &&
                         (now - pendingSeekLastWatchdogLogAtMs) >= 2000L) {
                         pendingSeekLastWatchdogLogAtMs = now
-                        Log.i(
-                            TAG,
+                        logInfo(
                             "evt=seek_pending_watchdog id=$pendingSeekRequestId target=$target from=$from pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs loading=$loading loading_observed=$pendingSeekLoadingObserved loading_recovered=$loadingRecovered play_when_ready=$playWhenReady state=${state.name} native_seek_active=$nativeSeekActive converged_now=$convergedNow converged_stable=$convergedStable native_converged_stuck=$nativeConvergedButStuck post_confirm_active=$pendingSeekPostConfirmActive source_category=$currentSourceCategory"
                         )
                     }
@@ -2898,8 +2896,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 pendingSeekPostConfirmActive = true
                                 pendingSeekPostConfirmStartAtMs = now
                                 pendingSeekPostConfirmBasePosSec = seekPosition
-                                Log.i(
-                                    TAG,
+                                logInfo(
                                     "evt=seek_post_confirm_arm target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs"
                                 )
                                 return@scheduleAtFixedRate
@@ -2921,8 +2918,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 confirmElapsedMs < seekCompletionUnhealthyPostConfirmWindowMs) {
                                 if ((now - pendingSeekLastWatchdogLogAtMs) >= 1000L) {
                                     pendingSeekLastWatchdogLogAtMs = now
-                                    Log.i(
-                                        TAG,
+                                    logInfo(
                                         "evt=seek_post_confirm_hold_unhealthy target=$target pos=$seekPosition ui_pos=$position elapsed_ms=$seekElapsedMs confirm_elapsed_ms=$confirmElapsedMs loading=$loading state=${state.name} playing=$playingAfterConfirm source_category=$currentSourceCategory"
                                     )
                                 }
@@ -3743,6 +3739,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     private fun maybeLogLocalHlsSegmentDiagnostic(reason: String, positionSec: Double) {
+        if (!canEmitDebugDiagLog()) return
         if (!currentSourceCategory.startsWith("local_hls")) return
         val source = lastOpenUrl ?: return
         if (!positionSec.isFinite() || positionSec < 0.0) return
@@ -3927,8 +3924,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             resetAudioHealthWatchdog("opening_or_loading_${state.name}")
             if ((nowMs - audioHealthLastLogAtMs) >= audioHealthLogIntervalMs) {
                 audioHealthLastLogAtMs = nowMs
-                Log.w(
-                    TAG,
+                logInfo(
                     "evt=audio_health_watchdog_skip reason=opening_or_loading state=${state.name} " +
                         "loading=$loading pos=$positionSec audio_state=${audioMetrics.audioOutputState} " +
                         "silent_ms=${audioMetrics.silentForMs}"
@@ -3940,8 +3936,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             resetAudioHealthWatchdog("open_guard")
             if ((nowMs - audioHealthLastLogAtMs) >= audioHealthLogIntervalMs) {
                 audioHealthLastLogAtMs = nowMs
-                Log.w(
-                    TAG,
+                logInfo(
                     "evt=audio_health_watchdog_skip reason=open_guard state=${state.name} loading=$loading " +
                         "pos=$positionSec suppress_left_ms=${audioHealthOpenSuppressUntilMs - nowMs} " +
                         "audio_state=${audioMetrics.audioOutputState} silent_ms=${audioMetrics.silentForMs}"
@@ -3987,8 +3982,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         if ((nowMs - audioHealthLastLogAtMs) >= audioHealthLogIntervalMs) {
             audioHealthLastLogAtMs = nowMs
-            Log.w(
-                TAG,
+            logInfo(
                 "evt=audio_health_watchdog_detect state=${state.name} loading=$loading playing=$isPlayingNow " +
                     "pos=$positionSec audio_state=$audioState silent_ms=${audioMetrics.silentForMs} " +
                     "opensl=${audioMetrics.openslState} underrun=${audioMetrics.underrunRecent} " +
