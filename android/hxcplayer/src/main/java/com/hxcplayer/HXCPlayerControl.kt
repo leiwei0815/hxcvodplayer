@@ -3690,6 +3690,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             logInfo("evt=stale_io_controlled_reopen_skip reason=no_retry_source source=$reason source_category=$currentSourceCategory")
             return false
         }
+        maybeLogLocalHlsSegmentDiagnostic(reason, basePositionSec)
         if (staleIoControlledReopenInFlight || autoReopenInFlight) {
             logInfo(
                 "evt=stale_io_controlled_reopen_skip reason=in_flight source=$reason " +
@@ -3754,6 +3755,165 @@ class HXCPlayerControl @JvmOverloads constructor(
             staleIoControlledReopenInFlight = false
         }
         return true
+    }
+
+    private fun maybeLogLocalHlsSegmentDiagnostic(reason: String, positionSec: Double) {
+        if (!currentSourceCategory.startsWith("local_hls")) return
+        val source = lastOpenUrl ?: return
+        if (!positionSec.isFinite() || positionSec < 0.0) return
+        val playlist = localPathToFile(source)
+        if (!playlist.exists() || !playlist.isFile) {
+            Log.w(
+                TAG,
+                "evt=local_hls_segment_diag reason=$reason pos=$positionSec playlist=${playlist.absolutePath} " +
+                    "playlist_exists=${playlist.exists()} playlist_len=${playlist.length()}"
+            )
+            return
+        }
+        runCatching {
+            val lines = playlist.readLines()
+            var pendingDuration = Double.NaN
+            var cursor = 0.0
+            var segmentIndex = 0
+            var matched = false
+            var previousSummary = "none"
+            for ((lineIndex, rawLine) in lines.withIndex()) {
+                val line = rawLine.trim()
+                if (line.startsWith("#EXTINF")) {
+                    pendingDuration = parseExtInfDuration(line)
+                    continue
+                }
+                if (line.isEmpty() || line.startsWith("#")) {
+                    continue
+                }
+                val duration = pendingDuration.takeIf { it.isFinite() && it > 0.0 } ?: 0.0
+                val start = cursor
+                val end = cursor + duration
+                val segmentFile = localPathToFile(line, playlist.parentFile)
+                val currentSummary = buildLocalHlsSegmentSummary(segmentIndex, start, end, segmentFile)
+                if (!matched && positionSec >= start - 0.25 && positionSec <= end + 0.25) {
+                    val nextSummary = findNextLocalHlsSegmentSummary(
+                        lines = lines,
+                        startLineIndex = lineIndex,
+                        fallbackIndex = segmentIndex + 1,
+                        fallbackStart = end,
+                        playlistDir = playlist.parentFile
+                    )
+                    Log.w(
+                        TAG,
+                        "evt=local_hls_segment_diag reason=$reason pos=$positionSec playlist=${playlist.absolutePath} " +
+                            "segment=$currentSummary prev=$previousSummary next=$nextSummary"
+                    )
+                    matched = true
+                    break
+                }
+                previousSummary = currentSummary
+                cursor = end
+                segmentIndex += 1
+                pendingDuration = Double.NaN
+            }
+            if (!matched) {
+                Log.w(
+                    TAG,
+                    "evt=local_hls_segment_diag reason=$reason pos=$positionSec playlist=${playlist.absolutePath} " +
+                        "matched=0 parsed_segments=$segmentIndex parsed_duration=$cursor"
+                )
+            }
+        }.onFailure { e ->
+            Log.w(TAG, "evt=local_hls_segment_diag_error reason=$reason pos=$positionSec err=${e.message}")
+        }
+    }
+
+    private fun findNextLocalHlsSegmentSummary(
+        lines: List<String>,
+        startLineIndex: Int,
+        fallbackIndex: Int,
+        fallbackStart: Double,
+        playlistDir: File?
+    ): String {
+        var pendingDuration = Double.NaN
+        for (i in (startLineIndex + 1) until lines.size) {
+            val rawLine = lines[i]
+            val line = rawLine.trim()
+            if (line.startsWith("#EXTINF")) {
+                pendingDuration = parseExtInfDuration(line)
+                continue
+            }
+            if (line.isEmpty() || line.startsWith("#")) {
+                continue
+            }
+            val duration = pendingDuration.takeIf { it.isFinite() && it > 0.0 } ?: 0.0
+            val file = localPathToFile(line, playlistDir)
+            return buildLocalHlsSegmentSummary(fallbackIndex, fallbackStart, fallbackStart + duration, file)
+        }
+        return "none"
+    }
+
+    private fun buildLocalHlsSegmentSummary(index: Int, start: Double, end: Double, file: File): String {
+        return "{idx=$index,start=$start,end=$end,exists=${file.exists()},len=${file.length()},probe=${probeLocalSegment(file)},path=${file.absolutePath}}"
+    }
+
+    private fun parseExtInfDuration(line: String): Double {
+        val colon = line.indexOf(':')
+        if (colon < 0) return Double.NaN
+        val comma = line.indexOf(',', colon + 1).takeIf { it > colon } ?: line.length
+        return line.substring(colon + 1, comma).trim().toDoubleOrNull() ?: Double.NaN
+    }
+
+    private fun localPathToFile(path: String, baseDir: File? = null): File {
+        val normalized = when {
+            path.startsWith("file://") -> path.removePrefix("file://")
+            path.startsWith("/") -> path
+            baseDir != null -> File(baseDir, path).absolutePath
+            else -> path
+        }
+        return File(normalized)
+    }
+
+    private fun probeLocalSegment(file: File): String {
+        if (!file.exists()) return "missing"
+        if (file.length() <= 0L) return "empty"
+        return runCatching {
+            val probe = ByteArray(minOf(file.length(), 4096L).toInt())
+            val read = file.inputStream().use { it.read(probe) }
+            when {
+                read <= 0 -> "unreadable"
+                looksLikeTsProbe(probe, read) -> "ts"
+                looksLikeFmp4Probe(probe, read) -> "fmp4"
+                else -> "unknown"
+            }
+        }.getOrElse { "read_error:${it.javaClass.simpleName}" }
+    }
+
+    private fun looksLikeTsProbe(bytes: ByteArray, length: Int): Boolean {
+        if (length < 188 * 2) return false
+        val maxOffset = minOf(187, length - 188 * 2)
+        for (offset in 0..maxOffset) {
+            val second = offset + 188
+            val third = offset + 376
+            if (bytes[offset] == 0x47.toByte() &&
+                second < length && bytes[second] == 0x47.toByte() &&
+                third < length && bytes[third] == 0x47.toByte()
+            ) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun looksLikeFmp4Probe(bytes: ByteArray, length: Int): Boolean {
+        var offset = 0
+        while (offset + 8 <= length && offset < 4096) {
+            val size = ((bytes[offset].toLong() and 0xffL) shl 24) or
+                ((bytes[offset + 1].toLong() and 0xffL) shl 16) or
+                ((bytes[offset + 2].toLong() and 0xffL) shl 8) or
+                (bytes[offset + 3].toLong() and 0xffL)
+            if (size < 8 || offset + size > length) break
+            val type = String(bytes, offset + 4, 4)
+            if (type == "ftyp" || type == "styp" || type == "moof" || type == "mdat") return true
+            offset += size.toInt()
+        }
+        return false
     }
 
     private fun maybeSkipLocalHlsGap(

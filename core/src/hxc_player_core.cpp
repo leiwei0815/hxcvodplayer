@@ -108,6 +108,19 @@ static bool hxc_is_network_like_url(const char* url) {
            (u.rfind("tcp://", 0) == 0);
 }
 
+static bool hxc_is_hls_playlist_url(const char* url) {
+    if (!url || !*url) {
+        return false;
+    }
+    std::string u(url);
+    for (char& c : u) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return u.find(".m3u8") != std::string::npos;
+}
+
 static bool hxc_is_loopback_http_url(const char* url) {
     if (!url || !*url) {
         return false;
@@ -2148,6 +2161,9 @@ void PlayerCore::read_thread() {
             }
             const bool network_like_input = hxc_is_network_like_url(format_ctx_ ? format_ctx_->url : nullptr);
             const bool secure_hls_input = !secure_session_.request_headers.empty();
+            const bool hls_playlist_input = hxc_is_hls_playlist_url(format_ctx_ ? format_ctx_->url : nullptr);
+            const bool recoverable_midstream_eof_input =
+                    network_like_input || secure_hls_input || hls_playlist_input;
             const bool eof_signal = (ret == AVERROR_EOF) || (format_ctx_->pb && avio_feof(format_ctx_->pb));
             const bool has_io_error = (io_error != 0);
             const double eof_pos = get_master_clock();
@@ -2157,9 +2173,9 @@ void PlayerCore::read_thread() {
                                       eof_duration > 0.0 &&
                                       (eof_duration - eof_pos) <= 1.2;
 
-            // 网络/SecureHLS 中途 EOF 不能按“文件结束”等待 seek，否则读线程会永久不再产出 packet。
+            // 网络/SecureHLS/本地 HLS 中途 EOF 不能按“文件结束”等待 seek，否则读线程会永久不再产出 packet。
             // 只有真正接近尾部时才进入 EOF 等待；远离尾部按可恢复断流走软重连。
-            if (eof_signal && !((network_like_input || secure_hls_input) && !eof_near_end)) {
+            if (eof_signal && !(recoverable_midstream_eof_input && !eof_near_end)) {
                 // 文件结束，发送结束包给解码器
                 LOG_INFO("读取线程：文件读取结束");
                 if (video_stream_ >= 0 && video_stream_opened_ && video_packet_queue_) {
@@ -2185,17 +2201,19 @@ void PlayerCore::read_thread() {
                 LOG_INFO("读取线程：检测到 seek 请求，继续读取");
                 continue;
             } else if (eof_signal) {
-                LOG_WARNING("读取线程：网络/SecureHLS 远离尾部收到 EOF，按可恢复断流处理。pos=",
+                LOG_WARNING("读取线程：HLS/网络远离尾部收到 EOF，按可恢复读包中断处理。pos=",
                             eof_pos, ", duration=", eof_duration,
                             ", network=", network_like_input ? 1 : 0,
                             ", secure=", secure_hls_input ? 1 : 0,
+                            ", hls=", hls_playlist_input ? 1 : 0,
+                            ", url=", (format_ctx_ && format_ctx_->url) ? format_ctx_->url : "",
                             ", io_error=", io_error);
             }
 
             int effective_ret = (ret != 0) ? ret : io_error;
             if (ret == AVERROR_EOF && has_io_error) {
                 effective_ret = io_error;
-            } else if (eof_signal && (network_like_input || secure_hls_input) && !eof_near_end) {
+            } else if (eof_signal && recoverable_midstream_eof_input && !eof_near_end) {
                 effective_ret = AVERROR(ETIMEDOUT);
             }
 

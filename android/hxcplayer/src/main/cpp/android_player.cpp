@@ -5579,12 +5579,14 @@ void AndroidPlayer::renderLoop() {
                 }
                 bool video_stall_already_paused =
                         video_empty_stall_forced_pause_.load(std::memory_order_acquire);
+                int64_t empty_stall_pause_ms =
+                        core_stale_io ? kCoreIoStaleEmptyRecoverMs : kVideoEmptyStallPauseMs;
                 bool non_tail_playing_empty_stall =
                         !near_end &&
                         !seek_flow_active &&
                         first_frame_ready &&
                         open_ready_for_tail_complete &&
-                        empty_ms >= kVideoEmptyStallPauseMs &&
+                        empty_ms >= empty_stall_pause_ms &&
                         !playback_completed_latched_.load(std::memory_order_acquire) &&
                         (video_stall_already_paused ||
                          (play_when_ready_now &&
@@ -5630,7 +5632,10 @@ void AndroidPlayer::renderLoop() {
                                   empty_ms, recover_pos, dur_now, remain_now, core_io_stale_ms);
                         }
                     }
-                    if (stall_ms >= (kVideoEmptyStallReopenMs - kVideoEmptyStallPauseMs) &&
+                    int64_t recover_delay_ms = core_stale_io
+                                               ? 0
+                                               : (kVideoEmptyStallReopenMs - kVideoEmptyStallPauseMs);
+                    if (stall_ms >= recover_delay_ms &&
                         !pending_video_stall_reopen_.load(std::memory_order_acquire)) {
                         double max_reopen_pos = (std::isfinite(dur_now) && dur_now > 0.35)
                                                 ? std::max(0.0, dur_now - 0.35)
