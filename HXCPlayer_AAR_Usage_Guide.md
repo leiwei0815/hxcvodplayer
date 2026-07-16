@@ -371,18 +371,21 @@ speedButton.setOnClickListener {
 }
 ```
 
-### 音量控制
+### 音量与静音
 
 ```kotlin
-// 设置音量（0.0 ~ 1.0）
-player.setVolume(0.5f)  // 50% 音量
+// App 静音开关；实际音量大小交给 Android 系统媒体音量控制
+player.setMuted(true)
+player.setMuted(false)
 
-// 音量条示例
+// 系统媒体音量条示例
+val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+volumeBar.max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+volumeBar.progress = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
 volumeBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
     override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
         if (fromUser) {
-            val volume = progress / 100.0f
-            player.setVolume(volume)
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, progress, 0)
         }
     }
     

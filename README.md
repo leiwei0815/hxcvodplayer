@@ -326,8 +326,9 @@ player.stop()
 // 设置播放速率（0.5x - 2.0x）
 player.setPlaybackRate(1.5f)
 
-// 设置音量（0.0 - 1.0）
-player.setVolume(0.8f)
+// App 静音开关；正常音量大小交给 Android 系统媒体音量控制
+player.setMuted(true)
+player.setMuted(false)
 
 // 设置画面比例模式
 player.setAspectRatioMode(0)  // 0: FIT（保持比例，黑边）

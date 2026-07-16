@@ -108,6 +108,19 @@ static bool hxc_is_network_like_url(const char* url) {
            (u.rfind("tcp://", 0) == 0);
 }
 
+static bool hxc_is_hls_playlist_url(const char* url) {
+    if (!url || !*url) {
+        return false;
+    }
+    std::string u(url);
+    for (char& c : u) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return u.find(".m3u8") != std::string::npos;
+}
+
 static bool hxc_is_loopback_http_url(const char* url) {
     if (!url || !*url) {
         return false;
@@ -426,6 +439,104 @@ std::string PlayerCore::get_video_decode_diagnostic() const {
     return video_decode_diag_;
 }
 
+bool PlayerCore::is_io_stale_for_playback(int64_t stale_threshold_ms, int64_t* stale_for_ms) const {
+    const int64_t now_us = av_gettime_relative();
+    const int64_t last_packet_us = io_last_packet_us_.load(std::memory_order_acquire);
+    const int64_t stale_ms = last_packet_us > 0 ? (now_us - last_packet_us) / 1000 : -1;
+    if (stale_for_ms) {
+        *stale_for_ms = stale_ms;
+    }
+    if (stale_threshold_ms <= 0 || stale_ms < stale_threshold_ms) {
+        return false;
+    }
+    if (!play_when_ready_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (seek_request_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const bool video_empty = !video_stream_opened_ ||
+                             !video_packet_queue_ ||
+                             video_packet_queue_->get_nb_packets() <= 0;
+    const bool audio_empty = !audio_stream_opened_ ||
+                             !audio_packet_queue_ ||
+                             audio_packet_queue_->get_nb_packets() <= 0;
+    const bool video_frames_empty = !video_stream_opened_ ||
+                                    !video_queue_ ||
+                                    video_queue_->nb_remaining() <= 0;
+    const bool audio_frames_empty = !audio_stream_opened_ ||
+                                    !audio_queue_ ||
+                                    audio_queue_->nb_remaining() <= 0;
+    if (!(video_empty && audio_empty && video_frames_empty && audio_frames_empty)) {
+        return false;
+    }
+    const double pos = get_position();
+    const double duration = get_duration();
+    const bool near_end = std::isfinite(pos) &&
+                          std::isfinite(duration) &&
+                          duration > 0.0 &&
+                          (duration - pos) <= 1.2;
+    return !near_end;
+}
+
+std::string PlayerCore::get_runtime_diagnostic() const {
+    const int64_t now_us = av_gettime_relative();
+    const int64_t last_packet_us = io_last_packet_us_.load(std::memory_order_acquire);
+    const int64_t last_packet_age_ms = last_packet_us > 0 ? (now_us - last_packet_us) / 1000 : -1;
+    const int64_t last_video_packet_us = io_last_video_packet_us_.load(std::memory_order_acquire);
+    const int64_t last_audio_packet_us = io_last_audio_packet_us_.load(std::memory_order_acquire);
+    const int64_t last_video_packet_age_ms = last_video_packet_us > 0 ? (now_us - last_video_packet_us) / 1000 : -1;
+    const int64_t last_audio_packet_age_ms = last_audio_packet_us > 0 ? (now_us - last_audio_packet_us) / 1000 : -1;
+    int64_t io_stale_ms = -1;
+    const bool stale_io = is_io_stale_for_playback(8000, &io_stale_ms);
+
+    std::ostringstream oss;
+    oss << "state=" << static_cast<int>(state_.load(std::memory_order_acquire))
+        << " pipeline=" << static_cast<int>(pipeline_state_.load(std::memory_order_acquire))
+        << " pwr=" << (play_when_ready_.load(std::memory_order_acquire) ? 1 : 0)
+        << " playing=" << (effective_is_playing_.load(std::memory_order_acquire) ? 1 : 0)
+        << " seek_req=" << (seek_request_.load(std::memory_order_acquire) ? 1 : 0)
+        << " seeking=" << (seeking_.load(std::memory_order_acquire) ? 1 : 0)
+        << " seek_loading=" << (seek_loading_.load(std::memory_order_acquire) ? 1 : 0)
+        << " io_loading=" << (io_loading_.load(std::memory_order_acquire) ? 1 : 0)
+        << " starvation_loading=" << (starvation_loading_.load(std::memory_order_acquire) ? 1 : 0)
+        << " stale_io=" << (stale_io ? 1 : 0)
+        << " io_stale_ms=" << io_stale_ms
+        << " decode_finished=" << (decode_finished_.load(std::memory_order_acquire) ? 1 : 0)
+        << " video_open=" << (video_stream_opened_ ? 1 : 0)
+        << " audio_open=" << (audio_stream_opened_ ? 1 : 0)
+        << " hw_video=" << (video_hw_decode_active_.load(std::memory_order_acquire) ? 1 : 0)
+        << " v_pkt_q=" << (video_packet_queue_ ? video_packet_queue_->get_nb_packets() : -1)
+        << " a_pkt_q=" << (audio_packet_queue_ ? audio_packet_queue_->get_nb_packets() : -1)
+        << " v_pkt_bytes=" << (video_packet_queue_ ? video_packet_queue_->get_size() : -1)
+        << " a_pkt_bytes=" << (audio_packet_queue_ ? audio_packet_queue_->get_size() : -1)
+        << " v_frame_q=" << (video_queue_ ? video_queue_->nb_remaining() : -1)
+        << " a_frame_q=" << (audio_queue_ ? audio_queue_->nb_remaining() : -1)
+        << " last_pkt_age_ms=" << last_packet_age_ms
+        << " last_pkt_stream=" << io_last_packet_stream_index_.load(std::memory_order_acquire)
+        << " last_pkt_size=" << io_last_packet_size_.load(std::memory_order_acquire)
+        << " last_pkt_pts=" << io_last_packet_pts_sec_.load(std::memory_order_acquire)
+        << " last_pkt_dts=" << io_last_packet_dts_sec_.load(std::memory_order_acquire)
+        << " last_v_pkt_age_ms=" << last_video_packet_age_ms
+        << " last_a_pkt_age_ms=" << last_audio_packet_age_ms
+        << " last_v_pkt_pts=" << io_last_video_packet_pts_sec_.load(std::memory_order_acquire)
+        << " last_a_pkt_pts=" << io_last_audio_packet_pts_sec_.load(std::memory_order_acquire)
+        << " read_v=" << io_video_packet_count_.load(std::memory_order_acquire)
+        << " read_a=" << io_audio_packet_count_.load(std::memory_order_acquire)
+        << " read_other=" << io_other_packet_count_.load(std::memory_order_acquire)
+        << " v_dec_ret=" << video_decode_last_ret_.load(std::memory_order_acquire)
+        << " a_dec_ret=" << audio_decode_last_ret_.load(std::memory_order_acquire)
+        << " v_dec_err=" << video_decode_error_streak_.load(std::memory_order_acquire)
+        << " a_dec_err=" << audio_decode_error_streak_.load(std::memory_order_acquire)
+        << " v_frames=" << video_decoded_frame_count_.load(std::memory_order_acquire)
+        << " a_frames=" << audio_decoded_frame_count_.load(std::memory_order_acquire)
+        << " v_last_pts=" << video_last_frame_pts_sec_.load(std::memory_order_acquire)
+        << " a_last_pts=" << audio_last_frame_pts_sec_.load(std::memory_order_acquire)
+        << " pos=" << get_position()
+        << " duration=" << get_duration();
+    return oss.str();
+}
+
 PlayerCore::PlayerCore()
     : state_(PlayerState::Idle)
     , format_ctx_(nullptr)
@@ -565,6 +676,25 @@ int PlayerCore::open(const std::string& filename) {
     video_hw_decode_active_.store(false, std::memory_order_release);
     playback_completed_notified_.store(false, std::memory_order_release);  // ⚠️ 重置播放完成通知标志
     io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
+    io_last_packet_stream_index_.store(-1, std::memory_order_release);
+    io_last_packet_size_.store(0, std::memory_order_release);
+    io_last_packet_pts_sec_.store(-1.0, std::memory_order_release);
+    io_last_packet_dts_sec_.store(-1.0, std::memory_order_release);
+    io_last_video_packet_us_.store(0, std::memory_order_release);
+    io_last_audio_packet_us_.store(0, std::memory_order_release);
+    io_last_video_packet_pts_sec_.store(-1.0, std::memory_order_release);
+    io_last_audio_packet_pts_sec_.store(-1.0, std::memory_order_release);
+    io_video_packet_count_.store(0, std::memory_order_release);
+    io_audio_packet_count_.store(0, std::memory_order_release);
+    io_other_packet_count_.store(0, std::memory_order_release);
+    video_decode_last_ret_.store(0, std::memory_order_release);
+    audio_decode_last_ret_.store(0, std::memory_order_release);
+    video_decode_error_streak_.store(0, std::memory_order_release);
+    audio_decode_error_streak_.store(0, std::memory_order_release);
+    video_decoded_frame_count_.store(0, std::memory_order_release);
+    audio_decoded_frame_count_.store(0, std::memory_order_release);
+    video_last_frame_pts_sec_.store(-1.0, std::memory_order_release);
+    audio_last_frame_pts_sec_.store(-1.0, std::memory_order_release);
 
     // ⚠️ 重置 seek 状态（close() 强杀线程时 seeking_ 可能残留 true，
     // 导致新会话的所有帧被误判为"seek 前的旧帧"而丢弃，播放从原 seek 目标位置开始而非 0）。
@@ -1005,6 +1135,25 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     decode_finished_ = false;
     playback_completed_notified_.store(false, std::memory_order_release);
     io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
+    io_last_packet_stream_index_.store(-1, std::memory_order_release);
+    io_last_packet_size_.store(0, std::memory_order_release);
+    io_last_packet_pts_sec_.store(-1.0, std::memory_order_release);
+    io_last_packet_dts_sec_.store(-1.0, std::memory_order_release);
+    io_last_video_packet_us_.store(0, std::memory_order_release);
+    io_last_audio_packet_us_.store(0, std::memory_order_release);
+    io_last_video_packet_pts_sec_.store(-1.0, std::memory_order_release);
+    io_last_audio_packet_pts_sec_.store(-1.0, std::memory_order_release);
+    io_video_packet_count_.store(0, std::memory_order_release);
+    io_audio_packet_count_.store(0, std::memory_order_release);
+    io_other_packet_count_.store(0, std::memory_order_release);
+    video_decode_last_ret_.store(0, std::memory_order_release);
+    audio_decode_last_ret_.store(0, std::memory_order_release);
+    video_decode_error_streak_.store(0, std::memory_order_release);
+    audio_decode_error_streak_.store(0, std::memory_order_release);
+    video_decoded_frame_count_.store(0, std::memory_order_release);
+    audio_decoded_frame_count_.store(0, std::memory_order_release);
+    video_last_frame_pts_sec_.store(-1.0, std::memory_order_release);
+    audio_last_frame_pts_sec_.store(-1.0, std::memory_order_release);
     
     // 保存自定义 IO
     custom_io_ = std::move(custom_io);
@@ -1324,6 +1473,16 @@ int PlayerCore::open_common_process(const std::string &filename) {
     
     // ⚠️ 必须先创建队列，再启动解码线程！
     // 创建数据包队列
+    LOG_INFO("audio_pipeline_open filename=", filename,
+             " streams=", format_ctx_ ? format_ctx_->nb_streams : 0,
+             " video_stream=", video_stream_,
+             " audio_stream=", audio_stream_,
+             " audio_codec=", media_info_.audio_codec,
+             " audio_sample_rate=", media_info_.audio_sample_rate,
+             " audio_channels=", media_info_.audio_channels,
+             " duration_us=", media_info_.duration,
+             " bitrate=", media_info_.bitrate);
+
     video_packet_queue_ = std::make_unique<PacketQueue>();
     audio_packet_queue_ = std::make_unique<PacketQueue>();
     subtitle_packet_queue_ = std::make_unique<PacketQueue>();
@@ -1547,6 +1706,14 @@ void PlayerCore::close() {
     set_io_loading(false);
     set_starvation_loading(false);
     io_last_packet_us_.store(0, std::memory_order_release);
+    io_last_packet_stream_index_.store(-1, std::memory_order_release);
+    io_last_packet_size_.store(0, std::memory_order_release);
+    io_last_packet_pts_sec_.store(-1.0, std::memory_order_release);
+    io_last_packet_dts_sec_.store(-1.0, std::memory_order_release);
+    io_last_video_packet_us_.store(0, std::memory_order_release);
+    io_last_audio_packet_us_.store(0, std::memory_order_release);
+    io_last_video_packet_pts_sec_.store(-1.0, std::memory_order_release);
+    io_last_audio_packet_pts_sec_.store(-1.0, std::memory_order_release);
     io_watchdog_disabled_.store(false, std::memory_order_release);
     set_play_when_ready_internal(false);
     first_video_frame_ready_.store(false, std::memory_order_release);
@@ -1785,6 +1952,9 @@ void PlayerCore::read_thread() {
     int soft_reconnect_attempt_count = 0;
     int64_t next_soft_reconnect_try_us = 0;
     bool pending_disconnect_error_after_drain = false;
+    int audio_packet_count = 0;
+    int video_packet_count = 0;
+    auto last_audio_pipeline_read_diag = std::chrono::steady_clock::now();
     
     while (!abort_request_) {
         // 处理 seek
@@ -1990,12 +2160,22 @@ void PlayerCore::read_thread() {
                 io_error = format_ctx_->pb->error;
             }
             const bool network_like_input = hxc_is_network_like_url(format_ctx_ ? format_ctx_->url : nullptr);
+            const bool secure_hls_input = !secure_session_.request_headers.empty();
+            const bool hls_playlist_input = hxc_is_hls_playlist_url(format_ctx_ ? format_ctx_->url : nullptr);
+            const bool recoverable_midstream_eof_input =
+                    network_like_input || secure_hls_input || hls_playlist_input;
             const bool eof_signal = (ret == AVERROR_EOF) || (format_ctx_->pb && avio_feof(format_ctx_->pb));
             const bool has_io_error = (io_error != 0);
+            const double eof_pos = get_master_clock();
+            const double eof_duration = get_duration();
+            const bool eof_near_end = std::isfinite(eof_pos) &&
+                                      std::isfinite(eof_duration) &&
+                                      eof_duration > 0.0 &&
+                                      (eof_duration - eof_pos) <= 1.2;
 
-            // 网络流出现 TLS/IO 错误时，FFmpeg 可能同时给出 EOF 信号；此时不能按“正常读完文件”处理，
-            // 否则会误进入“等待 seek/终止”分支，看起来像卡住。
-            if (eof_signal && !(network_like_input && has_io_error)) {
+            // 网络/SecureHLS/本地 HLS 中途 EOF 不能按“文件结束”等待 seek，否则读线程会永久不再产出 packet。
+            // 只有真正接近尾部时才进入 EOF 等待；远离尾部按可恢复断流走软重连。
+            if (eof_signal && !(recoverable_midstream_eof_input && !eof_near_end)) {
                 // 文件结束，发送结束包给解码器
                 LOG_INFO("读取线程：文件读取结束");
                 if (video_stream_ >= 0 && video_stream_opened_ && video_packet_queue_) {
@@ -2020,11 +2200,21 @@ void PlayerCore::read_thread() {
                 // 如果是 seek，则继续循环（seek 会在循环开头处理）
                 LOG_INFO("读取线程：检测到 seek 请求，继续读取");
                 continue;
+            } else if (eof_signal) {
+                LOG_WARNING("读取线程：HLS/网络远离尾部收到 EOF，按可恢复读包中断处理。pos=",
+                            eof_pos, ", duration=", eof_duration,
+                            ", network=", network_like_input ? 1 : 0,
+                            ", secure=", secure_hls_input ? 1 : 0,
+                            ", hls=", hls_playlist_input ? 1 : 0,
+                            ", url=", (format_ctx_ && format_ctx_->url) ? format_ctx_->url : "",
+                            ", io_error=", io_error);
             }
 
             int effective_ret = (ret != 0) ? ret : io_error;
             if (ret == AVERROR_EOF && has_io_error) {
                 effective_ret = io_error;
+            } else if (eof_signal && recoverable_midstream_eof_input && !eof_near_end) {
+                effective_ret = AVERROR(ETIMEDOUT);
             }
 
             // watchdog 中断会返回 AVERROR_EXIT（Immediate exit requested）。
@@ -2214,6 +2404,24 @@ void PlayerCore::read_thread() {
         soft_reconnect_attempt_count = 0;
         next_soft_reconnect_try_us = 0;
         io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
+        io_last_packet_stream_index_.store(pkt->stream_index, std::memory_order_release);
+        io_last_packet_size_.store(pkt->size, std::memory_order_release);
+        double pkt_pts_sec = -1.0;
+        double pkt_dts_sec = -1.0;
+        if (format_ctx_ &&
+            pkt->stream_index >= 0 &&
+            pkt->stream_index < static_cast<int>(format_ctx_->nb_streams) &&
+            format_ctx_->streams[pkt->stream_index]) {
+            AVRational tb = format_ctx_->streams[pkt->stream_index]->time_base;
+            if (pkt->pts != AV_NOPTS_VALUE) {
+                pkt_pts_sec = pkt->pts * av_q2d(tb);
+            }
+            if (pkt->dts != AV_NOPTS_VALUE) {
+                pkt_dts_sec = pkt->dts * av_q2d(tb);
+            }
+        }
+        io_last_packet_pts_sec_.store(pkt_pts_sec, std::memory_order_release);
+        io_last_packet_dts_sec_.store(pkt_dts_sec, std::memory_order_release);
         if (!secure_session_.request_headers.empty()) {
             if (resource_delegate_.on_request_segment) {
                 resource_delegate_.on_request_segment(format_ctx_ && format_ctx_->url ? format_ctx_->url : "");
@@ -2227,12 +2435,33 @@ void PlayerCore::read_thread() {
         if (pkt->stream_index == video_stream_ && video_stream_opened_ && video_packet_queue_) {
             video_packet_queue_->put(pkt);
             packet_count++;
+            video_packet_count++;
+            io_last_video_packet_us_.store(io_last_packet_us_.load(std::memory_order_acquire), std::memory_order_release);
+            io_last_video_packet_pts_sec_.store(pkt_pts_sec, std::memory_order_release);
+            io_video_packet_count_.fetch_add(1, std::memory_order_acq_rel);
 //            if (packet_count % 100 == 0) {
 //                LOG_INFO("已读取 ", packet_count, " 个视频包");
 //            }
         } else if (pkt->stream_index == audio_stream_ && audio_stream_opened_ && audio_packet_queue_) {
             audio_packet_queue_->put(pkt);
+            audio_packet_count++;
+            io_last_audio_packet_us_.store(io_last_packet_us_.load(std::memory_order_acquire), std::memory_order_release);
+            io_last_audio_packet_pts_sec_.store(pkt_pts_sec, std::memory_order_release);
+            io_audio_packet_count_.fetch_add(1, std::memory_order_acq_rel);
+            auto diag_now = std::chrono::steady_clock::now();
+            auto diag_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    diag_now - last_audio_pipeline_read_diag).count();
+            if (audio_packet_count == 1 || audio_packet_count % 100 == 0 || diag_elapsed_ms >= 10000) {
+                last_audio_pipeline_read_diag = diag_now;
+                LOG_INFO("audio_pipeline_read packets audio=", audio_packet_count,
+                         " video=", video_packet_count,
+                         " audio_queue_packets=", audio_packet_queue_->get_nb_packets(),
+                         " video_queue_packets=", video_packet_queue_ ? video_packet_queue_->get_nb_packets() : 0,
+                         " pkt_size=", pkt->size,
+                         " pkt_pts=", pkt->pts);
+            }
         } else {
+            io_other_packet_count_.fetch_add(1, std::memory_order_acq_rel);
             av_packet_unref(pkt);
         }
     }
@@ -2634,10 +2863,12 @@ void PlayerCore::video_thread() {
         }
         // 解码视频帧
         int ret = video_decoder_->decode_frame(frame);
+        video_decode_last_ret_.store(ret, std::memory_order_release);
         
         if (ret < 0) {
             // EAGAIN/中止类错误按可恢复处理，避免误报致命错误。
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EXIT || ret == -1) {
+                video_decode_error_streak_.store(0, std::memory_order_release);
                 if (abort_request_) {
                     break;
                 }
@@ -2646,6 +2877,7 @@ void PlayerCore::video_thread() {
             }
 
             error_count++;
+            video_decode_error_streak_.store(error_count, std::memory_order_release);
             if (error_count <= 3 || error_count % 100 == 0) {
                 LOG_ERROR("视频解码错误: ", ret, " (错误次数: ", error_count, ")");
             }
@@ -2660,6 +2892,7 @@ void PlayerCore::video_thread() {
             PLAYER_DELAY(10);
             continue;  // 继续尝试
         } else if (ret == 0) {
+            video_decode_error_streak_.store(0, std::memory_order_release);
             LOG_INFO("视频解码结束");
             // ⚠️ 设置解码结束标志
             decode_finished_.store(true, std::memory_order_release);
@@ -2688,6 +2921,9 @@ void PlayerCore::video_thread() {
         
         // 计算帧时间戳
         pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(format_ctx_->streams[video_stream_]->time_base);
+        video_decode_error_streak_.store(0, std::memory_order_release);
+        video_decoded_frame_count_.fetch_add(1, std::memory_order_acq_rel);
+        video_last_frame_pts_sec_.store(isnan(pts) ? -1.0 : pts, std::memory_order_release);
         bool is_seeking = seeking_.load(std::memory_order_acquire);
         if (is_seeking && !isnan(pts)) {
             double target = seek_target_pos_.load(std::memory_order_acquire);
@@ -2813,6 +3049,8 @@ void PlayerCore::audio_thread() {
     
     int frame_count = 0;
     int error_count = 0;
+    double last_audio_decode_pts = NAN;
+    auto last_audio_pipeline_decode_diag = std::chrono::steady_clock::now();
     
     LOG_INFO("[音频线程] 进入主循环, audio_decoder_ exists=", (audio_decoder_ != nullptr), ", audio_packet_queue_ exists=", (audio_packet_queue_ != nullptr));
     
@@ -2850,10 +3088,12 @@ void PlayerCore::audio_thread() {
         
         // 解码音频帧
         int ret = audio_decoder_->decode_frame(frame);
+        audio_decode_last_ret_.store(ret, std::memory_order_release);
         
         if (ret < 0) {
             // EAGAIN 常见于队列暂时无包，不应直接当成错误上报。
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EXIT || ret == -1) {
+                audio_decode_error_streak_.store(0, std::memory_order_release);
                 if (abort_request_) {
                     break;
                 }
@@ -2862,6 +3102,7 @@ void PlayerCore::audio_thread() {
             }
 
             error_count++;
+            audio_decode_error_streak_.store(error_count, std::memory_order_release);
             if (error_count == 1 || error_count % 100 == 0) {
                 LOG_ERROR("音频解码错误: ", ret, " (连续 ", error_count, " 次)");
             }
@@ -2876,6 +3117,7 @@ void PlayerCore::audio_thread() {
             PLAYER_DELAY(10);
             continue;  // 继续尝试
         } else if (ret == 0) {
+            audio_decode_error_streak_.store(0, std::memory_order_release);
             LOG_INFO("音频解码结束");
             
             // ⚠️ 不要退出线程！等待可能的 seek 操作或终止信号
@@ -2900,8 +3142,10 @@ void PlayerCore::audio_thread() {
         
         // 解码成功，重置错误计数
         error_count = 0;
+        audio_decode_error_streak_.store(0, std::memory_order_release);
         
         frame_count++;
+        audio_decoded_frame_count_.fetch_add(1, std::memory_order_acq_rel);
 //        if (frame_count == 1 || frame_count % 100 == 0) {
 //            LOG_INFO("已解码 ", frame_count, " 个音频帧");
 //        }
@@ -2914,6 +3158,7 @@ void PlayerCore::audio_thread() {
         // 计算时间戳
         double pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : 
                      frame->pts * av_q2d(format_ctx_->streams[audio_stream_]->time_base);
+        audio_last_frame_pts_sec_.store(isnan(pts) ? -1.0 : pts, std::memory_order_release);
 
         // seek 追帧策略（稳定优先）：
         // - 不在这里丢帧！audio_callback_impl 消费时对 pts < target 的帧输出静音。
@@ -2975,6 +3220,20 @@ void PlayerCore::audio_thread() {
         
         // 推入队列
         audio_queue_->push();
+        last_audio_decode_pts = pts;
+        auto decode_diag_now = std::chrono::steady_clock::now();
+        auto decode_diag_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                decode_diag_now - last_audio_pipeline_decode_diag).count();
+        if (frame_count == 1 || frame_count % 100 == 0 || decode_diag_elapsed_ms >= 10000) {
+            last_audio_pipeline_decode_diag = decode_diag_now;
+            LOG_INFO("audio_pipeline_decode frames=", frame_count,
+                     " last_pts=", last_audio_decode_pts,
+                     " queue_frames=", audio_queue_ ? audio_queue_->nb_remaining() : -1,
+                     " packet_serial=", audio_packet_queue_ ? audio_packet_queue_->get_serial() : -1,
+                     " sample_rate=", frame->sample_rate,
+                     " channels=", frame->ch_layout.nb_channels,
+                     " nb_samples=", frame->nb_samples);
+        }
         if (!first_audio_frame_ready_.exchange(true, std::memory_order_acq_rel)) {
             LOG_INFO("音频首帧已就绪");
             update_pipeline_state_from_runtime();

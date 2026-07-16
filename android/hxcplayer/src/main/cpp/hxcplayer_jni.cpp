@@ -272,6 +272,16 @@ Java_com_hxcplayer_HXCPlayerControl_nativeSetVolume(
     }
 }
 
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeSetMuted(
+        JNIEnv *env, jobject thiz, jlong handle, jboolean muted) {
+    LOGD("nativeSetMuted: %d", muted ? 1 : 0);
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player) {
+        player->setMuted(muted == JNI_TRUE);
+    }
+}
+
 // 设置比例模式
 JNIEXPORT void JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeSetAspectRatioMode(
@@ -660,22 +670,24 @@ Java_com_hxcplayer_HXCPlayerControl_nativeOpenWithCustomFile(
 JNIEXPORT jlongArray JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeGetAudioHealthMetrics(JNIEnv* env, jobject thiz, jlong handle) {
     (void)thiz;
-    jlong values[4] = {0, 0, 0, 0};
+    jlong values[5] = {0, 0, 0, 0, 0};
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
     if (player) {
         int64_t silent_ms = 0;
         int underrun = 0;
         int opensl_state = 0;
         int recover_attempts = 0;
-        player->getAudioHealthMetrics(&silent_ms, &underrun, &opensl_state, &recover_attempts);
+        int audio_output_state = 0;
+        player->getAudioHealthMetrics(&silent_ms, &underrun, &opensl_state, &recover_attempts, &audio_output_state);
         values[0] = static_cast<jlong>(silent_ms);
         values[1] = static_cast<jlong>(underrun);
         values[2] = static_cast<jlong>(opensl_state);
         values[3] = static_cast<jlong>(recover_attempts);
+        values[4] = static_cast<jlong>(audio_output_state);
     }
-    jlongArray result = env->NewLongArray(4);
+    jlongArray result = env->NewLongArray(5);
     if (result) {
-        env->SetLongArrayRegion(result, 0, 4, values);
+        env->SetLongArrayRegion(result, 0, 5, values);
     }
     return result;
 }
@@ -687,6 +699,46 @@ Java_com_hxcplayer_HXCPlayerControl_nativeRecoverAudioOutput(JNIEnv* env, jobjec
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
     if (!player) return JNI_FALSE;
     return player->recoverAudioOutput() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeRebuildAudioOutput(JNIEnv* env, jobject thiz, jlong handle) {
+    (void)env;
+    (void)thiz;
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return JNI_FALSE;
+    return player->rebuildAudioOutput() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeHandleAudioRouteChanged(JNIEnv* env, jobject thiz, jlong handle, jstring reason) {
+    (void)thiz;
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return JNI_FALSE;
+    const char* reason_str = reason ? env->GetStringUTFChars(reason, nullptr) : nullptr;
+    bool result = player->handleAudioRouteChanged(reason_str ? reason_str : "audio_route_changed");
+    if (reason_str) {
+        env->ReleaseStringUTFChars(reason, reason_str);
+    }
+    return result ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeSetSystemMusicVolumeZero(JNIEnv* env, jobject thiz, jlong handle, jboolean volume_zero) {
+    (void)env;
+    (void)thiz;
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return;
+    player->setSystemMusicVolumeZero(volume_zero == JNI_TRUE);
+}
+
+JNIEXPORT jdouble JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeConsumeVideoStallRecoverPosition(JNIEnv* env, jobject thiz, jlong handle) {
+    (void)env;
+    (void)thiz;
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return -1.0;
+    return player->consumeVideoStallRecoverPosition();
 }
 
 } // extern "C"

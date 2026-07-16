@@ -95,6 +95,7 @@ public:
     void   seekToWithIntent(double position, bool resume_after_seek);
     void   setPlaybackRate(float rate);
     void   setVolume(float volume);
+    void   setMuted(bool muted);
     void   setAspectRatioMode(int mode);   // 0=FIT, 1=FILL
     void   setDecodeMode(int mode);        // 0=software, 1=hardware
     void   setSecureSeekTuning(double drop_only_window_backward_sec,
@@ -136,8 +137,13 @@ public:
     void   getAudioHealthMetrics(int64_t* silent_for_ms,
                                  int* underrun_recent,
                                  int* opensl_state,
-                                 int* recover_attempts);
+                                 int* recover_attempts,
+                                 int* audio_output_state);
     bool   recoverAudioOutput();
+    bool   rebuildAudioOutput();
+    bool   handleAudioRouteChanged(const char* reason);
+    void   setSystemMusicVolumeZero(bool volume_zero);
+    double consumeVideoStallRecoverPosition();
 
 private:
     // -----------------------------------------------------------------------
@@ -260,6 +266,9 @@ private:
     void destroyAudioOutput();
     void destroyAudioOutputObjectsLocked();
     void ensureAudioOutputForCurrentStream();
+    bool primeAudioBufferQueue(const char* reason, bool clear_queue);
+    bool recreateAudioOutputForCurrentStream(const char* reason);
+    bool isAudioOutputEnabled() const;
     SLresult setOpenSLESPlayState(SLuint32 state, bool require_audible);
     static void audioCallback(SLAndroidSimpleBufferQueueItf bq, void* context);
     void onAudioData(SLAndroidSimpleBufferQueueItf bq);
@@ -272,6 +281,7 @@ private:
     std::atomic<bool>  audio_active_{false};
     std::atomic<int>   audio_cb_in_flight_{0};
     std::atomic<float> current_volume_{1.0f}; // last value passed to setVolume()
+    std::atomic<bool>  muted_{false};
     std::atomic<float> requested_playback_rate_{1.0f}; // rate requested by upper layer
     std::atomic<bool> seek_just_happened_{false};
     // When true: audio start is deferred until the first video frame is rendered
@@ -405,14 +415,33 @@ private:
     std::atomic<int>     audio_health_recover_attempts_{0};
     std::atomic<int64_t> last_audio_health_check_ms_{0};
     std::atomic<int>     recent_audio_underrun_total_{0};
+    std::atomic<int64_t> last_audio_callback_ms_{0};
+    std::atomic<int64_t> last_audio_prime_ms_{0};
+    std::atomic<int64_t> audio_av_split_started_ms_{0};
+    std::atomic<bool>    audio_av_split_forced_pause_{false};
+    std::atomic<bool>    system_music_volume_zero_{false};
+    std::atomic<int64_t> video_empty_stall_started_ms_{0};
+    std::atomic<bool>    video_empty_stall_forced_pause_{false};
+    std::atomic<bool>    pending_video_stall_reopen_{false};
+    std::atomic<double>  pending_video_stall_reopen_pos_{-1.0};
     static constexpr int64_t kAudioSilentThresholdMs = 2500;
-    static constexpr int   kAudioRecoverMaxAttempts = 3;
+    static constexpr int64_t kAudioCallbackStallMs = 1800;
+    static constexpr int64_t kAudioAvSplitPauseMs = 6500;
+    static constexpr int64_t kVideoEmptyStallPauseMs = 6000;
+    static constexpr int64_t kVideoEmptyStallReopenMs = 9000;
+    static constexpr int64_t kCoreIoStaleRecoverMs = 8000;
+    static constexpr int64_t kCoreIoStaleEmptyRecoverMs = 2000;
 
     int    queryOpenSLESPlayState();
+    int    resolveAudioOutputState(int64_t now, int opensl_state);
     SLresult setOpenSLESPlayStateWithRetry(SLuint32 state, bool require_audible, int max_retries = 3);
     bool   forceResumeAudioOutput(int64_t now, double anchor_pts, const char* reason);
+    bool   enforceAudioPauseDeadlines(int64_t now, const char* source);
     void   checkAndRecoverAudioHealth(int64_t now);
-    void   rebuildAudioOutputFromStream();
+    void   resetAudioHealthStateForOpen(const char* reason);
+    void   rebuildAudioOutputFromStream(bool force_recreate, const char* reason);
+    void   pausePlaybackForAudioSplit(int64_t now, double anchor_pts, const char* reason);
+    void   resetVideoEmptyStallRecovery(const char* reason);
 
     // -----------------------------------------------------------------------
     // Event forwarding (core callbacks -> JNI poll)

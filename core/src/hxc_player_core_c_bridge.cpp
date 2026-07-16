@@ -64,6 +64,12 @@ struct PlayerCoreHandle {
     int64_t post_anchor_audio_guard_until_ms;
     int post_anchor_audio_guard_drop_count;
     uint64_t last_core_audio_reset_serial;
+    int64_t audio_diag_last_log_ms;
+    int64_t audio_pcm_total_bytes;
+    int audio_pcm_zero_streak;
+    int audio_invalid_frame_drop_count;
+    int audio_seek_filter_drop_count;
+    int audio_resample_fail_count;
     std::mutex audio_data_mutex;        // 保护音频缓冲/重采样/SoundTouch并发访问
 
     // 音频重采样器
@@ -120,6 +126,12 @@ struct PlayerCoreHandle {
         , post_anchor_audio_guard_until_ms(0)
         , post_anchor_audio_guard_drop_count(0)
         , last_core_audio_reset_serial(0)
+        , audio_diag_last_log_ms(0)
+        , audio_pcm_total_bytes(0)
+        , audio_pcm_zero_streak(0)
+        , audio_invalid_frame_drop_count(0)
+        , audio_seek_filter_drop_count(0)
+        , audio_resample_fail_count(0)
 #ifdef HAS_SOUNDTOUCH
         , soundtouch(nullptr)
         , soundtouch_initialized(false)
@@ -390,6 +402,23 @@ const char* player_core_get_video_decode_diagnostic(PlayerCoreHandle* handle) {
     static thread_local std::string decode_diag;
     decode_diag = handle->core->get_video_decode_diagnostic();
     return decode_diag.c_str();
+}
+
+const char* player_core_get_runtime_diagnostic(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return "";
+    static thread_local std::string runtime_diag;
+    runtime_diag = handle->core->get_runtime_diagnostic();
+    return runtime_diag.c_str();
+}
+
+int player_core_is_io_stale_for_playback(PlayerCoreHandle* handle, int64_t stale_threshold_ms, int64_t* stale_for_ms) {
+    if (!handle || !handle->core) {
+        if (stale_for_ms) {
+            *stale_for_ms = -1;
+        }
+        return 0;
+    }
+    return handle->core->is_io_stale_for_playback(stale_threshold_ms, stale_for_ms) ? 1 : 0;
 }
 
 void player_core_seek(PlayerCoreHandle* handle, double pos) {
@@ -733,12 +762,36 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
                 handle->core->update_audio_pts(pts_for_clock, handle->audio_buf_serial);
             }
             
+            handle->audio_pcm_total_bytes += len1;
+            handle->audio_pcm_zero_streak = 0;
+            int64_t diag_now_ms = bridge_now_ms();
+            if (handle->audio_diag_last_log_ms <= 0 ||
+                diag_now_ms - handle->audio_diag_last_log_ms >= 10000) {
+                handle->audio_diag_last_log_ms = diag_now_ms;
+                LOG_INFO("audio_pipeline_pcm bytes_total=", handle->audio_pcm_total_bytes,
+                         " copied=", len1,
+                         " pts=", handle->audio_current_pts,
+                         " sample_rate=", handle->audio_current_sample_rate,
+                         " channels=", handle->audio_current_channels,
+                         " serial=", handle->audio_buf_serial);
+            }
             return len1;  // 返回复制的字节数
         }
         
         // 缓冲区为空，需要从队列获取新帧
         auto* audioQueue = handle->core->get_audio_queue();
         if (!audioQueue || audioQueue->size() <= 0) {
+            handle->audio_pcm_zero_streak++;
+            int64_t diag_now_ms = bridge_now_ms();
+            if (handle->audio_pcm_zero_streak == 1 ||
+                handle->audio_pcm_zero_streak % 100 == 0 ||
+                diag_now_ms - handle->audio_diag_last_log_ms >= 10000) {
+                handle->audio_diag_last_log_ms = diag_now_ms;
+                LOG_WARNING("audio_pipeline_pcm_empty reason=no_audio_frame zero_streak=",
+                            handle->audio_pcm_zero_streak,
+                            " queue_size=", audioQueue ? audioQueue->size() : -1,
+                            " bytes_total=", handle->audio_pcm_total_bytes);
+            }
             return 0;  // 没有可用音频帧
         }
         
