@@ -2249,6 +2249,30 @@ void PlayerCore::read_thread() {
                 }
             }
 
+            if (retryable_error && eof_near_end) {
+                LOG_WARNING("读取线程：片尾附近读包失败，按 EOF 收尾而不是软重连。ret=",
+                            effective_ret, ", pos=", eof_pos, ", duration=", eof_duration,
+                            ", video_pkt_q=", video_packet_queue_ ? video_packet_queue_->get_nb_packets() : -1,
+                            ", audio_pkt_q=", audio_packet_queue_ ? audio_packet_queue_->get_nb_packets() : -1);
+                if (video_stream_ >= 0 && video_stream_opened_ && video_packet_queue_) {
+                    video_packet_queue_->put_nullpacket(video_stream_);
+                }
+                if (audio_stream_ >= 0 && audio_stream_opened_ && audio_packet_queue_) {
+                    audio_packet_queue_->put_nullpacket(audio_stream_);
+                }
+                set_io_loading(false);
+                set_starvation_loading(false);
+                while (!abort_request_ && !seek_request_) {
+                    PLAYER_DELAY(100);
+                }
+                if (abort_request_) {
+                    LOG_INFO("读取线程：片尾等待期间收到终止信号，退出");
+                    break;
+                }
+                LOG_INFO("读取线程：片尾等待期间检测到 seek 请求，继续读取");
+                continue;
+            }
+
             if (non_retryable_error) {
                 char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
                 av_strerror(effective_ret, errbuf, sizeof(errbuf));
@@ -2320,9 +2344,16 @@ void PlayerCore::read_thread() {
                 if (!isnan(resume_pos) && resume_pos < 0.0) {
                     resume_pos = 0.0;
                 }
+                double raw_resume_pos = resume_pos;
+                double duration_now = get_duration();
+                if (std::isfinite(duration_now) && duration_now > 0.0 &&
+                    std::isfinite(resume_pos) && resume_pos > duration_now - 0.35) {
+                    resume_pos = std::max(0.0, duration_now - 0.35);
+                }
                 int64_t resume_ts = static_cast<int64_t>(std::max(0.0, resume_pos) * AV_TIME_BASE);
                 LOG_WARNING("读取线程：触发软重连尝试(", soft_reconnect_attempt_count + 1, "/",
-                            MAX_SOFT_RECONNECT_ATTEMPTS, "), resume_pos=", resume_pos, "s");
+                            MAX_SOFT_RECONNECT_ATTEMPTS, "), resume_pos=", resume_pos,
+                            "s raw_resume_pos=", raw_resume_pos, "s duration=", duration_now);
 
                 if (format_ctx_) {
                     avformat_flush(format_ctx_);
@@ -2545,6 +2576,12 @@ int PlayerCore::stream_component_open(int stream_index) {
         if (codec && codec->name) {
             decode_diag += std::string(" decoder=") + codec->name;
         }
+        decode_diag += " codec_id=" + std::to_string(codecpar->codec_id);
+        decode_diag += " profile=" + std::to_string(codecpar->profile);
+        decode_diag += " level=" + std::to_string(codecpar->level);
+        decode_diag += " width=" + std::to_string(codecpar->width);
+        decode_diag += " height=" + std::to_string(codecpar->height);
+        decode_diag += " par_fmt=" + std::to_string(codecpar->format);
 #if defined(__ANDROID__)
         if (request_video_hw_decode) {
             decode_diag += std::string(" hw_decoder=") +

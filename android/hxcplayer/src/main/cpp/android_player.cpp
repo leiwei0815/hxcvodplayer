@@ -535,11 +535,20 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
         const char* decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+        int open_video_w = player_core_get_video_width(player_core_);
+        int open_video_h = player_core_get_video_height(player_core_);
         DECODEI("evt=open_result method=openURL requested=%s hw_active=%d final_mode=%s diag=%s",
                 decode_mode_ == 1 ? "hardware" : "software",
                 hw_active ? 1 : 0,
                 hw_active ? "hardware" : "software",
                 decode_diag ? decode_diag : "");
+        if (!hw_active && (open_video_w >= 7680 || open_video_h >= 4320)) {
+            DECODEW("evt=openurl_8k_software_decode_risk video_w=%d video_h=%d requested=%s diag=%s",
+                    open_video_w,
+                    open_video_h,
+                    decode_mode_ == 1 ? "hardware" : "software",
+                    decode_diag ? decode_diag : "");
+        }
         // Reset sync state for the new stream
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
@@ -897,16 +906,15 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         resetRenderStateForStreamSwitch();
     };
 
-    // SecureHLS stability policy: use software decode directly. Current FFmpeg/MediaCodec
-    // path still fails codec probing on some encrypted streams (codecID=0), and the
-    // hardware probe adds open latency before falling back to the same software path.
+    player_core_apply_secure_playback_profile(player_core_);
+    // SecureHLS stability policy: keep software decode fixed. Current encrypted HLS
+    // streams are not compatible with the Android MediaCodec path in this SDK build.
     PlayerDecodeModeC secure_effective_mode = PLAYER_DECODE_MODE_SOFTWARE;
-    DECODEI("evt=secure_decode_policy mode=fixed_software user_pref=%s reason=secure_hls_stability",
+    DECODEI("evt=secure_decode_policy mode=fixed_software user_pref=%s reason=secure_hls_hw_unsupported",
             user_pref_hw ? "hardware" : "software");
     DECODEI("evt=open method=openWithSecureSession decode_mode=software user_pref=%s start=%.3f",
             user_pref_hw ? "hardware" : "software",
             start_position);
-    player_core_apply_secure_playback_profile(player_core_);
     player_core_set_decode_mode(player_core_, secure_effective_mode);
 
     int result = -1;
@@ -3400,8 +3408,11 @@ void AndroidPlayer::renderLoop() {
                 seek_progress_last_improve_ms = 0;
             }
             bool likely_4k = (frame_data.width >= 3840 || gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160);
+            bool likely_8k = (frame_data.width >= 7680 || gl_last_video_w_ >= 7680 ||
+                              frame_data.height >= 4320 || gl_last_video_h_ >= 4320);
             bool hw_decode_active = player_core_is_video_hardware_decoding(player_core_) != 0;
             bool sw_decode_4k = likely_4k && !hw_decode_active;
+            bool sw_decode_8k = likely_8k && !hw_decode_active;
             if (adaptive_rate_cap_until_ms > 0 && now >= adaptive_rate_cap_until_ms) {
                 SYNCI("evt=adaptive_rate_cap_expire cap=%.2f req=%.2f delay=%.3f",
                       adaptive_rate_cap_value, requested_rate, delay);
@@ -3423,19 +3434,28 @@ void AndroidPlayer::renderLoop() {
             bool ultra_high_rate_4k = high_rate_4k && playback_rate >= 2.5f;
             bool very_high_rate_4k = high_rate_4k && playback_rate >= 2.75f;
             bool mid_rate_4k = false; // rollback: avoid mid-rate (1.25~1.75x) aggressive sync policy
-            SYNCI_RATE(120, "evt=sync_snapshot pts=%.3f clk=%.3f delay=%.3f rate=%.2f video_w=%d video_h=%d is_4k=%d is_high_rate_4k=%d is_ultra_high_rate_4k=%d",
+            SYNCI_RATE(120, "evt=sync_snapshot pts=%.3f clk=%.3f delay=%.3f rate=%.2f video_w=%d video_h=%d is_4k=%d is_8k=%d is_high_rate_4k=%d is_ultra_high_rate_4k=%d hw_video=%d",
                        pts, clock, delay, playback_rate, frame_data.width, frame_data.height,
-                       likely_4k ? 1 : 0, high_rate_4k ? 1 : 0, ultra_high_rate_4k ? 1 : 0);
+                       likely_4k ? 1 : 0, likely_8k ? 1 : 0,
+                       high_rate_4k ? 1 : 0, ultra_high_rate_4k ? 1 : 0,
+                       hw_decode_active ? 1 : 0);
 
             // Soft re-anchor safeguard: if we stay severely behind for too long under
             // 4K high/mid-rate playback, perform one bounded seek near audio clock to
             // break out of endless drop loops (especially after rate changes).
-            bool reanchor_candidate_4k = likely_4k && playback_rate >= 2.0f;
+            bool reanchor_candidate_4k = (likely_4k && playback_rate >= 2.0f) || sw_decode_8k;
             double reanchor_delay_threshold = -3.2;
             int64_t reanchor_lag_persistent_ms = 3000;
             int64_t reanchor_cooldown_ms = 6000;
             int reanchor_budget = 3;
-            if (very_high_rate_4k) {
+            if (sw_decode_8k) {
+                // 8K software decode can fall behind even at 1.0x. If the device cannot
+                // sustain decode, bounded re-anchor prevents endless old-frame drops.
+                reanchor_delay_threshold = -2.8;
+                reanchor_lag_persistent_ms = 2200;
+                reanchor_cooldown_ms = 9000;
+                reanchor_budget = 2;
+            } else if (very_high_rate_4k) {
                 // Tencent-like: at >=2.75x prioritize fast convergence over long-tail smoothness.
                 reanchor_delay_threshold = -2.6;
                 reanchor_lag_persistent_ms = 1200;
@@ -3452,8 +3472,12 @@ void AndroidPlayer::renderLoop() {
                 reanchor_cooldown_ms = 7000;
             }
 
+            double duration_for_reanchor = player_core_get_duration(player_core_);
+            bool near_tail_for_reanchor = std::isfinite(duration_for_reanchor) &&
+                                          duration_for_reanchor > 0.0 &&
+                                          (duration_for_reanchor - clock) <= 2.0;
             if (!in_seek_recovery && reanchor_candidate_4k && delay < reanchor_delay_threshold &&
-                player_core_is_playing(player_core_)) {
+                player_core_is_playing(player_core_) && !near_tail_for_reanchor) {
                 if (severe_lag_start_ms_ == 0) severe_lag_start_ms_ = now;
                 bool lag_persistent = (now - severe_lag_start_ms_) >= reanchor_lag_persistent_ms;
                 bool reanchor_cooldown_ok = (last_soft_reanchor_ms_ == 0) ||
@@ -3495,11 +3519,11 @@ void AndroidPlayer::renderLoop() {
             // users don't hear "audio keeps moving while picture is frozen".
             if (!in_seek_recovery && !seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 !audio_rebuffer_pending_.load(std::memory_order_acquire) &&
-                player_core_is_playing(player_core_) && high_rate_4k) {
-                double lag_pause_threshold = very_high_rate_4k ? -2.2 : ((playback_rate >= 2.5) ? -2.5 : ((playback_rate >= 2.0) ? -2.8 : -2.2));
-                int64_t lag_pause_trigger_ms = very_high_rate_4k ? 220 : ((playback_rate >= 2.5) ? 320 : ((playback_rate >= 2.0) ? 420 : 700));
-                int64_t lag_pause_fallback_ms = very_high_rate_4k ? 1700 : ((playback_rate >= 2.0) ? 1400 : 1800);
-                int64_t lag_pause_min_hold_ms = very_high_rate_4k ? 1100 : ((playback_rate >= 2.5) ? 900 : ((playback_rate >= 2.0) ? 800 : 600));
+                player_core_is_playing(player_core_) && (high_rate_4k || sw_decode_8k)) {
+                double lag_pause_threshold = sw_decode_8k ? -1.8 : (very_high_rate_4k ? -2.2 : ((playback_rate >= 2.5) ? -2.5 : ((playback_rate >= 2.0) ? -2.8 : -2.2)));
+                int64_t lag_pause_trigger_ms = sw_decode_8k ? 360 : (very_high_rate_4k ? 220 : ((playback_rate >= 2.5) ? 320 : ((playback_rate >= 2.0) ? 420 : 700)));
+                int64_t lag_pause_fallback_ms = sw_decode_8k ? 2400 : (very_high_rate_4k ? 1700 : ((playback_rate >= 2.0) ? 1400 : 1800));
+                int64_t lag_pause_min_hold_ms = sw_decode_8k ? 1300 : (very_high_rate_4k ? 1100 : ((playback_rate >= 2.5) ? 900 : ((playback_rate >= 2.0) ? 800 : 600)));
                 if (delay <= lag_pause_threshold) {
                     if (severe_lag_audio_pause_start_ms_ == 0) severe_lag_audio_pause_start_ms_ = now;
                     int64_t severe_lag_ms = now - severe_lag_audio_pause_start_ms_;
