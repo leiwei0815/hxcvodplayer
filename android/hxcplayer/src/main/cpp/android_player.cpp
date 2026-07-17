@@ -3444,19 +3444,12 @@ void AndroidPlayer::renderLoop() {
             // Soft re-anchor safeguard: if we stay severely behind for too long under
             // 4K high/mid-rate playback, perform one bounded seek near audio clock to
             // break out of endless drop loops (especially after rate changes).
-            bool reanchor_candidate_4k = (likely_4k && playback_rate >= 2.0f) || sw_decode_8k;
+            bool reanchor_candidate_4k = likely_4k && playback_rate >= 2.0f;
             double reanchor_delay_threshold = -3.2;
             int64_t reanchor_lag_persistent_ms = 3000;
             int64_t reanchor_cooldown_ms = 6000;
             int reanchor_budget = 3;
-            if (sw_decode_8k) {
-                // 8K software decode can fall behind even at 1.0x. If the device cannot
-                // sustain decode, bounded re-anchor prevents endless old-frame drops.
-                reanchor_delay_threshold = -2.8;
-                reanchor_lag_persistent_ms = 2200;
-                reanchor_cooldown_ms = 9000;
-                reanchor_budget = 2;
-            } else if (very_high_rate_4k) {
+            if (very_high_rate_4k) {
                 // Tencent-like: at >=2.75x prioritize fast convergence over long-tail smoothness.
                 reanchor_delay_threshold = -2.6;
                 reanchor_lag_persistent_ms = 1200;
@@ -3520,11 +3513,11 @@ void AndroidPlayer::renderLoop() {
             // users don't hear "audio keeps moving while picture is frozen".
             if (!in_seek_recovery && !seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 !audio_rebuffer_pending_.load(std::memory_order_acquire) &&
-                player_core_is_playing(player_core_) && (high_rate_4k || sw_decode_8k)) {
-                double lag_pause_threshold = sw_decode_8k ? -1.8 : (very_high_rate_4k ? -2.2 : ((playback_rate >= 2.5) ? -2.5 : ((playback_rate >= 2.0) ? -2.8 : -2.2)));
-                int64_t lag_pause_trigger_ms = sw_decode_8k ? 360 : (very_high_rate_4k ? 220 : ((playback_rate >= 2.5) ? 320 : ((playback_rate >= 2.0) ? 420 : 700)));
-                int64_t lag_pause_fallback_ms = sw_decode_8k ? 2400 : (very_high_rate_4k ? 1700 : ((playback_rate >= 2.0) ? 1400 : 1800));
-                int64_t lag_pause_min_hold_ms = sw_decode_8k ? 1300 : (very_high_rate_4k ? 1100 : ((playback_rate >= 2.5) ? 900 : ((playback_rate >= 2.0) ? 800 : 600)));
+                player_core_is_playing(player_core_) && high_rate_4k) {
+                double lag_pause_threshold = very_high_rate_4k ? -2.2 : ((playback_rate >= 2.5) ? -2.5 : ((playback_rate >= 2.0) ? -2.8 : -2.2));
+                int64_t lag_pause_trigger_ms = very_high_rate_4k ? 220 : ((playback_rate >= 2.5) ? 320 : ((playback_rate >= 2.0) ? 420 : 700));
+                int64_t lag_pause_fallback_ms = very_high_rate_4k ? 1700 : ((playback_rate >= 2.0) ? 1400 : 1800);
+                int64_t lag_pause_min_hold_ms = very_high_rate_4k ? 1100 : ((playback_rate >= 2.5) ? 900 : ((playback_rate >= 2.0) ? 800 : 600));
                 if (delay <= lag_pause_threshold) {
                     if (severe_lag_audio_pause_start_ms_ == 0) severe_lag_audio_pause_start_ms_ = now;
                     int64_t severe_lag_ms = now - severe_lag_audio_pause_start_ms_;
@@ -4772,6 +4765,27 @@ void AndroidPlayer::renderLoop() {
                             should_display = should_consume = true;
                             consecutive_drop_count_ = 0;
                             LOGI_RATE(20, "[sync] mid-rate cadence display: pts=%.3f clk=%.3f delay=%.3f step=%d",
+                                      pts, clock, delay, cadence_step);
+                        } else {
+                            should_consume = true;
+                        }
+                    } else if (sw_decode_8k) {
+                        // 8K software decode is below real-time on many devices. Do not
+                        // enter endless drop-only mode; show a sparse cadence so motion
+                        // keeps advancing while the app can decide to switch to a lower rendition.
+                        consecutive_drop_count_++;
+                        int cadence_step = 5;
+                        if (delay > -1.2) {
+                            cadence_step = 2;
+                        } else if (delay > -2.4) {
+                            cadence_step = 3;
+                        } else if (delay > -4.0) {
+                            cadence_step = 4;
+                        }
+                        if (consecutive_drop_count_ >= cadence_step) {
+                            should_display = should_consume = true;
+                            consecutive_drop_count_ = 0;
+                            LOGI_RATE(20, "[sync] sw8k_cadence display: pts=%.3f clk=%.3f delay=%.3f step=%d",
                                       pts, clock, delay, cadence_step);
                         } else {
                             should_consume = true;

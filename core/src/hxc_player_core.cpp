@@ -28,6 +28,10 @@ extern "C" {
 #include <libavformat/avformat.h>
 }
 
+#if defined(__ANDROID__)
+extern "C" int hxc_ffmpeg_jni_vm_bind_status() __attribute__((weak));
+#endif
+
 // FFmpeg 错误码定义
 #ifndef AVERROR_PATCHWELCOME
 #define AVERROR_PATCHWELCOME (-MKTAG('P','A','W','E'))  // "功能未实现"
@@ -358,6 +362,17 @@ static bool hxc_avcodec_config_has_mediacodec() {
     return std::strstr(cfg, "mediacodec") != nullptr;
 }
 
+static int hxc_get_ffmpeg_jni_vm_bind_status() {
+#if defined(__ANDROID__)
+    if (hxc_ffmpeg_jni_vm_bind_status) {
+        return hxc_ffmpeg_jni_vm_bind_status();
+    }
+    return -3; // symbol unavailable in this build
+#else
+    return 0;
+#endif
+}
+
 static std::string hxc_calc_file_fingerprint(const std::string& path) {
     if (path.empty()) {
         return "";
@@ -506,6 +521,7 @@ std::string PlayerCore::get_runtime_diagnostic() const {
         << " video_open=" << (video_stream_opened_ ? 1 : 0)
         << " audio_open=" << (audio_stream_opened_ ? 1 : 0)
         << " hw_video=" << (video_hw_decode_active_.load(std::memory_order_acquire) ? 1 : 0)
+        << " sw8k_profile=" << (ultra_high_res_software_decode_active_.load(std::memory_order_acquire) ? 1 : 0)
         << " v_pkt_q=" << (video_packet_queue_ ? video_packet_queue_->get_nb_packets() : -1)
         << " a_pkt_q=" << (audio_packet_queue_ ? audio_packet_queue_->get_nb_packets() : -1)
         << " v_pkt_bytes=" << (video_packet_queue_ ? video_packet_queue_->get_size() : -1)
@@ -674,6 +690,7 @@ int PlayerCore::open(const std::string& filename) {
     abort_request_ = false;
     decode_finished_ = false;  // ⚠️ 重置解码结束标志
     video_hw_decode_active_.store(false, std::memory_order_release);
+    ultra_high_res_software_decode_active_.store(false, std::memory_order_release);
     playback_completed_notified_.store(false, std::memory_order_release);  // ⚠️ 重置播放完成通知标志
     io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
     io_last_packet_stream_index_.store(-1, std::memory_order_release);
@@ -1133,6 +1150,8 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     // 重置标志
     abort_request_ = false;
     decode_finished_ = false;
+    video_hw_decode_active_.store(false, std::memory_order_release);
+    ultra_high_res_software_decode_active_.store(false, std::memory_order_release);
     playback_completed_notified_.store(false, std::memory_order_release);
     io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
     io_last_packet_stream_index_.store(-1, std::memory_order_release);
@@ -2597,6 +2616,7 @@ int PlayerCore::stream_component_open(int stream_index) {
             }
             decode_diag += std::string(" ffmcfg=") +
                            (hxc_avcodec_config_has_mediacodec() ? "1" : "0");
+            decode_diag += " jni_vm_bind=" + std::to_string(hxc_get_ffmpeg_jni_vm_bind_status());
             std::string avcodec_path = hxc_get_avcodec_loaded_path();
             if (!avcodec_path.empty()) {
                 decode_diag += std::string(" avcodec_path=") + avcodec_path;
@@ -2675,6 +2695,14 @@ int PlayerCore::stream_component_open(int stream_index) {
             decode_diag += " width=" + std::to_string(codecpar->width);
             decode_diag += " height=" + std::to_string(codecpar->height);
             decode_diag += " par_fmt=" + std::to_string(codecpar->format);
+            decode_diag += " jni_vm_bind=" + std::to_string(hxc_get_ffmpeg_jni_vm_bind_status());
+            if (hxc_get_ffmpeg_jni_vm_bind_status() < 0) {
+                decode_diag += " hint=ffmpeg_jni_vm_not_bound";
+            } else if (codecpar->codec_id == AV_CODEC_ID_H264 &&
+                       (codecpar->width >= 7680 || codecpar->height >= 4320 ||
+                        codecpar->level >= 60)) {
+                decode_diag += " hint=device_mediacodec_may_not_support_h264_8k_level";
+            }
             if (codec && codec->name) {
                 decode_diag += std::string(" open_codec=") + codec->name;
             }
@@ -2710,6 +2738,24 @@ int PlayerCore::stream_component_open(int stream_index) {
     if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
         video_codec_ctx_ = codec_ctx;
         video_hw_decode_active_.store(hw_decode_enabled, std::memory_order_release);
+        const bool sw_ultra_high_res =
+                !hw_decode_enabled &&
+                (codecpar->width >= 7680 || codecpar->height >= 4320);
+        ultra_high_res_software_decode_active_.store(sw_ultra_high_res, std::memory_order_release);
+        if (sw_ultra_high_res) {
+            // Mature-player degradation path: if 8K cannot use MediaCodec, reduce
+            // CPU-heavy software decode work and let the video thread dynamically
+            // skip non-reference frames when it falls behind.
+            codec_ctx->skip_loop_filter = AVDISCARD_ALL;
+            codec_ctx->skip_idct = AVDISCARD_NONREF;
+            decode_diag += " sw8k_profile=1 skip_loop_filter=ALL skip_idct=NONREF";
+            LOG_WARNING("evt=sw8k_decode_profile_enable width=", codecpar->width,
+                        " height=", codecpar->height,
+                        " codec_id=", codecpar->codec_id,
+                        " level=", codecpar->level);
+        } else {
+            ultra_high_res_software_decode_active_.store(false, std::memory_order_release);
+        }
         {
             std::lock_guard<std::mutex> lock(video_decode_diag_mutex_);
             video_decode_diag_ = decode_diag + (hw_decode_enabled ? " final=hardware" : " final=software");
@@ -2897,6 +2943,25 @@ void PlayerCore::video_thread() {
         
         if (abort_request_) {
             break;
+        }
+        if (video_codec_ctx_ &&
+            ultra_high_res_software_decode_active_.load(std::memory_order_acquire) &&
+            !seeking_.load(std::memory_order_acquire)) {
+            double last_video_pts = video_last_frame_pts_sec_.load(std::memory_order_acquire);
+            double master_clock = get_master_clock();
+            double lag_sec = (std::isfinite(last_video_pts) && last_video_pts >= 0.0 &&
+                              std::isfinite(master_clock))
+                                     ? (master_clock - last_video_pts)
+                                     : 0.0;
+            enum AVDiscard target_skip = lag_sec >= 1.2 ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+            if (video_codec_ctx_->skip_frame != target_skip) {
+                video_codec_ctx_->skip_frame = target_skip;
+                LOG_WARNING("evt=sw8k_dynamic_skip_frame mode=",
+                            target_skip == AVDISCARD_NONREF ? "NONREF" : "DEFAULT",
+                            " lag=", lag_sec,
+                            " master=", master_clock,
+                            " last_video_pts=", last_video_pts);
+            }
         }
         // 解码视频帧
         int ret = video_decoder_->decode_frame(frame);

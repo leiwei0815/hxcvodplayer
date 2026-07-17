@@ -2809,6 +2809,14 @@ class HXCPlayerControl @JvmOverloads constructor(
         return nativeIsHardwareDecodingActive(handle)
     }
 
+    private fun isUltraHighResolutionSoftwareDecode(handle: Long): Boolean {
+        if (handle == 0L || isReleased) return false
+        if (nativeIsHardwareDecodingActive(handle)) return false
+        val width = nativeGetVideoWidth(handle).coerceAtLeast(lastVideoSize.width)
+        val height = nativeGetVideoHeight(handle).coerceAtLeast(lastVideoSize.height)
+        return width >= 7680 || height >= 4320
+    }
+
     // 启动位置更新定时器
     private fun startPositionUpdates() {
         updateExecutor = Executors.newSingleThreadScheduledExecutor()
@@ -3671,6 +3679,19 @@ class HXCPlayerControl @JvmOverloads constructor(
             }
             playLoopHitCount = 0
             playLoopWindowStartMs = 0L
+            return
+        }
+        if (isUltraHighResolutionSoftwareDecode(handle)) {
+            if (positionSec.isFinite()) {
+                playLoopMaxPosSec = positionSec
+                playLoopAnchorPosSec = positionSec
+            }
+            playLoopHitCount = 0
+            playLoopWindowStartMs = 0L
+            logInfo(
+                "evt=play_loop_recover_suppressed reason=sw8k_decode_limit pos=$positionSec " +
+                    "duration=$durationSec size=${lastVideoSize.width}x${lastVideoSize.height} source_category=$currentSourceCategory"
+            )
             return
         }
         val wantsPlayback = isPlayingNow || state == PlayerState.PLAYING || (state == PlayerState.PAUSED && playWhenReady)

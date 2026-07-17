@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <string>
+#include <atomic>
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include <dlfcn.h>
@@ -42,6 +43,12 @@ static int g_hxc_jni_runtime_log_level = HXC_PLAYER_RUNTIME_LOG_LEVEL;
 
 extern "C" {
 
+static std::atomic<int> g_ffmpeg_jni_vm_bind_status{-2}; // -2 unknown, -1 symbol missing, <0 failed, 0 ok
+
+int hxc_ffmpeg_jni_vm_bind_status() {
+    return g_ffmpeg_jni_vm_bind_status.load(std::memory_order_acquire);
+}
+
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     (void)reserved;
     // FFmpeg Android MediaCodec 依赖 JavaVM 绑定；未绑定时常见表现是：
@@ -49,12 +56,14 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     using AvJniSetJavaVmFn = int(*)(void*, void*);
     auto* sym = dlsym(RTLD_DEFAULT, "av_jni_set_java_vm");
     if (!sym) {
+        g_ffmpeg_jni_vm_bind_status.store(-1, std::memory_order_release);
         LOGW("JNI_OnLoad: av_jni_set_java_vm symbol not found, MediaCodec may fallback to software");
         DECODEW("evt=jni_vm_bind status=symbol_not_found func=av_jni_set_java_vm");
         return JNI_VERSION_1_6;
     }
     auto fn = reinterpret_cast<AvJniSetJavaVmFn>(sym);
     int ret = fn(reinterpret_cast<void*>(vm), nullptr);
+    g_ffmpeg_jni_vm_bind_status.store(ret, std::memory_order_release);
     if (ret < 0) {
         LOGE("JNI_OnLoad: av_jni_set_java_vm failed ret=%d", ret);
         DECODEE("evt=jni_vm_bind status=failed ret=%d", ret);
