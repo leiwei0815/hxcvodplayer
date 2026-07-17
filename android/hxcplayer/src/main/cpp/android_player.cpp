@@ -98,6 +98,7 @@ static std::atomic<int> g_hxc_runtime_log_level{HXC_PLAYER_RUNTIME_LOG_LEVEL};
 #define SYNCI_RATE(...) TAGI_RATE(LOG_TAG_SYNC, __VA_ARGS__)
 #define SYNCW_RATE(...) TAGW_RATE(LOG_TAG_SYNC, __VA_ARGS__)
 #define DECODEI(...)    TAGI(LOG_TAG_DECODE, __VA_ARGS__)
+#define DECODEW(...)    TAGW(LOG_TAG_DECODE, __VA_ARGS__)
 #define PBOD(...)       TAGD(LOG_TAG_PBO, __VA_ARGS__)
 #define PBOI(...)       ((void)0)
 #define PBOW(...)       TAGW(LOG_TAG_PBO, __VA_ARGS__)
