@@ -1057,12 +1057,26 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     private fun shouldEmitCompletedToApp(
         state: PlayerState,
-        playWhenReady: Boolean
+        playWhenReady: Boolean,
+        position: Double,
+        duration: Double
     ): Boolean {
-        // Mature player rule: completion is terminal and should not be emitted
-        // during OPENING/LOADING while autoplay intent is still active.
+        // Native completion is a terminal signal. Do not drop it just because the
+        // Java-side state is still LOADING near the tail; mature players treat
+        // EOF/end-of-stream as stronger than transient buffering state.
         val inOpeningWindow = state == PlayerState.OPENING || state == PlayerState.LOADING
-        return !(inOpeningWindow && playWhenReady)
+        if (!inOpeningWindow || !playWhenReady) {
+            return true
+        }
+        val hasValidProgress = java.lang.Double.isFinite(position) && position > 0.5
+        val hasValidDuration = java.lang.Double.isFinite(duration) && duration > 0.0
+        val nearEnd = hasValidDuration && hasValidProgress && (duration - position) <= 1.5
+        if (nearEnd) {
+            return true
+        }
+        // Only suppress the event during very early startup, where stale native
+        // callbacks from a previous open can otherwise race with the new session.
+        return hasValidProgress
     }
 
     /**
@@ -3458,13 +3472,13 @@ class HXCPlayerControl @JvmOverloads constructor(
 
                 // 透传播放完成事件（由 core 回调写入，Java 侧轮询消费）
                 if (nativeConsumePlaybackCompleted(handle) && !isReleased) {
-                    val emitCompletedToApp = shouldEmitCompletedToApp(state, playWhenReady)
+                    val emitCompletedToApp = shouldEmitCompletedToApp(state, playWhenReady, position, duration)
                     if (!emitCompletedToApp) {
                         if (canEmitDebugDiagLog()) {
                             Log.d(
                                 TAG,
                                 "evt=playback_completed_blocked_opening_window " +
-                                    "state=${state.name} pwr=$playWhenReady loading=$loading pos=$position duration=$duration"
+                                    "state=${state.name} pwr=$playWhenReady loading=$loading pos=$position duration=$duration reason=startup_guard"
                             )
                         }
                     } else {
