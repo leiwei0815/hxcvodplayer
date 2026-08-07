@@ -795,23 +795,33 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             return 0;  // 没有可用音频帧
         }
         
-        auto* af = audioQueue->peek_readable();
-        if (!af || !af->frame) {
+        // 原子 peek + av_frame_clone：避免 flush() 在 peek_readable 返回后、读取 frame->data 期间
+        // 释放帧导致 swr_convert use-after-free。frame_ref 持有引用，flush 释放队列帧时底层缓冲区仍存活。
+        AVFrame* frame_ref = nullptr;
+        // RAII 守卫：所有 return/continue 路径自动 av_frame_free，避免逐处手动释放遗漏。
+        struct FrameRefGuard {
+            AVFrame** p;
+            explicit FrameRefGuard(AVFrame** p) : p(p) {}
+            ~FrameRefGuard() { if (p && *p) { av_frame_free(p); } }
+        } frame_ref_guard(&frame_ref);
+        auto* af = audioQueue->peek_readable_frame_ref(&frame_ref);
+        if (!af || !frame_ref) {
             return 0;
         }
 
-        while (af && af->frame && af->serial != latest_audio_serial) {
+        while (af && frame_ref && af->serial != latest_audio_serial) {
+            av_frame_free(&frame_ref);
             audioQueue->next();
             if (audioQueue->size() <= 0) {
                 return 0;
             }
-            af = audioQueue->peek_readable();
+            af = audioQueue->peek_readable_frame_ref(&frame_ref);
         }
-        if (!af || !af->frame) {
+        if (!af || !frame_ref) {
             return 0;
         }
-        
-        AVFrame* frame = af->frame;
+
+        AVFrame* frame = frame_ref;  // 使用引用后的帧，flush 释放队列帧时底层缓冲区仍存活
         int channels = frame->ch_layout.nb_channels;
         int samples = frame->nb_samples;
         int sample_rate = frame->sample_rate;

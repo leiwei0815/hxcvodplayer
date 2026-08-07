@@ -3714,25 +3714,35 @@ class HXCPlayerControl @JvmOverloads constructor(
                 "duration=$durationSec source_category=$currentSourceCategory"
         )
 
-        mainHandler.post {
-            if (isReleased) {
-                staleIoControlledReopenInFlight = false
-                return@post
+        // 异步在 openExecutor 执行 open，避免主线程阻塞在 native avformat_open_input / TLS 握手导致 ANR。
+        // play() 与状态收尾回主线程执行，保证 UI/回调线程一致。
+        // 调用方均在主线程或 updateExecutor，不会与 openExecutor 单线程队列死锁。
+        try {
+            openExecutor.execute {
+                if (isReleased) {
+                    mainHandler.post { staleIoControlledReopenInFlight = false }
+                    return@execute
+                }
+                val opened = if (retryModel != null) {
+                    openWithPlayModel(retryModel, start)
+                } else {
+                    openURL(retryUrl!!, start)
+                }
+                mainHandler.post {
+                    if (opened && !isReleased) {
+                        play()
+                    } else {
+                        Log.w(
+                            TAG,
+                            "evt=stale_io_controlled_reopen_open_result opened=$opened reason=$reason " +
+                                "start=$start released=$isReleased source_category=$currentSourceCategory"
+                        )
+                    }
+                    staleIoControlledReopenInFlight = false
+                }
             }
-            val opened = if (retryModel != null) {
-                openWithPlayModel(retryModel, start)
-            } else {
-                openURL(retryUrl!!, start)
-            }
-            if (opened && !isReleased) {
-                play()
-            } else {
-                Log.w(
-                    TAG,
-                    "evt=stale_io_controlled_reopen_open_result opened=$opened reason=$reason " +
-                        "start=$start released=$isReleased source_category=$currentSourceCategory"
-                )
-            }
+        } catch (_: RejectedExecutionException) {
+            // release() 后 executor 已关闭：直接清理 in-flight 标记，避免状态残留。
             staleIoControlledReopenInFlight = false
         }
         return true
