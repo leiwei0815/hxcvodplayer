@@ -781,6 +781,10 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         // 缓冲区为空，需要从队列获取新帧
         auto* audioQueue = handle->core->get_audio_queue();
         if (!audioQueue || audioQueue->size() <= 0) {
+            // audio_queue 空：暂停 audio_clock，避免 wall clock 跑过头。
+            // io_loading 恢复后新帧 pts ≈ 断点，update_audio_pts 不会把 audio_clock 拉回，
+            // 从而消除进度条回退 + 声音重播。取到新帧时 resume。
+            handle->core->pause_audio_clock();
             handle->audio_pcm_zero_streak++;
             int64_t diag_now_ms = bridge_now_ms();
             if (handle->audio_pcm_zero_streak == 1 ||

@@ -209,6 +209,8 @@ public:
     
     // ⚠️ 音频时钟更新（供 iOS/macOS/Android 平台使用）
     void update_audio_pts(double pts, int serial);
+    // io_loading 期间 audio_queue 空时暂停 audio_clock，避免 wall clock 跑过头导致恢复后回退
+    void pause_audio_clock();
     double get_seek_target_pos() const { return seek_target_pos_.load(std::memory_order_acquire); }
     int get_post_seek_warmup_frames() const { return post_seek_warmup_frames_.load(std::memory_order_acquire); }
     uint64_t get_audio_output_reset_serial() const {

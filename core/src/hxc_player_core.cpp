@@ -3746,7 +3746,14 @@ void PlayerCore::update_video_pts(double pts, int serial) {
 }
 
 void PlayerCore::update_audio_pts(double pts, int serial) {
+    // audio_queue 空时 bridge 层会 pause_audio_clock()。取到新帧消费时这里 resume + set_clock，
+    // audio_clock 从新帧 pts 按 wall clock 走，避免 io_loading 恢复后 audio_clock 回退。
+    audio_clock_.resume();
     audio_clock_.set_clock(pts, serial);
+}
+
+void PlayerCore::pause_audio_clock() {
+    audio_clock_.pause();
 }
 
 bool PlayerCore::has_first_renderable_frame_ready() const {
