@@ -862,6 +862,21 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         }
         double pts = af->pts;  // ⚠️ 保存 PTS，用于后续时钟更新
 
+        // 诊断 io_loading 恢复时 audio_clock 回退根因：若新帧 pts 比上一次缓冲基准明显回退
+        // （非 seek/anchor 触发），说明 audio_queue 里残留了 pts 较小的旧帧，update_audio_pts
+        // 会把 audio_clock 拉回，导致进度条回退 + 声音重复。记录便于定位。
+        if (std::isfinite(pts) && pts >= 0.0 &&
+            std::isfinite(handle->audio_buf_pts_base) &&
+            handle->audio_buf_pts_base >= 0.0 &&
+            handle->post_anchor_audio_guard_until_ms == 0 &&
+            pts < (handle->audio_buf_pts_base - kBridgeSeekAudioBackwardToleranceSec)) {
+            LOG_WARNING("bridge_audio_pts_backward pts=", pts,
+                        " prev_base=", handle->audio_buf_pts_base,
+                        " delta=", pts - handle->audio_buf_pts_base,
+                        " serial=", af->serial,
+                        " buf_serial=", handle->audio_buf_serial);
+        }
+
         if (std::isfinite(pts) && pts >= 0.0 &&
             handle->post_anchor_audio_guard_until_ms > 0) {
             int64_t now_ms = bridge_now_ms();
