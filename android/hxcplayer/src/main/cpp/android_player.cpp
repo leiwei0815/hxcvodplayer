@@ -5507,11 +5507,12 @@ void AndroidPlayer::renderLoop() {
             int64_t rebuffer_min_hold_ms = high_rate ? 650 : (sw_decode_secure ? 300 : 450);
             if (likely_4k) rebuffer_min_hold_ms += 150;
             bool rebuffer_cooldown_active = now < audio_rebuffer_cooldown_until_ms_;
-            bool should_pause_audio_on_starvation = high_rate || sw_decode_secure || !likely_4k;
+            bool should_pause_audio_on_starvation = high_rate || sw_decode_secure;
             if (!seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 should_pause_audio_on_starvation && in_empty_streak &&
-                play_when_ready_for_empty &&
+                !in_loading &&
                 !in_sync_warmup &&
+                core_playing &&
                 !rebuffer_cooldown_active &&
                 !audio_rebuffer_pending_.load(std::memory_order_acquire)) {
                 int64_t empty_ms = now - empty_start_ms;
