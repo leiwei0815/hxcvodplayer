@@ -1061,6 +1061,7 @@ void AndroidPlayer::play() {
         consecutive_drop_count_ = 0;
         severe_lag_start_ms_ = 0;
         severe_lag_audio_pause_start_ms_ = 0;
+        non4k_severe_behind_start_ms_ = 0;
 
         if (playItf_) {
             bool video_stream_opened = player_core_is_video_stream_opened(player_core_) != 0;
@@ -1145,6 +1146,7 @@ void AndroidPlayer::pause() {
     first_frame_wait_started_ms_ = 0;
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
+    non4k_severe_behind_start_ms_ = 0;
     player_core_pause(player_core_);
 
     if (playItf_) {
@@ -1181,6 +1183,7 @@ void AndroidPlayer::stop() {
     first_frame_rendered_.store(false, std::memory_order_release);
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
+    non4k_severe_behind_start_ms_ = 0;
     secure_session_active_.store(false, std::memory_order_release);
     secure_forward_seek_bias_sec_.store(0.0, std::memory_order_release);
     secure_forward_seek_bias_hits_.store(0, std::memory_order_release);
@@ -1465,6 +1468,7 @@ void AndroidPlayer::seekTo(double position) {
     consecutive_drop_count_ = 0;
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
+    non4k_severe_behind_start_ms_ = 0;
     last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
     bool is_forward_seek = position > seek_from + 0.5;
     bool apply_secure_forward_preroll = secure_session && is_forward_seek && seek_span >= 120.0;
@@ -1551,6 +1555,7 @@ void AndroidPlayer::setPlaybackRate(float rate) {
         soft_reanchor_count_ = 0;
         severe_lag_start_ms_ = 0;
         severe_lag_audio_pause_start_ms_ = 0;
+        non4k_severe_behind_start_ms_ = 0;
         last_soft_reanchor_ms_ = 0;
         SYNCI("evt=reanchor_budget_reset reason=rate_drop prev=%.3f now=%.3f",
               previous_rate, normalized_rate);
@@ -4648,6 +4653,29 @@ void AndroidPlayer::renderLoop() {
                     should_consume = true;
                     LOGI_RATE(10, "[sync] severe behind drop: pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
                               pts, clock, delay, playback_rate);
+                    // 非4K 持续 severe-behind-drop 兜底：音频时钟跑在视频前面太多时，
+                    // 视频帧被持续丢弃、永远追不上 → 帧队列长期空 → 卡顿。
+                    // 连续 severe-behind 超过阈值后重锚主时钟到当前视频 pts，闭合时差，
+                    // 让后续解码帧不再被判为 severe behind。仅 seek 恢复中/未在播时跳过。
+                    if (!in_seek_recovery && player_core_is_playing(player_core_)) {
+                        if (non4k_severe_behind_start_ms_ == 0) {
+                            non4k_severe_behind_start_ms_ = now;
+                        }
+                        const int64_t non4k_reanchor_persistent_ms = 2000;
+                        const int64_t non4k_reanchor_cooldown_ms = 8000;
+                        bool lag_persistent = (now - non4k_severe_behind_start_ms_) >= non4k_reanchor_persistent_ms;
+                        bool cooldown_ok = (last_non4k_reanchor_ms_ == 0) ||
+                                           (now - last_non4k_reanchor_ms_) >= non4k_reanchor_cooldown_ms;
+                        if (lag_persistent && cooldown_ok && std::isfinite(pts) && pts >= 0.0) {
+                            player_core_anchor_clock(player_core_, pts);
+                            last_non4k_reanchor_ms_ = now;
+                            non4k_severe_behind_start_ms_ = 0;
+                            LOGW("[sync] non-4k severe behind re-anchor: pts=%.3f clk=%.3f delay=%.3f",
+                                 pts, clock, delay);
+                            SYNCW("evt=non4k_severe_behind_reanchor pts=%.3f clk=%.3f delay=%.3f rate=%.2f",
+                                  pts, clock, delay, playback_rate);
+                        }
+                    }
                 }
             } else if (!in_seek_recovery && !should_consume) {
                 // Dynamic sync threshold based on actual frame interval
@@ -4846,6 +4874,8 @@ void AndroidPlayer::renderLoop() {
             if (should_display) {
                 bool is_displaying_first_frame = open_first_frame_pending;
                 consecutive_drop_count_ = 0;
+                // 已成功渲染帧 → severe-behind 结束，重置非4K 持续丢帧计数器。
+                non4k_severe_behind_start_ms_ = 0;
                 if (seek_audio_wait_video_.load(std::memory_order_acquire)) {
                     // Stability-first triple gate:
                     // 1) 视频已到 seek 目标窗口

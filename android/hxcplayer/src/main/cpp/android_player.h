@@ -400,6 +400,11 @@ private:
     int64_t             severe_lag_start_ms_{0};
     // Severe-lag detector for "video stuck but queue not empty" audio pause.
     int64_t             severe_lag_audio_pause_start_ms_{0};
+    // 非4K 持续 severe-behind-drop 检测：音频时钟跑在视频前面 6~8s 时，视频帧被
+    // severe behind drop 持续丢弃、视频永远追不上 → 帧队列长期空 → 卡顿。
+    // 记录连续 severe-behind 起始时刻，超过阈值后重锚主时钟到当前视频 pts，闭合时差。
+    int64_t             non4k_severe_behind_start_ms_{0};
+    int64_t             last_non4k_reanchor_ms_{0};
     int64_t             last_soft_reanchor_ms_{0};
     int                 soft_reanchor_count_{0};
     int               audio_cb_count_{0};
