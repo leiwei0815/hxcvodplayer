@@ -2152,8 +2152,21 @@ void PlayerCore::read_thread() {
         }
         
         // 读取包
+        int64_t read_start_us = av_gettime_relative();
         int ret = av_read_frame(format_ctx_, pkt);
-        
+        int64_t read_dur_ms = (av_gettime_relative() - read_start_us) / 1000;
+        // 末尾卡顿排查：av_read_frame 阻塞超过阈值时记录，定位是否为网络读阻塞导致供包断流。
+        if (read_dur_ms > 500) {
+            LOG_WARNING("evt=read_stall av_read_frame_ms=", read_dur_ms,
+                        " ret=", ret,
+                        " v_pkt_q=", (video_packet_queue_ ? video_packet_queue_->get_nb_packets() : -1),
+                        " a_pkt_q=", (audio_packet_queue_ ? audio_packet_queue_->get_nb_packets() : -1),
+                        " v_pkt_bytes=", (video_packet_queue_ ? video_packet_queue_->get_size() : -1),
+                        " a_pkt_bytes=", (audio_packet_queue_ ? audio_packet_queue_->get_size() : -1),
+                        " pos=", get_position(),
+                        " url=", (format_ctx_ && format_ctx_->url) ? format_ctx_->url : "");
+        }
+
         if (ret < 0) {
             int io_error = 0;
             if (format_ctx_->pb && format_ctx_->pb->error) {

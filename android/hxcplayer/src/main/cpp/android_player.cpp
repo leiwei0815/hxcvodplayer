@@ -3296,6 +3296,14 @@ void AndroidPlayer::renderLoop() {
                 LOGD_RATE(30, "[render] buffer refilled after %" PRId64 "ms (empty_cnt=%d) frame=%dx%d",
                           now_ms() - empty_start_ms, empty_count,
                           frame_data.width, frame_data.height);
+                // 末尾卡顿排查：每次从空队列恢复时打印核心运行时诊断，
+                // 用于区分 read 线程供包不足（packet queue 空/last_pkt_age 大）还是解码跟不上（packet queue 满但 frame queue 空）。
+                if (player_core_) {
+                    const char* core_diag = player_core_get_runtime_diagnostic(player_core_);
+                    SYNCI_RATE(15, "evt=render_refill_diag empty_ms=%" PRId64 " empty_cnt=%d diag=%s",
+                              now_ms() - empty_start_ms, empty_count,
+                              core_diag ? core_diag : "");
+                }
                 in_empty_streak = false;
                 if (video_empty_stall_forced_pause_.load(std::memory_order_acquire)) {
                     is_loading_.store(false, std::memory_order_release);
@@ -5507,6 +5515,13 @@ void AndroidPlayer::renderLoop() {
                 LOGD_RATE(30, "[render] frame queue empty: state=%d pos=%.3f",
                           player_core_get_state(player_core_),
                           player_core_get_position(player_core_));
+                // 末尾卡顿排查：帧队列刚开始空时打印核心诊断，对比 packet queue 是否已空（read 供不上）还是仍满（解码跟不上）。
+                if (player_core_) {
+                    const char* core_diag = player_core_get_runtime_diagnostic(player_core_);
+                    SYNCI_RATE(15, "evt=render_empty_diag pos=%.3f diag=%s",
+                              player_core_get_position(player_core_),
+                              core_diag ? core_diag : "");
+                }
             } else if (empty_count % 300 == 0) {
                 LOGD_RATE(10, "[render] still buffering: empty_ms=%" PRId64 " state=%d pos=%.3f",
                           now_ms() - empty_start_ms,
