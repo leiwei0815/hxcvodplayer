@@ -2772,6 +2772,12 @@ void AndroidPlayer::renderLoop() {
     const int64_t kTailStallDiagIntervalMs = 2000;
     const int64_t kTailStallForceCompleteMs = 12000;
     const int64_t kTailStallForceCompleteFastMs = 3200;
+    // 真正到达时长末尾（remain<=0.5）时的快速完播阈值。
+    // 背景：核心被 video_empty_stall_forced_pause 暂停后无法恢复时，解码器被暂停、
+    // 永远拿不到 EOF，decode_finished 恒为 0，自然完播回调不会触发。
+    // 此时只能靠 tail force-complete 兜底，但默认 12s 太长，用户看到"一直 loading"。
+    // 当 remain<=0.5 且帧队列已空 2.5s 时，可判定为 EOF 停滞，立即完播。
+    const int64_t kTailStallForceCompleteEofMs = 2500;
     // Force-resume soft success detector:
     // some secure seek sessions keep core state at PAUSED while clock/frames
     // still progress toward target. Avoid retry storms in that situation.
@@ -4984,6 +4990,13 @@ void AndroidPlayer::renderLoop() {
                                                    ((playback_rate >= 2.0f) ? 700 : 450));
                             audio_rebuffer_cooldown_until_ms_ = now + cooldown_ms;
                             if (playItf_ && isAudioOutputEnabled()) {
+                                // 暂停期间 OpenSL 缓冲队列里残留的旧 PCM 会在恢复时被重新播出来，
+                                // 用户感知"声音重播1-2s"。恢复前先清空队列并重锚音频时钟到当前视频 pts，
+                                // 让音频从当前位置继续，而不是把暂停前的旧缓冲再放一遍。
+                                if (std::isfinite(pts) && pts >= 0.0 && player_core_) {
+                                    player_core_anchor_clock(player_core_, pts);
+                                }
+                                primeAudioBufferQueue("severe_lag_resume", true);
                                 SLresult r = setOpenSLESPlayStateWithRetry(SL_PLAYSTATE_PLAYING, true);
                                 LOGI("[sync] audio resumed after video rebuffer: result=%d", r);
                             }
@@ -5548,6 +5561,13 @@ void AndroidPlayer::renderLoop() {
                                            (high_rate ? 700 : 450));
                     audio_rebuffer_cooldown_until_ms_ = now + cooldown_ms;
                     if (core_playing && playItf_ && isAudioOutputEnabled()) {
+                        // 与 severe_lag_resume 路径保持一致：恢复前先清空 OpenSL 残留 PCM 并重锚音频时钟，
+                        // 否则暂停期间残留的旧缓冲会在恢复时被重新播放，用户感知"声音重播1-2s"。
+                        double resume_anchor = player_core_get_position(player_core_);
+                        if (std::isfinite(resume_anchor) && resume_anchor >= 0.0 && player_core_) {
+                            player_core_anchor_clock(player_core_, resume_anchor);
+                        }
+                        primeAudioBufferQueue("rebuffer_fallback_resume", true);
                         SLresult r = setOpenSLESPlayStateWithRetry(SL_PLAYSTATE_PLAYING, true);
                         LOGI("[sync] audio rebuffer fallback resume: result=%d", r);
                     }
@@ -5611,6 +5631,12 @@ void AndroidPlayer::renderLoop() {
                 int64_t tail_force_complete_ms = recent_open_tail_intent
                                                  ? kTailStallForceCompleteFastMs
                                                  : kTailStallForceCompleteMs;
+                // 真正到达时长末尾（remain<=0.5）时用更短的 EOF 阈值兜底完播，
+                // 避免核心被 stall-pause 卡死后自然完播永不触发、长期卡 loading。
+                bool true_eof_tail = near_end && std::isfinite(remain_now) && remain_now <= 0.5;
+                if (true_eof_tail) {
+                    tail_force_complete_ms = kTailStallForceCompleteEofMs;
+                }
                 if ((now_empty - tail_stall_diag_last_log_ms) >= kTailStallDiagIntervalMs) {
                     tail_stall_diag_last_log_ms = now_empty;
                     SYNCI("evt=tail_stall_diag empty_ms=%" PRId64 " pos=%.3f dur=%.3f remain=%.3f near_end=%d pwr=%d seek_flow=%d loading=%d state=%d tail_intent=%d force_ms=%" PRId64 " open_start=%.3f open_age_ms=%" PRId64 " open_ready=%d first_frame=%d audio_pending=%d audio_rebuffer=%d stale_io=%d stale_ms=%" PRId64,
