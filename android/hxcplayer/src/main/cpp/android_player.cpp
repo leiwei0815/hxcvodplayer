@@ -3494,11 +3494,26 @@ void AndroidPlayer::renderLoop() {
             // users don't hear "audio keeps moving while picture is frozen".
             if (!in_seek_recovery && !seek_audio_wait_video_.load(std::memory_order_acquire) &&
                 !audio_rebuffer_pending_.load(std::memory_order_acquire) &&
-                player_core_is_playing(player_core_) && high_rate_4k) {
-                double lag_pause_threshold = very_high_rate_4k ? -2.2 : ((playback_rate >= 2.5) ? -2.5 : ((playback_rate >= 2.0) ? -2.8 : -2.2));
-                int64_t lag_pause_trigger_ms = very_high_rate_4k ? 220 : ((playback_rate >= 2.5) ? 320 : ((playback_rate >= 2.0) ? 420 : 700));
-                int64_t lag_pause_fallback_ms = very_high_rate_4k ? 1700 : ((playback_rate >= 2.0) ? 1400 : 1800);
-                int64_t lag_pause_min_hold_ms = very_high_rate_4k ? 1100 : ((playback_rate >= 2.5) ? 900 : ((playback_rate >= 2.0) ? 800 : 600));
+                player_core_is_playing(player_core_) &&
+                (high_rate_4k || !likely_4k)) {
+                double lag_pause_threshold;
+                int64_t lag_pause_trigger_ms;
+                int64_t lag_pause_fallback_ms;
+                int64_t lag_pause_min_hold_ms;
+                if (high_rate_4k) {
+                    lag_pause_threshold = very_high_rate_4k ? -2.2 : ((playback_rate >= 2.5) ? -2.5 : ((playback_rate >= 2.0) ? -2.8 : -2.2));
+                    lag_pause_trigger_ms = very_high_rate_4k ? 220 : ((playback_rate >= 2.5) ? 320 : ((playback_rate >= 2.0) ? 420 : 700));
+                    lag_pause_fallback_ms = very_high_rate_4k ? 1700 : ((playback_rate >= 2.0) ? 1400 : 1800);
+                    lag_pause_min_hold_ms = very_high_rate_4k ? 1100 : ((playback_rate >= 2.5) ? 900 : ((playback_rate >= 2.0) ? 800 : 600));
+                } else {
+                    // 非4K：音频时钟跑在视频前面（delay 很负）时暂停音频让视频追上，
+                    // 避免 severe behind drop 持续丢帧导致帧队列长期空、画面卡住。
+                    // 阈值放在 severe-behind-drop(-5) 之前，trigger 略宽避免抖动。
+                    lag_pause_threshold = -3.0;
+                    lag_pause_trigger_ms = 400;
+                    lag_pause_fallback_ms = 3000;
+                    lag_pause_min_hold_ms = 800;
+                }
                 if (delay <= lag_pause_threshold) {
                     if (severe_lag_audio_pause_start_ms_ == 0) severe_lag_audio_pause_start_ms_ = now;
                     int64_t severe_lag_ms = now - severe_lag_audio_pause_start_ms_;
