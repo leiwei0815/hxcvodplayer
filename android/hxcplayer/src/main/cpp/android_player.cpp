@@ -4991,8 +4991,11 @@ void AndroidPlayer::renderLoop() {
                             audio_rebuffer_cooldown_until_ms_ = now + cooldown_ms;
                             if (playItf_ && isAudioOutputEnabled()) {
                                 // 暂停期间 OpenSL 缓冲队列里残留的旧 PCM 会在恢复时被重新播出来，
-                                // 用户感知"声音重播1-2s"。恢复前先清空队列并重锚音频时钟到当前视频 pts，
-                                // 让音频从当前位置继续，而不是把暂停前的旧缓冲再放一遍。
+                                // 用户感知"声音重播1-2s"。恢复前先清空 OpenSL 队列并重锚音频时钟到当前视频 pts。
+                                // 注意：不能 flush core 层 audio_queue——恢复后新解码帧尚未到达会静音。
+                                // anchor_clock 内部会设置 post_anchor_audio_guard（2.5s 窗口），
+                                // 在 player_core_get_audio_data 取帧时自动丢弃 pts < anchor-0.35s 的旧帧，
+                                // 保留 pts 接近 anchor 的帧，既避免大段重播又不会静音。
                                 if (std::isfinite(pts) && pts >= 0.0 && player_core_) {
                                     player_core_anchor_clock(player_core_, pts);
                                 }
@@ -5563,6 +5566,7 @@ void AndroidPlayer::renderLoop() {
                     if (core_playing && playItf_ && isAudioOutputEnabled()) {
                         // 与 severe_lag_resume 路径保持一致：恢复前先清空 OpenSL 残留 PCM 并重锚音频时钟，
                         // 否则暂停期间残留的旧缓冲会在恢复时被重新播放，用户感知"声音重播1-2s"。
+                        // 不 flush core 层 audio_queue，依赖 anchor_clock 的 post_anchor_audio_guard 自动过滤旧帧。
                         double resume_anchor = player_core_get_position(player_core_);
                         if (std::isfinite(resume_anchor) && resume_anchor >= 0.0 && player_core_) {
                             player_core_anchor_clock(player_core_, resume_anchor);
@@ -6798,6 +6802,8 @@ bool AndroidPlayer::forceResumeAudioOutput(int64_t now, double anchor_pts, const
     if (player_core_ && std::isfinite(anchor_pts) && anchor_pts >= 0.0) {
         player_core_anchor_clock(player_core_, anchor_pts);
     }
+    // 不 flush core 层 audio_queue：anchor_clock 内部已设置 post_anchor_audio_guard，
+    // 取帧时会自动丢弃 pts < anchor-0.35s 的旧帧，保留接近 anchor 的帧，避免静音。
     if (!playItf_) {
         LOGW("evt=audio_force_resume_skip reason=%s detail=no_play_interface anchor=%.3f",
              reason ? reason : "", anchor_pts);
