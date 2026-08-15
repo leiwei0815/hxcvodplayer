@@ -575,6 +575,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var staleIoControlledReopenInFlight: Boolean = false
     private var staleIoControlledReopenLastAtMs: Long = 0L
     private val staleIoControlledReopenCooldownMs: Long = 30000L
+    // reopen 场景鉴权失败时抑制 dispatchError，避免触发 App 层 fallback 停止播放器。
+    // reopen 是 SDK 内部卡顿恢复行为，鉴权失败不应导致整个播放会话终止，
+    // 尤其是加密视频无 playUrl 时无法回退腾讯，停止播放器会让进度清零。
+    @Volatile private var suppressSecureAuthErrorForReopen: Boolean = false
     @Volatile private var secondarySyncMode: Boolean = false
     private var networkLoadingSinceMs: Long = 0L
     private var networkTotalStallMs: Long = 0L
@@ -588,6 +592,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastOpenUrl: String? = null
     private var lastOpenStartPosition: Double = 0.0
     private var lastOpenPlayModel: PlayerDataSourcePlayModel? = null
+    // 保存首次打开 SecureHLS 鉴权返回的 secureHeaders，reopen 时复用避免重新鉴权。
+    // secureHeaders 在整个播放会话期间有效（HLS 分片请求持续使用同一组 headers），
+    // reopen 只是重新加载 m3u8，复用缓存的 headers 不会过期。
+    private var lastOpenSecureHeaders: String? = null
     private var currentSourceCategory: String = "unknown"
     @Volatile private var decodeMode: DecodeMode = DecodeMode.HARDWARE
     private var decodeFallbackTriedForCurrentSource: Boolean = false
@@ -1081,6 +1089,8 @@ class HXCPlayerControl @JvmOverloads constructor(
             if (workingModel.video != null) {
                 try {
                     val authResult = performSecureHlsAuth(cfg, workingModel.video!!)
+                    // 鉴权成功，清理 suppress 标记
+                    suppressSecureAuthErrorForReopen = false
                     workingModel.url = authResult.playUrl
                     workingModel.encryptedFile = authResult.encrypted
                     secureHeaders = authResult.secureHeaders
@@ -1093,6 +1103,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                         workingModel.mode = PlayerDataSourceMode.DEFAULT
                     }
                 } catch (e: Exception) {
+                    if (suppressSecureAuthErrorForReopen) {
+                        // reopen 场景鉴权失败不触发 dispatchError，保留当前播放会话。
+                        // 首次打开的鉴权失败才需要通知上层走 fallback。
+                        Log.w(TAG, "evt=secure_auth_failed_reopen_suppressed reason=${e.javaClass.simpleName} msg=${e.message}")
+                        suppressSecureAuthErrorForReopen = false
+                        return@synchronized false
+                    }
                     dispatchError(PlayerErrorCode.SECURE_AUTH_FAILED, e.message ?: "SecureHLS 鉴权失败")
                     return@synchronized false
                 }
@@ -1109,6 +1126,9 @@ class HXCPlayerControl @JvmOverloads constructor(
             lastOpenUrl = workingModel.url
             lastOpenStartPosition = maxOf(0.0, startPosition)
             lastOpenPlayModel = clonePlayModel(workingModel)
+            if (workingModel.mode == PlayerDataSourceMode.SECURE_HLS) {
+                lastOpenSecureHeaders = secureHeaders
+            }
             currentSourceCategory = resolveSourceCategory(
                 url = workingModel.url,
                 mode = workingModel.mode,
@@ -1175,6 +1195,58 @@ class HXCPlayerControl @JvmOverloads constructor(
             }
             result
         }
+    }
+
+    /**
+     * 使用首次打开缓存的 play_url + secureHeaders 重新打开 SecureHLS 源，跳过鉴权。
+     *
+     * 触发场景：controlledReopenForStaleIo / maybeAutoReopen 等内部恢复机制需要 reopen。
+     * 此时 timestamp/sign 已过期，重新鉴权必然失败；但 secureHeaders 在整个播放会话
+     * 期间有效（HLS 分片请求持续使用同一组 headers），复用缓存的 headers 重新加载
+     * m3u8 不会过期，从源头避免 -4101 鉴权失败。
+     *
+     * @return true 表示 reopen 成功；false 表示无可用缓存（需回退到 openWithPlayModel 重新鉴权）
+     */
+    private fun reopenWithCachedSecureSource(startPosition: Double): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) {
+            logInfo("evt=cached_secure_reopen_skip reason=no_handle")
+            return false
+        }
+        val cachedUrl = lastOpenUrl
+        val cachedHeaders = lastOpenSecureHeaders
+        val cachedModel = lastOpenPlayModel
+        if (cachedUrl.isNullOrBlank() || cachedHeaders.isNullOrBlank() || cachedModel == null) {
+            logInfo("evt=cached_secure_reopen_skip reason=no_cache")
+            return false
+        }
+        if (cachedModel.mode != PlayerDataSourceMode.SECURE_HLS) {
+            logInfo("evt=cached_secure_reopen_skip reason=not_secure_hls mode=${cachedModel.mode}")
+            return false
+        }
+        val video = cachedModel.video
+        logInfo("evt=cached_secure_reopen start=$startPosition url=${cachedUrl.take(64)} videoId=${video?.videoId}")
+        lastOpenStartPosition = maxOf(0.0, startPosition)
+        resetPlaybackHealthStateForOpen("cached_secure_reopen", lastOpenStartPosition)
+        applyDecodeModeForHandle(handle)
+        val ok = nativeOpenWithSecureSession(
+            handle = handle,
+            url = cachedUrl,
+            startPosition = lastOpenStartPosition,
+            authToken = null,
+            videoId = video?.videoId,
+            deviceId = null,
+            secretId = video?.secretId,
+            nonce = null,
+            playSessionId = null,
+            secureHeaders = cachedHeaders,
+            sessionExpireAtMs = 0L,
+            keyMode = 0,
+            keyMaterialB64 = null,
+            keyIvHex = null
+        )
+        logInfo("evt=cached_secure_reopen_result ok=$ok")
+        return ok
     }
 
     private fun validatePlayModelInput(model: PlayerDataSourcePlayModel): String? {
@@ -1521,6 +1593,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!autoReopenOnRecoverableErrorEnabled) return
         if (autoReopenInFlight) return
         if (autoReopenAttemptCount >= autoReopenMaxAttempts) return
+        // seek 进行中不触发 auto reopen：reopen 会重新走 performSecureHlsAuth，
+        // 鉴权失败对加密视频（无 playUrl）会直接停止播放器，比 seek 卡住更严重。
+        if (pendingSeekActive) {
+            logInfo("evt=auto_reopen_skip reason=seek_in_progress code=$errorCode")
+            return
+        }
 
         val retryModel = lastOpenPlayModel?.let { clonePlayModel(it) }
         val retryUrl = lastOpenUrl
@@ -1537,11 +1615,23 @@ class HXCPlayerControl @JvmOverloads constructor(
                 autoReopenInFlight = false
                 return@postDelayed
             }
+            // auto reopen 鉴权失败时抑制 dispatchError，避免触发 App 层 fallback 停止播放器
+            if (retryModel != null) {
+                suppressSecureAuthErrorForReopen = true
+            }
+            // 优先使用缓存的 play_url + secureHeaders 直接 reopen，跳过鉴权，避免 timestamp 过期。
             val ok = if (retryModel != null) {
-                openWithPlayModel(retryModel, retryStart)
+                if (retryModel.mode == PlayerDataSourceMode.SECURE_HLS &&
+                    reopenWithCachedSecureSource(retryStart)
+                ) {
+                    true
+                } else {
+                    openWithPlayModel(retryModel, retryStart)
+                }
             } else {
                 openURL(retryUrl!!, retryStart)
             }
+            suppressSecureAuthErrorForReopen = false
             if (ok) {
                 play()
             }
@@ -1587,6 +1677,42 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (video.videoId.isBlank() || video.sign.isBlank() || video.secretId.isBlank()) {
             throw IllegalArgumentException("SecureHLS 缺少必要参数：videoId/sign/secretId")
         }
+        var lastException: Exception? = null
+        val maxAttempts = 3
+        for (attempt in 1..maxAttempts) {
+            try {
+                return performSecureHlsAuthOnce(config, video)
+            } catch (e: IllegalArgumentException) {
+                // 入参缺失不可重试，直接抛出
+                throw e
+            } catch (e: IllegalStateException) {
+                // 业务错误（响应为空/鉴权失败/缺少 play_url）：可能是 timestamp 过期、sign 失效、
+                // 服务端拒绝等，重试同样参数无意义，直接抛出由上层处理。
+                Log.w(TAG, "evt=secure_auth_biz_error attempt=$attempt msg=${e.message}")
+                throw e
+            } catch (e: java.io.IOException) {
+                // 网络异常（连接超时、读超时、连接重置等）可重试
+                lastException = e
+                Log.w(TAG, "evt=secure_auth_io_retry attempt=$attempt max=$maxAttempts err=${e.message}")
+                if (attempt < maxAttempts) {
+                    try {
+                        Thread.sleep(300L)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        throw e
+                    }
+                }
+            } catch (e: Exception) {
+                // 其他异常不重试
+                Log.w(TAG, "evt=secure_auth_unknown_error attempt=$attempt type=${e.javaClass.simpleName} msg=${e.message}")
+                throw e
+            }
+        }
+        throw lastException ?: IllegalStateException("SecureHLS 鉴权失败")
+    }
+
+    @Throws(Exception::class)
+    private fun performSecureHlsAuthOnce(config: PlayerDataSourceConfig, video: PlayerVideo): SecureAuthResult {
         val connection = (URL(secureHlsAuthUrl).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = config.timeoutMs
@@ -1618,7 +1744,10 @@ class HXCPlayerControl @JvmOverloads constructor(
             val hasBizCode = root.has("code") && !root.isNull("code")
             val bizCode = if (hasBizCode) root.optLong("code", 200L) else 200L
             if (code !in 200..299 || (hasBizCode && bizCode != 200L)) {
-                throw IllegalStateException(root.optString("msg", "SecureHLS 鉴权失败"))
+                val msg = root.optString("msg", "SecureHLS 鉴权失败")
+                Log.w(TAG, "evt=secure_auth_rejected http=$code biz=$bizCode msg=$msg " +
+                    "videoId=${video.videoId} timestamp=${video.timestamp}")
+                throw IllegalStateException(msg)
             }
 
             val data = root.optJSONObject("data") ?: root
@@ -1753,6 +1882,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             lastOpenUrl = url
             lastOpenStartPosition = startPosition
             lastOpenPlayModel = null
+            lastOpenSecureHeaders = null
             currentSourceCategory = resolveSourceCategory(
                 url = url,
                 mode = PlayerDataSourceMode.DEFAULT,
@@ -1803,6 +1933,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastOpenUrl = url
         lastOpenStartPosition = startPosition
         lastOpenPlayModel = null
+        lastOpenSecureHeaders = null
         currentSourceCategory = resolveSourceCategory(
             url = url,
             mode = PlayerDataSourceMode.DEFAULT,
@@ -1864,6 +1995,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastOpenUrl = model.url
         lastOpenStartPosition = 0.0
         lastOpenPlayModel = clonePlayModel(model)
+        lastOpenSecureHeaders = null
         if (!autoReopenInFlight) {
             autoReopenAttemptCount = 0
             networkTotalStallMs = 0L
@@ -2030,14 +2162,20 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val checkPlayWhenReady = getPlayWhenReady()
                 val checkIsPlaying = isPlaying()
                 val progressed = checkPos - playStallBasePosSec
+                // seek 进行中导致的 LOADING 是正常态，不应误判为卡住触发 reopen，
+                // 否则会在 seek 期间重新走 openWithPlayModel → performSecureHlsAuth，
+                // 一旦鉴权失败（网络抖动/token 失效）就会 dispatchError(-4101)，
+                // 加密视频无 playUrl 时无法回退腾讯，只能停止播放器，进度清零。
                 val stillStuck =
                     checkPlayWhenReady &&
+                        !pendingSeekActive &&
                         (checkLoading || checkState == PlayerState.LOADING || checkState == PlayerState.PAUSED || !checkIsPlaying) &&
                         progressed < manualPlayHardRecoverMinProgressSec
                 if (!stillStuck) {
                     logInfo(
                         "evt=manual_play_quick_stale_check_resolved pos=$checkPos progressed=$progressed " +
-                            "state=${checkState.name} loading=$checkLoading is_playing=$checkIsPlaying"
+                            "state=${checkState.name} loading=$checkLoading is_playing=$checkIsPlaying" +
+                            (if (pendingSeekActive) " seek_in_progress=true" else "")
                     )
                     return@postDelayed
                 }
@@ -2283,7 +2421,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                     return@execute
                 }
                 val opened = if (retryModel != null) {
-                    openWithPlayModel(retryModel, start)
+                    if (retryModel.mode == PlayerDataSourceMode.SECURE_HLS &&
+                        reopenWithCachedSecureSource(start)
+                    ) {
+                        true
+                    } else {
+                        openWithPlayModel(retryModel, start)
+                    }
                 } else {
                     openURL(retryUrl!!, start)
                 }
@@ -3650,6 +3794,13 @@ class HXCPlayerControl @JvmOverloads constructor(
             logInfo("evt=stale_io_controlled_reopen_skip reason=inactive source=$reason released=$isReleased secondary=$secondarySyncMode")
             return false
         }
+        // seek 进行中不允许触发 controlled reopen：seek 导致的 LOADING 是正常态，
+        // 此时 reopen 会重新走 performSecureHlsAuth，鉴权失败会 dispatchError(-4101)，
+        // 加密视频无 playUrl 时无法回退腾讯，导致播放器被停止、进度清零。
+        if (pendingSeekActive) {
+            logInfo("evt=stale_io_controlled_reopen_skip reason=seek_in_progress source=$reason")
+            return false
+        }
         if (!basePositionSec.isFinite() || basePositionSec < 0.0) {
             logInfo("evt=stale_io_controlled_reopen_skip reason=bad_base source=$reason base=$basePositionSec duration=$durationSec")
             return false
@@ -3723,11 +3874,27 @@ class HXCPlayerControl @JvmOverloads constructor(
                     mainHandler.post { staleIoControlledReopenInFlight = false }
                     return@execute
                 }
+                // reopen 场景鉴权失败时抑制 dispatchError，避免触发 App 层 fallback 停止播放器。
+                // reopen 是 SDK 内部卡顿恢复，鉴权失败不应终止整个播放会话（尤其加密视频无 playUrl）。
+                if (retryModel != null) {
+                    suppressSecureAuthErrorForReopen = true
+                }
+                // 优先使用缓存的 play_url + secureHeaders 直接 reopen，跳过鉴权。
+                // secureHeaders 在整个播放会话期间有效，复用避免 timestamp 过期导致的 -4101。
+                // 仅当缓存不可用（首次打开失败/非 SecureHLS）时回退到 openWithPlayModel 重新鉴权。
                 val opened = if (retryModel != null) {
-                    openWithPlayModel(retryModel, start)
+                    if (retryModel.mode == PlayerDataSourceMode.SECURE_HLS &&
+                        reopenWithCachedSecureSource(start)
+                    ) {
+                        true
+                    } else {
+                        openWithPlayModel(retryModel, start)
+                    }
                 } else {
                     openURL(retryUrl!!, start)
                 }
+                // 确保 suppress 标记被清理（openWithPlayModel 内部正常/异常路径都会清理，这里兜底）
+                suppressSecureAuthErrorForReopen = false
                 mainHandler.post {
                     if (opened && !isReleased) {
                         play()
@@ -4147,6 +4314,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastOpenUrl = null
         lastOpenPlayModel = null
         lastOpenStartPosition = 0.0
+        lastOpenSecureHeaders = null
         lastPlayerState = null
         lastPipelineState = null
         lastIsPlayingState = null
