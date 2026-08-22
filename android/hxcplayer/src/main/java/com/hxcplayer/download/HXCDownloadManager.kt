@@ -1,6 +1,7 @@
 package com.hxcplayer.download
 
 import android.content.Context
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -251,14 +252,89 @@ object HXCDownloadManager {
         keys.forEach { deleteDownload(it, deleteFile) }
     }
 
-    fun getAllDownloads(): List<HXCDownloadInfo> = downloads.values.toList()
+    fun getAllDownloads(): List<HXCDownloadInfo> = buildAggregatedDownloads()
 
     fun getDownloadsByStatus(status: HXCDownloadStatus): List<HXCDownloadInfo> {
-        return downloads.values.filter { it.status == status }
+        return buildAggregatedDownloads().filter { it.status == status }
     }
 
     fun queryByChapterAndVideo(chapterId: String, videoId: String): HXCDownloadInfo? {
-        return downloads.values.firstOrNull { it.chapterId == chapterId && it.videoId == videoId }
+        return buildAggregatedDownloads().firstOrNull {
+            it.chapterId == chapterId && it.videoId == videoId
+        }
+    }
+
+    /**
+     * 获取完成下载任务的可播放本地路径。
+     *
+     * - MP4 返回下载完成的本地文件。
+     * - M3U8 返回 SDK 生成的本地 index.m3u8。
+     * - 未完成、路径为空或文件不存在时返回 null。
+     *
+     * @param asFileUri true 时返回 file:// URI；false 时返回绝对路径。
+     */
+    @JvmOverloads
+    fun getPlayablePath(info: HXCDownloadInfo?, asFileUri: Boolean = false): String? {
+        if (info == null || info.status != HXCDownloadStatus.FINISH || info.localPath.isBlank()) {
+            return null
+        }
+        val file = File(info.localPath)
+        if (!file.exists()) return null
+        return if (asFileUri) file.toURI().toString() else file.absolutePath
+    }
+
+    /** 完成任务是否具备可播放本地文件。 */
+    fun isPlayable(info: HXCDownloadInfo?): Boolean {
+        return getPlayablePath(info) != null
+    }
+
+    /** 通过 downloadKey 判断完成任务是否具备可播放本地文件。 */
+    fun isPlayable(downloadKey: String): Boolean {
+        return getPlayablePath(downloadKey) != null
+    }
+
+    /** 获取完成任务的可播放本地 Uri。 */
+    fun getPlayableUri(info: HXCDownloadInfo?): Uri? {
+        val path = getPlayablePath(info) ?: return null
+        return Uri.fromFile(File(path))
+    }
+
+    /** 通过 downloadKey 获取完成任务的可播放本地 Uri。 */
+    fun getPlayableUri(downloadKey: String): Uri? {
+        val path = getPlayablePath(downloadKey) ?: return null
+        return Uri.fromFile(File(path))
+    }
+
+    /**
+     * 通过 downloadKey 获取完成任务的可播放本地路径。
+     */
+    @JvmOverloads
+    fun getPlayablePath(downloadKey: String, asFileUri: Boolean = false): String? {
+        if (downloadKey.isBlank()) return null
+        return getPlayablePath(downloads[downloadKey], asFileUri)
+    }
+
+    /**
+     * 按章节和视频 ID 查询完成任务的可播放本地路径。
+     */
+    @JvmOverloads
+    fun getPlayablePathByChapterAndVideo(
+        chapterId: String,
+        videoId: String,
+        asFileUri: Boolean = false
+    ): String? {
+        return getPlayablePath(queryByChapterAndVideo(chapterId, videoId), asFileUri)
+    }
+
+    /** 按章节和视频 ID 获取完成任务的可播放本地 Uri。 */
+    fun getPlayableUriByChapterAndVideo(chapterId: String, videoId: String): Uri? {
+        val path = getPlayablePathByChapterAndVideo(chapterId, videoId) ?: return null
+        return Uri.fromFile(File(path))
+    }
+
+    /** 按章节和视频 ID 判断完成任务是否具备可播放本地文件。 */
+    fun isPlayableByChapterAndVideo(chapterId: String, videoId: String): Boolean {
+        return getPlayablePathByChapterAndVideo(chapterId, videoId) != null
     }
 
     private fun runDownload(info: HXCDownloadInfo, cancelFlag: AtomicBoolean) {
@@ -1301,7 +1377,47 @@ object HXCDownloadManager {
             progressStage = source.progressStage
             stageProgress = source.stageProgress
             overallProgress = source.overallProgress
+            mainProgress = source.mainProgress
+            isChildTask = source.isChildTask
+            child = source.child?.let { cloneInfo(it).apply { isChildTask = true } }
         }
+    }
+
+    private fun buildAggregatedDownloads(): List<HXCDownloadInfo> {
+        val roots = linkedMapOf<String, HXCDownloadInfo>()
+        val children = mutableListOf<HXCDownloadInfo>()
+        downloads.values.forEach { raw ->
+            val copy = cloneInfo(raw)
+            if (isChildRecord(copy)) {
+                copy.isChildTask = true
+                children += copy
+            } else {
+                roots[parentKey(copy)] = copy
+            }
+        }
+        children.forEach { child ->
+            val parent = roots[parentKeyFromChild(child)]
+            if (parent != null) {
+                parent.attachChild(child)
+            } else {
+                roots["orphan|${child.downloadKey}"] = child
+            }
+        }
+        roots.values.forEach { it.refreshAggregateState() }
+        return roots.values.toList()
+    }
+
+    private fun isChildRecord(info: HXCDownloadInfo): Boolean {
+        return info.isChildTask || info.videoId.endsWith("_child")
+    }
+
+    private fun parentKey(info: HXCDownloadInfo): String {
+        return "${info.chapterId}|${info.videoId}"
+    }
+
+    private fun parentKeyFromChild(child: HXCDownloadInfo): String {
+        val parentVideoId = child.videoId.removeSuffix("_child")
+        return "${child.chapterId}|$parentVideoId"
     }
 
     private fun applyHeaders(conn: HttpURLConnection, headers: String) {
@@ -1333,7 +1449,7 @@ object HXCDownloadManager {
 
     private fun notifyListChanged() {
         val all = getAllDownloads()
-        store?.save(all)
+        store?.save(downloads.values.map { cloneInfo(it) })
         mainHandler.post { listener?.onDownloadListChanged(all) }
     }
 

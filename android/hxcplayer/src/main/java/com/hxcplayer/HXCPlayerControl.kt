@@ -214,6 +214,37 @@ class HXCPlayerControl @JvmOverloads constructor(
         val audioOutputState: AudioOutputState = AudioOutputState.IDLE
     )
 
+    enum class AudioHealthAction {
+        HEALTHY,
+        WARNING,
+        RECOVERING,
+        RECOVERED
+    }
+
+    enum class AudioHealthReason {
+        NONE,
+        SILENT_OUTPUT,
+        OPENSL_NOT_PLAYING,
+        UNDERRUN
+    }
+
+    /** SDK 侧音频健康事件。业务层只消费事件，不需要主动恢复音频输出。 */
+    data class AudioHealthEvent(
+        val metrics: AudioHealthMetrics,
+        val action: AudioHealthAction,
+        val reason: AudioHealthReason,
+        val updatedAtMs: Long = SystemClock.elapsedRealtime()
+    )
+
+    /** 当前视频尺寸。宽高为 0 表示暂未解析到视频轨道尺寸。 */
+    data class VideoSize(
+        val width: Int = 0,
+        val height: Int = 0
+    ) {
+        val isValid: Boolean
+            get() = width > 0 && height > 0
+    }
+
     /** 对齐 iOS 的视频模型（fileId + sign + secretId + timestamp） */
     class PlayerVideo {
         var videoId: String = ""
@@ -304,6 +335,36 @@ class HXCPlayerControl @JvmOverloads constructor(
                     this.encryptedFile = encryptedFile
                 }
             }
+
+            @JvmStatic
+            fun secureHls(
+                url: String,
+                videoId: String,
+                sign: String,
+                secretId: String,
+                timestamp: String = ""
+            ): PlayerDataSourcePlayModel {
+                return PlayerDataSourcePlayModel().apply {
+                    this.url = url
+                    this.mode = PlayerDataSourceMode.SECURE_HLS
+                    this.encryptedFile = false
+                    this.video = PlayerVideo().apply {
+                        this.videoId = videoId
+                        this.sign = sign
+                        this.secretId = secretId
+                        this.timestamp = timestamp
+                    }
+                }
+            }
+
+            @JvmStatic
+            fun encryptedFile(url: String): PlayerDataSourcePlayModel {
+                return PlayerDataSourcePlayModel().apply {
+                    this.url = url
+                    this.mode = PlayerDataSourceMode.DEFAULT
+                    this.encryptedFile = true
+                }
+            }
         }
     }
 
@@ -371,6 +432,40 @@ class HXCPlayerControl @JvmOverloads constructor(
             elapsedMs: Long,
             byTimeout: Boolean
         ) {}
+        // 首帧真正渲染到输出 Surface 后触发。默认空实现，兼容旧接入方。
+        fun onRenderedFirstFrame() {}
+        // 视频轨道尺寸变化。默认空实现，适合 UI 做比例、占位图和横竖屏适配。
+        fun onVideoSizeChanged(width: Int, height: Int) {}
+        // SDK 音频健康与自动恢复事件。业务层用于日志/埋点，不需要再主动调用 recoverAudioOutput。
+        fun onAudioHealthChanged(event: AudioHealthEvent) {}
+    }
+
+    /**
+     * Java/Kotlin 友好的回调适配器。
+     *
+     * 接入方只需重写关心的回调；Demo 和业务层不必实现所有方法。
+     */
+    open class PlayerCallbackAdapter : PlayerCallback {
+        override fun onPlayerStateChanged(state: PlayerState) = Unit
+        override fun onPlayerPositionUpdated(position: Double, duration: Double) = Unit
+        override fun onPlayerError(errorCode: Int, errorMessage: String) = Unit
+        override fun onPlayerErrorWithRecoverability(
+            errorCode: Int,
+            errorMessage: String,
+            recoverable: Boolean
+        ) = Unit
+        override fun onPlayerLoadingChanged(isLoading: Boolean) = Unit
+        override fun onNetworkQoEUpdated(currentStallMs: Long, totalStallMs: Long, reconnectCount: Int) = Unit
+        override fun onSeekCompleted(
+            requestId: Long,
+            targetPosition: Double,
+            currentPosition: Double,
+            elapsedMs: Long,
+            byTimeout: Boolean
+        ) = Unit
+        override fun onRenderedFirstFrame() = Unit
+        override fun onVideoSizeChanged(width: Int, height: Int) = Unit
+        override fun onAudioHealthChanged(event: AudioHealthEvent) = Unit
     }
 
     /**
@@ -407,6 +502,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         )
     }
 
+    fun interface AudioHealthListener {
+        fun onAudioHealthChanged(event: AudioHealthEvent)
+    }
+
     /**
      * 异步 [playWithModelAsync] / [openWithPlayModelAsync] 结果回调。
      * 使用 SAM，便于 Java 调用方避免 Kotlin `Unit` 与 Java `void` 类型不兼容。
@@ -420,10 +519,14 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var completedCallback: PlaybackCompletedCallback? = null
     private var playbackSnapshotCallback: PlaybackSnapshotCallback? = null
     private var playbackSnapshotListener: PlaybackSnapshotListener? = null
+    private var audioHealthListener: AudioHealthListener? = null
     private var lastPlayerState: PlayerState? = null
     private var lastPipelineState: PipelineState? = null
     private var lastIsPlayingState: Boolean? = null
     private var lastPlaybackSnapshot: PlaybackSnapshot? = null
+    private var lastAudioHealthEvent: AudioHealthEvent? = null
+    private var lastAudioHealthDispatchAtMs: Long = 0L
+    private var lastAudioHealthRecoverAttempts: Int = 0
     private var sdkDiagVersionLogged: Boolean = false
     private var updateExecutor: ScheduledExecutorService? = null
     private var lastLoadingState: Boolean? = null
@@ -434,9 +537,13 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val playbackCommandAppliedGeneration = AtomicLong(0L)
     @Volatile
     private var desiredPlayWhenReady: Boolean = false
+    @Volatile
+    private var preferredVolume: Float = 1.0f
     private val mainHandler = Handler(Looper.getMainLooper())
     private val loadingShowDebounceMs = 450L
     private val loadingHideDebounceMs = 150L
+    private val audioHealthDispatchIntervalMs = 1000L
+    private val audioHealthSilentWarningMs = 3000L
     // 播放中若位置持续前进，抑制瞬时 loading=true，避免 UI 闪一下。
     private val loadingShowProgressSuppressWindowMs = 1200L
     private val loadingProgressSuppressMinStepSec = 0.04
@@ -600,6 +707,8 @@ class HXCPlayerControl @JvmOverloads constructor(
     @Volatile private var decodeMode: DecodeMode = DecodeMode.HARDWARE
     private var decodeFallbackTriedForCurrentSource: Boolean = false
     private var decodeFallbackLastAtMs: Long = 0L
+    private var renderedFirstFrameNotified: Boolean = false
+    private var lastVideoSize: VideoSize = VideoSize()
     private val secureHlsAuthUrl = "https://console-api.huaxiacloud.net/third_party/verify/sign"
 
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
@@ -626,6 +735,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun setCallback(callback: PlayerCallback) {
         this.callback = callback
         dispatchCurrentStateSnapshot(callback)
+        dispatchCurrentMediaMetadata(callback)
     }
 
     /**
@@ -660,6 +770,16 @@ class HXCPlayerControl @JvmOverloads constructor(
             if (isReleased || this.playbackSnapshotListener !== listener) return@post
             dispatchPlaybackSnapshotToListener(listener, getPlaybackSnapshot())
         }
+    }
+
+    /**
+     * 设置 SDK 音频健康事件监听。
+     *
+     * 该事件由 SDK 内部音频健康 watchdog 统一驱动，业务层只需要做日志、埋点或弱网提示，
+     * 不应再自行定时调用 [recoverAudioOutput]，避免与 SDK 恢复策略重叠。
+     */
+    fun setAudioHealthListener(listener: AudioHealthListener?) {
+        this.audioHealthListener = listener
     }
 
     /**
@@ -772,11 +892,34 @@ class HXCPlayerControl @JvmOverloads constructor(
         callback?.onNetworkQoEUpdated(currentStallMs, networkTotalStallMs, networkReconnectCount)
     }
 
+    private fun dispatchCurrentMediaMetadata(target: PlayerCallback) {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return
+        val videoSize = getVideoSize()
+        if (videoSize.isValid) {
+            lastVideoSize = videoSize
+            mainHandler.post {
+                if (!isReleased) target.onVideoSizeChanged(videoSize.width, videoSize.height)
+            }
+        }
+        if (nativeHasRenderedFirstFrame(handle)) {
+            renderedFirstFrameNotified = true
+            mainHandler.post {
+                if (!isReleased) target.onRenderedFirstFrame()
+            }
+        }
+    }
+
     private fun dispatchPlaybackSnapshot(snapshot: PlaybackSnapshot) {
         playbackSnapshotCallback?.onPlaybackSnapshotChanged(snapshot)
         playbackSnapshotListener?.let { listener ->
             dispatchPlaybackSnapshotToListener(listener, snapshot)
         }
+    }
+
+    private fun dispatchAudioHealthEvent(event: AudioHealthEvent) {
+        callback?.onAudioHealthChanged(event)
+        audioHealthListener?.onAudioHealthChanged(event)
     }
 
     private fun dispatchPlaybackSnapshotToListener(
@@ -794,6 +937,88 @@ class HXCPlayerControl @JvmOverloads constructor(
             snapshot.shouldShowPlayingUi,
             snapshot.updatedAtMs
         )
+    }
+
+    private fun maybeDispatchAudioHealthEvent(
+        handle: Long,
+        playWhenReady: Boolean,
+        isPlayingNow: Boolean,
+        loading: Boolean,
+        nowMs: Long
+    ) {
+        if (secondarySyncMode || !playWhenReady || preferredVolume <= 0f) {
+            resetAudioHealthDispatchState()
+            return
+        }
+        if (!isPlayingNow && !loading) {
+            return
+        }
+        val raw = nativeGetAudioHealthMetrics(handle) ?: return
+        val metrics = AudioHealthMetrics(
+            silentForMs = raw.getOrElse(0) { 0L },
+            underrunRecent = raw.getOrElse(1) { 0L }.toInt(),
+            openslState = raw.getOrElse(2) { 0L }.toInt(),
+            recoverAttempts = raw.getOrElse(3) { 0L }.toInt()
+        )
+        val reason = resolveAudioHealthReason(metrics)
+        val previousEvent = lastAudioHealthEvent
+        val action = when {
+            reason == AudioHealthReason.NONE &&
+                    previousEvent != null &&
+                    previousEvent.action != AudioHealthAction.HEALTHY -> AudioHealthAction.RECOVERED
+            reason == AudioHealthReason.NONE -> AudioHealthAction.HEALTHY
+            metrics.recoverAttempts > lastAudioHealthRecoverAttempts -> AudioHealthAction.RECOVERING
+            else -> AudioHealthAction.WARNING
+        }
+        lastAudioHealthRecoverAttempts = metrics.recoverAttempts
+        if (action == AudioHealthAction.HEALTHY && previousEvent == null) {
+            return
+        }
+        val event = AudioHealthEvent(
+            metrics = metrics,
+            action = action,
+            reason = reason,
+            updatedAtMs = nowMs
+        )
+        if (!shouldDispatchAudioHealthEvent(previousEvent, event, nowMs)) {
+            return
+        }
+        lastAudioHealthEvent = if (action == AudioHealthAction.RECOVERED) null else event
+        lastAudioHealthDispatchAtMs = nowMs
+        mainHandler.post {
+            if (!isReleased) {
+                dispatchAudioHealthEvent(event)
+            }
+        }
+    }
+
+    private fun resolveAudioHealthReason(metrics: AudioHealthMetrics): AudioHealthReason {
+        return when {
+            metrics.openslState == 2 || metrics.openslState == 3 -> AudioHealthReason.OPENSL_NOT_PLAYING
+            metrics.silentForMs >= audioHealthSilentWarningMs -> AudioHealthReason.SILENT_OUTPUT
+            metrics.underrunRecent > 0 -> AudioHealthReason.UNDERRUN
+            else -> AudioHealthReason.NONE
+        }
+    }
+
+    private fun shouldDispatchAudioHealthEvent(
+        previous: AudioHealthEvent?,
+        current: AudioHealthEvent,
+        nowMs: Long
+    ): Boolean {
+        if (previous == null) {
+            return current.action != AudioHealthAction.HEALTHY
+        }
+        if (previous.action != current.action || previous.reason != current.reason) {
+            return true
+        }
+        return nowMs - lastAudioHealthDispatchAtMs >= audioHealthDispatchIntervalMs
+    }
+
+    private fun resetAudioHealthDispatchState() {
+        lastAudioHealthEvent = null
+        lastAudioHealthDispatchAtMs = 0L
+        lastAudioHealthRecoverAttempts = 0
     }
 
     private fun currentHandle(): Long {
@@ -840,12 +1065,26 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     private fun shouldEmitCompletedToApp(
         state: PlayerState,
-        playWhenReady: Boolean
+        playWhenReady: Boolean,
+        position: Double,
+        duration: Double
     ): Boolean {
-        // Mature player rule: completion is terminal and should not be emitted
-        // during OPENING/LOADING while autoplay intent is still active.
+        // Native completion is a terminal signal. Do not drop it just because the
+        // Java-side state is still LOADING near the tail; mature players treat
+        // EOF/end-of-stream as stronger than transient buffering state.
         val inOpeningWindow = state == PlayerState.OPENING || state == PlayerState.LOADING
-        return !(inOpeningWindow && playWhenReady)
+        if (!inOpeningWindow || !playWhenReady) {
+            return true
+        }
+        val hasValidProgress = java.lang.Double.isFinite(position) && position > 0.5
+        val hasValidDuration = java.lang.Double.isFinite(duration) && duration > 0.0
+        val nearEnd = hasValidDuration && hasValidProgress && (duration - position) <= 1.5
+        if (nearEnd) {
+            return true
+        }
+        // Only suppress the event during very early startup, where stale native
+        // callbacks from a previous open can otherwise race with the new session.
+        return hasValidProgress
     }
 
     /**
@@ -1467,6 +1706,9 @@ class HXCPlayerControl @JvmOverloads constructor(
         lastPipelineState = null
         lastIsPlayingState = null
         lastPlaybackSnapshot = null
+        resetAudioHealthDispatchState()
+        renderedFirstFrameNotified = false
+        lastVideoSize = VideoSize()
         loadingSessionLikelySeek = false
         loadingCandidateState = null
         loadingCandidateSinceMs = 0L
@@ -2219,7 +2461,9 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     // 跳转
     fun seekTo(position: Double) {
-        val resumeAfterSeek = isPlaying() || getPlayWhenReady()
+        val resumeAfterSeek = isPlaying() ||
+            getPlayWhenReady() ||
+            getPipelineState() == PipelineState.ENDED
         seekToWithIntent(position, resumeAfterSeek)
     }
 
@@ -2291,9 +2535,13 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     // 设置音量
     fun setVolume(volume: Float) {
+        preferredVolume = volume.coerceIn(0f, 1f)
+        if (preferredVolume <= 0f) {
+            resetAudioHealthDispatchState()
+        }
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        nativeSetVolume(handle, volume)
+        nativeSetVolume(handle, preferredVolume)
     }
 
     // 设置 App 级静音；不改变播放器基础增益，实际音量仍由系统媒体音量控制。
@@ -2476,6 +2724,23 @@ class HXCPlayerControl @JvmOverloads constructor(
         val handle = currentHandle()
         if (handle == 0L || isReleased) return 0.0
         return nativeGetPosition(handle)
+    }
+
+    /** 获取当前视频尺寸。未打开或尚未解析到视频轨道时返回 0x0。 */
+    fun getVideoSize(): VideoSize {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return VideoSize()
+        return VideoSize(
+            width = nativeGetVideoWidth(handle).coerceAtLeast(0),
+            height = nativeGetVideoHeight(handle).coerceAtLeast(0)
+        )
+    }
+
+    /** 当前播放会话是否已经渲染首帧。 */
+    fun hasRenderedFirstFrame(): Boolean {
+        val handle = currentHandle()
+        if (handle == 0L || isReleased) return false
+        return nativeHasRenderedFirstFrame(handle)
     }
 
     // 获取状态
@@ -2702,6 +2967,14 @@ class HXCPlayerControl @JvmOverloads constructor(
         return nativeIsHardwareDecodingActive(handle)
     }
 
+    private fun isUltraHighResolutionSoftwareDecode(handle: Long): Boolean {
+        if (handle == 0L || isReleased) return false
+        if (nativeIsHardwareDecodingActive(handle)) return false
+        val width = nativeGetVideoWidth(handle).coerceAtLeast(lastVideoSize.width)
+        val height = nativeGetVideoHeight(handle).coerceAtLeast(lastVideoSize.height)
+        return width >= 7680 || height >= 4320
+    }
+
     // 启动位置更新定时器
     private fun startPositionUpdates() {
         updateExecutor = Executors.newSingleThreadScheduledExecutor()
@@ -2710,6 +2983,27 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val handle = currentHandle()
                 if (handle == 0L || isReleased) {
                     return@scheduleAtFixedRate
+                }
+
+                val firstFrameRendered = nativeHasRenderedFirstFrame(handle)
+                if (firstFrameRendered && !renderedFirstFrameNotified) {
+                    renderedFirstFrameNotified = true
+                    mainHandler.post {
+                        if (!isReleased) callback?.onRenderedFirstFrame()
+                    }
+                } else if (!firstFrameRendered) {
+                    renderedFirstFrameNotified = false
+                }
+
+                val videoSize = VideoSize(
+                    width = nativeGetVideoWidth(handle).coerceAtLeast(0),
+                    height = nativeGetVideoHeight(handle).coerceAtLeast(0)
+                )
+                if (videoSize.isValid && videoSize != lastVideoSize) {
+                    lastVideoSize = videoSize
+                    mainHandler.post {
+                        if (!isReleased) callback?.onVideoSizeChanged(videoSize.width, videoSize.height)
+                    }
                 }
 
                 val rawPosition = getPosition()
@@ -2778,6 +3072,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                         dispatchPlaybackSnapshot(snapshot)
                     }
                 }
+                maybeDispatchAudioHealthEvent(
+                    handle = handle,
+                    playWhenReady = playWhenReady,
+                    isPlayingNow = isPlaying,
+                    loading = loading,
+                    nowMs = now
+                )
 
                 maybeRecoverPlayStall(
                     handle = handle,
@@ -3315,13 +3616,13 @@ class HXCPlayerControl @JvmOverloads constructor(
 
                 // 透传播放完成事件（由 core 回调写入，Java 侧轮询消费）
                 if (nativeConsumePlaybackCompleted(handle) && !isReleased) {
-                    val emitCompletedToApp = shouldEmitCompletedToApp(state, playWhenReady)
+                    val emitCompletedToApp = shouldEmitCompletedToApp(state, playWhenReady, position, duration)
                     if (!emitCompletedToApp) {
                         if (canEmitDebugDiagLog()) {
                             Log.d(
                                 TAG,
                                 "evt=playback_completed_blocked_opening_window " +
-                                    "state=${state.name} pwr=$playWhenReady loading=$loading pos=$position duration=$duration"
+                                    "state=${state.name} pwr=$playWhenReady loading=$loading pos=$position duration=$duration reason=startup_guard"
                             )
                         }
                     } else {
@@ -3536,6 +3837,19 @@ class HXCPlayerControl @JvmOverloads constructor(
             }
             playLoopHitCount = 0
             playLoopWindowStartMs = 0L
+            return
+        }
+        if (isUltraHighResolutionSoftwareDecode(handle)) {
+            if (positionSec.isFinite()) {
+                playLoopMaxPosSec = positionSec
+                playLoopAnchorPosSec = positionSec
+            }
+            playLoopHitCount = 0
+            playLoopWindowStartMs = 0L
+            logInfo(
+                "evt=play_loop_recover_suppressed reason=sw8k_decode_limit pos=$positionSec " +
+                    "duration=$durationSec size=${lastVideoSize.width}x${lastVideoSize.height} source_category=$currentSourceCategory"
+            )
             return
         }
         val wantsPlayback = isPlayingNow || state == PlayerState.PLAYING || (state == PlayerState.PAUSED && playWhenReady)
@@ -4393,6 +4707,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeResetSecureSeekTuning(handle: Long)
     private external fun nativeGetDuration(handle: Long): Double
     private external fun nativeGetPosition(handle: Long): Double
+    private external fun nativeGetVideoWidth(handle: Long): Int
+    private external fun nativeGetVideoHeight(handle: Long): Int
+    private external fun nativeHasRenderedFirstFrame(handle: Long): Boolean
     private external fun nativeGetState(handle: Long): Int
     private external fun nativeGetPipelineState(handle: Long): Int
     private external fun nativeGetPlayWhenReady(handle: Long): Boolean

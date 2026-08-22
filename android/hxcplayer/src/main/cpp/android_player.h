@@ -118,6 +118,9 @@ public:
     // --- State queries ---
     double getDuration() const;
     double getPosition() const;
+    int    getVideoWidth() const;
+    int    getVideoHeight() const;
+    bool   hasRenderedFirstFrame() const;
     int    getState() const;
     int    getPipelineState() const;
     bool   getPlayWhenReady() const;

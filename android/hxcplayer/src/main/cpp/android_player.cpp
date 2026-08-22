@@ -98,6 +98,7 @@ static std::atomic<int> g_hxc_runtime_log_level{HXC_PLAYER_RUNTIME_LOG_LEVEL};
 #define SYNCI_RATE(...) TAGI_RATE(LOG_TAG_SYNC, __VA_ARGS__)
 #define SYNCW_RATE(...) TAGW_RATE(LOG_TAG_SYNC, __VA_ARGS__)
 #define DECODEI(...)    TAGI(LOG_TAG_DECODE, __VA_ARGS__)
+#define DECODEW(...)    TAGW(LOG_TAG_DECODE, __VA_ARGS__)
 #define PBOD(...)       TAGD(LOG_TAG_PBO, __VA_ARGS__)
 #define PBOI(...)       ((void)0)
 #define PBOW(...)       TAGW(LOG_TAG_PBO, __VA_ARGS__)
@@ -535,11 +536,20 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         player_core_pause(player_core_);
         bool hw_active = player_core_is_video_hardware_decoding(player_core_) != 0;
         const char* decode_diag = player_core_get_video_decode_diagnostic(player_core_);
+        int open_video_w = player_core_get_video_width(player_core_);
+        int open_video_h = player_core_get_video_height(player_core_);
         DECODEI("evt=open_result method=openURL requested=%s hw_active=%d final_mode=%s diag=%s",
                 decode_mode_ == 1 ? "hardware" : "software",
                 hw_active ? 1 : 0,
                 hw_active ? "hardware" : "software",
                 decode_diag ? decode_diag : "");
+        if (!hw_active && (open_video_w >= 7680 || open_video_h >= 4320)) {
+            DECODEW("evt=openurl_8k_software_decode_risk video_w=%d video_h=%d requested=%s diag=%s",
+                    open_video_w,
+                    open_video_h,
+                    decode_mode_ == 1 ? "hardware" : "software",
+                    decode_diag ? decode_diag : "");
+        }
         // Reset sync state for the new stream
         sync_warmup_frames_.store(20, std::memory_order_release);
         last_sync_video_pts_ = std::numeric_limits<double>::quiet_NaN();
@@ -897,16 +907,15 @@ bool AndroidPlayer::openWithSecureSession(const char* url,
         resetRenderStateForStreamSwitch();
     };
 
-    // SecureHLS stability policy: use software decode directly. Current FFmpeg/MediaCodec
-    // path still fails codec probing on some encrypted streams (codecID=0), and the
-    // hardware probe adds open latency before falling back to the same software path.
+    player_core_apply_secure_playback_profile(player_core_);
+    // SecureHLS stability policy: keep software decode fixed. Current encrypted HLS
+    // streams are not compatible with the Android MediaCodec path in this SDK build.
     PlayerDecodeModeC secure_effective_mode = PLAYER_DECODE_MODE_SOFTWARE;
-    DECODEI("evt=secure_decode_policy mode=fixed_software user_pref=%s reason=secure_hls_stability",
+    DECODEI("evt=secure_decode_policy mode=fixed_software user_pref=%s reason=secure_hls_hw_unsupported",
             user_pref_hw ? "hardware" : "software");
     DECODEI("evt=open method=openWithSecureSession decode_mode=software user_pref=%s start=%.3f",
             user_pref_hw ? "hardware" : "software",
             start_position);
-    player_core_apply_secure_playback_profile(player_core_);
     player_core_set_decode_mode(player_core_, secure_effective_mode);
 
     int result = -1;
@@ -1727,6 +1736,20 @@ double AndroidPlayer::getDuration() const {
 double AndroidPlayer::getPosition() const {
     if (!player_core_) return 0.0;
     return player_core_get_position(player_core_);
+}
+
+int AndroidPlayer::getVideoWidth() const {
+    if (!player_core_) return 0;
+    return player_core_get_video_width(player_core_);
+}
+
+int AndroidPlayer::getVideoHeight() const {
+    if (!player_core_) return 0;
+    return player_core_get_video_height(player_core_);
+}
+
+bool AndroidPlayer::hasRenderedFirstFrame() const {
+    return first_frame_rendered_.load(std::memory_order_acquire);
 }
 
 int AndroidPlayer::getState() const {
@@ -3405,8 +3428,11 @@ void AndroidPlayer::renderLoop() {
                 seek_progress_last_improve_ms = 0;
             }
             bool likely_4k = (frame_data.width >= 3840 || gl_last_video_w_ >= 3840 || gl_last_video_h_ >= 2160);
+            bool likely_8k = (frame_data.width >= 7680 || gl_last_video_w_ >= 7680 ||
+                              frame_data.height >= 4320 || gl_last_video_h_ >= 4320);
             bool hw_decode_active = player_core_is_video_hardware_decoding(player_core_) != 0;
             bool sw_decode_4k = likely_4k && !hw_decode_active;
+            bool sw_decode_8k = likely_8k && !hw_decode_active;
             if (adaptive_rate_cap_until_ms > 0 && now >= adaptive_rate_cap_until_ms) {
                 SYNCI("evt=adaptive_rate_cap_expire cap=%.2f req=%.2f delay=%.3f",
                       adaptive_rate_cap_value, requested_rate, delay);
@@ -3428,9 +3454,11 @@ void AndroidPlayer::renderLoop() {
             bool ultra_high_rate_4k = high_rate_4k && playback_rate >= 2.5f;
             bool very_high_rate_4k = high_rate_4k && playback_rate >= 2.75f;
             bool mid_rate_4k = false; // rollback: avoid mid-rate (1.25~1.75x) aggressive sync policy
-            SYNCI_RATE(120, "evt=sync_snapshot pts=%.3f clk=%.3f delay=%.3f rate=%.2f video_w=%d video_h=%d is_4k=%d is_high_rate_4k=%d is_ultra_high_rate_4k=%d",
+            SYNCI_RATE(120, "evt=sync_snapshot pts=%.3f clk=%.3f delay=%.3f rate=%.2f video_w=%d video_h=%d is_4k=%d is_8k=%d is_high_rate_4k=%d is_ultra_high_rate_4k=%d hw_video=%d",
                        pts, clock, delay, playback_rate, frame_data.width, frame_data.height,
-                       likely_4k ? 1 : 0, high_rate_4k ? 1 : 0, ultra_high_rate_4k ? 1 : 0);
+                       likely_4k ? 1 : 0, likely_8k ? 1 : 0,
+                       high_rate_4k ? 1 : 0, ultra_high_rate_4k ? 1 : 0,
+                       hw_decode_active ? 1 : 0);
 
             // Soft re-anchor safeguard: if we stay severely behind for too long under
             // 4K high/mid-rate playback, perform one bounded seek near audio clock to
@@ -3457,8 +3485,12 @@ void AndroidPlayer::renderLoop() {
                 reanchor_cooldown_ms = 7000;
             }
 
+            double duration_for_reanchor = player_core_get_duration(player_core_);
+            bool near_tail_for_reanchor = std::isfinite(duration_for_reanchor) &&
+                                          duration_for_reanchor > 0.0 &&
+                                          (duration_for_reanchor - clock) <= 2.0;
             if (!in_seek_recovery && reanchor_candidate_4k && delay < reanchor_delay_threshold &&
-                player_core_is_playing(player_core_)) {
+                player_core_is_playing(player_core_) && !near_tail_for_reanchor) {
                 if (severe_lag_start_ms_ == 0) severe_lag_start_ms_ = now;
                 bool lag_persistent = (now - severe_lag_start_ms_) >= reanchor_lag_persistent_ms;
                 bool reanchor_cooldown_ok = (last_soft_reanchor_ms_ == 0) ||
@@ -4678,7 +4710,17 @@ void AndroidPlayer::renderLoop() {
                     // 视频帧被持续丢弃、永远追不上 → 帧队列长期空 → 卡顿。
                     // 连续 severe-behind 超过阈值后重锚主时钟到当前视频 pts，闭合时差，
                     // 让后续解码帧不再被判为 severe behind。仅 seek 恢复中/未在播时跳过。
-                    if (!in_seek_recovery && player_core_is_playing(player_core_)) {
+                    // 尾点保护：视频已接近末尾时不 reanchor，避免把时钟/进度拉回导致
+                    // app near_end_stalled 检测重置、完播延迟。与 4K reanchor 的 near_tail 保护对齐。
+                    // 用 pts 判断（reanchor 目标即 pts）：pts 已到末尾时 reanchor 无意义且可能回退进度。
+                    double duration_for_non4k_reanchor = player_core_get_duration(player_core_);
+                    bool near_tail_for_non4k_reanchor =
+                            std::isfinite(duration_for_non4k_reanchor) &&
+                            duration_for_non4k_reanchor > 0.0 &&
+                            std::isfinite(pts) &&
+                            (duration_for_non4k_reanchor - pts) <= 2.0;
+                    if (!in_seek_recovery && player_core_is_playing(player_core_) &&
+                        !near_tail_for_non4k_reanchor) {
                         if (non4k_severe_behind_start_ms_ == 0) {
                             non4k_severe_behind_start_ms_ = now;
                         }
@@ -4790,6 +4832,27 @@ void AndroidPlayer::renderLoop() {
                             should_display = should_consume = true;
                             consecutive_drop_count_ = 0;
                             LOGI_RATE(20, "[sync] mid-rate cadence display: pts=%.3f clk=%.3f delay=%.3f step=%d",
+                                      pts, clock, delay, cadence_step);
+                        } else {
+                            should_consume = true;
+                        }
+                    } else if (sw_decode_8k) {
+                        // 8K software decode is below real-time on many devices. Do not
+                        // enter endless drop-only mode; show a sparse cadence so motion
+                        // keeps advancing while the app can decide to switch to a lower rendition.
+                        consecutive_drop_count_++;
+                        int cadence_step = 5;
+                        if (delay > -1.2) {
+                            cadence_step = 2;
+                        } else if (delay > -2.4) {
+                            cadence_step = 3;
+                        } else if (delay > -4.0) {
+                            cadence_step = 4;
+                        }
+                        if (consecutive_drop_count_ >= cadence_step) {
+                            should_display = should_consume = true;
+                            consecutive_drop_count_ = 0;
+                            LOGI_RATE(20, "[sync] sw8k_cadence display: pts=%.3f clk=%.3f delay=%.3f step=%d",
                                       pts, clock, delay, cadence_step);
                         } else {
                             should_consume = true;

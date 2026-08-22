@@ -372,6 +372,7 @@ private:
     std::atomic<int>   post_seek_warmup_frames_{0}; // seek 结束后放宽 A/V 同步丢帧阈值的剩余帧数
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
     std::atomic<bool> video_hw_decode_active_{false}; // 当前视频流是否在硬解
+    std::atomic<bool> ultra_high_res_software_decode_active_{false}; // 8K/超高清软解降级 profile
     mutable std::mutex video_decode_diag_mutex_;
     std::string video_decode_diag_;
     std::atomic<int64_t> io_last_packet_us_{0}; // 最近一次成功读取 packet 的时间（us）
