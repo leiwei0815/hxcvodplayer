@@ -6,6 +6,7 @@ set(CORE_SOURCES
     hxc_audio_resampler.cpp
     hxc_player_core.cpp
     hxc_player_core_c_bridge.cpp
+    hxc_player_monitor.cpp
     hxc_custom_io.cpp
     hxc_aes256_cbc.c
 )
@@ -19,6 +20,7 @@ set(CORE_HEADERS
     ${CMAKE_SOURCE_DIR}/core/include/hxc_audio_resampler.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_player_core.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_player_core_c_bridge.h
+    ${CMAKE_SOURCE_DIR}/core/include/hxc_player_monitor.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_custom_io.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_logger.h
     ${CMAKE_SOURCE_DIR}/core/include/hxc_aes256_cbc.h

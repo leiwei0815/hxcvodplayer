@@ -32,6 +32,7 @@ set(CORE_SOURCES
     ${PROJECT_ROOT}/core/src/hxc_player_types.cpp
     ${PROJECT_ROOT}/core/src/hxc_packet_queue.cpp
     ${PROJECT_ROOT}/core/src/hxc_player_core_c_bridge.cpp
+    ${PROJECT_ROOT}/core/src/hxc_player_monitor.cpp
     ${PROJECT_ROOT}/core/src/hxc_custom_io.cpp
     ${PROJECT_ROOT}/core/src/hxc_audio_resampler.cpp
 )

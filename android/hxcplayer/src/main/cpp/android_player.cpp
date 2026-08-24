@@ -344,6 +344,7 @@ AndroidPlayer::AndroidPlayer()
         player_core_set_loading_callback(player_core_, loadingStateCallback, this);
         player_core_set_error_callback(player_core_, errorStateCallback, this);
         player_core_set_playback_completed_callback(player_core_, playbackCompletedCallback, this);
+        setupMonitorCallback();
         LOGI("Player core created, callbacks registered");
     }
 
@@ -7128,6 +7129,76 @@ double AndroidPlayer::consumeVideoStallRecoverPosition() {
     }
     SYNCI("evt=video_empty_stall_consume_forward_seek pos=%.3f", pos);
     return pos;
+}
+
+void AndroidPlayer::setupMonitorCallback() {
+    if (!player_core_) return;
+    player_core_set_monitor_event_callback(player_core_,
+        [](const PlayerMonitorEventC* ev, void* user_data) {
+            auto* self = static_cast<AndroidPlayer*>(user_data);
+            if (!self || !ev) return;
+
+            MonitorEventEntry entry;
+            entry.event_name = ev->event_name ? ev->event_name : "unknown";
+            entry.detail = ev->detail ? ev->detail : "";
+            entry.position = ev->position;
+            entry.duration = ev->duration;
+            entry.timestamp_ms = ev->timestamp_ms;
+            entry.error_code = ev->error_code;
+            entry.ffmpeg_code = ev->ffmpeg_code;
+            entry.reconnect_count = ev->reconnect_count;
+            entry.total_stall_ms = ev->total_stall_ms;
+            entry.buffer_ahead_sec = ev->buffer_ahead_sec;
+            entry.recoverable = ev->recoverable;
+            entry.seek_target = ev->seek_target;
+            entry.seek_landing = ev->seek_landing;
+            entry.cost_ms = ev->cost_ms;
+            entry.stall_ms = ev->stall_ms;
+
+            {
+                std::lock_guard<std::mutex> lock(self->monitor_queue_mutex_);
+                if (self->monitor_queue_.size() < 200) {
+                    self->monitor_queue_.push_back(std::move(entry));
+                }
+            }
+        }, this);
+}
+
+bool AndroidPlayer::consumeMonitorEvent(std::string& event_name,
+                                        std::string& detail,
+                                        double& position,
+                                        double& duration,
+                                        int64_t& timestamp_ms,
+                                        int& error_code,
+                                        int& ffmpeg_code,
+                                        int& reconnect_count,
+                                        int64_t& total_stall_ms,
+                                        double& buffer_ahead_sec,
+                                        int& recoverable,
+                                        double& seek_target,
+                                        double& seek_landing,
+                                        int64_t& cost_ms,
+                                        int64_t& stall_ms) {
+    std::lock_guard<std::mutex> lock(monitor_queue_mutex_);
+    if (monitor_queue_.empty()) return false;
+    MonitorEventEntry& entry = monitor_queue_.front();
+    event_name = std::move(entry.event_name);
+    detail = std::move(entry.detail);
+    position = entry.position;
+    duration = entry.duration;
+    timestamp_ms = entry.timestamp_ms;
+    error_code = entry.error_code;
+    ffmpeg_code = entry.ffmpeg_code;
+    reconnect_count = entry.reconnect_count;
+    total_stall_ms = entry.total_stall_ms;
+    buffer_ahead_sec = entry.buffer_ahead_sec;
+    recoverable = entry.recoverable;
+    seek_target = entry.seek_target;
+    seek_landing = entry.seek_landing;
+    cost_ms = entry.cost_ms;
+    stall_ms = entry.stall_ms;
+    monitor_queue_.erase(monitor_queue_.begin());
+    return true;
 }
 
 void AndroidPlayer::getAudioHealthMetrics(int64_t* silent_for_ms,

@@ -750,4 +750,56 @@ Java_com_hxcplayer_HXCPlayerControl_nativeConsumeVideoStallRecoverPosition(JNIEn
     return player->consumeVideoStallRecoverPosition();
 }
 
+JNIEXPORT jstring JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeConsumeMonitorEvent(JNIEnv* env, jobject thiz, jlong handle) {
+    (void)thiz;
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (!player) return nullptr;
+
+    std::string event_name, detail;
+    double position = 0.0, duration = 0.0, buffer_ahead_sec = -1.0;
+    double seek_target = 0.0, seek_landing = 0.0;
+    int64_t timestamp_ms = 0, total_stall_ms = 0, cost_ms = 0, stall_ms = 0;
+    int error_code = 0, ffmpeg_code = 0, reconnect_count = 0, recoverable = 0;
+
+    if (!player->consumeMonitorEvent(event_name, detail, position, duration,
+                                     timestamp_ms, error_code, ffmpeg_code,
+                                     reconnect_count, total_stall_ms,
+                                     buffer_ahead_sec, recoverable,
+                                     seek_target, seek_landing,
+                                     cost_ms, stall_ms)) {
+        return nullptr;
+    }
+
+    // 组装 JSON 返回给 Kotlin
+    std::string json = "{\"event\":\"" + event_name + "\"";
+    json += ",\"position\":" + std::to_string(position);
+    json += ",\"duration\":" + std::to_string(duration);
+    json += ",\"timestampMs\":" + std::to_string(timestamp_ms);
+    json += ",\"errorCode\":" + std::to_string(error_code);
+    json += ",\"ffmpegCode\":" + std::to_string(ffmpeg_code);
+    json += ",\"reconnectCount\":" + std::to_string(reconnect_count);
+    json += ",\"totalStallMs\":" + std::to_string(total_stall_ms);
+    json += ",\"bufferAheadSec\":" + std::to_string(buffer_ahead_sec);
+    json += ",\"recoverable\":" + std::to_string(recoverable);
+    json += ",\"seekTarget\":" + std::to_string(seek_target);
+    json += ",\"seekLanding\":" + std::to_string(seek_landing);
+    json += ",\"costMs\":" + std::to_string(cost_ms);
+    json += ",\"stallMs\":" + std::to_string(stall_ms);
+    // detail 转义双引号
+    std::string escaped_detail;
+    escaped_detail.reserve(detail.size());
+    for (char c : detail) {
+        if (c == '"') escaped_detail += "\\\"";
+        else if (c == '\\') escaped_detail += "\\\\";
+        else if (c == '\n') escaped_detail += "\\n";
+        else if (c == '\r') escaped_detail += "\\r";
+        else escaped_detail += c;
+    }
+    json += ",\"detail\":\"" + escaped_detail + "\"";
+    json += "}";
+
+    return env->NewStringUTF(json.c_str());
+}
+
 } // extern "C"

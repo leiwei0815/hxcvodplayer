@@ -5,6 +5,7 @@
 
 #include "hxc_player_core_c_bridge.h"
 #include "hxc_player_core.h"
+#include "hxc_player_monitor.h"
 #include "hxc_audio_resampler.h"
 #include <cstring>
 #include <cmath>
@@ -107,6 +108,10 @@ struct PlayerCoreHandle {
 
     PlayingChangedCallbackC playing_changed_callback;
     void* playing_changed_user_data;
+
+    MonitorEventCallbackC monitor_event_callback;
+    void* monitor_event_user_data;
+
     std::mutex callback_mutex;
     
     PlayerCoreHandle() 
@@ -153,6 +158,8 @@ struct PlayerCoreHandle {
         , pipeline_state_user_data(nullptr)
         , playing_changed_callback(nullptr)
         , playing_changed_user_data(nullptr)
+        , monitor_event_callback(nullptr)
+        , monitor_event_user_data(nullptr)
     {}
     
     ~PlayerCoreHandle() {
@@ -218,6 +225,65 @@ static PlayerPipelineStateC hxc_to_c_pipeline_state(hxcplayer::PipelineState sta
         case hxcplayer::PipelineState::Error:
         default:
             return PLAYER_PIPELINE_STATE_ERROR;
+    }
+}
+
+/// 监控回调 C 字符串的生命周期必须延续到平台层完成同步拷贝（thread_local 保留下一次回调前有效）。
+struct MonitorEventBridgeStrings {
+    std::string url;
+    std::string detail;
+    std::string error_message;
+    std::string ffmpeg_message;
+    std::string message;
+    std::string trace_point;
+    std::string phase;
+
+    void bind(const hxcplayer::MonitorEvent& ev, PlayerMonitorEventC& out) {
+        url = ev.url;
+        detail = ev.detail;
+        error_message = ev.error.message;
+        ffmpeg_message = ev.error.ffmpeg_message;
+        message = ev.message;
+        trace_point = ev.trace_point;
+        phase = ev.phase;
+
+        out.url = url.empty() ? nullptr : url.c_str();
+        out.detail = detail.empty() ? nullptr : detail.c_str();
+        out.error_message = error_message.empty() ? nullptr : error_message.c_str();
+        out.ffmpeg_message = ffmpeg_message.empty() ? nullptr : ffmpeg_message.c_str();
+        out.message = message.empty() ? nullptr : message.c_str();
+        out.trace_point = trace_point.empty() ? nullptr : trace_point.c_str();
+        out.phase = phase.empty() ? nullptr : phase.c_str();
+        out.error_domain = hxcplayer::monitor_error_domain_name(ev.error.domain);
+        out.event_name = hxcplayer::monitor_event_type_name(ev.type);
+    }
+};
+
+thread_local MonitorEventBridgeStrings g_monitor_event_bridge_strings;
+
+PlayerCoreHandle* g_monitor_error_report_handle = nullptr;
+
+void hxc_bind_monitor_error_report(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) {
+        hxcplayer::set_monitor_error_report_callback(nullptr);
+        g_monitor_error_report_handle = nullptr;
+        return;
+    }
+    g_monitor_error_report_handle = handle;
+    hxcplayer::set_monitor_error_report_callback(
+        [](int error_code, const std::string& message, const std::string& detail, bool recoverable) {
+            PlayerCoreHandle* bound = g_monitor_error_report_handle;
+            if (!bound || !bound->core) {
+                return;
+            }
+            bound->core->report_monitor_error_event(error_code, message, detail, recoverable);
+        });
+}
+
+void hxc_unbind_monitor_error_report(PlayerCoreHandle* handle) {
+    if (g_monitor_error_report_handle == handle) {
+        g_monitor_error_report_handle = nullptr;
+        hxcplayer::set_monitor_error_report_callback(nullptr);
     }
 }
 
@@ -1356,6 +1422,57 @@ void player_core_set_playing_changed_callback(PlayerCoreHandle* handle, PlayingC
         });
     } else {
         handle->core->set_playing_changed_callback(nullptr);
+    }
+}
+
+void player_core_set_monitor_event_callback(PlayerCoreHandle* handle, MonitorEventCallbackC callback, void* user_data) {
+    if (!handle || !handle->core) return;
+
+    {
+        std::lock_guard<std::mutex> lock(handle->callback_mutex);
+        handle->monitor_event_callback = callback;
+        handle->monitor_event_user_data = user_data;
+    }
+
+    if (callback) {
+        handle->core->set_monitor_event_callback([handle](const hxcplayer::MonitorEvent& ev) {
+            MonitorEventCallbackC cb = nullptr;
+            void* ud = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(handle->callback_mutex);
+                cb = handle->monitor_event_callback;
+                ud = handle->monitor_event_user_data;
+            }
+            if (!cb) {
+                return;
+            }
+            PlayerMonitorEventC out{};
+            out.type = static_cast<PlayerMonitorEventTypeC>(ev.type);
+            out.timestamp_ms = ev.timestamp_ms;
+            out.position = ev.position;
+            out.duration = ev.duration;
+            out.start_position = ev.start_position;
+            out.seek_target = ev.seek_target;
+            out.seek_landing = ev.seek_landing;
+            out.cost_ms = ev.cost_ms;
+            out.stall_ms = ev.stall_ms;
+            out.total_stall_ms = ev.total_stall_ms;
+            out.reconnect_count = ev.reconnect_count;
+            out.buffer_ahead_sec = ev.buffer_ahead_sec;
+            out.loading = ev.loading ? 1 : 0;
+            out.encrypted = ev.encrypted ? 1 : 0;
+            out.data_source_mode = ev.data_source_mode;
+            out.error_code = ev.error.code;
+            out.ffmpeg_code = ev.error.ffmpeg_code;
+            out.recoverable = ev.error.recoverable ? 1 : 0;
+            out.http_status = ev.error.http_status;
+            g_monitor_event_bridge_strings.bind(ev, out);
+            cb(&out, ud);
+        });
+        hxc_bind_monitor_error_report(handle);
+    } else {
+        handle->core->set_monitor_event_callback(nullptr);
+        hxc_unbind_monitor_error_report(handle);
     }
 }
 

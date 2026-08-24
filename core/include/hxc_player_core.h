@@ -11,6 +11,7 @@
 #include "hxc_frame_queue.h"
 #include "hxc_decoder.h"
 #include "hxc_custom_io.h"
+#include "hxc_player_monitor.h"
 #include <string>
 #include <memory>
 #include <thread>
@@ -18,6 +19,7 @@
 #include <functional>
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -43,10 +45,10 @@ extern "C" {
 
 namespace hxcplayer {
 
-// ⚠️ 播放器错误码定义
+// ⚠️ 播放器错误码定义（稳定业务码；FFmpeg AVERROR_* 另存 ffmpeg_code，不直接对外主码）
 enum PlayerErrorCode {
-    // 自定义错误码 (1-999)
-    ERROR_NONE = 0,                      // 无错误
+    ERROR_NONE = 0,                          // 无错误
+    // -1001 ~ -1999 播放器通用
     ERROR_INVALID_URL = -1001,               // 无效的 URL
     ERROR_OPEN_INPUT_FAILED = -1002,         // 打开输入失败
     ERROR_FIND_STREAM_INFO_FAILED = -1003,   // 查找流信息失败
@@ -55,37 +57,57 @@ enum PlayerErrorCode {
     ERROR_CODEC_NOT_FOUND = -1006,           // 找不到解码器
     ERROR_CODEC_OPEN_FAILED = -1007,         // 打开解码器失败
     ERROR_ALLOC_CONTEXT_FAILED = -1008,      // 分配上下文失败
-    
     ERROR_SDL_INIT_FAILED = -1009,           // SDL 初始化失败
-    ERROR_AUDIO_DEVICE_OPEN_FAILED = -1010, // 音频设备打开失败
-    ERROR_SEEK_FAILED = -1011,              // Seek 操作失败
-    ERROR_READ_FRAME_FAILED = -1012,        // 读取帧失败
-    ERROR_DECODE_FAILED = -1013,            // 解码失败
-    ERROR_OUT_OF_MEMORY = -1014,            // 内存不足
-    ERROR_NET_CONNECTION_TIMEOUT = -2001,      //网络连接超时
-    ERROR_NET_CONNECTION_REFUSED = -2002,       //服务器拒绝连接
-    ERROR_NET_UNREACHABLE = -2003,          //网络不可达，请检查网络设置
-    
-    ERROR_HTTP_BAD_REQUEST = -3001,         //HTTP 请求错误（400）
-    ERROR_HTTP_NOT_FOUND = -3002,           // http 404
-    ERROR_HTTP_SERVER_ERROR = -3003,        // server error
-    ERROR_HTTP_UNAUTHORIZED = -3004,        //需要身份验证
-    ERROR_HTTP_FORBIDDEN = -3005,           //访问被禁止（403）
-    ERROR_INPUT_INVALID_DATA = -1018,        //无效数据
-    ERROR_NOT_SUPPORT = -1019,
-    ERROR_UNKNOWN = -1099,                 // 未知错误
-    // Secure HLS 鉴权/密钥错误
-    ERROR_SECURE_AUTH_FAILED = -4101,      // 鉴权失败
-    ERROR_SECURE_AUTH_EXPIRED = -4102,     // 鉴权过期
-    ERROR_SECURE_KEY_EXPIRED = -4103,      // 密钥过期
-    ERROR_SECURE_KEY_INVALID = -4104,      // 密钥非法
-    ERROR_SECURE_REPLAY_BLOCKED = -4105,   // 重放被拒绝
-    ERROR_SECURE_CLOCK_SKEW = -4106,       // 设备时钟偏移过大
-    
-    // FFmpeg 错误码范围 (负数)
-    // 使用 FFmpeg 原始错误码，例如：
-    // AVERROR_EOF, AVERROR(ENOMEM), AVERROR(EINVAL) 等
-    // 这些值保持为 FFmpeg 的负数错误码
+    ERROR_AUDIO_DEVICE_OPEN_FAILED = -1010,  // 音频设备打开失败
+    ERROR_SEEK_FAILED = -1011,               // Seek 操作失败
+    ERROR_READ_FRAME_FAILED = -1012,         // 读取帧失败
+    ERROR_DECODE_FAILED = -1013,             // 解码失败
+    ERROR_OUT_OF_MEMORY = -1014,             // 内存不足
+    ERROR_INPUT_INVALID_DATA = -1018,        // 无效数据
+    ERROR_NOT_SUPPORT = -1019,               // 不支持的格式或协议
+    ERROR_UNKNOWN = -1099,                   // 未知错误
+
+    // -2001 ~ -2999 网络
+    ERROR_NET_CONNECTION_TIMEOUT = -2001,    // 网络连接超时
+    ERROR_NET_CONNECTION_REFUSED = -2002,    // 服务器拒绝连接
+    ERROR_NET_UNREACHABLE = -2003,           // 网络不可达
+    ERROR_NET_DNS_FAILED = -2004,            // DNS 解析失败
+    ERROR_NET_TLS_FAILED = -2005,            // TLS/SSL 握手失败
+    ERROR_NET_READ_TIMEOUT = -2006,          // 读超时
+    ERROR_NET_CONNECTION_LOST = -2007,       // 连接中断
+    ERROR_NET_RECONNECT_FAILED = -2008,      // 弱网重连失败
+
+    // -3001 ~ -3999 HTTP
+    ERROR_HTTP_BAD_REQUEST = -3001,          // HTTP 400
+    ERROR_HTTP_NOT_FOUND = -3002,            // HTTP 404
+    ERROR_HTTP_SERVER_ERROR = -3003,         // HTTP 5xx
+    ERROR_HTTP_UNAUTHORIZED = -3004,        // HTTP 401
+    ERROR_HTTP_FORBIDDEN = -3005,             // HTTP 403
+
+    // -4001 ~ -4099 License
+    ERROR_LICENSE_VALIDATION_FAILED = -4001, // License 校验失败
+
+    // -4101 ~ -4199 SecureHLS / 加密鉴权
+    ERROR_SECURE_AUTH_FAILED = -4101,        // 鉴权失败
+    ERROR_SECURE_AUTH_EXPIRED = -4102,       // 鉴权过期
+    ERROR_SECURE_KEY_EXPIRED = -4103,        // 密钥过期
+    ERROR_SECURE_KEY_INVALID = -4104,        // 密钥非法
+    ERROR_SECURE_REPLAY_BLOCKED = -4105,     // 重放被拒绝
+    ERROR_SECURE_CLOCK_SKEW = -4106,         // 设备时钟偏移过大
+
+    // -5001 ~ -5099 渲染
+    ERROR_RENDER_SURFACE_UNAVAILABLE = -5001,// Surface/Layer 不可用
+    ERROR_RENDER_FIRST_FRAME_FAILED = -5002, // 首帧提交失败
+    ERROR_RENDER_PIXELBUFFER_FAILED = -5003, // PixelBuffer 创建失败
+
+    // -5101 ~ -5199 音频输出
+    ERROR_AUDIO_OUTPUT_INIT_FAILED = -5101,  // 音频输出初始化失败
+    ERROR_AUDIO_OUTPUT_WRITE_FAILED = -5102, // 音频输出写入失败
+
+    // -9001 ~ -9999 监控系统自身（不影响播放）
+    ERROR_MONITOR_INVALID_ENDPOINT = -9001,
+    ERROR_MONITOR_QUEUE_OVERFLOW = -9002,
+    ERROR_MONITOR_SERIALIZE_FAILED = -9003,
 };
 
 // ⚠️ 数据源模式
@@ -264,6 +286,15 @@ public:
         std::lock_guard<std::mutex> lock(callback_mutex_);
         playing_changed_callback_ = callback;
     }
+    void set_monitor_event_callback(MonitorEventCallback callback) {
+        monitor_event_callback_ = callback;
+    }
+
+    /// 供 bridge / 独立模块（如 AudioResampler）经 monitor 回调转发错误上报。
+    void report_monitor_error_event(int error_code,
+                                    const std::string& message,
+                                    const std::string& detail,
+                                    bool recoverable);
 
 private:
     // 读取线程（解复用）
@@ -299,10 +330,28 @@ private:
     void update_pipeline_state_from_runtime();
     bool has_first_renderable_frame_ready() const;
     void emit_error(int error_code, const std::string& error_msg);
+    /// 可恢复异常：写 LOG_ERROR 并上报 monitor（recoverable=true，eventType 多为 warn）。
+    void emit_recoverable_error(int error_code, const std::string& error_msg, const std::string& detail = "");
+    /// 解码线程瞬时错误：限流上报，避免刷屏。
+    void emit_transient_decode_error(const char* stream_label, int ffmpeg_ret, int error_count);
+    void emit_monitor_event(MonitorEvent event);
+    void emit_monitor_trace(const std::string& trace_point,
+                            const std::string& message,
+                            const std::string& detail = "",
+                            const std::string& phase = "");
+    void emit_decode_path_resolved(const std::string& reason);
+    void emit_ffmpeg_io_event(const std::string& detail, int ffmpeg_code = 0);
     void set_seek_loading(bool is_loading);
     void set_io_loading(bool is_loading);
     void set_starvation_loading(bool is_loading);
     void refresh_loading_state();
+    std::string monitor_open_url() const;
+    std::string monitor_open_url_redirect_detail() const;
+    void monitor_note_io_bytes(int bytes);
+    void monitor_maybe_emit_network_snapshot();
+    void monitor_maybe_emit_weak_signal(const std::string& reason, int throughput_kbps);
+    /// 相对当前播放位置的缓冲超前量（秒）；未知时返回 -1。
+    double get_buffer_ahead_sec() const;
     /** 播放结束(Ended)后 seek：重置完成态并恢复 playWhenReady，无需 App 重开流 */
     void prepare_seek_from_ended_session();
 
@@ -315,6 +364,8 @@ private:
     std::atomic<bool> first_audio_frame_ready_{false};
     std::atomic<bool> effective_is_playing_{false};
     MediaInfo media_info_;
+    std::string open_request_url_;
+    std::string open_resolved_url_;
     
     // FFmpeg 对象
     AVFormatContext* format_ctx_;
@@ -367,6 +418,14 @@ private:
     std::atomic<bool> seek_loading_{false};  // seek 触发的 loading
     std::atomic<bool> io_loading_{false};    // 网络读取失败触发的 loading
     std::atomic<bool> starvation_loading_{false}; // 队列低水位/进度停滞触发的 loading
+    int monitor_rebuffer_count_ = 0;
+    int monitor_reconnect_count_ = 0;
+    int64_t loading_begin_ms_ = 0;
+    int64_t monitor_total_stall_ms_ = 0;
+    int64_t monitor_io_window_bytes_ = 0;
+    int64_t monitor_io_window_start_ms_ = 0;
+    int64_t monitor_last_snapshot_ms_ = 0;
+    int64_t monitor_last_weak_signal_ms_ = 0;
     std::atomic<bool> loading_notified_{false};  // 对外已通知的 loading 状态
     std::atomic<double> seek_target_pos_;  // ⚠️ seek 的目标位置，在 seek 期间返回此值
     std::atomic<int>   post_seek_warmup_frames_{0}; // seek 结束后放宽 A/V 同步丢帧阈值的剩余帧数
@@ -453,6 +512,8 @@ private:
     LoadingCallback loading_callback_;                   // 网络加载回调
     PipelineStateChangedCallback pipeline_state_changed_callback_;
     PlayingChangedCallback playing_changed_callback_;
+    MonitorEventCallback monitor_event_callback_;
+    std::unordered_map<std::string, int64_t> monitor_trace_last_ms_;
     mutable std::mutex callback_mutex_;
     
     // 自定义数据源

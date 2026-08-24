@@ -5,6 +5,7 @@
 
 #include "hxc_player_core.h"
 #include "hxc_player_core_c_bridge.h"  // 引入错误码定义
+#include "hxc_player_monitor.h"
 #include "hxc_logger.h"
 #include "hxc_debug_helper.h"
 #include <iostream>
@@ -663,6 +664,15 @@ int PlayerCore::open(const std::string& filename) {
     LOG_INFO("开始打开文件");
     LOG_INFO("========================================");
     LOG_INFO("URL: ", filename);
+    open_request_url_ = filename;
+    open_resolved_url_.clear();
+    monitor_rebuffer_count_ = 0;
+    monitor_reconnect_count_ = 0;
+    monitor_total_stall_ms_ = 0;
+    monitor_io_window_bytes_ = 0;
+    monitor_io_window_start_ms_ = 0;
+    monitor_last_snapshot_ms_ = 0;
+    monitor_last_weak_signal_ms_ = 0;
     if (filename.find(".m3u8") != std::string::npos) {
         const bool has_crypto = hxc_ffmpeg_has_input_protocol("crypto");
         LOG_INFO("FFmpeg 协议检查: crypto=", has_crypto ? "enabled" : "disabled");
@@ -924,6 +934,8 @@ int PlayerCore::open(const std::string& filename) {
         io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
         
         auto attempt_begin = std::chrono::steady_clock::now();
+        emit_monitor_trace("core.open.avformat_open", "调用 avformat_open_input",
+                           "url=" + filename + ",retry=" + std::to_string(retry_count), "open");
         // 尝试打开
         ret = avformat_open_input(&format_ctx_, url_with_params.c_str(), nullptr, &options);
         auto attempt_cost_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1150,6 +1162,15 @@ int PlayerCore::open_with_custom_io(std::unique_ptr<CustomAVIOContext> custom_io
     // 重置标志
     abort_request_ = false;
     decode_finished_ = false;
+    open_request_url_ = url_for_format;
+    open_resolved_url_ = url_for_format;
+    monitor_rebuffer_count_ = 0;
+    monitor_reconnect_count_ = 0;
+    monitor_total_stall_ms_ = 0;
+    monitor_io_window_bytes_ = 0;
+    monitor_io_window_start_ms_ = 0;
+    monitor_last_snapshot_ms_ = 0;
+    monitor_last_weak_signal_ms_ = 0;
     video_hw_decode_active_.store(false, std::memory_order_release);
     ultra_high_res_software_decode_active_.store(false, std::memory_order_release);
     playback_completed_notified_.store(false, std::memory_order_release);
@@ -1289,7 +1310,17 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
     LOG_INFO("  URL: ", url);
     LOG_INFO("  模式: ", static_cast<int>(mode));
     LOG_INFO("========================================");
-    
+
+    open_request_url_ = url;
+    open_resolved_url_.clear();
+    monitor_rebuffer_count_ = 0;
+    monitor_reconnect_count_ = 0;
+    monitor_total_stall_ms_ = 0;
+    monitor_io_window_bytes_ = 0;
+    monitor_io_window_start_ms_ = 0;
+    monitor_last_snapshot_ms_ = 0;
+    monitor_last_weak_signal_ms_ = 0;
+
     // 根据模式选择打开方式
     switch (mode) {
         case DataSourceMode::Default:
@@ -1444,6 +1475,7 @@ int PlayerCore::open_common_process(const std::string &filename) {
     auto common_begin = std::chrono::steady_clock::now();
     video_stream_opened_ = false;
     audio_stream_opened_ = false;
+    emit_monitor_trace("core.open.common_begin", "进入 open_common_process", filename, "open");
     // 获取流信息
     auto find_stream_begin = std::chrono::steady_clock::now();
     int ret = avformat_find_stream_info(format_ctx_, nullptr);
@@ -1620,7 +1652,9 @@ int PlayerCore::open_common_process(const std::string &filename) {
     auto common_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - common_begin).count();
     LOG_INFO("open_common_process 总耗时: ", common_total_ms, " ms");
-    
+    emit_monitor_trace("core.open.common_done", "open_common_process 完成",
+                       "costMs=" + std::to_string(common_total_ms), "open");
+
     return 0;
 }
 
@@ -2469,6 +2503,8 @@ void PlayerCore::read_thread() {
         io_last_packet_us_.store(av_gettime_relative(), std::memory_order_release);
         io_last_packet_stream_index_.store(pkt->stream_index, std::memory_order_release);
         io_last_packet_size_.store(pkt->size, std::memory_order_release);
+        monitor_note_io_bytes(pkt->size);
+        monitor_maybe_emit_network_snapshot();
         double pkt_pts_sec = -1.0;
         double pkt_dts_sec = -1.0;
         if (format_ctx_ &&
@@ -2774,7 +2810,8 @@ int PlayerCore::stream_component_open(int stream_index) {
             video_decode_diag_ = decode_diag + (hw_decode_enabled ? " final=hardware" : " final=software");
         }
         LOG_INFO("视频解码最终模式: ", hw_decode_enabled ? "硬解" : "软解");
-        
+        emit_decode_path_resolved(hw_decode_enabled ? "hardware" : "software");
+
         LOG_INFO("创建视频解码器...");
         video_decoder_ = std::make_unique<VideoDecoder>();
         video_decoder_->init(codec_ctx, video_packet_queue_.get());
@@ -4003,6 +4040,24 @@ void PlayerCore::refresh_loading_state() {
     const bool prev = loading_notified_.exchange(merged_loading, std::memory_order_acq_rel);
     update_pipeline_state_from_runtime();
     if (prev != merged_loading) {
+        MonitorEvent ev;
+        ev.type = merged_loading ? MonitorEventType::LoadingBegin : MonitorEventType::LoadingEnd;
+        ev.timestamp_ms = monitor_now_ms();
+        ev.position = get_position();
+        ev.duration = get_duration();
+        ev.loading = merged_loading;
+        if (merged_loading) {
+            loading_begin_ms_ = ev.timestamp_ms;
+            monitor_rebuffer_count_ += 1;
+        } else if (loading_begin_ms_ > 0) {
+            ev.stall_ms = std::max<int64_t>(0, ev.timestamp_ms - loading_begin_ms_);
+            monitor_total_stall_ms_ += ev.stall_ms;
+            loading_begin_ms_ = 0;
+        }
+        ev.total_stall_ms = monitor_total_stall_ms_;
+        ev.reconnect_count = monitor_reconnect_count_;
+        ev.buffer_ahead_sec = get_buffer_ahead_sec();
+        emit_monitor_event(ev);
         LoadingCallback cb;
         {
             std::lock_guard<std::mutex> lock(callback_mutex_);
@@ -4015,14 +4070,255 @@ void PlayerCore::refresh_loading_state() {
 }
 
 void PlayerCore::emit_error(int error_code, const std::string& error_msg) {
+    MonitorErrorInfo mapped = map_monitor_error(error_code, error_msg);
     ErrorCallback cb;
     {
         std::lock_guard<std::mutex> lock(callback_mutex_);
         cb = error_callback_;
     }
     if (cb) {
-        cb(error_code, error_msg);
+        const int stable = (mapped.code != 0) ? mapped.code : error_code;
+        cb(stable, error_msg);
     }
+    if (mapped.category == MonitorErrorCategory::UserCancel) {
+        return;
+    }
+    MonitorEvent ev;
+    ev.type = MonitorEventType::OpenFail;
+    if (mapped.domain == MonitorErrorDomain::Render) {
+        ev.type = MonitorEventType::RenderError;
+    } else if (mapped.domain == MonitorErrorDomain::Audio) {
+        ev.type = MonitorEventType::AudioError;
+    } else if (mapped.code == ERROR_DECODE_FAILED || mapped.code == ERROR_CODEC_OPEN_FAILED ||
+               mapped.code == ERROR_CODEC_NOT_FOUND) {
+        ev.type = MonitorEventType::DecodeError;
+    } else if (get_state() != PlayerState::Opening) {
+        if (mapped.domain == MonitorErrorDomain::Network || mapped.domain == MonitorErrorDomain::Http) {
+            ev.type = MonitorEventType::FfmpegIoEvent;
+        } else {
+            ev.type = MonitorEventType::DecodeError;
+        }
+    }
+    ev.timestamp_ms = monitor_now_ms();
+    ev.position = get_position();
+    ev.duration = get_duration();
+    ev.error = mapped;
+    ev.detail = error_msg;
+    emit_monitor_event(ev);
+}
+
+void PlayerCore::emit_recoverable_error(int error_code, const std::string& error_msg, const std::string& detail) {
+    MonitorErrorInfo mapped = map_monitor_error(error_code, error_msg);
+    mapped.recoverable = true;
+    mapped.category = MonitorErrorCategory::Recoverable;
+
+    MonitorEvent ev;
+    ev.type = MonitorEventType::DecodeError;
+    if (mapped.domain == MonitorErrorDomain::Render) {
+        ev.type = MonitorEventType::RenderError;
+    } else if (mapped.domain == MonitorErrorDomain::Audio) {
+        ev.type = MonitorEventType::AudioError;
+    } else if (mapped.domain == MonitorErrorDomain::Network || mapped.domain == MonitorErrorDomain::Http) {
+        ev.type = MonitorEventType::FfmpegIoEvent;
+    }
+    ev.timestamp_ms = monitor_now_ms();
+    ev.position = get_position();
+    ev.duration = get_duration();
+    ev.error = mapped;
+    ev.detail = detail.empty() ? error_msg : detail;
+    emit_monitor_event(ev);
+}
+
+void PlayerCore::emit_transient_decode_error(const char* stream_label, int ffmpeg_ret, int error_count) {
+    if (error_count != 1 && error_count % 50 != 0) {
+        return;
+    }
+    std::ostringstream oss;
+    oss << (stream_label ? stream_label : "decode") << " transient ret=" << ffmpeg_ret
+        << " count=" << error_count;
+    const std::string detail = oss.str();
+    emit_recoverable_error(ERROR_DECODE_FAILED, detail, detail);
+}
+
+void PlayerCore::emit_monitor_event(MonitorEvent event) {
+    if (event.timestamp_ms == 0) {
+        event.timestamp_ms = monitor_now_ms();
+    }
+    if (monitor_event_callback_) {
+        monitor_event_callback_(event);
+    }
+}
+
+void PlayerCore::emit_monitor_trace(const std::string& trace_point,
+                                     const std::string& message,
+                                     const std::string& detail,
+                                     const std::string& phase) {
+    if (!monitor_event_callback_) {
+        return;
+    }
+    const int64_t now_ms = monitor_now_ms();
+    constexpr int64_t kMinIntervalMs = 500;
+    auto it = monitor_trace_last_ms_.find(trace_point);
+    if (it != monitor_trace_last_ms_.end() && (now_ms - it->second) < kMinIntervalMs) {
+        return;
+    }
+    monitor_trace_last_ms_[trace_point] = now_ms;
+
+    MonitorEvent ev;
+    ev.type = MonitorEventType::Trace;
+    ev.timestamp_ms = now_ms;
+    ev.position = get_position();
+    ev.duration = get_duration();
+    ev.message = message;
+    ev.trace_point = trace_point;
+    ev.phase = phase;
+    ev.detail = detail;
+    emit_monitor_event(ev);
+}
+
+void PlayerCore::emit_decode_path_resolved(const std::string& reason) {
+    MonitorEvent ev;
+    ev.type = MonitorEventType::DecodePathResolved;
+    ev.timestamp_ms = monitor_now_ms();
+    ev.position = get_position();
+    ev.duration = get_duration();
+    std::string video_mode = "none";
+    if (video_stream_opened_) {
+        video_mode = video_hw_decode_active_.load(std::memory_order_acquire) ? "hardware" : "software";
+    }
+    const std::string audio_mode = audio_stream_opened_ ? "software" : "none";
+    ev.detail = "video=" + video_mode + ",audio=" + audio_mode + ",reason=" + reason;
+    emit_monitor_event(ev);
+}
+
+void PlayerCore::emit_ffmpeg_io_event(const std::string& detail, int ffmpeg_code) {
+    if (detail.rfind("soft_reconnect", 0) == 0) {
+        monitor_reconnect_count_ += 1;
+    }
+    MonitorEvent ev;
+    ev.type = MonitorEventType::FfmpegIoEvent;
+    ev.timestamp_ms = monitor_now_ms();
+    ev.position = get_position();
+    ev.duration = get_duration();
+    ev.detail = detail;
+    ev.reconnect_count = monitor_reconnect_count_;
+    ev.total_stall_ms = monitor_total_stall_ms_;
+    if (ffmpeg_code != 0) {
+        if (!(ffmpeg_code == AVERROR_EOF && detail == "normal_eof")) {
+            ev.error = map_monitor_error(ffmpeg_code, detail);
+        }
+    }
+    emit_monitor_event(ev);
+}
+
+void PlayerCore::report_monitor_error_event(int error_code,
+                                            const std::string& message,
+                                            const std::string& detail,
+                                            bool recoverable) {
+    if (recoverable) {
+        emit_recoverable_error(error_code, message, detail);
+        return;
+    }
+    const std::string full = detail.empty() ? message : message + " | " + detail;
+    emit_error(error_code, full);
+}
+
+void PlayerCore::monitor_note_io_bytes(int bytes) {
+    if (bytes <= 0) {
+        return;
+    }
+    const int64_t now = monitor_now_ms();
+    if (monitor_io_window_start_ms_ <= 0 || (now - monitor_io_window_start_ms_) > 10000) {
+        monitor_io_window_start_ms_ = now;
+        monitor_io_window_bytes_ = bytes;
+    } else {
+        monitor_io_window_bytes_ += bytes;
+    }
+}
+
+void PlayerCore::monitor_maybe_emit_network_snapshot() {
+    const int64_t now = monitor_now_ms();
+    constexpr int64_t kSnapshotIntervalMs = 20000;
+    if (monitor_last_snapshot_ms_ > 0 && (now - monitor_last_snapshot_ms_) < kSnapshotIntervalMs) {
+        return;
+    }
+    const PlayerState st = get_state();
+    if (st != PlayerState::Playing && st != PlayerState::Opening && st != PlayerState::Paused) {
+        return;
+    }
+    monitor_last_snapshot_ms_ = now;
+
+    int throughput_kbps = 0;
+    if (monitor_io_window_start_ms_ > 0 && monitor_io_window_bytes_ > 0) {
+        const int64_t elapsed_ms = std::max<int64_t>(1, now - monitor_io_window_start_ms_);
+        throughput_kbps = static_cast<int>((monitor_io_window_bytes_ * 8LL * 1000LL) / (elapsed_ms * 1000LL));
+    }
+
+    std::ostringstream oss;
+    oss << "throughputKbps=" << throughput_kbps;
+    if (format_ctx_ && format_ctx_->bit_rate > 0) {
+        oss << ",mediaBitrateKbps=" << (format_ctx_->bit_rate / 1000);
+    }
+    const bool buffering = seek_loading_.load(std::memory_order_acquire) ||
+                           io_loading_.load(std::memory_order_acquire) ||
+                           starvation_loading_.load(std::memory_order_acquire);
+    oss << ",buffering=" << (buffering ? "1" : "0");
+
+    MonitorEvent ev;
+    ev.type = MonitorEventType::NetworkSnapshot;
+    ev.timestamp_ms = now;
+    ev.position = get_position();
+    ev.duration = get_duration();
+    ev.total_stall_ms = monitor_total_stall_ms_;
+    ev.reconnect_count = monitor_reconnect_count_;
+    ev.buffer_ahead_sec = get_buffer_ahead_sec();
+    ev.detail = oss.str();
+    emit_monitor_event(ev);
+
+    if (format_ctx_ && format_ctx_->bit_rate > 0 && throughput_kbps > 0 &&
+        throughput_kbps * 1000 < format_ctx_->bit_rate / 2) {
+        monitor_maybe_emit_weak_signal("throughput_below_half_media_bitrate", throughput_kbps);
+    }
+    if (buffering && throughput_kbps > 0 && throughput_kbps < 200) {
+        monitor_maybe_emit_weak_signal("buffering_low_throughput", throughput_kbps);
+    }
+}
+
+void PlayerCore::monitor_maybe_emit_weak_signal(const std::string& reason, int throughput_kbps) {
+    const int64_t now = monitor_now_ms();
+    constexpr int64_t kWeakSignalDebounceMs = 30000;
+    if (monitor_last_weak_signal_ms_ > 0 &&
+        (now - monitor_last_weak_signal_ms_) < kWeakSignalDebounceMs) {
+        return;
+    }
+    monitor_last_weak_signal_ms_ = now;
+
+    MonitorEvent ev;
+    ev.type = MonitorEventType::NetworkWeakSignal;
+    ev.timestamp_ms = now;
+    ev.position = get_position();
+    ev.duration = get_duration();
+    ev.total_stall_ms = monitor_total_stall_ms_;
+    ev.reconnect_count = monitor_reconnect_count_;
+    ev.buffer_ahead_sec = get_buffer_ahead_sec();
+    std::ostringstream oss;
+    oss << "reason=" << reason << ",throughputKbps=" << throughput_kbps;
+    ev.detail = oss.str();
+    emit_monitor_event(ev);
+}
+
+double PlayerCore::get_buffer_ahead_sec() const {
+    // 当前分支队列未提供 newest_pts 接口，暂返回 -1（未知）；
+    // monitor 协议中 -1 表示未知，不影响上报。
+    return -1.0;
+}
+
+std::string PlayerCore::monitor_open_url() const {
+    return {};
+}
+
+std::string PlayerCore::monitor_open_url_redirect_detail() const {
+    return {};
 }
 
 // 设置播放速率（倍速播放）

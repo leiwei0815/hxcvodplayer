@@ -12,6 +12,10 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
+import com.hxcplayer.monitor.HXCPlayerMonitorConfig
+import com.hxcplayer.monitor.HXCPlayerMonitorMetadata
+import com.hxcplayer.monitor.HXCPlayerMonitorSession
+import com.hxcplayer.monitor.HXCPlayerMonitorUserContext
 import kotlin.jvm.JvmOverloads
 import kotlin.math.abs
 import java.io.File
@@ -321,6 +325,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         var mode: PlayerDataSourceMode = PlayerDataSourceMode.DEFAULT
         var encryptedFile: Boolean = false
         var video: PlayerVideo? = null
+        var monitorMetadata: HXCPlayerMonitorMetadata? = null
 
         companion object {
             @JvmStatic
@@ -397,6 +402,11 @@ class HXCPlayerControl @JvmOverloads constructor(
         const val NET_CONNECTION_TIMEOUT = -2001
         const val NET_CONNECTION_REFUSED = -2002
         const val NET_UNREACHABLE = -2003
+        const val NET_DNS_FAILED = -2004
+        const val NET_TLS_FAILED = -2005
+        const val NET_READ_TIMEOUT = -2006
+        const val NET_CONNECTION_LOST = -2007
+        const val NET_RECONNECT_FAILED = -2008
 
         const val HTTP_BAD_REQUEST = -3001
         const val HTTP_NOT_FOUND = -3002
@@ -411,6 +421,17 @@ class HXCPlayerControl @JvmOverloads constructor(
         const val SECURE_KEY_INVALID = -4104
         const val SECURE_REPLAY_BLOCKED = -4105
         const val SECURE_CLOCK_SKEW = -4106
+
+        const val RENDER_SURFACE_UNAVAILABLE = -5001
+        const val RENDER_FIRST_FRAME_FAILED = -5002
+        const val RENDER_PIXELBUFFER_FAILED = -5003
+
+        const val AUDIO_OUTPUT_INIT_FAILED = -5101
+        const val AUDIO_OUTPUT_WRITE_FAILED = -5102
+
+        const val MONITOR_INVALID_ENDPOINT = -9001
+        const val MONITOR_QUEUE_OVERFLOW = -9002
+        const val MONITOR_SERIALIZE_FAILED = -9003
     }
 
     // 回调接口
@@ -529,6 +550,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var lastAudioHealthRecoverAttempts: Int = 0
     private var sdkDiagVersionLogged: Boolean = false
     private var updateExecutor: ScheduledExecutorService? = null
+    private val monitorEventExecutor = Executors.newSingleThreadScheduledExecutor()
     private var lastLoadingState: Boolean? = null
     private var loadingCandidateState: Boolean? = null
     private var loadingCandidateSinceMs: Long = 0L
@@ -714,6 +736,20 @@ class HXCPlayerControl @JvmOverloads constructor(
     /** TextureView 模式下由我方从 [SurfaceTexture] 创建的包装 Surface，需在适当时机 [Surface.release] */
     private var textureDecoderSurface: Surface? = null
 
+    private var monitorUserContext: HXCPlayerMonitorUserContext? = null
+    private val monitorSession: HXCPlayerMonitorSession =
+        HXCPlayerMonitorSession(context, HXCPlayerMonitorConfig())
+
+    /**
+     * 设置监控上报的用户 id（SDK 内部自动监控并上报，应用层仅需在登录/播放时传入）。
+     * 传 null 或空串则回退为匿名用户。可在任意时机调用，变化后会以新 user_id 重连上报通道。
+     */
+    fun setMonitorUserId(userId: String?) {
+        val ctx = monitorUserContext ?: HXCPlayerMonitorUserContext().also { monitorUserContext = it }
+        ctx.userId = userId
+        monitorSession.userContext = ctx
+    }
+
     /**
      * 用于承载解码输出的视图（[SurfaceView] 或 [TextureView]），请加入布局。
      */
@@ -885,6 +921,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     appId = source.appId
                 }
             }
+            monitorMetadata = model.monitorMetadata
         }
     }
 
@@ -1382,6 +1419,14 @@ class HXCPlayerControl @JvmOverloads constructor(
                 networkReconnectCount = 0
             }
             applyDecodeModeForHandle(handle)
+            beginMonitorSession(
+                workingModel.url,
+                workingModel.mode.ordinal,
+                workingModel.encryptedFile,
+                lastOpenStartPosition,
+                workingModel.monitorMetadata
+            )
+            val openBegin = SystemClock.elapsedRealtime()
             val result = when (workingModel.mode) {
                 PlayerDataSourceMode.DEFAULT ->
                     nativeOpenURLWithStartPosition(handle, workingModel.url, lastOpenStartPosition)
@@ -1430,6 +1475,12 @@ class HXCPlayerControl @JvmOverloads constructor(
                 openLoadingGuardStartPosSec = -1.0
                 dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "打开失败: mode=${workingModel.mode}, url=${workingModel.url}")
             } else {
+                monitorSession.trackOpenSuccess(
+                    getDuration(),
+                    0,
+                    0,
+                    SystemClock.elapsedRealtime() - openBegin
+                )
                 armOpenLoadingHideGuard()
             }
             result
@@ -1825,8 +1876,36 @@ class HXCPlayerControl @JvmOverloads constructor(
     private fun dispatchError(errorCode: Int, errorMessage: String) {
         val recoverable = isRecoverableErrorCode(errorCode)
         maybeAutoReopen(errorCode, recoverable)
+        val state = getState()
+        if (state == PlayerState.OPENING || state == PlayerState.IDLE) {
+            monitorSession.trackOpenFail(errorCode, errorMessage, getPosition(), getDuration())
+        } else {
+            monitorSession.trackError(
+                "decode_error",
+                errorCode,
+                errorMessage,
+                getPosition(),
+                getDuration()
+            )
+            if (!recoverable) {
+                monitorSession.endSession("failed", getPosition(), getDuration())
+            }
+        }
         callback?.onPlayerError(errorCode, errorMessage)
         callback?.onPlayerErrorWithRecoverability(errorCode, errorMessage, recoverable)
+    }
+
+    private fun beginMonitorSession(
+        url: String?,
+        mode: Int,
+        encrypted: Boolean,
+        startPosition: Double,
+        metadata: HXCPlayerMonitorMetadata? = null
+    ) {
+        monitorSession.engineType = "custom"
+        monitorSession.userContext = monitorUserContext
+        monitorSession.metadata = metadata
+        monitorSession.beginSession(url, mode, encrypted, startPosition)
     }
 
     private fun maybeAutoReopen(errorCode: Int, recoverable: Boolean) {
@@ -2139,6 +2218,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                 networkReconnectCount = 0
             }
             applyDecodeModeForHandle(handle)
+            beginMonitorSession(url, PlayerDataSourceMode.DEFAULT.ordinal, false, startPosition)
+            val openBegin = SystemClock.elapsedRealtime()
             // 始终用带起始位置的接口，确保 startPosition=0 时也能清除上次残留进度
             val result = nativeOpenURLWithStartPosition(handle, url, startPosition)
 
@@ -2148,6 +2229,12 @@ class HXCPlayerControl @JvmOverloads constructor(
                 openLoadingGuardStartPosSec = -1.0
                 dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "无法打开 URL: $url")
             } else {
+                monitorSession.trackOpenSuccess(
+                    getDuration(),
+                    0,
+                    0,
+                    SystemClock.elapsedRealtime() - openBegin
+                )
                 armOpenLoadingHideGuard()
             }
             result
@@ -2450,6 +2537,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun stop() {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
+        monitorSession.endSession("stopped", getPosition(), getDuration())
         val generation = nextPlaybackCommandGeneration(false)
         enqueuePlaybackCommand("stop", generation, false) { current ->
             nativeStop(current)
@@ -2988,6 +3076,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val firstFrameRendered = nativeHasRenderedFirstFrame(handle)
                 if (firstFrameRendered && !renderedFirstFrameNotified) {
                     renderedFirstFrameNotified = true
+                    monitorSession.trackFirstFrame(getPosition(), getDuration())
                     mainHandler.post {
                         if (!isReleased) callback?.onRenderedFirstFrame()
                     }
@@ -3060,6 +3149,7 @@ class HXCPlayerControl @JvmOverloads constructor(
 
                 if (lastPlayerState != state) {
                     lastPlayerState = state
+                    monitorSession.trackStateChange(state.name, getPosition(), getDuration())
                     mainHandler.post { callback?.onPlayerStateChanged(state) }
                 }
                 lastPipelineState = pipeline
@@ -3223,6 +3313,10 @@ class HXCPlayerControl @JvmOverloads constructor(
                             if (loading) {
                                 networkLoadingSinceMs = SystemClock.elapsedRealtime()
                                 notifyNetworkQoE(0L)
+                                monitorSession.trackLoading(
+                                    true, 0L, networkTotalStallMs, networkReconnectCount,
+                                    getPosition(), getDuration()
+                                )
                             } else {
                                 val nowMs = SystemClock.elapsedRealtime()
                                 val currentStall = if (networkLoadingSinceMs > 0L) {
@@ -3233,6 +3327,10 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 networkLoadingSinceMs = 0L
                                 networkTotalStallMs += currentStall
                                 notifyNetworkQoE(currentStall)
+                                monitorSession.trackLoading(
+                                    false, currentStall, networkTotalStallMs, networkReconnectCount,
+                                    getPosition(), getDuration()
+                                )
                             }
                         }
                     }
@@ -3628,6 +3726,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     } else {
                         logInfo("[播放完成] Kotlin 层：收到播放完成事件，position=${getPosition()} duration=${getDuration()} state=${getState()}")
                         mainHandler.post {
+                            monitorSession.trackComplete(getPosition(), getDuration())
                             if (completedCallback != null) {
                                 logInfo("[播放完成] Kotlin 层：派发 onPlaybackCompleted 到应用层")
                                 completedCallback?.onPlaybackCompleted()
@@ -3641,6 +3740,49 @@ class HXCPlayerControl @JvmOverloads constructor(
                 e.printStackTrace()
             }
         }, 0, 100, TimeUnit.MILLISECONDS)
+
+        // 监控事件轮询：消费 Core 层 push 的 monitor 事件并转发到 Session
+        monitorEventExecutor.scheduleAtFixedRate({
+            if (isReleased) return@scheduleAtFixedRate
+            val handle = currentHandle()
+            if (handle == 0L) return@scheduleAtFixedRate
+            try {
+                while (true) {
+                    val json = nativeConsumeMonitorEvent(handle) ?: break
+                    try {
+                        val ev = JSONObject(json)
+                        val eventName = ev.optString("event", "")
+                        if (eventName.isEmpty()) continue
+                        val extra = mutableMapOf<String, Any?>()
+                        if (ev.has("errorCode") && ev.optInt("errorCode") != 0) {
+                            extra["errorCode"] = ev.optInt("errorCode")
+                        }
+                        if (ev.has("ffmpegCode")) extra["ffmpegCode"] = ev.optInt("ffmpegCode")
+                        if (ev.has("recoverable")) extra["recoverable"] = ev.optBoolean("recoverable")
+                        if (ev.has("reconnectCount")) extra["reconnectCount"] = ev.optInt("reconnectCount")
+                        if (ev.has("totalStallMs")) extra["totalStallMs"] = ev.optLong("totalStallMs")
+                        if (ev.has("stallMs")) extra["stallMs"] = ev.optLong("stallMs")
+                        if (ev.has("costMs")) extra["costMs"] = ev.optLong("costMs")
+                        if (ev.has("seekTarget")) extra["seekTarget"] = ev.optDouble("seekTarget")
+                        if (ev.has("seekLanding")) extra["seekLanding"] = ev.optDouble("seekLanding")
+                        if (ev.has("throughputKbps")) extra["throughputKbps"] = ev.optInt("throughputKbps")
+                        val detail = ev.optString("detail", null)
+                        monitorSession.trackNamed(
+                            eventName,
+                            ev.optDouble("position", getPosition()),
+                            ev.optDouble("duration", getDuration()),
+                            detail,
+                            if (extra.isNotEmpty()) extra else null,
+                            false
+                        )
+                    } catch (je: Exception) {
+                        // JSON 解析失败忽略单条事件
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }, 0, 500, TimeUnit.MILLISECONDS)
     }
 
     private fun maybeRecoverPlayStall(
@@ -4534,6 +4676,9 @@ class HXCPlayerControl @JvmOverloads constructor(
             if (isReleased) return
             isReleased = true
         }
+        monitorSession.endSession("released", getPosition(), getDuration())
+        monitorSession.shutdown()
+        monitorEventExecutor.shutdownNow()
         updateExecutor?.shutdownNow()
         // 不在主线程等待 openExecutor/锁，避免 Activity.onDestroy ANR。
         // 真实 native 释放放到 openExecutor 串行收尾，确保与 open/reopen 同队列。
@@ -4727,6 +4872,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeHandleAudioRouteChanged(handle: Long, reason: String): Boolean
     private external fun nativeSetSystemMusicVolumeZero(handle: Long, volumeZero: Boolean)
     private external fun nativeConsumeVideoStallRecoverPosition(handle: Long): Double
+    private external fun nativeConsumeMonitorEvent(handle: Long): String?
 
     // 获取当前是否处于加载中（可用于主动查询 UI 状态）
     fun isLoading(): Boolean {

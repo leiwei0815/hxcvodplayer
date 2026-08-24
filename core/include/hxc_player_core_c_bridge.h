@@ -81,7 +81,21 @@ typedef enum {
     PLAYER_ERROR_SECURE_KEY_INVALID = -4104,            // SecureHLS 密钥非法
     PLAYER_ERROR_SECURE_REPLAY_BLOCKED = -4105,         // SecureHLS 重放被拒绝
     PLAYER_ERROR_SECURE_CLOCK_SKEW = -4106,             // SecureHLS 设备时钟偏移过大
-    
+
+    // -5001 ~ -5099 渲染
+    PLAYER_ERROR_RENDER_SURFACE_UNAVAILABLE = -5001,    // Surface/Layer 不可用
+    PLAYER_ERROR_RENDER_FIRST_FRAME_FAILED = -5002,     // 首帧提交失败
+    PLAYER_ERROR_RENDER_PIXELBUFFER_FAILED = -5003,     // PixelBuffer 创建失败
+
+    // -5101 ~ -5199 音频输出
+    PLAYER_ERROR_AUDIO_OUTPUT_INIT_FAILED = -5101,      // 音频输出初始化失败
+    PLAYER_ERROR_AUDIO_OUTPUT_WRITE_FAILED = -5102,     // 音频输出写入失败
+
+    // -9001 ~ -9999 监控系统自身（不影响播放）
+    PLAYER_ERROR_MONITOR_INVALID_ENDPOINT = -9001,
+    PLAYER_ERROR_MONITOR_QUEUE_OVERFLOW = -9002,
+    PLAYER_ERROR_MONITOR_SERIALIZE_FAILED = -9003,
+
     // FFmpeg 错误码范围 (负数)
     // 使用 FFmpeg 原始错误码，例如：
     // AVERROR_EOF = -541478725 (0xDFFFFFE3)
@@ -320,6 +334,107 @@ typedef void (*LoadingCallbackC)(bool is_loading, void* user_data);          // 
 typedef void (*PipelineStateChangedCallbackC)(PlayerPipelineStateC state, void* user_data);
 typedef void (*PlayingChangedCallbackC)(int is_playing, void* user_data);    // 1=true,0=false
 
+/// core 监控事件类型（与 hxc_player_monitor.h 对齐）
+typedef enum {
+    PLAYER_MONITOR_EVENT_PLAY_SESSION_START = 0,
+    PLAYER_MONITOR_EVENT_OPEN_BEGIN,
+    PLAYER_MONITOR_EVENT_OPEN_SUCCESS,
+    PLAYER_MONITOR_EVENT_OPEN_FAIL,
+    PLAYER_MONITOR_EVENT_STATE_CHANGE,
+    PLAYER_MONITOR_EVENT_FIRST_FRAME,
+    PLAYER_MONITOR_EVENT_POSITION_HEARTBEAT,
+    PLAYER_MONITOR_EVENT_SEEK_BEGIN,
+    PLAYER_MONITOR_EVENT_SEEK_COMPLETE,
+    PLAYER_MONITOR_EVENT_SEEK_FAIL,
+    PLAYER_MONITOR_EVENT_LOADING_BEGIN,
+    PLAYER_MONITOR_EVENT_LOADING_END,
+    PLAYER_MONITOR_EVENT_NETWORK_CHANGE,
+    PLAYER_MONITOR_EVENT_FFMPEG_IO,
+    PLAYER_MONITOR_EVENT_DECODE_ERROR,
+    PLAYER_MONITOR_EVENT_RENDER_ERROR,
+    PLAYER_MONITOR_EVENT_AUDIO_ERROR,
+    PLAYER_MONITOR_EVENT_PLAY_COMPLETE,
+    PLAYER_MONITOR_EVENT_PLAY_SESSION_END,
+
+    PLAYER_MONITOR_EVENT_USER_PLAY = 100,
+    PLAYER_MONITOR_EVENT_USER_PAUSE = 101,
+    PLAYER_MONITOR_EVENT_USER_SEEK = 102,
+    PLAYER_MONITOR_EVENT_USER_STOP = 103,
+    PLAYER_MONITOR_EVENT_USER_RATE_CHANGE = 104,
+
+    PLAYER_MONITOR_EVENT_APP_ENTER_BACKGROUND = 105,
+    PLAYER_MONITOR_EVENT_APP_ENTER_FOREGROUND = 106,
+    PLAYER_MONITOR_EVENT_BG_AUTO_PAUSE = 107,
+    PLAYER_MONITOR_EVENT_FG_AUTO_RESUME = 108,
+    PLAYER_MONITOR_EVENT_BG_RELEASE_HW_DECODER = 109,
+
+    PLAYER_MONITOR_EVENT_PIP_WILL_START = 110,
+    PLAYER_MONITOR_EVENT_PIP_DID_START = 111,
+    PLAYER_MONITOR_EVENT_PIP_WILL_STOP = 112,
+    PLAYER_MONITOR_EVENT_PIP_DID_STOP = 113,
+    PLAYER_MONITOR_EVENT_PIP_START_FAIL = 114,
+    PLAYER_MONITOR_EVENT_PIP_RESTORE_UI = 115,
+    PLAYER_MONITOR_EVENT_PIP_USER_START = 116,
+
+    PLAYER_MONITOR_EVENT_AUDIO_QUEUE_START = 120,
+    PLAYER_MONITOR_EVENT_AUDIO_QUEUE_PAUSE = 121,
+    PLAYER_MONITOR_EVENT_AUDIO_QUEUE_STOP = 122,
+    PLAYER_MONITOR_EVENT_AUDIO_QUEUE_START_FAIL = 123,
+    PLAYER_MONITOR_EVENT_AUDIO_QUEUE_ENQUEUE_FAIL = 124,
+    PLAYER_MONITOR_EVENT_AUDIO_SILENCE = 125,
+
+    PLAYER_MONITOR_EVENT_VIDEO_RENDER_STALL = 130,
+    PLAYER_MONITOR_EVENT_VIDEO_FRAME_DROP = 131,
+
+    PLAYER_MONITOR_EVENT_AUDIO_INTERRUPTION_BEGAN = 132,
+    PLAYER_MONITOR_EVENT_AUDIO_INTERRUPTION_ENDED = 133,
+    PLAYER_MONITOR_EVENT_AUDIO_ROUTE_CHANGE = 134,
+    PLAYER_MONITOR_EVENT_AUDIO_OUTPUT_RECOVER = 135,
+    PLAYER_MONITOR_EVENT_AUDIO_MEDIA_SERVICES_LOST = 136,
+    PLAYER_MONITOR_EVENT_AUDIO_MEDIA_SERVICES_RESET = 137,
+
+    PLAYER_MONITOR_EVENT_DECODE_PATH_RESOLVED = 138,
+    PLAYER_MONITOR_EVENT_OPEN_URL_RESOLVED = 139,
+
+    PLAYER_MONITOR_EVENT_TRACE = 150,
+
+    PLAYER_MONITOR_EVENT_NETWORK_SNAPSHOT = 160,
+    PLAYER_MONITOR_EVENT_NETWORK_WEAK_SIGNAL = 162,
+} PlayerMonitorEventTypeC;
+
+typedef struct {
+    PlayerMonitorEventTypeC type;
+    int64_t timestamp_ms;
+    double position;
+    double duration;
+    double start_position;
+    double seek_target;
+    double seek_landing;
+    int64_t cost_ms;
+    int64_t stall_ms;
+    int64_t total_stall_ms;
+    int reconnect_count;
+    double buffer_ahead_sec;    // 缓冲超前量（秒），未知时为 -1
+    int loading;              // 0/1
+    int encrypted;            // 0/1
+    int data_source_mode;
+    int error_code;
+    int ffmpeg_code;
+    int recoverable;          // 0/1
+    int http_status;
+    const char* url;
+    const char* detail;
+    const char* error_message;
+    const char* ffmpeg_message;
+    const char* error_domain;
+    const char* event_name;
+    const char* message;
+    const char* trace_point;
+    const char* phase;
+} PlayerMonitorEventC;
+
+typedef void (*MonitorEventCallbackC)(const PlayerMonitorEventC* event, void* user_data);
+
 // 设置回调函数
 void player_core_set_state_changed_callback(PlayerCoreHandle* handle, StateChangedCallbackC callback, void* user_data);
 void player_core_set_error_callback(PlayerCoreHandle* handle, ErrorCallbackC callback, void* user_data);
@@ -329,6 +444,7 @@ void player_core_set_playback_completed_callback(PlayerCoreHandle* handle, Playb
 void player_core_set_loading_callback(PlayerCoreHandle* handle, LoadingCallbackC callback, void* user_data);
 void player_core_set_pipeline_state_changed_callback(PlayerCoreHandle* handle, PipelineStateChangedCallbackC callback, void* user_data);
 void player_core_set_playing_changed_callback(PlayerCoreHandle* handle, PlayingChangedCallbackC callback, void* user_data);
+void player_core_set_monitor_event_callback(PlayerCoreHandle* handle, MonitorEventCallbackC callback, void* user_data);
 
 // ========== 日志配置 ==========
 

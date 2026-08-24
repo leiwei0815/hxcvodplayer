@@ -145,6 +145,24 @@ public:
     void   setSystemMusicVolumeZero(bool volume_zero);
     double consumeVideoStallRecoverPosition();
 
+    // 监控事件队列（polling 模式：Core push → 队列 → JNI poll → Kotlin trackNamed）
+    void   setupMonitorCallback();
+    bool   consumeMonitorEvent(std::string& event_name,
+                               std::string& detail,
+                               double& position,
+                               double& duration,
+                               int64_t& timestamp_ms,
+                               int& error_code,
+                               int& ffmpeg_code,
+                               int& reconnect_count,
+                               int64_t& total_stall_ms,
+                               double& buffer_ahead_sec,
+                               int& recoverable,
+                               double& seek_target,
+                               double& seek_landing,
+                               int64_t& cost_ms,
+                               int64_t& stall_ms);
+
 private:
     // -----------------------------------------------------------------------
     // Core
@@ -152,6 +170,27 @@ private:
     // 串行化控制面 API（open/stop/play/pause/seek/release），避免并发操作 core。
     mutable std::mutex api_mutex_;
     PlayerCoreHandle* player_core_;
+
+    // 监控事件队列（Core push 回调写入，JNI polling 消费）
+    struct MonitorEventEntry {
+        std::string event_name;
+        std::string detail;
+        double position = 0.0;
+        double duration = 0.0;
+        int64_t timestamp_ms = 0;
+        int error_code = 0;
+        int ffmpeg_code = 0;
+        int reconnect_count = 0;
+        int64_t total_stall_ms = 0;
+        double buffer_ahead_sec = -1.0;
+        int recoverable = 0;
+        double seek_target = 0.0;
+        double seek_landing = 0.0;
+        int64_t cost_ms = 0;
+        int64_t stall_ms = 0;
+    };
+    std::mutex monitor_queue_mutex_;
+    std::vector<MonitorEventEntry> monitor_queue_;
 
     // -----------------------------------------------------------------------
     // Surface state  (protected by render_mutex_ / render_cv_)
