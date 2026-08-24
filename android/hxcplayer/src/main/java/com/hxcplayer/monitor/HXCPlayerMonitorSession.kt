@@ -123,7 +123,7 @@ class HXCPlayerMonitorSession(
         fun defaultEventType(code: Int, errorCode: Int = 0, recoverable: Boolean = false): String = when (code) {
             CODE_OPEN_FAIL, CODE_SEEK_FAIL -> "error"
             CODE_LOADING_BEGIN -> "warn"
-            CODE_NETWORK_SNAPSHOT -> "trace"
+            CODE_TRACE, CODE_NETWORK_SNAPSHOT -> "trace"
             CODE_NETWORK_WEAK_SIGNAL -> "warn"
             CODE_DECODE_ERROR, CODE_RENDER_ERROR, CODE_AUDIO_ERROR ->
                 if (recoverable) "warn" else "error"
