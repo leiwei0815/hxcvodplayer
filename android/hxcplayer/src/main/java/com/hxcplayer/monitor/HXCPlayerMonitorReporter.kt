@@ -74,6 +74,7 @@ class HXCPlayerMonitorReporter(
                         "eventCode=${event.optInt("eventCode")} " +
                         "eventType=${event.optString("eventType")} " +
                         "errorCode=${event.optInt("errorCode")} " +
+                        "userId=${this.userId} " +
                         "immediate=$immediate")
             }
             sendText(text)
