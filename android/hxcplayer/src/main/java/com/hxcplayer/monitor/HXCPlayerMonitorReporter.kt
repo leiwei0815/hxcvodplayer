@@ -8,7 +8,6 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONObject
 import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
@@ -111,20 +110,13 @@ class HXCPlayerMonitorReporter(
 
     private fun webSocketUrl(): String? {
         val base = config.endpoint ?: return null
-        // toHttpUrlOrNull() 不支持 wss/ws scheme，先转成 https/http 再解析
-        val httpBase = when {
-            base.startsWith("wss://") -> "https://" + base.substring(6)
-            base.startsWith("ws://") -> "http://" + base.substring(5)
-            else -> base
-        }
-        val comp = httpBase.toHttpUrlOrNull() ?: return null
-        val builder = comp.newBuilder()
-            .addQueryParameter("user_id", this.userId)
-            .addQueryParameter("terminal", terminalTag())
-        // 强制 wss/ws scheme
-        if (comp.scheme == "https") builder.scheme("wss")
-        else if (comp.scheme == "http") builder.scheme("ws")
-        return builder.build().toString()
+        // 直接拼接 query 参数，不经过 HttpUrl 解析（其对 wss/ws scheme 支持有限）
+        val separator = if (base.contains("?")) "&" else "?"
+        return "$base${separator}user_id=${urlEncode(userId)}&terminal=${urlEncode(terminalTag())}"
+    }
+
+    private fun urlEncode(value: String): String {
+        return java.net.URLEncoder.encode(value, "UTF-8")
     }
 
     private fun connectIfNeeded() {
