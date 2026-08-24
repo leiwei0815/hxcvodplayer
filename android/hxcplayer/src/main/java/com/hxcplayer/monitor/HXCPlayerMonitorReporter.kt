@@ -111,7 +111,13 @@ class HXCPlayerMonitorReporter(
 
     private fun webSocketUrl(): String? {
         val base = config.endpoint ?: return null
-        val comp = base.toHttpUrlOrNull() ?: return null
+        // toHttpUrlOrNull() 不支持 wss/ws scheme，先转成 https/http 再解析
+        val httpBase = when {
+            base.startsWith("wss://") -> "https://" + base.substring(6)
+            base.startsWith("ws://") -> "http://" + base.substring(5)
+            else -> base
+        }
+        val comp = httpBase.toHttpUrlOrNull() ?: return null
         val builder = comp.newBuilder()
             .addQueryParameter("user_id", this.userId)
             .addQueryParameter("terminal", terminalTag())
