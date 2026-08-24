@@ -753,6 +753,16 @@ class HXCPlayerControl @JvmOverloads constructor(
         monitorSession.userContext = ctx
     }
 
+    /** 应用进入后台，app 在 onStop 中调用。 */
+    fun onAppEnterBackground() {
+        monitorSession.trackNamed("app_enter_background", getPosition(), getDuration(), null, null, false)
+    }
+
+    /** 应用回到前台，app 在 onStart/onResume 中调用。 */
+    fun onAppEnterForeground() {
+        monitorSession.trackNamed("app_enter_foreground", getPosition(), getDuration(), null, null, false)
+    }
+
     /**
      * 用于承载解码输出的视图（[SurfaceView] 或 [TextureView]），请加入布局。
      */
@@ -2457,6 +2467,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!licenseAllowedOrNotify("play")) {
             return
         }
+        monitorSession.trackNamed("user_play", getPosition(), getDuration(), null, null, false)
         val requestAtMs = SystemClock.elapsedRealtime()
         playStallLastPlayReqAtMs = requestAtMs
         playStallCheckArmed = true
@@ -2528,6 +2539,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun pause() {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
+        monitorSession.trackNamed("user_pause", getPosition(), getDuration(), null, null, false)
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
         val generation = nextPlaybackCommandGeneration(false)
@@ -2567,6 +2579,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         var target = maxOf(0.0, position)
         val duration = getDuration()
+        monitorSession.trackNamed("user_seek", getPosition(), duration,
+            "target=${"%.3f".format(target)}", mapOf("seekTarget" to target), false)
         if (duration > 0.0) {
             val maxSeek = maxOf(0.0, duration - 0.35)
             if (target > maxSeek) {
@@ -2621,6 +2635,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         preferredPlaybackRate = normalizedRate
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
+        monitorSession.trackNamed("user_rate_change", getPosition(), getDuration(),
+            "rate=${normalizedRate}", mapOf("rate" to normalizedRate.toDouble()), false)
         nativeSetPlaybackRate(handle, normalizedRate)
     }
 
