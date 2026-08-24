@@ -738,7 +738,10 @@ class HXCPlayerControl @JvmOverloads constructor(
 
     private var monitorUserContext: HXCPlayerMonitorUserContext? = null
     private val monitorSession: HXCPlayerMonitorSession =
-        HXCPlayerMonitorSession(context, HXCPlayerMonitorConfig())
+        HXCPlayerMonitorSession(context, HXCPlayerMonitorConfig().apply {
+            // 调试阶段开启监控日志，验证上报链路；稳定后可关闭
+            debugLog = true
+        })
 
     /**
      * 设置监控上报的用户 id（SDK 内部自动监控并上报，应用层仅需在登录/播放时传入）。

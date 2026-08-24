@@ -70,6 +70,13 @@ class HXCPlayerMonitorReporter(
                 .put("terminal", terminalTag())
                 .put("content", event)
             val text = message.toString()
+            if (config.debugLog) {
+                Log.d(TAG, "enqueue: eventName=${event.optString("eventName")} " +
+                        "eventCode=${event.optInt("eventCode")} " +
+                        "eventType=${event.optString("eventType")} " +
+                        "errorCode=${event.optInt("errorCode")} " +
+                        "immediate=$immediate")
+            }
             sendText(text)
             if (immediate) {
                 connectIfNeeded()
@@ -124,6 +131,7 @@ class HXCPlayerMonitorReporter(
             override fun onOpen(ws: WebSocket, response: Response) {
                 connecting = false
                 reconnectAttempts = 0
+                if (config.debugLog) Log.d(TAG, "ws connected: ${response.code} url=$url")
                 drainPending()
             }
 
@@ -170,10 +178,14 @@ class HXCPlayerMonitorReporter(
                     Log.w(TAG, "pending overflow, drop oldest")
                 }
                 pendingQueue.addLast(text)
+                if (config.debugLog) Log.d(TAG, "queued (ws not ready), pending=${pendingQueue.size}")
             }
             return
         }
         val ok = ws.send(text)
+        if (config.debugLog) {
+            Log.d(TAG, if (ok) "sent ok, len=${text.length}" else "send failed")
+        }
         if (!ok) {
             // 发送失败：重连，该消息不重发（实时事件过期意义不大）
             ws.cancel()

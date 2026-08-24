@@ -30,5 +30,7 @@ data class HXCPlayerMonitorConfig(
     var flushIntervalMs: Long = 5000L,
     var maxQueueSize: Int = 200,
     var requestTimeoutMs: Int = 3000,
-    var maxRetryCount: Int = 2
+    var maxRetryCount: Int = 2,
+    /** 调试日志开关：开启后在 logcat 输出事件发送/连接状态，TAG=HXCMonitor */
+    var debugLog: Boolean = false
 )
