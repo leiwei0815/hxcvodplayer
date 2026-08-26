@@ -149,6 +149,10 @@ public:
     void   setupMonitorCallback();
     bool   consumeMonitorEvent(std::string& event_name,
                                std::string& detail,
+                               std::string& message,
+                               std::string& trace_point,
+                               std::string& phase,
+                               std::string& url,
                                double& position,
                                double& duration,
                                int64_t& timestamp_ms,
@@ -175,6 +179,10 @@ private:
     struct MonitorEventEntry {
         std::string event_name;
         std::string detail;
+        std::string message;
+        std::string trace_point;
+        std::string phase;
+        std::string url;
         double position = 0.0;
         double duration = 0.0;
         int64_t timestamp_ms = 0;

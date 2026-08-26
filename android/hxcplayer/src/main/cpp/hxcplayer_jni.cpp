@@ -750,19 +750,33 @@ Java_com_hxcplayer_HXCPlayerControl_nativeConsumeVideoStallRecoverPosition(JNIEn
     return player->consumeVideoStallRecoverPosition();
 }
 
+static std::string hxc_json_escape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        if (c == '"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else out += c;
+    }
+    return out;
+}
+
 JNIEXPORT jstring JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeConsumeMonitorEvent(JNIEnv* env, jobject thiz, jlong handle) {
     (void)thiz;
     auto* player = reinterpret_cast<AndroidPlayer*>(handle);
     if (!player) return nullptr;
 
-    std::string event_name, detail;
+    std::string event_name, detail, message, trace_point, phase, media_url;
     double position = 0.0, duration = 0.0, buffer_ahead_sec = -1.0;
     double seek_target = 0.0, seek_landing = 0.0;
     int64_t timestamp_ms = 0, total_stall_ms = 0, cost_ms = 0, stall_ms = 0;
     int error_code = 0, ffmpeg_code = 0, reconnect_count = 0, recoverable = 0;
 
-    if (!player->consumeMonitorEvent(event_name, detail, position, duration,
+    if (!player->consumeMonitorEvent(event_name, detail, message, trace_point, phase, media_url,
+                                     position, duration,
                                      timestamp_ms, error_code, ffmpeg_code,
                                      reconnect_count, total_stall_ms,
                                      buffer_ahead_sec, recoverable,
@@ -771,8 +785,7 @@ Java_com_hxcplayer_HXCPlayerControl_nativeConsumeMonitorEvent(JNIEnv* env, jobje
         return nullptr;
     }
 
-    // 组装 JSON 返回给 Kotlin
-    std::string json = "{\"event\":\"" + event_name + "\"";
+    std::string json = "{\"event\":\"" + hxc_json_escape(event_name) + "\"";
     json += ",\"position\":" + std::to_string(position);
     json += ",\"duration\":" + std::to_string(duration);
     json += ",\"timestampMs\":" + std::to_string(timestamp_ms);
@@ -786,17 +799,11 @@ Java_com_hxcplayer_HXCPlayerControl_nativeConsumeMonitorEvent(JNIEnv* env, jobje
     json += ",\"seekLanding\":" + std::to_string(seek_landing);
     json += ",\"costMs\":" + std::to_string(cost_ms);
     json += ",\"stallMs\":" + std::to_string(stall_ms);
-    // detail 转义双引号
-    std::string escaped_detail;
-    escaped_detail.reserve(detail.size());
-    for (char c : detail) {
-        if (c == '"') escaped_detail += "\\\"";
-        else if (c == '\\') escaped_detail += "\\\\";
-        else if (c == '\n') escaped_detail += "\\n";
-        else if (c == '\r') escaped_detail += "\\r";
-        else escaped_detail += c;
-    }
-    json += ",\"detail\":\"" + escaped_detail + "\"";
+    json += ",\"detail\":\"" + hxc_json_escape(detail) + "\"";
+    json += ",\"message\":\"" + hxc_json_escape(message) + "\"";
+    json += ",\"tracePoint\":\"" + hxc_json_escape(trace_point) + "\"";
+    json += ",\"phase\":\"" + hxc_json_escape(phase) + "\"";
+    json += ",\"url\":\"" + hxc_json_escape(media_url) + "\"";
     json += "}";
 
     return env->NewStringUTF(json.c_str());

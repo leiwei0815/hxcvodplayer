@@ -1475,6 +1475,27 @@ int PlayerCore::open_common_process(const std::string &filename) {
     auto common_begin = std::chrono::steady_clock::now();
     video_stream_opened_ = false;
     audio_stream_opened_ = false;
+    if (format_ctx_ && format_ctx_->url) {
+        const std::string resolved = format_ctx_->url;
+        if (!resolved.empty() && resolved != filename) {
+            MonitorEvent redirect_ev;
+            redirect_ev.type = MonitorEventType::OpenUrlResolved;
+            redirect_ev.timestamp_ms = monitor_now_ms();
+            redirect_ev.position = 0;
+            redirect_ev.duration = 0;
+            redirect_ev.url = resolved;
+            redirect_ev.detail = "requestUrl=" + filename + ",resolvedUrl=" + resolved;
+            emit_monitor_event(redirect_ev);
+        }
+    }
+    {
+        MonitorEvent ev;
+        ev.type = MonitorEventType::OpenBegin;
+        ev.timestamp_ms = monitor_now_ms();
+        ev.position = 0;
+        ev.duration = 0;
+        emit_monitor_event(ev);
+    }
     emit_monitor_trace("core.open.common_begin", "进入 open_common_process", filename, "open");
     // 获取流信息
     auto find_stream_begin = std::chrono::steady_clock::now();

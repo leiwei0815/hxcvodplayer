@@ -16,12 +16,13 @@ import java.util.concurrent.TimeUnit
  * WebSocket 实时上报（失败不影响播放）。
  *
  * 连接 URL：{endpoint}?user_id={userId}&terminal={terminalTag}
- * 消息体：{"user_id": "...", "terminal": "...", "content": {event}}
+ * 消息体：{"app_name":"...","user_id":"...","terminal":"...","content":{event}}
  */
 class HXCPlayerMonitorReporter(
     @Volatile private var config: HXCPlayerMonitorConfig,
     private val terminalType: String,
-    private val sdkVersion: String
+    private val sdkVersion: String,
+    private val appName: String = ""
 ) {
     @Volatile private var userId: String = "anonymous"
 
@@ -65,6 +66,7 @@ class HXCPlayerMonitorReporter(
                 return@post
             }
             val message = JSONObject()
+                .put("app_name", appName.ifBlank { "unknown" })
                 .put("user_id", this.userId)
                 .put("terminal", terminalTag())
                 .put("content", event)

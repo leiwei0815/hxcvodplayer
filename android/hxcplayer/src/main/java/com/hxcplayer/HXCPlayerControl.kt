@@ -1924,7 +1924,13 @@ class HXCPlayerControl @JvmOverloads constructor(
         monitorSession.engineType = "custom"
         monitorSession.userContext = monitorUserContext
         monitorSession.metadata = metadata
-        monitorSession.beginSession(url, mode, encrypted, startPosition)
+        monitorSession.beginSession(
+            url,
+            mode,
+            encrypted,
+            startPosition,
+            if (decodeMode == DecodeMode.HARDWARE) "hardware" else "software"
+        )
     }
 
     private fun maybeAutoReopen(errorCode: Int, recoverable: Boolean) {
@@ -3101,7 +3107,9 @@ class HXCPlayerControl @JvmOverloads constructor(
                 val firstFrameRendered = nativeHasRenderedFirstFrame(handle)
                 if (firstFrameRendered && !renderedFirstFrameNotified) {
                     renderedFirstFrameNotified = true
-                    monitorSession.trackFirstFrame(getPosition(), getDuration())
+                    val w = nativeGetVideoWidth(handle).coerceAtLeast(lastVideoSize.width)
+                    val h = nativeGetVideoHeight(handle).coerceAtLeast(lastVideoSize.height)
+                    monitorSession.trackFirstFrame(getPosition(), getDuration(), w, h)
                     mainHandler.post {
                         if (!isReleased) callback?.onRenderedFirstFrame()
                     }
@@ -3783,7 +3791,8 @@ class HXCPlayerControl @JvmOverloads constructor(
                             extra["errorCode"] = ev.optInt("errorCode")
                         }
                         if (ev.has("ffmpegCode")) extra["ffmpegCode"] = ev.optInt("ffmpegCode")
-                        if (ev.has("recoverable")) extra["recoverable"] = ev.optBoolean("recoverable")
+                        if (ev.has("recoverable")) extra["recoverable"] =
+                            ev.optInt("recoverable", 0) == 1 || ev.optBoolean("recoverable")
                         if (ev.has("reconnectCount")) extra["reconnectCount"] = ev.optInt("reconnectCount")
                         if (ev.has("totalStallMs")) extra["totalStallMs"] = ev.optLong("totalStallMs")
                         if (ev.has("stallMs")) extra["stallMs"] = ev.optLong("stallMs")
@@ -3791,6 +3800,15 @@ class HXCPlayerControl @JvmOverloads constructor(
                         if (ev.has("seekTarget")) extra["seekTarget"] = ev.optDouble("seekTarget")
                         if (ev.has("seekLanding")) extra["seekLanding"] = ev.optDouble("seekLanding")
                         if (ev.has("throughputKbps")) extra["throughputKbps"] = ev.optInt("throughputKbps")
+                        if (ev.has("bufferAheadSec")) extra["bufferAheadSec"] = ev.optDouble("bufferAheadSec")
+                        val mediaUrl = ev.optString("url", "")
+                        if (mediaUrl.isNotEmpty()) extra["url"] = mediaUrl
+                        val coreMessage = ev.optString("message", "")
+                        if (coreMessage.isNotEmpty()) extra["message"] = coreMessage
+                        val tracePoint = ev.optString("tracePoint", "")
+                        if (tracePoint.isNotEmpty()) extra["tracePoint"] = tracePoint
+                        val phase = ev.optString("phase", "")
+                        if (phase.isNotEmpty()) extra["phase"] = phase
                         val detail = ev.optString("detail", null)
                         monitorSession.trackNamed(
                             eventName,

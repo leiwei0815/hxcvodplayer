@@ -26,6 +26,8 @@ data class HXCPlayerMonitorConfig(
     var appId: String? = null,
     var uploadFullUrl: Boolean = true,
     var heartbeatIntervalMs: Long = 5000L,
+    /** 位置心跳（eventCode=6）。文档/iOS 默认关闭，core 也未 emit。 */
+    var enablePositionHeartbeat: Boolean = false,
     var batchSize: Int = 10,
     var flushIntervalMs: Long = 5000L,
     var maxQueueSize: Int = 200,

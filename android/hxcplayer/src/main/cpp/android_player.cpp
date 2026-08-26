@@ -7141,6 +7141,10 @@ void AndroidPlayer::setupMonitorCallback() {
             MonitorEventEntry entry;
             entry.event_name = ev->event_name ? ev->event_name : "unknown";
             entry.detail = ev->detail ? ev->detail : "";
+            entry.message = ev->message ? ev->message : "";
+            entry.trace_point = ev->trace_point ? ev->trace_point : "";
+            entry.phase = ev->phase ? ev->phase : "";
+            entry.url = ev->url ? ev->url : "";
             entry.position = ev->position;
             entry.duration = ev->duration;
             entry.timestamp_ms = ev->timestamp_ms;
@@ -7166,6 +7170,10 @@ void AndroidPlayer::setupMonitorCallback() {
 
 bool AndroidPlayer::consumeMonitorEvent(std::string& event_name,
                                         std::string& detail,
+                                        std::string& message,
+                                        std::string& trace_point,
+                                        std::string& phase,
+                                        std::string& url,
                                         double& position,
                                         double& duration,
                                         int64_t& timestamp_ms,
@@ -7184,6 +7192,10 @@ bool AndroidPlayer::consumeMonitorEvent(std::string& event_name,
     MonitorEventEntry& entry = monitor_queue_.front();
     event_name = std::move(entry.event_name);
     detail = std::move(entry.detail);
+    message = std::move(entry.message);
+    trace_point = std::move(entry.trace_point);
+    phase = std::move(entry.phase);
+    url = std::move(entry.url);
     position = entry.position;
     duration = entry.duration;
     timestamp_ms = entry.timestamp_ms;

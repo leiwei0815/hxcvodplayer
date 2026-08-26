@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import org.json.JSONObject
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.UUID
 
 /**
@@ -17,7 +18,7 @@ import java.util.UUID
 class HXCPlayerMonitorSession(
     context: Context,
     config: HXCPlayerMonitorConfig,
-    private val sdkVersion: String = "1.0.0"
+    private val sdkVersion: String = "1.0.9"
 ) {
     companion object {
         // 事件码（对齐 MonitorEventType 枚举）
@@ -41,9 +42,11 @@ class HXCPlayerMonitorSession(
         const val CODE_PLAY_COMPLETE = 17
         const val CODE_PLAY_SESSION_END = 18
         const val CODE_DECODE_PATH_RESOLVED = 138
+        const val CODE_OPEN_URL_RESOLVED = 139
         const val CODE_TRACE = 150
         const val CODE_NETWORK_SNAPSHOT = 160
         const val CODE_NETWORK_WEAK_SIGNAL = 162
+        const val CODE_VIDEO_RENDER_STALL = 130
         const val CODE_USER_PLAY = 100
         const val CODE_USER_PAUSE = 101
         const val CODE_USER_SEEK = 102
@@ -51,6 +54,14 @@ class HXCPlayerMonitorSession(
         const val CODE_USER_RATE_CHANGE = 104
         const val CODE_APP_ENTER_BACKGROUND = 105
         const val CODE_APP_ENTER_FOREGROUND = 106
+
+        private val NETWORK_TYPED_CODES = setOf(
+            CODE_PLAY_SESSION_START, CODE_OPEN_BEGIN, CODE_OPEN_SUCCESS, CODE_OPEN_FAIL,
+            CODE_SEEK_COMPLETE, CODE_SEEK_FAIL, CODE_LOADING_BEGIN, CODE_LOADING_END,
+            CODE_PLAY_COMPLETE, CODE_PLAY_SESSION_END, CODE_DECODE_PATH_RESOLVED,
+            CODE_OPEN_URL_RESOLVED, CODE_DECODE_ERROR, CODE_NETWORK_SNAPSHOT,
+            CODE_NETWORK_WEAK_SIGNAL
+        )
 
         fun eventNameToCode(name: String): Int = when (name) {
             "play_session_start" -> CODE_PLAY_SESSION_START
@@ -73,6 +84,8 @@ class HXCPlayerMonitorSession(
             "play_complete" -> CODE_PLAY_COMPLETE
             "play_session_end" -> CODE_PLAY_SESSION_END
             "decode_path_resolved" -> CODE_DECODE_PATH_RESOLVED
+            "open_url_resolved" -> CODE_OPEN_URL_RESOLVED
+            "video_render_stall" -> CODE_VIDEO_RENDER_STALL
             "trace" -> CODE_TRACE
             "network_snapshot" -> CODE_NETWORK_SNAPSHOT
             "network_weak_signal" -> CODE_NETWORK_WEAK_SIGNAL
@@ -107,6 +120,8 @@ class HXCPlayerMonitorSession(
             CODE_PLAY_COMPLETE -> "播放完成"
             CODE_PLAY_SESSION_END -> "播放会话结束"
             CODE_DECODE_PATH_RESOLVED -> "视频解码路径确定"
+            CODE_OPEN_URL_RESOLVED -> "播放地址已重定向"
+            CODE_VIDEO_RENDER_STALL -> "视频渲染等待超时"
             CODE_TRACE -> ""
             CODE_NETWORK_SNAPSHOT -> "网络快照"
             CODE_NETWORK_WEAK_SIGNAL -> "弱网信号"
@@ -123,6 +138,7 @@ class HXCPlayerMonitorSession(
         fun defaultEventType(code: Int, errorCode: Int = 0, recoverable: Boolean = false): String = when (code) {
             CODE_OPEN_FAIL, CODE_SEEK_FAIL -> "error"
             CODE_LOADING_BEGIN -> "warn"
+            CODE_VIDEO_RENDER_STALL -> "warn"
             CODE_TRACE, CODE_NETWORK_SNAPSHOT -> "trace"
             CODE_NETWORK_WEAK_SIGNAL -> "warn"
             CODE_DECODE_ERROR, CODE_RENDER_ERROR, CODE_AUDIO_ERROR ->
@@ -151,7 +167,14 @@ class HXCPlayerMonitorSession(
         private set
 
     private val appContext = context.applicationContext
-    private val reporter = HXCPlayerMonitorReporter(config, "android", sdkVersion)
+    private val appName: String = try {
+        context.applicationContext.applicationInfo
+            .loadLabel(context.applicationContext.packageManager)
+            .toString()
+    } catch (_: Throwable) {
+        context.applicationContext.packageName
+    }
+    private val reporter = HXCPlayerMonitorReporter(config, "android", sdkVersion, appName)
     private val sessionThread = HandlerThread("hxc-monitor-session").apply { start() }
     private val sessionHandler = Handler(sessionThread.looper)
 
@@ -169,6 +192,9 @@ class HXCPlayerMonitorSession(
     private var networkConstrained: Boolean = false
     private var totalStallMs: Long = 0
     private var reconnectCount: Int = 0
+    private var rebufferCount: Int = 0
+    private var lastErrorCode: Int = 0
+    private var expectedDecodeMode: String? = null
     private var sessionActive: Boolean = false
     private var openBeginMs: Long = 0L
     private var traceSeq: Long = 0L
@@ -224,11 +250,12 @@ class HXCPlayerMonitorSession(
         url: String?,
         dataSourceMode: Int,
         encrypted: Boolean,
-        startPosition: Double
+        startPosition: Double,
+        expectedDecodeMode: String? = null
     ) {
         sessionHandler.post {
             if (sessionActive) {
-                endSession("replaced", lastPosition, duration)
+                endSessionLocked("replaced", lastPosition, duration, errorCode = 0, eventType = "info")
             }
             playSessionId = UUID.randomUUID().toString()
             this.url = url
@@ -236,30 +263,65 @@ class HXCPlayerMonitorSession(
             this.dataSourceMode = dataSourceMode
             this.encrypted = encrypted
             this.startPosition = startPosition
+            this.expectedDecodeMode = expectedDecodeMode
             this.sessionActive = true
             this.totalStallMs = 0
             this.reconnectCount = 0
+            this.rebufferCount = 0
+            this.lastErrorCode = 0
             this.openBeginMs = System.currentTimeMillis()
             traceSeq = 0
+            refreshNetworkSnapshot()
+            val detail = buildString {
+                append("mode=").append(dataSourceMode)
+                append(" encrypted=").append(if (encrypted) "YES" else "NO")
+                append(" startPosition=").append("%.3f".format(Locale.US, startPosition))
+                if (!expectedDecodeMode.isNullOrEmpty()) {
+                    append(" expectedDecodeMode=").append(expectedDecodeMode)
+                }
+                append(" url=").append(url ?: "")
+                append(" ").append(networkSnapshotDetail())
+            }
             emit(CODE_PLAY_SESSION_START, "play_session_start", "info",
-                 message = "播放会话开始", position = startPosition, duration = duration,
-                 immediate = true)
+                 message = "播放会话开始", position = startPosition, duration = 0.0,
+                 detail = detail, expectedDecodeMode = expectedDecodeMode,
+                 attachNetworkType = true, immediate = true)
             restartHeartbeat()
         }
     }
 
     fun endSession(reason: String, position: Double, duration: Double) {
         sessionHandler.post {
-            if (!sessionActive) return@post
-            sessionActive = false
-            stopHeartbeat()
-            lastPosition = position
-            this.duration = duration
-            emit(CODE_PLAY_SESSION_END, "play_session_end", "info",
-                 message = "播放会话结束", position = position, duration = duration,
-                 detail = reason, immediate = true)
-            reporter.flush()
+            val failed = reason == "failed"
+            endSessionLocked(
+                reason = reason,
+                position = position,
+                duration = duration,
+                errorCode = if (failed) lastErrorCode else 0,
+                eventType = if (failed) "error" else "info"
+            )
         }
+    }
+
+    private fun endSessionLocked(
+        reason: String,
+        position: Double,
+        duration: Double,
+        errorCode: Int,
+        eventType: String
+    ) {
+        if (!sessionActive) return
+        sessionActive = false
+        stopHeartbeat()
+        lastPosition = position
+        this.duration = duration
+        val detail = "endReason=$reason,${networkSnapshotDetail()}," +
+                "totalStallMs=$totalStallMs,rebufferCount=$rebufferCount,reconnectCount=$reconnectCount"
+        emit(CODE_PLAY_SESSION_END, "play_session_end", eventType,
+             errorCode = errorCode, message = "播放会话结束",
+             position = position, duration = duration,
+             detail = detail, attachNetworkType = true, immediate = true)
+        reporter.flush()
     }
 
     fun trackOpenSuccess(duration: Double, width: Int, height: Int, costMs: Long) {
@@ -268,14 +330,20 @@ class HXCPlayerMonitorSession(
             videoWidth = width
             videoHeight = height
             emit(CODE_OPEN_SUCCESS, "open_success", "info",
-                 message = "打开成功", position = startPosition, duration = duration,
-                 costMs = costMs, immediate = true)
+                 message = "打开成功", position = 0.0, duration = duration,
+                 costMs = costMs, attachNetworkType = true, immediate = true)
         }
     }
 
     fun trackOpenFail(code: Int, message: String, position: Double, duration: Double) {
-        trackError("open_fail", code, message, position, duration)
-        endSession("failed", position, duration)
+        sessionHandler.post {
+            lastErrorCode = code
+            emit(CODE_OPEN_FAIL, "open_fail", "error",
+                 errorCode = code, message = message,
+                 position = position, duration = duration,
+                 detail = message, attachNetworkType = true, immediate = true)
+            endSessionLocked("failed", position, duration, errorCode = code, eventType = "error")
+        }
     }
 
     fun trackError(
@@ -286,28 +354,34 @@ class HXCPlayerMonitorSession(
         duration: Double
     ) {
         sessionHandler.post {
+            lastErrorCode = code
             val eventCode = eventNameToCode(eventName)
             val eventType = if (eventName == "open_fail") "error" else "warn"
             emit(eventCode, eventName, eventType,
                  errorCode = code, message = message,
-                 position = position, duration = duration, immediate = true)
+                 position = position, duration = duration,
+                 detail = message, attachNetworkType = true, immediate = true)
         }
     }
 
-    fun trackFirstFrame(position: Double, duration: Double) {
+    fun trackFirstFrame(position: Double, duration: Double, width: Int = 0, height: Int = 0) {
         sessionHandler.post {
+            if (width > 0) videoWidth = width
+            if (height > 0) videoHeight = height
             val cost = if (openBeginMs > 0) System.currentTimeMillis() - openBeginMs else 0L
+            val sizeDetail = if (videoWidth > 0 && videoHeight > 0) "${videoWidth}x$videoHeight" else null
             emit(CODE_FIRST_FRAME, "first_frame", "info",
                  message = "首帧渲染", position = position, duration = duration,
-                 costMs = cost, immediate = true)
+                 detail = sizeDetail, costMs = cost, immediate = true)
         }
     }
 
     fun trackStateChange(state: String, position: Double, duration: Double) {
         sessionHandler.post {
+            val normalized = if (state.startsWith("state=")) state else "state=${state.lowercase()}"
             emit(CODE_STATE_CHANGE, "state_change", "info",
                  message = "播放状态变更", position = position, duration = duration,
-                 detail = state, immediate = false)
+                 detail = normalized, immediate = false)
         }
     }
 
@@ -323,13 +397,14 @@ class HXCPlayerMonitorSession(
             this.totalStallMs = totalStallMs
             this.reconnectCount = reconnectCount
             if (loading) {
+                rebufferCount += 1
                 emit(CODE_LOADING_BEGIN, "loading_begin", "warn",
                      message = "开始缓冲", position = position, duration = duration,
-                     immediate = false)
+                     attachNetworkType = true, immediate = false)
             } else {
                 emit(CODE_LOADING_END, "loading_end", "info",
                      message = "缓冲结束", position = position, duration = duration,
-                     stallMs = stallMs, immediate = true)
+                     stallMs = stallMs, attachNetworkType = true, immediate = true)
             }
         }
     }
@@ -338,7 +413,7 @@ class HXCPlayerMonitorSession(
         sessionHandler.post {
             emit(CODE_PLAY_COMPLETE, "play_complete", "info",
                  message = "播放完成", position = position, duration = duration,
-                 immediate = true)
+                 attachNetworkType = true, immediate = true)
         }
         endSession("completed", position, duration)
     }
@@ -357,7 +432,7 @@ class HXCPlayerMonitorSession(
             networkConstrained = constrained
             emit(CODE_NETWORK_CHANGE, "network_change", "info",
                  message = "网络变化", position = lastPosition, duration = this.duration,
-                 detail = type, immediate = false)
+                 detail = type, attachNetworkType = true, immediate = false)
         }
     }
 
@@ -375,28 +450,52 @@ class HXCPlayerMonitorSession(
         sessionHandler.post {
             lastPosition = position
             if (duration > 0) this.duration = duration
+            (extra?.get("totalStallMs") as? Number)?.toLong()?.let { totalStallMs = it }
+            (extra?.get("reconnectCount") as? Number)?.toInt()?.let { reconnectCount = it }
             val eventCode = eventNameToCode(eventName)
-            val errorCode = (extra?.get("errorCode") as? Int) ?: 0
-            val recoverable = (extra?.get("recoverable") as? Boolean) ?: false
+            val errorCode = (extra?.get("errorCode") as? Number)?.toInt() ?: 0
+            val recoverable = (extra?.get("recoverable") as? Boolean)
+                ?: ((extra?.get("recoverable") as? Number)?.toInt() == 1)
+            val coreMessage = (extra?.get("message") as? String)?.takeIf { it.isNotEmpty() }
+            val tracePoint = (extra?.get("tracePoint") as? String)?.takeIf { it.isNotEmpty() }
+            val phase = (extra?.get("phase") as? String)?.takeIf { it.isNotEmpty() }
+            if (eventName == "trace") {
+                emitTrace(
+                    tracePoint = tracePoint,
+                    phase = phase,
+                    message = coreMessage ?: defaultMessage(CODE_TRACE),
+                    detail = detail,
+                    position = position,
+                    duration = if (duration > 0) duration else this.duration
+                )
+                return@post
+            }
+            if (errorCode != 0) lastErrorCode = errorCode
             val eventType = defaultEventType(eventCode, errorCode, recoverable)
-            val message = defaultMessage(eventCode)
-            val costMs = (extra?.get("costMs") as? Long) ?: 0L
-            val stallMs = (extra?.get("stallMs") as? Long) ?: 0L
-            val seekTarget = (extra?.get("seekTarget") as? Double) ?: 0.0
-            val seekLanding = (extra?.get("seekLanding") as? Double) ?: 0.0
-            val ffmpegCode = (extra?.get("ffmpegCode") as? Int) ?: 0
-            // 网络快照：从 detail 解析 throughputKbps
-            var throughputKbps = (extra?.get("throughputKbps") as? Int) ?: -1
+            val message = coreMessage ?: defaultMessage(eventCode)
+            val costMs = (extra?.get("costMs") as? Number)?.toLong() ?: 0L
+            val stallMs = (extra?.get("stallMs") as? Number)?.toLong() ?: 0L
+            val seekTarget = (extra?.get("seekTarget") as? Number)?.toDouble() ?: 0.0
+            val seekLanding = (extra?.get("seekLanding") as? Number)?.toDouble() ?: 0.0
+            val ffmpegCode = (extra?.get("ffmpegCode") as? Number)?.toInt() ?: 0
+            var throughputKbps = (extra?.get("throughputKbps") as? Number)?.toInt() ?: -1
             if (eventCode == CODE_NETWORK_SNAPSHOT && throughputKbps < 0) {
                 throughputKbps = parseKvFromDetail(detail, "throughputKbps")?.toIntOrNull() ?: -1
             }
+            val bufferAheadSec = (extra?.get("bufferAheadSec") as? Number)?.toDouble() ?: -1.0
+            val mediaUrl = (extra?.get("url") as? String)?.takeIf { it.isNotEmpty() }
+                ?: parseKvFromDetail(detail, "resolvedUrl")
             emit(eventCode, eventName, eventType,
                  errorCode = errorCode, message = message,
                  position = position, duration = if (duration > 0) duration else this.duration,
                  detail = detail, costMs = costMs, stallMs = stallMs,
                  seekTarget = seekTarget, seekLanding = seekLanding,
                  ffmpegCode = ffmpegCode, recoverable = recoverable,
-                 throughputKbps = throughputKbps, immediate = immediate)
+                 throughputKbps = throughputKbps,
+                 bufferAheadSec = bufferAheadSec,
+                 mediaUrl = mediaUrl,
+                 attachNetworkType = eventCode in NETWORK_TYPED_CODES,
+                 immediate = immediate)
         }
     }
 
@@ -414,7 +513,7 @@ class HXCPlayerMonitorSession(
 
     private fun restartHeartbeat() {
         stopHeartbeat()
-        if (!config.enabled) return
+        if (!config.enabled || !config.enablePositionHeartbeat) return
         sessionHandler.postDelayed(heartbeatRunnable, config.heartbeatIntervalMs.coerceAtLeast(1000L))
     }
 
@@ -442,6 +541,10 @@ class HXCPlayerMonitorSession(
         ffmpegCode: Int = 0,
         recoverable: Boolean = false,
         throughputKbps: Int = -1,
+        bufferAheadSec: Double = -1.0,
+        mediaUrl: String? = null,
+        expectedDecodeMode: String? = null,
+        attachNetworkType: Boolean = false,
         immediate: Boolean
     ) {
         if (!config.enabled) return
@@ -459,23 +562,21 @@ class HXCPlayerMonitorSession(
         event.put("sdkVersion", sdkVersion)
         event.put("recoverable", recoverable)
 
-        if (!url.isNullOrEmpty()) {
-            event.put("url", if (config.uploadFullUrl) url else "")
-        }
-        if (!urlHash.isNullOrEmpty()) event.put("urlHash", urlHash)
-
         if (!detail.isNullOrEmpty()) event.put("detail", detail)
+        if (!mediaUrl.isNullOrEmpty()) event.put("url", mediaUrl)
         if (costMs > 0) event.put("costMs", costMs)
         if (stallMs > 0) event.put("stallMs", stallMs)
         if (totalStallMs > 0) event.put("totalStallMs", totalStallMs)
+        if (rebufferCount > 0) event.put("rebufferCount", rebufferCount)
         if (reconnectCount > 0) event.put("reconnectCount", reconnectCount)
-        if (networkType != "unknown") event.put("networkType", networkType)
+        if (attachNetworkType && networkType.isNotEmpty()) event.put("networkType", networkType)
         if (seekTarget > 0) event.put("seekTarget", seekTarget)
         if (seekLanding > 0) event.put("seekLanding", seekLanding)
         if (ffmpegCode != 0) event.put("ffmpegCode", ffmpegCode)
         if (throughputKbps >= 0) event.put("throughputKbps", throughputKbps)
+        if (bufferAheadSec >= 0) event.put("bufferAheadSec", bufferAheadSec)
+        if (!expectedDecodeMode.isNullOrEmpty()) event.put("expectedDecodeMode", expectedDecodeMode)
 
-        // 解码路径确定事件：从 detail 解析 actualDecodeMode / decodePathReason
         if (eventCode == CODE_DECODE_PATH_RESOLVED) {
             val reason = parseKvFromDetail(detail, "reason")
             val actualDecodeMode = parseKvFromDetail(detail, "video")
@@ -485,36 +586,72 @@ class HXCPlayerMonitorSession(
             }
         }
 
-        if (eventType == "trace") {
+        if (eventType == "trace" && eventCode == CODE_NETWORK_SNAPSHOT) {
             traceSeq += 1
             event.put("traceSeq", traceSeq)
+            event.put("tracePoint", "qoe.network_snapshot")
+            event.put("phase", "io")
         }
-
-        event.put("terminalType", "android")
-        event.put("appVersion", appVersion())
-        event.put("osVersion", "Android ${Build.VERSION.RELEASE}")
-        event.put("deviceModel", Build.MODEL ?: "unknown")
-
-        userContext?.userId?.let { event.put("userId", it) }
-        userContext?.anonymousId?.let { event.put("anonymousId", it) }
-        userContext?.deviceId?.let { event.put("deviceId", it) }
-        userContext?.tenantId?.let { event.put("tenantId", it) }
-        userContext?.appSessionId?.let { event.put("appSessionId", it) }
-        val biz = metadata?.businessVideoId ?: userContext?.businessVideoId
-        biz?.let { event.put("businessVideoId", it) }
 
         reporter.enqueue(event, immediate)
     }
 
-    private fun appVersion(): String {
-        return try {
-            val pi = appContext.packageManager.getPackageInfo(appContext.packageName, 0)
-            val versionName = pi.versionName ?: ""
-            val code = if (Build.VERSION.SDK_INT >= 28) pi.longVersionCode else @Suppress("DEPRECATION") pi.versionCode.toLong()
-            if (versionName.isEmpty()) "$code" else "$versionName($code)"
-        } catch (_: Throwable) {
-            "unknown"
+    /** 对齐 iOS hxc_sendTraceLocked：eventName 空串、eventCode=0。 */
+    private fun emitTrace(
+        tracePoint: String?,
+        phase: String?,
+        message: String,
+        detail: String?,
+        position: Double,
+        duration: Double
+    ) {
+        if (!config.enabled) return
+        traceSeq += 1
+        val event = JSONObject()
+        event.put("eventType", "trace")
+        event.put("eventName", "")
+        event.put("eventCode", 0)
+        event.put("errorCode", 0)
+        event.put("message", message)
+        event.put("timestampMs", System.currentTimeMillis())
+        event.put("traceSeq", traceSeq)
+        event.put("playSessionId", playSessionId)
+        event.put("position", position)
+        event.put("duration", duration)
+        if (!tracePoint.isNullOrEmpty()) event.put("tracePoint", tracePoint)
+        if (!phase.isNullOrEmpty()) event.put("phase", phase)
+        if (!detail.isNullOrEmpty()) event.put("detail", detail)
+        event.put("recoverable", false)
+        event.put("engineType", engineType)
+        event.put("sdkVersion", sdkVersion)
+        reporter.enqueue(event, false)
+    }
+
+    private fun refreshNetworkSnapshot() {
+        val cm = connectivityManager ?: return
+        val network = cm.activeNetwork ?: run {
+            networkType = "offline"
+            networkExpensive = false
+            networkConstrained = false
+            return
         }
+        val caps = cm.getNetworkCapabilities(network) ?: return
+        networkType = when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            else -> "other"
+        }
+        networkExpensive = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        networkConstrained = if (Build.VERSION.SDK_INT >= 28) {
+            !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_CONGESTED)
+        } else false
+    }
+
+    private fun networkSnapshotDetail(): String {
+        val connected = if (networkType != "offline" && networkType != "unknown") 1 else 0
+        return "type=$networkType,expensive=${if (networkExpensive) 1 else 0}," +
+                "constrained=${if (networkConstrained) 1 else 0},connected=$connected"
     }
 
     private fun sha256(input: String): String {
