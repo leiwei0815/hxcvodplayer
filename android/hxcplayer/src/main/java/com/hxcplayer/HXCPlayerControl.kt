@@ -51,6 +51,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val context: Context,
     private val renderViewType: VideoRenderViewType = VideoRenderViewType.SURFACE_VIEW
 ) {
+    init {
+        android.util.Log.d("HXCMonitor", "HXCPlayerControl created: renderViewType=$renderViewType")
+    }
     /** 视频输出目标：SurfaceView（默认）或 TextureView */
     enum class VideoRenderViewType {
         /**
@@ -748,6 +751,7 @@ class HXCPlayerControl @JvmOverloads constructor(
      * 传 null 或空串则回退为匿名用户。可在任意时机调用，变化后会以新 user_id 重连上报通道。
      */
     fun setMonitorUserId(userId: String?) {
+        android.util.Log.d("HXCMonitor", "setMonitorUserId called: userId=$userId")
         val ctx = monitorUserContext ?: HXCPlayerMonitorUserContext().also { monitorUserContext = it }
         ctx.userId = userId
         monitorSession.userContext = ctx
@@ -1915,6 +1919,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         startPosition: Double,
         metadata: HXCPlayerMonitorMetadata? = null
     ) {
+        val uid = monitorUserContext?.userId ?: "null"
+        android.util.Log.d("HXCMonitor", "beginMonitorSession: url=$url, userId=$uid, monitorUserContext=${monitorUserContext != null}")
         monitorSession.engineType = "custom"
         monitorSession.userContext = monitorUserContext
         monitorSession.metadata = metadata

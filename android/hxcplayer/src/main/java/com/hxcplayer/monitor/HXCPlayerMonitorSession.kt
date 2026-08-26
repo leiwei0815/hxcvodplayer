@@ -216,6 +216,7 @@ class HXCPlayerMonitorSession(
     private fun updateReporterUserId() {
         val ctx = userContext
         val uid = ctx?.userId ?: ctx?.anonymousId ?: ctx?.deviceId ?: "anonymous"
+        android.util.Log.d("HXCMonitor", "updateReporterUserId: userId=${ctx?.userId}, anonymousId=${ctx?.anonymousId}, deviceId=${ctx?.deviceId}, resolved=$uid")
         reporter.setUserId(uid)
     }
 
