@@ -6,6 +6,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import com.hxcplayer.download.m3u8.HXCM3u8Parser
+import com.hxcplayer.monitor.HXCDownloadMonitorSession
 import java.io.File
 import java.io.InterruptedIOException
 import java.io.RandomAccessFile
@@ -108,6 +109,8 @@ object HXCDownloadManager {
             downloads[it.downloadKey] = it
         }
         inited = true
+        HXCDownloadMonitorSession.init(appContext)
+        HXCDownloadMonitorSession.resetTaskStates()
         notifyListChanged()
     }
 
@@ -121,6 +124,10 @@ object HXCDownloadManager {
     }
 
     fun startDownload(requests: List<HXCDownloadRequest>) {
+        startDownloadInternal(requests, fromResume = false)
+    }
+
+    private fun startDownloadInternal(requests: List<HXCDownloadRequest>, fromResume: Boolean) {
         ensureInit()
         requests.forEach { req ->
             val key = req.buildDownloadKey()
@@ -134,12 +141,19 @@ object HXCDownloadManager {
                 d("start ignored: task already scheduled/running, key=$key, status=${info.status}")
                 return@forEach
             }
+            val queued = fromResume && activeScheduledCount() >= config.maxConcurrent
             downloads[key] = info
             info.status = HXCDownloadStatus.WAITING
             info.isWaiting = true
             info.errorMessage = ""
             updateStage(info, stage = "WAITING", stageProgress = 0f, overallProgress = info.progress)
+            if (!fromResume) {
+                HXCDownloadMonitorSession.emitStart(info)
+            }
             postStatusChanged(info)
+            if (queued) {
+                HXCDownloadMonitorSession.emitResumeQueued(info)
+            }
             notifyListChanged()
 
             val future = ioExecutor.submit {
@@ -193,15 +207,22 @@ object HXCDownloadManager {
     }
 
     fun resumeDownload(downloadKey: String) {
-        val info = downloads[downloadKey] ?: return
+        val info = downloads[downloadKey]
+        if (info == null) {
+            HXCDownloadMonitorSession.emitResumeReject(null, downloadKey, "下载任务不存在: $downloadKey")
+            return
+        }
         val runningFuture = runningFutures[downloadKey]
         if (runningFuture != null && !runningFuture.isDone) {
             d("resume ignored: task already scheduled/running, key=$downloadKey, status=${info.status}")
             return
         }
         if (info.resolvedUrl.isBlank()) {
+            val reason = "resume failed: missing resolved url"
             info.status = HXCDownloadStatus.ERROR
-            info.errorMessage = "resume failed: missing resolved url"
+            info.errorMessage = reason
+            HXCDownloadMonitorSession.emitResumeReject(info, downloadKey, reason)
+            HXCDownloadMonitorSession.noteStatus(info.downloadKey, HXCDownloadStatus.ERROR)
             postStatusChanged(info)
             notifyListChanged()
             return
@@ -219,7 +240,7 @@ object HXCDownloadManager {
             .duration(info.duration)
             .encrypted(info.isEncrypted)
             .secureHeaders(info.secureHeaders)
-        startDownload(request)
+        startDownloadInternal(listOf(request), fromResume = true)
     }
 
     fun resumeAll() {
@@ -235,8 +256,10 @@ object HXCDownloadManager {
         cancelledFlags.remove(downloadKey)
         clearProgressState(downloadKey)
         val info = downloads.remove(downloadKey) ?: return
+        var cacheRemoved = true
+        var deleteError: String? = null
         if (deleteFile && info.localPath.isNotBlank()) {
-            kotlin.runCatching {
+            val result = kotlin.runCatching {
                 val local = File(info.localPath)
                 if (local.name.equals("index.m3u8", ignoreCase = true) && local.parentFile?.exists() == true) {
                     local.parentFile?.deleteRecursively()
@@ -244,7 +267,25 @@ object HXCDownloadManager {
                     local.delete()
                 }
             }
+            if (result.isFailure) {
+                cacheRemoved = false
+                deleteError = result.exceptionOrNull()?.message
+            } else {
+                val local = File(info.localPath)
+                cacheRemoved = if (local.name.equals("index.m3u8", ignoreCase = true)) {
+                    local.parentFile?.exists() != true
+                } else {
+                    !local.exists()
+                }
+            }
         }
+        HXCDownloadMonitorSession.emitDelete(
+            info = info,
+            removeFiles = deleteFile,
+            cacheRemoved = cacheRemoved,
+            persistenceSuccess = true,
+            errorMessage = deleteError
+        )
         notifyListChanged()
     }
 
@@ -1471,7 +1512,12 @@ object HXCDownloadManager {
 
     private fun postStatusChanged(info: HXCDownloadInfo) {
         val copy = cloneInfo(info)
+        HXCDownloadMonitorSession.onStatusChanged(copy)
         mainHandler.post { listener?.onStatusChanged(copy) }
+    }
+
+    private fun activeScheduledCount(): Int {
+        return runningFutures.count { !it.value.isDone }
     }
 
     private fun ensureInit() {

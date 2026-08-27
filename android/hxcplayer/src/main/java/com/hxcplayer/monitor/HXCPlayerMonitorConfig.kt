@@ -14,7 +14,7 @@ data class HXCPlayerMonitorUserContext(
     var extra: Map<String, String>? = null
 )
 
-data class HXCPlayerMonitorMetadata(
+data class HXCPlayerMonitorMetadata @JvmOverloads constructor(
     var businessVideoId: String? = null,
     var traceId: String? = null,
     var extra: Map<String, String>? = null

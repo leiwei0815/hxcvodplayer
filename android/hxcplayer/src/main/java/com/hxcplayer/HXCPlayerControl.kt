@@ -757,6 +757,27 @@ class HXCPlayerControl @JvmOverloads constructor(
         monitorSession.userContext = ctx
     }
 
+    fun setMonitorPlayerRole(role: String?) {
+        monitorSession.playerRole = if (role.isNullOrBlank()) "main" else role
+    }
+
+    fun setMonitorReportingEnabled(enabled: Boolean) {
+        monitorSession.reportingEnabled = enabled
+    }
+
+    fun setMonitorMetadata(metadata: HXCPlayerMonitorMetadata?) {
+        monitorSession.metadata = metadata
+        val ctx = monitorUserContext ?: HXCPlayerMonitorUserContext().also { monitorUserContext = it }
+        ctx.businessVideoId = metadata?.businessVideoId
+        ctx.traceId = metadata?.traceId
+        monitorSession.userContext = ctx
+    }
+
+    @JvmOverloads
+    fun trackMonitorPageEvent(eventName: String, message: String? = null, detail: String? = null) {
+        monitorSession.trackPageEvent(eventName, message, detail)
+    }
+
     /** 应用进入后台，app 在 onStop 中调用。 */
     fun onAppEnterBackground() {
         monitorSession.trackNamed("app_enter_background", getPosition(), getDuration(), null, null, false)
@@ -1317,7 +1338,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         val pos = pendingStartPosition
         pendingStartPosition = 0.0  // 消费后重置，防止下次意外复用
         val ok = openURL(url, pos)
-        if (ok && autoPlayer) play()
+        if (ok && autoPlayer) play("system")
         return ok
     }
 
@@ -1329,7 +1350,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         val pos = pendingStartPosition
         pendingStartPosition = 0.0  // 消费后重置
         val ok = openWithPlayModel(model, pos)
-        if (ok && autoPlayer) play()
+        if (ok && autoPlayer) play("system")
         return ok
     }
 
@@ -1356,11 +1377,11 @@ class HXCPlayerControl @JvmOverloads constructor(
         when {
             replayModel != null -> {
                 openWithPlayModel(replayModel, safeStart)
-                if (autoPlayer) play()
+                play("system")
             }
             !replayUrl.isNullOrBlank() -> {
                 openURL(replayUrl, safeStart)
-                if (autoPlayer) play()
+                play("system")
             }
         }
     }
@@ -1979,7 +2000,13 @@ class HXCPlayerControl @JvmOverloads constructor(
             }
             suppressSecureAuthErrorForReopen = false
             if (ok) {
-                play()
+                monitorSession.trackNamed(
+                    "auto_reopen", getPosition(), getDuration(),
+                    "reason=recoverable_error,code=$errorCode,attempt=$autoReopenAttemptCount",
+                    mapOf("errorCode" to errorCode, "source" to "auto_reopen"),
+                    true
+                )
+                play("auto_reopen")
             }
             autoReopenInFlight = false
         }, 300L)
@@ -2396,7 +2423,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     ) {
         openWithPlayModelAsync(model, startPosition) { opened ->
             if (opened && !isReleased && autoPlayer) {
-                play()
+                play("system")
             }
             callback?.onResult(opened)
         }
@@ -2473,13 +2500,19 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     // 播放
-    fun play() {
+    @JvmOverloads
+    fun play(source: String = "user") {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         if (!licenseAllowedOrNotify("play")) {
             return
         }
-        monitorSession.trackNamed("user_play", getPosition(), getDuration(), null, null, false)
+        if (source != "auto_reopen") {
+            monitorSession.trackNamed(
+                "user_play", getPosition(), getDuration(), null,
+                mapOf("source" to source), false
+            )
+        }
         val requestAtMs = SystemClock.elapsedRealtime()
         playStallLastPlayReqAtMs = requestAtMs
         playStallCheckArmed = true
@@ -2548,10 +2581,14 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     // 暂停
-    fun pause() {
+    @JvmOverloads
+    fun pause(source: String = "user") {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
-        monitorSession.trackNamed("user_pause", getPosition(), getDuration(), null, null, false)
+        monitorSession.trackNamed(
+            "user_pause", getPosition(), getDuration(), null,
+            mapOf("source" to source), false
+        )
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
         val generation = nextPlaybackCommandGeneration(false)
@@ -2564,6 +2601,10 @@ class HXCPlayerControl @JvmOverloads constructor(
     fun stop() {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
+        monitorSession.trackNamed(
+            "user_stop", getPosition(), getDuration(), null,
+            mapOf("source" to "user"), true
+        )
         monitorSession.endSession("stopped", getPosition(), getDuration())
         val generation = nextPlaybackCommandGeneration(false)
         enqueuePlaybackCommand("stop", generation, false) { current ->
@@ -2583,7 +2624,8 @@ class HXCPlayerControl @JvmOverloads constructor(
     }
 
     // 跳转（显式指定 seek 完成后是否恢复播放）
-    fun seekToWithIntent(position: Double, resumeAfterSeek: Boolean) {
+    @JvmOverloads
+    fun seekToWithIntent(position: Double, resumeAfterSeek: Boolean, source: String = "user") {
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         if (!licenseAllowedOrNotify("seekTo")) {
@@ -2591,8 +2633,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         var target = maxOf(0.0, position)
         val duration = getDuration()
-        monitorSession.trackNamed("user_seek", getPosition(), duration,
-            "target=${"%.3f".format(target)}", mapOf("seekTarget" to target), false)
+        if (source == "user") {
+            monitorSession.trackNamed("user_seek", getPosition(), duration,
+                "target=${"%.3f".format(target)}", mapOf("seekTarget" to target, "source" to source), false)
+        }
         if (duration > 0.0) {
             val maxSeek = maxOf(0.0, duration - 0.35)
             if (target > maxSeek) {
@@ -2648,7 +2692,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         val handle = currentHandle()
         if (handle == 0L || isReleased) return
         monitorSession.trackNamed("user_rate_change", getPosition(), getDuration(),
-            "rate=${normalizedRate}", mapOf("rate" to normalizedRate.toDouble()), false)
+            "rate=${normalizedRate}", mapOf("rate" to normalizedRate.toDouble(), "source" to "user"), false)
         nativeSetPlaybackRate(handle, normalizedRate)
     }
 
@@ -2799,7 +2843,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     openURL(retryUrl!!, start)
                 }
                 if (opened && !isReleased && autoPlayer) {
-                    play()
+                    play("system")
                 }
                 mainHandler.post {
                     if (!isReleased) {
@@ -3113,8 +3157,6 @@ class HXCPlayerControl @JvmOverloads constructor(
                     mainHandler.post {
                         if (!isReleased) callback?.onRenderedFirstFrame()
                     }
-                } else if (!firstFrameRendered) {
-                    renderedFirstFrameNotified = false
                 }
 
                 val videoSize = VideoSize(
@@ -3346,10 +3388,6 @@ class HXCPlayerControl @JvmOverloads constructor(
                             if (loading) {
                                 networkLoadingSinceMs = SystemClock.elapsedRealtime()
                                 notifyNetworkQoE(0L)
-                                monitorSession.trackLoading(
-                                    true, 0L, networkTotalStallMs, networkReconnectCount,
-                                    getPosition(), getDuration()
-                                )
                             } else {
                                 val nowMs = SystemClock.elapsedRealtime()
                                 val currentStall = if (networkLoadingSinceMs > 0L) {
@@ -3360,10 +3398,6 @@ class HXCPlayerControl @JvmOverloads constructor(
                                 networkLoadingSinceMs = 0L
                                 networkTotalStallMs += currentStall
                                 notifyNetworkQoE(currentStall)
-                                monitorSession.trackLoading(
-                                    false, currentStall, networkTotalStallMs, networkReconnectCount,
-                                    getPosition(), getDuration()
-                                )
                             }
                         }
                     }
@@ -3710,6 +3744,19 @@ class HXCPlayerControl @JvmOverloads constructor(
                             }
                         }
                         mainHandler.post {
+                            monitorSession.trackNamed(
+                                if (completeByTimeout) "seek_fail" else "seek_complete",
+                                position,
+                                duration,
+                                if (completeByTimeout) "timeout" else null,
+                                mapOf(
+                                    "seekTarget" to target,
+                                    "seekLanding" to position,
+                                    "costMs" to seekElapsedMs,
+                                    "errorCode" to if (completeByTimeout) -1011 else 0
+                                ),
+                                true
+                            )
                             callback?.onSeekCompleted(
                                 requestId = requestId,
                                 targetPosition = target,
@@ -3825,7 +3872,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             } catch (e: Exception) {
                 e.printStackTrace()
             }
-        }, 0, 500, TimeUnit.MILLISECONDS)
+        }, 0, 100, TimeUnit.MILLISECONDS)
     }
 
     private fun maybeRecoverPlayStall(
@@ -4279,7 +4326,13 @@ class HXCPlayerControl @JvmOverloads constructor(
             "evt=abnormal_forward_seek reason=$reason from=$basePositionSec target=$target " +
                 "duration=$durationSec source_category=$currentSourceCategory"
         )
-        seekToWithIntent(target, true)
+        monitorSession.trackNamed(
+            "stall_recover", basePositionSec, durationSec,
+            "reason=$reason,target=$target,forwardSec=$forwardSec",
+            mapOf("source" to "system", "seekTarget" to target),
+            true
+        )
+        seekToWithIntent(target, true, "system")
         return true
     }
 
@@ -4396,7 +4449,13 @@ class HXCPlayerControl @JvmOverloads constructor(
                 suppressSecureAuthErrorForReopen = false
                 mainHandler.post {
                     if (opened && !isReleased) {
-                        play()
+                        monitorSession.trackNamed(
+                            "auto_reopen", getPosition(), getDuration(),
+                            "reason=$reason,start=$start",
+                            mapOf("source" to "auto_reopen"),
+                            true
+                        )
+                        play("auto_reopen")
                     } else {
                         Log.w(
                             TAG,

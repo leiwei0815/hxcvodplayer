@@ -18,7 +18,7 @@ import java.util.UUID
 class HXCPlayerMonitorSession(
     context: Context,
     config: HXCPlayerMonitorConfig,
-    private val sdkVersion: String = "1.0.9"
+    private val sdkVersion: String = "1.0.10"
 ) {
     companion object {
         // 事件码（对齐 MonitorEventType 枚举）
@@ -54,6 +54,23 @@ class HXCPlayerMonitorSession(
         const val CODE_USER_RATE_CHANGE = 104
         const val CODE_APP_ENTER_BACKGROUND = 105
         const val CODE_APP_ENTER_FOREGROUND = 106
+        const val CODE_PIP_WILL_START = 110
+        const val CODE_PIP_DID_START = 111
+        const val CODE_PIP_WILL_STOP = 112
+        const val CODE_PIP_DID_STOP = 113
+        const val CODE_PIP_START_FAIL = 114
+        const val CODE_PIP_RESTORE_UI = 115
+        const val CODE_PIP_USER_START = 116
+        const val CODE_PAGE_ENTER = 170
+        const val CODE_AUTH_REQUEST = 171
+        const val CODE_AUTH_SUCCESS = 172
+        const val CODE_AUTH_FAIL = 173
+        const val CODE_SWITCH_VIDEO = 174
+        const val CODE_REPLAY = 175
+        const val CODE_SWITCH_EPISODE = 176
+        const val CODE_KERNEL_FALLBACK = 177
+        const val CODE_AUTO_REOPEN = 178
+        const val CODE_STALL_RECOVER = 179
 
         private val NETWORK_TYPED_CODES = setOf(
             CODE_PLAY_SESSION_START, CODE_OPEN_BEGIN, CODE_OPEN_SUCCESS, CODE_OPEN_FAIL,
@@ -96,6 +113,23 @@ class HXCPlayerMonitorSession(
             "user_rate_change" -> CODE_USER_RATE_CHANGE
             "app_enter_background" -> CODE_APP_ENTER_BACKGROUND
             "app_enter_foreground" -> CODE_APP_ENTER_FOREGROUND
+            "pip_will_start" -> CODE_PIP_WILL_START
+            "pip_did_start" -> CODE_PIP_DID_START
+            "pip_will_stop" -> CODE_PIP_WILL_STOP
+            "pip_did_stop" -> CODE_PIP_DID_STOP
+            "pip_start_fail" -> CODE_PIP_START_FAIL
+            "pip_restore_ui" -> CODE_PIP_RESTORE_UI
+            "pip_user_start" -> CODE_PIP_USER_START
+            "page_enter" -> CODE_PAGE_ENTER
+            "auth_request" -> CODE_AUTH_REQUEST
+            "auth_success" -> CODE_AUTH_SUCCESS
+            "auth_fail" -> CODE_AUTH_FAIL
+            "switch_video" -> CODE_SWITCH_VIDEO
+            "replay" -> CODE_REPLAY
+            "switch_episode" -> CODE_SWITCH_EPISODE
+            "kernel_fallback" -> CODE_KERNEL_FALLBACK
+            "auto_reopen" -> CODE_AUTO_REOPEN
+            "stall_recover" -> CODE_STALL_RECOVER
             else -> CODE_TRACE
         }
 
@@ -132,6 +166,23 @@ class HXCPlayerMonitorSession(
             CODE_USER_RATE_CHANGE -> "用户倍速变更"
             CODE_APP_ENTER_BACKGROUND -> "应用进入后台"
             CODE_APP_ENTER_FOREGROUND -> "应用进入前台"
+            CODE_PIP_WILL_START -> "画中画即将开始"
+            CODE_PIP_DID_START -> "画中画已开始"
+            CODE_PIP_WILL_STOP -> "画中画即将停止"
+            CODE_PIP_DID_STOP -> "画中画已停止"
+            CODE_PIP_START_FAIL -> "画中画启动失败"
+            CODE_PIP_RESTORE_UI -> "从画中画恢复界面"
+            CODE_PIP_USER_START -> "用户启动画中画"
+            CODE_PAGE_ENTER -> "进入播放页"
+            CODE_AUTH_REQUEST -> "开始鉴权"
+            CODE_AUTH_SUCCESS -> "鉴权成功"
+            CODE_AUTH_FAIL -> "鉴权失败"
+            CODE_SWITCH_VIDEO -> "切换视频"
+            CODE_REPLAY -> "用户重播"
+            CODE_SWITCH_EPISODE -> "切换上下集"
+            CODE_KERNEL_FALLBACK -> "回退腾讯内核"
+            CODE_AUTO_REOPEN -> "自动重开播放"
+            CODE_STALL_RECOVER -> "卡顿恢复"
             else -> ""
         }
 
@@ -144,6 +195,8 @@ class HXCPlayerMonitorSession(
             CODE_DECODE_ERROR, CODE_RENDER_ERROR, CODE_AUDIO_ERROR ->
                 if (recoverable) "warn" else "error"
             CODE_FFMPEG_IO -> if (errorCode != 0) "warn" else "info"
+            CODE_AUTH_FAIL, CODE_KERNEL_FALLBACK -> "error"
+            CODE_AUTO_REOPEN, CODE_STALL_RECOVER -> "warn"
             else -> "info"
         }
     }
@@ -162,6 +215,10 @@ class HXCPlayerMonitorSession(
         }
     var metadata: HXCPlayerMonitorMetadata? = null
     var engineType: String = "custom"
+    /** main=主课画面，small=三分屏小窗。 */
+    @Volatile var playerRole: String = "main"
+    /** 小窗默认可关闭上报，避免和主播放器双会话混在一起。 */
+    @Volatile var reportingEnabled: Boolean = true
 
     var playSessionId: String = UUID.randomUUID().toString()
         private set
@@ -198,6 +255,20 @@ class HXCPlayerMonitorSession(
     private var sessionActive: Boolean = false
     private var openBeginMs: Long = 0L
     private var traceSeq: Long = 0L
+
+    private var lastNetworkSig: String = ""
+    private var loadingOpen: Boolean = false
+    private var loadingBeginEmitted: Boolean = false
+    private var lastLoadingBeginAt: Long = 0L
+    private var lastStateDetail: String = ""
+    private var lastStateAt: Long = 0L
+    private var lastErrorDedupeKey: String = ""
+    private var lastErrorDedupeAt: Long = 0L
+    private var lastGenericDedupeKey: String = ""
+    private var lastGenericDedupeAt: Long = 0L
+    private var lastLifecycleCode: Int = -1
+    private var lastLifecycleAt: Long = 0L
+    private var lastFirstFrameAt: Long = 0L
 
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
@@ -271,6 +342,12 @@ class HXCPlayerMonitorSession(
             this.lastErrorCode = 0
             this.openBeginMs = System.currentTimeMillis()
             traceSeq = 0
+            loadingOpen = false
+            loadingBeginEmitted = false
+            lastStateDetail = ""
+            lastErrorDedupeKey = ""
+            lastGenericDedupeKey = ""
+            lastFirstFrameAt = 0L
             refreshNetworkSnapshot()
             val detail = buildString {
                 append("mode=").append(dataSourceMode)
@@ -378,7 +455,12 @@ class HXCPlayerMonitorSession(
 
     fun trackStateChange(state: String, position: Double, duration: Double) {
         sessionHandler.post {
-            val normalized = if (state.startsWith("state=")) state else "state=${state.lowercase()}"
+            val raw = if (state.startsWith("state=")) state.substring(6) else state
+            // LOADING 已有 loading_begin/end，避免一次卡顿刷两条状态。
+            if (raw.equals("LOADING", ignoreCase = true) || raw.equals("BUFFERING", ignoreCase = true)) {
+                return@post
+            }
+            val normalized = "state=${raw.lowercase()}"
             emit(CODE_STATE_CHANGE, "state_change", "info",
                  message = "播放状态变更", position = position, duration = duration,
                  detail = normalized, immediate = false)
@@ -427,6 +509,9 @@ class HXCPlayerMonitorSession(
 
     fun trackNetworkChange(type: String, expensive: Boolean, constrained: Boolean) {
         sessionHandler.post {
+            val sig = "$type|$expensive|$constrained"
+            if (sig == lastNetworkSig) return@post
+            lastNetworkSig = sig
             networkType = type
             networkExpensive = expensive
             networkConstrained = constrained
@@ -485,6 +570,7 @@ class HXCPlayerMonitorSession(
             val bufferAheadSec = (extra?.get("bufferAheadSec") as? Number)?.toDouble() ?: -1.0
             val mediaUrl = (extra?.get("url") as? String)?.takeIf { it.isNotEmpty() }
                 ?: parseKvFromDetail(detail, "resolvedUrl")
+            val source = (extra?.get("source") as? String)?.takeIf { it.isNotEmpty() }
             emit(eventCode, eventName, eventType,
                  errorCode = errorCode, message = message,
                  position = position, duration = if (duration > 0) duration else this.duration,
@@ -494,9 +580,16 @@ class HXCPlayerMonitorSession(
                  throughputKbps = throughputKbps,
                  bufferAheadSec = bufferAheadSec,
                  mediaUrl = mediaUrl,
+                 source = source,
                  attachNetworkType = eventCode in NETWORK_TYPED_CODES,
                  immediate = immediate)
         }
+    }
+
+    @JvmOverloads
+    fun trackPageEvent(eventName: String, message: String? = null, detail: String? = null) {
+        val extra = if (message.isNullOrEmpty()) null else mapOf("message" to message)
+        trackNamed(eventName, lastPosition, duration, detail, extra, true)
     }
 
     fun shutdown() {
@@ -522,6 +615,72 @@ class HXCPlayerMonitorSession(
     }
 
     /**
+     * 同类事件去重：避免 core 回调 + Kotlin 层、loading 抖动、系统网络回调连打。
+     */
+    private fun shouldSuppressDuplicate(
+        eventCode: Int,
+        eventName: String,
+        errorCode: Int,
+        detail: String?,
+        source: String?
+    ): Boolean {
+        val now = System.currentTimeMillis()
+        when (eventCode) {
+            CODE_USER_PLAY -> {
+                if (source == "auto_reopen") return true
+            }
+            CODE_LOADING_BEGIN -> {
+                if (loadingOpen) return true
+                loadingOpen = true
+                if (now - lastLoadingBeginAt < 1500L) {
+                    loadingBeginEmitted = false
+                    return true
+                }
+                lastLoadingBeginAt = now
+                loadingBeginEmitted = true
+                return false
+            }
+            CODE_LOADING_END -> {
+                if (!loadingOpen) return true
+                loadingOpen = false
+                val emit = loadingBeginEmitted
+                loadingBeginEmitted = false
+                return !emit
+            }
+            CODE_STATE_CHANGE -> {
+                val d = detail.orEmpty()
+                if (d == lastStateDetail && now - lastStateAt < 800L) return true
+                lastStateDetail = d
+                lastStateAt = now
+                return false
+            }
+            CODE_FIRST_FRAME -> {
+                if (now - lastFirstFrameAt < 2000L) return true
+                lastFirstFrameAt = now
+                return false
+            }
+            CODE_OPEN_FAIL, CODE_DECODE_ERROR, CODE_RENDER_ERROR, CODE_AUDIO_ERROR, CODE_FFMPEG_IO -> {
+                val key = "$eventCode:$errorCode:${detail?.take(80).orEmpty()}"
+                if (key == lastErrorDedupeKey && now - lastErrorDedupeAt < 1500L) return true
+                lastErrorDedupeKey = key
+                lastErrorDedupeAt = now
+                return false
+            }
+            CODE_APP_ENTER_BACKGROUND, CODE_APP_ENTER_FOREGROUND -> {
+                if (eventCode == lastLifecycleCode && now - lastLifecycleAt < 1500L) return true
+                lastLifecycleCode = eventCode
+                lastLifecycleAt = now
+                return false
+            }
+        }
+        val genericKey = "$eventCode:$eventName:$errorCode:${source.orEmpty()}:${detail?.take(60).orEmpty()}"
+        if (genericKey == lastGenericDedupeKey && now - lastGenericDedupeAt < 400L) return true
+        lastGenericDedupeKey = genericKey
+        lastGenericDedupeAt = now
+        return false
+    }
+
+    /**
      * 统一事件发送入口（字段结构对齐 PLAYER_MONITOR_SOCKET_PLAN.md §2.4）。
      * 关键字段：eventType / eventName / eventCode / errorCode / message / position / duration 顶层。
      */
@@ -544,10 +703,12 @@ class HXCPlayerMonitorSession(
         bufferAheadSec: Double = -1.0,
         mediaUrl: String? = null,
         expectedDecodeMode: String? = null,
+        source: String? = null,
         attachNetworkType: Boolean = false,
         immediate: Boolean
     ) {
-        if (!config.enabled) return
+        if (!config.enabled || !reportingEnabled) return
+        if (shouldSuppressDuplicate(eventCode, eventName, errorCode, detail, source)) return
         val event = JSONObject()
         event.put("eventType", eventType)
         event.put("eventName", eventName)
@@ -561,6 +722,7 @@ class HXCPlayerMonitorSession(
         event.put("engineType", engineType)
         event.put("sdkVersion", sdkVersion)
         event.put("recoverable", recoverable)
+        attachIdentityFields(event, source)
 
         if (!detail.isNullOrEmpty()) event.put("detail", detail)
         if (!mediaUrl.isNullOrEmpty()) event.put("url", mediaUrl)
@@ -605,7 +767,7 @@ class HXCPlayerMonitorSession(
         position: Double,
         duration: Double
     ) {
-        if (!config.enabled) return
+        if (!config.enabled || !reportingEnabled) return
         traceSeq += 1
         val event = JSONObject()
         event.put("eventType", "trace")
@@ -624,6 +786,7 @@ class HXCPlayerMonitorSession(
         event.put("recoverable", false)
         event.put("engineType", engineType)
         event.put("sdkVersion", sdkVersion)
+        attachIdentityFields(event, null)
         reporter.enqueue(event, false)
     }
 
@@ -670,5 +833,27 @@ class HXCPlayerMonitorSession(
         if (end < 0) end = detail.length
         val value = detail.substring(start + token.length, end).trim()
         return value.ifEmpty { null }
+    }
+
+    private fun attachIdentityFields(event: JSONObject, source: String?) {
+        event.put("playerRole", playerRole)
+        val videoId = metadata?.businessVideoId?.takeIf { it.isNotEmpty() }
+            ?: userContext?.businessVideoId?.takeIf { it.isNotEmpty() }
+        if (!videoId.isNullOrEmpty() && !event.has("businessVideoId")) {
+            event.put("businessVideoId", videoId)
+        }
+        val traceId = metadata?.traceId?.takeIf { it.isNotEmpty() }
+            ?: userContext?.traceId?.takeIf { it.isNotEmpty() }
+        if (!traceId.isNullOrEmpty() && !event.has("traceId")) {
+            event.put("traceId", traceId)
+        }
+        metadata?.extra?.forEach { (key, value) ->
+            if (key.isNotEmpty() && !value.isNullOrEmpty() && !event.has(key)) {
+                event.put(key, value)
+            }
+        }
+        if (!source.isNullOrEmpty()) {
+            event.put("source", source)
+        }
     }
 }
