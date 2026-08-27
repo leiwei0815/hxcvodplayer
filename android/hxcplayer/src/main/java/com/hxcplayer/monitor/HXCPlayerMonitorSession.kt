@@ -18,7 +18,7 @@ import java.util.UUID
 class HXCPlayerMonitorSession(
     context: Context,
     config: HXCPlayerMonitorConfig,
-    private val sdkVersion: String = "1.0.10"
+    private val sdkVersion: String = "1.0.11"
 ) {
     companion object {
         // 事件码（对齐 MonitorEventType 枚举）
@@ -219,6 +219,10 @@ class HXCPlayerMonitorSession(
     @Volatile var playerRole: String = "main"
     /** 小窗默认可关闭上报，避免和主播放器双会话混在一起。 */
     @Volatile var reportingEnabled: Boolean = true
+        set(value) {
+            field = value
+            reporter.setActive(value)
+        }
 
     var playSessionId: String = UUID.randomUUID().toString()
         private set
@@ -269,6 +273,7 @@ class HXCPlayerMonitorSession(
     private var lastLifecycleCode: Int = -1
     private var lastLifecycleAt: Long = 0L
     private var lastFirstFrameAt: Long = 0L
+    private var networkSnapshotReady: Boolean = false
 
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
@@ -294,6 +299,15 @@ class HXCPlayerMonitorSession(
             val constrained = if (Build.VERSION.SDK_INT >= 28) {
                 !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_CONGESTED)
             } else false
+            // 注册回调会立刻给一次当前网络，这不是变化，只记快照。
+            if (!networkSnapshotReady) {
+                networkSnapshotReady = true
+                networkType = type
+                networkExpensive = expensive
+                networkConstrained = constrained
+                lastNetworkSig = "$type|$expensive|$constrained"
+                return
+            }
             trackNetworkChange(type, expensive, constrained)
         }
 

@@ -34,6 +34,9 @@ class HXCPlayerMonitorReporter(
     @Volatile private var connecting: Boolean = false
     @Volatile private var reconnectAttempts: Int = 0
     @Volatile private var shuttingDown: Boolean = false
+    /** 主动 cancel/换 userId 重连，不应当成故障去指数退避再连一次。 */
+    @Volatile private var suppressDisconnectReconnect: Boolean = false
+    @Volatile private var reporterActive: Boolean = true
 
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -46,7 +49,9 @@ class HXCPlayerMonitorReporter(
     fun updateConfig(config: HXCPlayerMonitorConfig) {
         handler.post {
             this.config = config
-            reconnect()
+            if (webSocket != null || connecting) {
+                reconnect()
+            }
         }
     }
 
@@ -55,14 +60,26 @@ class HXCPlayerMonitorReporter(
             val newUid = if (userId.isNullOrBlank()) "anonymous" else userId
             if (newUid == this.userId) return@post
             this.userId = newUid
-            // user_id 是 URL 参数，变化后必须重连
-            reconnect()
+            // user_id 是 URL 参数。尚未建连时只更新字段，避免 anonymous→真实用户空打一条再被 cancel。
+            if (webSocket != null || connecting) {
+                reconnect()
+            }
+        }
+    }
+
+    fun setActive(active: Boolean) {
+        handler.post {
+            if (reporterActive == active) return@post
+            reporterActive = active
+            if (!active) {
+                closeQuietly()
+            }
         }
     }
 
     fun enqueue(event: JSONObject, immediate: Boolean) {
         handler.post {
-            if (shuttingDown || !config.enabled || config.endpoint.isNullOrBlank()) {
+            if (shuttingDown || !reporterActive || !config.enabled || config.endpoint.isNullOrBlank()) {
                 return@post
             }
             val message = JSONObject()
@@ -96,9 +113,7 @@ class HXCPlayerMonitorReporter(
     fun shutdown() {
         handler.post {
             shuttingDown = true
-            webSocket?.cancel()
-            webSocket = null
-            connecting = false
+            closeQuietly()
             thread.quitSafely()
         }
     }
@@ -123,7 +138,7 @@ class HXCPlayerMonitorReporter(
     }
 
     private fun connectIfNeeded() {
-        if (shuttingDown || !config.enabled) return
+        if (shuttingDown || !reporterActive || !config.enabled) return
         if (webSocket != null || connecting) return
         val url = webSocketUrl() ?: return
         connecting = true
@@ -137,25 +152,31 @@ class HXCPlayerMonitorReporter(
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                onDisconnected("closed code=$code reason=$reason")
+                onDisconnected("closed code=$code reason=$reason", quiet = false)
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                onDisconnected("failure ${t.message}")
+                onDisconnected("failure ${t.message}", quiet = isCanceled(t))
             }
         })
     }
 
-    private fun onDisconnected(reason: String) {
+    private fun onDisconnected(reason: String, quiet: Boolean) {
         webSocket = null
         connecting = false
         if (shuttingDown) return
+        val suppress = quiet || suppressDisconnectReconnect
+        suppressDisconnectReconnect = false
+        if (suppress) {
+            if (config.debugLog) Log.d(TAG, "ws closed (reconnect/cancel): $reason")
+            return
+        }
         Log.w(TAG, "ws disconnected: $reason")
         scheduleReconnect()
     }
 
     private fun scheduleReconnect() {
-        if (shuttingDown) return
+        if (shuttingDown || !reporterActive) return
         reconnectAttempts += 1
         // 指数退避，上限 30s
         val delayMs = Math.min(30_000L, 1000L * (1L shl Math.min(reconnectAttempts, 5)))
@@ -163,24 +184,34 @@ class HXCPlayerMonitorReporter(
     }
 
     private fun reconnect() {
+        closeQuietly()
+        connectIfNeeded()
+    }
+
+    private fun closeQuietly() {
+        suppressDisconnectReconnect = webSocket != null || connecting
         webSocket?.cancel()
         webSocket = null
         connecting = false
-        connectIfNeeded()
+    }
+
+    private fun isCanceled(t: Throwable): Boolean {
+        return t is java.io.IOException && (
+            t.message.equals("Canceled", ignoreCase = true) ||
+                t.message.equals("Socket closed", ignoreCase = true)
+            )
     }
 
     private fun sendText(text: String) {
         val ws = webSocket
-        if (ws == null) {
+        if (ws == null || connecting) {
             connectIfNeeded()
-            if (webSocket == null) {
-                while (pendingQueue.size >= config.maxQueueSize && pendingQueue.isNotEmpty()) {
-                    pendingQueue.removeFirst()
-                    Log.w(TAG, "pending overflow, drop oldest")
-                }
-                pendingQueue.addLast(text)
-                if (config.debugLog) Log.d(TAG, "queued (ws not ready), pending=${pendingQueue.size}")
+            while (pendingQueue.size >= config.maxQueueSize && pendingQueue.isNotEmpty()) {
+                pendingQueue.removeFirst()
+                Log.w(TAG, "pending overflow, drop oldest")
             }
+            pendingQueue.addLast(text)
+            if (config.debugLog) Log.d(TAG, "queued (ws not ready), pending=${pendingQueue.size}")
             return
         }
         val ok = ws.send(text)

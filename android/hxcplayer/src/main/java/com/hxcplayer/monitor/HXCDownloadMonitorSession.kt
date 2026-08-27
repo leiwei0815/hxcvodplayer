@@ -32,7 +32,7 @@ object HXCDownloadMonitorSession {
     const val CODE_DOWNLOAD_RESUME_REJECT = 213
     const val CODE_DOWNLOAD_RESUME_QUEUED = 214
 
-    private const val SDK_VERSION = "1.0.10"
+    private const val SDK_VERSION = "1.0.11"
     private const val MODULE_TYPE = "download"
 
     @Volatile
