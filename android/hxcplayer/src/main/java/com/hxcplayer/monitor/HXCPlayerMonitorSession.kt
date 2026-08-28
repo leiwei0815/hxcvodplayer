@@ -7,10 +7,14 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
+import android.util.Log
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Android 播放监控会话（字段与 iOS 对齐）
@@ -18,7 +22,7 @@ import java.util.UUID
 class HXCPlayerMonitorSession(
     context: Context,
     config: HXCPlayerMonitorConfig,
-    private val sdkVersion: String = "1.0.13"
+    private val sdkVersion: String = "1.0.14"
 ) {
     companion object {
         // 事件码（对齐 MonitorEventType 枚举）
@@ -218,6 +222,7 @@ class HXCPlayerMonitorSession(
     /** main=主课画面，small=三分屏小窗。 */
     @Volatile var playerRole: String = "main"
 
+    @Volatile
     var playSessionId: String = UUID.randomUUID().toString()
         private set
 
@@ -335,54 +340,101 @@ class HXCPlayerMonitorSession(
         reporter.setUserId(uid)
     }
 
+    /**
+     * @param renewSession false 表示同一视频的内部恢复（软重连/autoReopen），沿用当前会话 ID。
+     *                     切集/新 open 必须为 true，保证每个视频一条 playSessionId。
+     */
     fun beginSession(
         url: String?,
         dataSourceMode: Int,
         encrypted: Boolean,
         startPosition: Double,
-        expectedDecodeMode: String? = null
+        expectedDecodeMode: String? = null,
+        renewSession: Boolean = true
     ) {
+        val task = Runnable {
+            beginSessionLocked(
+                url, dataSourceMode, encrypted, startPosition, expectedDecodeMode, renewSession
+            )
+        }
+        if (Looper.myLooper() == sessionThread.looper) {
+            task.run()
+            return
+        }
+        val latch = CountDownLatch(1)
         sessionHandler.post {
-            if (sessionActive) {
-                endSessionLocked("replaced", lastPosition, duration, errorCode = 0, eventType = "info")
+            try {
+                task.run()
+            } finally {
+                latch.countDown()
             }
-            playSessionId = UUID.randomUUID().toString()
+        }
+        try {
+            // 等会话 ID 换完再继续 native open，避免新视频事件仍打在上一条会话上。
+            latch.await(2, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    private fun beginSessionLocked(
+        url: String?,
+        dataSourceMode: Int,
+        encrypted: Boolean,
+        startPosition: Double,
+        expectedDecodeMode: String?,
+        renewSession: Boolean
+    ) {
+        if (!renewSession && sessionActive) {
             this.url = url
             this.urlHash = sha256(url ?: "")
             this.dataSourceMode = dataSourceMode
             this.encrypted = encrypted
             this.startPosition = startPosition
             this.expectedDecodeMode = expectedDecodeMode
-            this.sessionActive = true
-            this.totalStallMs = 0
-            this.reconnectCount = 0
-            this.rebufferCount = 0
-            this.lastErrorCode = 0
-            this.openBeginMs = System.currentTimeMillis()
-            traceSeq = 0
-            loadingOpen = false
-            loadingBeginEmitted = false
-            lastStateDetail = ""
-            lastErrorDedupeKey = ""
-            lastGenericDedupeKey = ""
-            lastFirstFrameAt = 0L
-            refreshNetworkSnapshot()
-            val detail = buildString {
-                append("mode=").append(dataSourceMode)
-                append(" encrypted=").append(if (encrypted) "YES" else "NO")
-                append(" startPosition=").append("%.3f".format(Locale.US, startPosition))
-                if (!expectedDecodeMode.isNullOrEmpty()) {
-                    append(" expectedDecodeMode=").append(expectedDecodeMode)
-                }
-                append(" url=").append(url ?: "")
-                append(" ").append(networkSnapshotDetail())
-            }
-            emit(CODE_PLAY_SESSION_START, "play_session_start", "info",
-                 message = "播放会话开始", position = startPosition, duration = 0.0,
-                 detail = detail, expectedDecodeMode = expectedDecodeMode,
-                 attachNetworkType = true, immediate = true)
-            restartHeartbeat()
+            Log.d("HXCMonitor", "beginSession: keep playSessionId=$playSessionId (same video recover)")
+            return
         }
+        if (sessionActive) {
+            endSessionLocked("replaced", lastPosition, duration, errorCode = 0, eventType = "info")
+        }
+        playSessionId = UUID.randomUUID().toString()
+        this.url = url
+        this.urlHash = sha256(url ?: "")
+        this.dataSourceMode = dataSourceMode
+        this.encrypted = encrypted
+        this.startPosition = startPosition
+        this.expectedDecodeMode = expectedDecodeMode
+        this.sessionActive = true
+        this.totalStallMs = 0
+        this.reconnectCount = 0
+        this.rebufferCount = 0
+        this.lastErrorCode = 0
+        this.openBeginMs = System.currentTimeMillis()
+        traceSeq = 0
+        loadingOpen = false
+        loadingBeginEmitted = false
+        lastStateDetail = ""
+        lastErrorDedupeKey = ""
+        lastGenericDedupeKey = ""
+        lastFirstFrameAt = 0L
+        refreshNetworkSnapshot()
+        val detail = buildString {
+            append("mode=").append(dataSourceMode)
+            append(" encrypted=").append(if (encrypted) "YES" else "NO")
+            append(" startPosition=").append("%.3f".format(Locale.US, startPosition))
+            if (!expectedDecodeMode.isNullOrEmpty()) {
+                append(" expectedDecodeMode=").append(expectedDecodeMode)
+            }
+            append(" url=").append(url ?: "")
+            append(" ").append(networkSnapshotDetail())
+        }
+        Log.d("HXCMonitor", "beginSession: new playSessionId=$playSessionId url=$url")
+        emit(CODE_PLAY_SESSION_START, "play_session_start", "info",
+             message = "播放会话开始", position = startPosition, duration = 0.0,
+             detail = detail, expectedDecodeMode = expectedDecodeMode,
+             attachNetworkType = true, immediate = true)
+        restartHeartbeat()
     }
 
     fun endSession(reason: String, position: Double, duration: Double) {
@@ -750,6 +802,7 @@ class HXCPlayerMonitorSession(
         immediate: Boolean
     ) {
         if (!config.enabled || !reportingEnabled) return
+        if (!sessionActive && eventCode != CODE_PLAY_SESSION_END) return
         if (shouldSuppressDuplicate(eventCode, eventName, errorCode, detail, source)) return
         val event = JSONObject()
         event.put("eventType", eventType)
@@ -815,6 +868,7 @@ class HXCPlayerMonitorSession(
         duration: Double
     ) {
         if (!config.enabled || !reportingEnabled) return
+        if (!sessionActive) return
         traceSeq += 1
         val event = JSONObject()
         event.put("eventType", "trace")

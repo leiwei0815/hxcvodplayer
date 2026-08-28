@@ -86,6 +86,7 @@ class HXCPlayerMonitorReporter(
                 .put("app_name", appName.ifBlank { "unknown" })
                 .put("user_id", this.userId)
                 .put("terminal", terminalTag())
+                .put("playSessionId", event.optString("playSessionId"))
                 .put("content", event)
             val text = message.toString()
             if (config.debugLog) {
@@ -94,6 +95,7 @@ class HXCPlayerMonitorReporter(
                         "eventType=${event.optString("eventType")} " +
                         "errorCode=${event.optInt("errorCode")} " +
                         "playerRole=${event.optString("playerRole")} " +
+                        "playSessionId=${event.optString("playSessionId")} " +
                         "userId=${this.userId} " +
                         "immediate=$immediate")
             }

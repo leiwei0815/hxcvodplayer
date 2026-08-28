@@ -704,6 +704,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var autoReopenMaxAttempts: Int = 1
     private var autoReopenAttemptCount: Int = 0
     private var autoReopenInFlight: Boolean = false
+    private var autoReopenToken: Int = 0
     private var staleIoControlledReopenInFlight: Boolean = false
     private var staleIoControlledReopenLastAtMs: Long = 0L
     private val staleIoControlledReopenCooldownMs: Long = 30000L
@@ -1945,15 +1946,21 @@ class HXCPlayerControl @JvmOverloads constructor(
         if (!monitorSession.reportingEnabled) {
             return
         }
+        val previousVideoId = monitorSession.metadata?.businessVideoId
         monitorSession.engineType = "custom"
         monitorSession.userContext = monitorUserContext
         monitorSession.metadata = metadata
+        val incomingVideoId = metadata?.businessVideoId
+        val sameVideoRecover = autoReopenInFlight &&
+            !incomingVideoId.isNullOrBlank() &&
+            incomingVideoId == previousVideoId
         monitorSession.beginSession(
             url,
             mode,
             encrypted,
             startPosition,
-            if (decodeMode == DecodeMode.HARDWARE) "hardware" else "software"
+            if (decodeMode == DecodeMode.HARDWARE) "hardware" else "software",
+            renewSession = !sameVideoRecover
         )
     }
 
@@ -1980,9 +1987,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         notifyNetworkQoE(0L)
 
         val retryStart = getPosition().takeIf { it > 0.0 } ?: lastOpenStartPosition
+        val reopenToken = autoReopenToken
         mainHandler.postDelayed({
-            if (isReleased) {
-                autoReopenInFlight = false
+            if (isReleased || reopenToken != autoReopenToken) {
+                if (reopenToken == autoReopenToken) {
+                    autoReopenInFlight = false
+                }
                 return@postDelayed
             }
             // auto reopen 鉴权失败时抑制 dispatchError，避免触发 App 层 fallback 停止播放器
@@ -2609,6 +2619,8 @@ class HXCPlayerControl @JvmOverloads constructor(
             mapOf("source" to "user"), true
         )
         monitorSession.endSession("stopped", getPosition(), getDuration())
+        autoReopenToken += 1
+        autoReopenInFlight = false
         val generation = nextPlaybackCommandGeneration(false)
         enqueuePlaybackCommand("stop", generation, false) { current ->
             nativeStop(current)
@@ -4876,6 +4888,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         networkReconnectCount = 0
         autoReopenAttemptCount = 0
         autoReopenInFlight = false
+        autoReopenToken += 1
         decodeFallbackTriedForCurrentSource = false
         decodeFallbackLastAtMs = 0L
         lastOpenUrl = null
