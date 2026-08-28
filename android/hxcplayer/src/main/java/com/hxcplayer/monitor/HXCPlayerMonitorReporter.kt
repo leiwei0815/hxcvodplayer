@@ -15,8 +15,9 @@ import java.util.concurrent.TimeUnit
 /**
  * WebSocket 实时上报（失败不影响播放）。
  *
- * 连接 URL：{endpoint}?user_id={userId}&terminal={terminalTag}
- * 消息体：{"app_name":"...","user_id":"...","terminal":"...","content":{event}}
+ * 连接 URL：{endpoint}?user_id={userId}&terminal={terminalTag}&playSessionId={playSessionId}
+ * 与 iPad 一致：后台会话 ID 使用同一个 playSessionId，切集时换 ID 并重连。
+ * 消息体：{"app_name":"...","user_id":"...","terminal":"...","playSessionId":"...","content":{event}}
  */
 class HXCPlayerMonitorReporter(
     @Volatile private var config: HXCPlayerMonitorConfig,
@@ -25,6 +26,7 @@ class HXCPlayerMonitorReporter(
     private val appName: String = ""
 ) {
     @Volatile private var userId: String = "anonymous"
+    @Volatile private var playSessionId: String = ""
 
     private val thread = HandlerThread("hxc-monitor-reporter").apply { start() }
     private val handler = Handler(thread.looper)
@@ -51,6 +53,21 @@ class HXCPlayerMonitorReporter(
             this.config = config
             if (webSocket != null || connecting) {
                 reconnect()
+            }
+        }
+    }
+
+    fun setPlaySessionId(sessionId: String?) {
+        handler.post {
+            val newId = sessionId?.trim().orEmpty()
+            if (newId == this.playSessionId) return@post
+            this.playSessionId = newId
+            if (newId.isBlank()) return@post
+            // 切集换会话：必须换一条 WS，后台才会用新的 playSessionId 当会话键。
+            if (webSocket != null || connecting) {
+                reconnect()
+            } else {
+                connectIfNeeded()
             }
         }
     }
@@ -131,9 +148,11 @@ class HXCPlayerMonitorReporter(
 
     private fun webSocketUrl(): String? {
         val base = config.endpoint ?: return null
+        if (playSessionId.isBlank()) return null
         // 直接拼接 query 参数，不经过 HttpUrl 解析（其对 wss/ws scheme 支持有限）
         val separator = if (base.contains("?")) "&" else "?"
-        return "$base${separator}user_id=${urlEncode(userId)}&terminal=${urlEncode(terminalTag())}"
+        return "$base${separator}user_id=${urlEncode(userId)}&terminal=${urlEncode(terminalTag())}" +
+                "&playSessionId=${urlEncode(playSessionId)}"
     }
 
     private fun urlEncode(value: String): String {

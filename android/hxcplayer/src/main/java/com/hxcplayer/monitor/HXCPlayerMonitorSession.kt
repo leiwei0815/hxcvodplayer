@@ -22,7 +22,7 @@ import java.util.concurrent.TimeUnit
 class HXCPlayerMonitorSession(
     context: Context,
     config: HXCPlayerMonitorConfig,
-    private val sdkVersion: String = "1.0.15"
+    private val sdkVersion: String = "1.0.16"
 ) {
     companion object {
         // 事件码（对齐 MonitorEventType 枚举）
@@ -430,6 +430,7 @@ class HXCPlayerMonitorSession(
             append(" ").append(networkSnapshotDetail())
         }
         Log.d("HXCMonitor", "beginSession: new playSessionId=$playSessionId url=$url")
+        reporter.setPlaySessionId(playSessionId)
         emit(CODE_PLAY_SESSION_START, "play_session_start", "info",
              message = "播放会话开始", position = startPosition, duration = 0.0,
              detail = detail, expectedDecodeMode = expectedDecodeMode,
