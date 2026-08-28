@@ -370,6 +370,10 @@ private:
     void monitor_maybe_emit_weak_signal(const std::string& reason, int throughput_kbps);
     /// 仅在缓冲/低水位/读超时等“会影响观感”的状态下为 true，用于过滤高频噪声日志。
     bool monitor_should_report_unhealthy_io() const;
+    /// 已缓存内容足够继续播（含已覆盖片尾），读失败时不应转圈/软重连。
+    bool has_healthy_playback_buffer() const;
+    /// 已缓存包覆盖到片尾（允许 1.2s 误差）。
+    bool buffer_covers_remaining_media() const;
     /// 相对当前播放位置的缓冲超前量（秒）；未知时返回 -1。
     double get_buffer_ahead_sec() const;
     /** 播放结束(Ended)后 seek：重置完成态并恢复 playWhenReady，无需 App 重开流 */

@@ -22,7 +22,7 @@ import java.util.concurrent.TimeUnit
 class HXCPlayerMonitorSession(
     context: Context,
     config: HXCPlayerMonitorConfig,
-    private val sdkVersion: String = "1.0.14"
+    private val sdkVersion: String = "1.0.15"
 ) {
     companion object {
         // 事件码（对齐 MonitorEventType 枚举）

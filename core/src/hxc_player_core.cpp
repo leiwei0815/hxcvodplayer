@@ -2336,10 +2336,12 @@ void PlayerCore::read_thread() {
             const bool has_io_error = (io_error != 0);
             const double eof_pos = get_master_clock();
             const double eof_duration = get_duration();
-            const bool eof_near_end = std::isfinite(eof_pos) &&
-                                      std::isfinite(eof_duration) &&
-                                      eof_duration > 0.0 &&
-                                      (eof_duration - eof_pos) <= 1.2;
+            const bool eof_near_end =
+                    (std::isfinite(eof_pos) &&
+                     std::isfinite(eof_duration) &&
+                     eof_duration > 0.0 &&
+                     (eof_duration - eof_pos) <= 1.2) ||
+                    buffer_covers_remaining_media();
 
             // 网络/SecureHLS/本地 HLS 中途 EOF 不能按“文件结束”等待 seek，否则读线程会永久不再产出 packet。
             // 只有真正接近尾部时才进入 EOF 等待；远离尾部按可恢复断流走软重连。
@@ -2469,6 +2471,24 @@ void PlayerCore::read_thread() {
                 set_io_loading(false);
                 set_state(PlayerState::Error);
                 break;
+            }
+
+            // 缓冲仍够播（或已经下完剩下的片）：预取超时不要转圈，更不要软重连冲掉已有包。
+            if (has_healthy_playback_buffer()) {
+                if (read_error_count == 0) {
+                    read_error_begin = std::chrono::steady_clock::now();
+                }
+                read_error_count++;
+                LOG_INFO("读取线程：读包失败但缓冲充足，跳过 loading/软重连。ret=",
+                         effective_ret,
+                         ", ahead=", get_buffer_ahead_sec(),
+                         ", pos=", get_position(),
+                         ", duration=", get_duration(),
+                         ", v_pkt_q=", video_packet_queue_ ? video_packet_queue_->get_nb_packets() : -1,
+                         ", a_pkt_q=", audio_packet_queue_ ? audio_packet_queue_->get_nb_packets() : -1);
+                int retry_delay_ms = hxc_calc_retry_delay_ms(read_error_count - 1, 10, 800);
+                PLAYER_DELAY(retry_delay_ms);
+                continue;
             }
 
             // 读取失败（通常是弱网/暂时断流），进入加载状态。
@@ -4515,6 +4535,26 @@ void PlayerCore::monitor_note_io_bytes(int bytes) {
     } else {
         monitor_io_window_bytes_ += bytes;
     }
+}
+
+bool PlayerCore::buffer_covers_remaining_media() const {
+    const double pos = get_position();
+    const double duration = get_duration();
+    const double ahead = get_buffer_ahead_sec();
+    if (!(std::isfinite(pos) && std::isfinite(duration) && duration > 0.0 && ahead >= 0.0)) {
+        return false;
+    }
+    return (pos + ahead) >= (duration - 1.2);
+}
+
+bool PlayerCore::has_healthy_playback_buffer() const {
+    if (buffer_covers_remaining_media()) {
+        return true;
+    }
+    const double ahead = get_buffer_ahead_sec();
+    const int v_pkt = video_packet_queue_ ? video_packet_queue_->get_nb_packets() : 0;
+    const int a_pkt = audio_packet_queue_ ? audio_packet_queue_->get_nb_packets() : 0;
+    return ahead >= 8.0 && (v_pkt + a_pkt) > 8;
 }
 
 bool PlayerCore::monitor_should_report_unhealthy_io() const {
