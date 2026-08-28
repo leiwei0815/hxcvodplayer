@@ -165,7 +165,8 @@ public:
                                double& seek_target,
                                double& seek_landing,
                                int64_t& cost_ms,
-                               int64_t& stall_ms);
+                               int64_t& stall_ms,
+                               int& http_status);
 
 private:
     // -----------------------------------------------------------------------
@@ -196,6 +197,7 @@ private:
         double seek_landing = 0.0;
         int64_t cost_ms = 0;
         int64_t stall_ms = 0;
+        int http_status = 0;
     };
     std::mutex monitor_queue_mutex_;
     std::vector<MonitorEventEntry> monitor_queue_;
@@ -476,6 +478,8 @@ private:
     std::atomic<bool>    video_empty_stall_forced_pause_{false};
     std::atomic<bool>    pending_video_stall_reopen_{false};
     std::atomic<double>  pending_video_stall_reopen_pos_{-1.0};
+    int64_t last_video_render_stall_ms_{0};
+    bool first_frame_stall_emitted_{false};
     static constexpr int64_t kAudioSilentThresholdMs = 2500;
     static constexpr int64_t kAudioCallbackStallMs = 1800;
     static constexpr int64_t kAudioAvSplitPauseMs = 6500;
@@ -494,6 +498,9 @@ private:
     void   rebuildAudioOutputFromStream(bool force_recreate, const char* reason);
     void   pausePlaybackForAudioSplit(int64_t now, double anchor_pts, const char* reason);
     void   resetVideoEmptyStallRecovery(const char* reason);
+    void   enqueueMonitorNamed(const char* event_name,
+                               const char* message,
+                               const std::string& detail);
 
     // -----------------------------------------------------------------------
     // Event forwarding (core callbacks -> JNI poll)

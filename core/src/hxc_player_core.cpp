@@ -17,6 +17,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <cerrno>
 #if defined(__ANDROID__)
 #include <dlfcn.h>
 #endif
@@ -60,9 +61,49 @@ static bool hxc_is_retryable_network_error(int ret) {
     return ret == AVERROR(ETIMEDOUT) ||
            ret == AVERROR(ECONNREFUSED) ||
            ret == AVERROR(ENETUNREACH) ||
+#ifdef EHOSTUNREACH
+           ret == AVERROR(EHOSTUNREACH) ||
+#endif
+#ifdef ECONNRESET
+           ret == AVERROR(ECONNRESET) ||
+#endif
+#ifdef ENETDOWN
+           ret == AVERROR(ENETDOWN) ||
+#endif
+#ifdef EPIPE
+           ret == AVERROR(EPIPE) ||
+#endif
            ret == AVERROR(EIO) ||
            ret == AVERROR(EAGAIN) ||
            ret == AVERROR_HTTP_SERVER_ERROR;
+}
+
+static int hxc_http_status_from_ffmpeg(int ret) {
+    if (ret == AVERROR_HTTP_BAD_REQUEST) return 400;
+    if (ret == AVERROR_HTTP_UNAUTHORIZED) return 401;
+    if (ret == AVERROR_HTTP_FORBIDDEN) return 403;
+    if (ret == AVERROR_HTTP_NOT_FOUND) return 404;
+    if (ret == AVERROR_HTTP_SERVER_ERROR) return 500;
+    return 0;
+}
+
+static std::string hxc_resource_name_from_url(const std::string& url) {
+    if (url.empty()) {
+        return {};
+    }
+    std::string u = url;
+    const auto query = u.find('?');
+    if (query != std::string::npos) {
+        u.resize(query);
+    }
+    const auto slash = u.find_last_of("/\\");
+    if (slash != std::string::npos && slash + 1 < u.size()) {
+        u = u.substr(slash + 1);
+    }
+    if (u.size() > 96) {
+        u = u.substr(u.size() - 96);
+    }
+    return u;
 }
 
 static int hxc_calc_retry_delay_ms(int retry_count, int base_delay_ms, int max_delay_ms) {
@@ -124,6 +165,16 @@ static bool hxc_is_hls_playlist_url(const char* url) {
         }
     }
     return u.find(".m3u8") != std::string::npos;
+}
+
+static const char* hxc_input_kind_from_url(const char* url) {
+    if (hxc_is_hls_playlist_url(url)) {
+        return "hls";
+    }
+    if (hxc_is_network_like_url(url)) {
+        return "http";
+    }
+    return "file";
 }
 
 static bool hxc_is_loopback_http_url(const char* url) {
@@ -1088,12 +1139,37 @@ int PlayerCore::open(const std::string& filename) {
         } else if (ret == AVERROR(ECONNREFUSED)) {
             error_message += "服务器拒绝连接";
             code = ERROR_NET_CONNECTION_REFUSED;
-        } else if (ret == AVERROR(ENETUNREACH)) {
+        } else if (ret == AVERROR(ENETUNREACH)
+#ifdef EHOSTUNREACH
+                   || ret == AVERROR(EHOSTUNREACH)
+#endif
+                   ) {
             error_message += "网络不可达，请检查网络设置";
-            code = ERROR_INPUT_INVALID_DATA;
+            code = ERROR_NET_UNREACHABLE;
         } else if (ret == AVERROR(EIO)) {
-            code = ERROR_OPEN_INPUT_FAILED;
-            error_message += "I/O 错误，可能是网络问题";
+            char io_errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+            av_strerror(ret, io_errbuf, sizeof(io_errbuf));
+            const std::string io_msg = io_errbuf;
+            if (io_msg.find("Name or service") != std::string::npos ||
+                io_msg.find("nodename") != std::string::npos ||
+                io_msg.find("getaddrinfo") != std::string::npos ||
+                io_msg.find("Unknown host") != std::string::npos ||
+                io_msg.find("No address associated") != std::string::npos) {
+                code = ERROR_NET_DNS_FAILED;
+                error_message += "DNS 解析失败";
+            } else if (io_msg.find("SSL") != std::string::npos ||
+                       io_msg.find("TLS") != std::string::npos ||
+                       io_msg.find("handshake") != std::string::npos ||
+                       io_msg.find("certificate") != std::string::npos) {
+                code = ERROR_NET_TLS_FAILED;
+                error_message += "TLS/SSL 握手失败";
+            } else if (hxc_is_network_like_url(filename.c_str())) {
+                code = ERROR_NET_CONNECTION_LOST;
+                error_message += "I/O 错误，可能是网络问题";
+            } else {
+                code = ERROR_OPEN_INPUT_FAILED;
+                error_message += "I/O 错误，可能是网络问题";
+            }
         } else if (ret == AVERROR_HTTP_BAD_REQUEST) {
             code = ERROR_HTTP_BAD_REQUEST;
             error_message += "HTTP 请求错误（400）";
@@ -1477,6 +1553,7 @@ int PlayerCore::open_common_process(const std::string &filename) {
     audio_stream_opened_ = false;
     if (format_ctx_ && format_ctx_->url) {
         const std::string resolved = format_ctx_->url;
+        open_resolved_url_ = resolved;
         if (!resolved.empty() && resolved != filename) {
             MonitorEvent redirect_ev;
             redirect_ev.type = MonitorEventType::OpenUrlResolved;
@@ -2189,7 +2266,7 @@ void PlayerCore::read_thread() {
             const bool audio_drained = (!audio_stream_opened_ || !audio_queue_ || audio_queue_->nb_remaining() <= 0);
             if (video_drained && audio_drained) {
                 LOG_ERROR("读取线程：重连失败且缓冲已耗尽，回调网络断开错误");
-                emit_error(ERROR_NET_UNREACHABLE, "网络连接已断开，重连失败");
+                emit_error(ERROR_NET_RECONNECT_FAILED, "网络连接已断开，重连失败");
                 set_io_loading(false);
                 set_starvation_loading(false);
                 set_state(PlayerState::Error);
@@ -2239,6 +2316,7 @@ void PlayerCore::read_thread() {
                         " a_pkt_bytes=", (audio_packet_queue_ ? audio_packet_queue_->get_size() : -1),
                         " pos=", get_position(),
                         " url=", (format_ctx_ && format_ctx_->url) ? format_ctx_->url : "");
+            emit_io_diag("read_stall", "读包阻塞", ret, read_dur_ms, 0, 3000);
         }
 
         if (ret < 0) {
@@ -2295,6 +2373,7 @@ void PlayerCore::read_thread() {
                             ", hls=", hls_playlist_input ? 1 : 0,
                             ", url=", (format_ctx_ && format_ctx_->url) ? format_ctx_->url : "",
                             ", io_error=", io_error);
+                emit_io_diag("midstream_eof", "中途EOF按断流处理", io_error != 0 ? io_error : ret, 0, 0, 3000);
             }
 
             int effective_ret = (ret != 0) ? ret : io_error;
@@ -2328,6 +2407,8 @@ void PlayerCore::read_thread() {
                     retryable_error = true;
                     LOG_WARNING("读取线程：网络流出现 INVALIDDATA，先快速重试（",
                                 invalid_data_retry_count, "/", MAX_INVALIDDATA_FAST_RETRY, "）");
+                    emit_io_diag("invaliddata", "HLS分片数据无效", effective_ret, 0,
+                                 invalid_data_retry_count, 1000);
                 } else {
                     // 超过快速重试阈值后继续走可恢复链路（软重连/超时兜底）。
                     non_retryable_error = false;
@@ -2404,6 +2485,7 @@ void PlayerCore::read_thread() {
                             ", 连续失败次数=", read_error_count,
                             ", 卡顿时长=", stall_ms, " ms",
                             ", 是否可重试=", retryable_error ? "是" : "未知按可重试");
+                emit_io_diag("read_fail", "读包失败", effective_ret, stall_ms, read_error_count, 0);
             }
 
             // 网络类错误给更长恢复窗口；未知错误维持较短窗口，避免无限挂起。
@@ -2441,6 +2523,8 @@ void PlayerCore::read_thread() {
                 LOG_WARNING("读取线程：触发软重连尝试(", soft_reconnect_attempt_count + 1, "/",
                             MAX_SOFT_RECONNECT_ATTEMPTS, "), resume_pos=", resume_pos,
                             "s raw_resume_pos=", raw_resume_pos, "s duration=", duration_now);
+                emit_io_diag("soft_reconnect_begin", "软重连开始", effective_ret, stall_ms,
+                             soft_reconnect_attempt_count + 1, 0);
 
                 if (format_ctx_) {
                     avformat_flush(format_ctx_);
@@ -2472,10 +2556,13 @@ void PlayerCore::read_thread() {
                     LOG_INFO("读取线程：软重连成功，继续读取，audio_output_reset_serial=",
                              audio_output_reset_serial_.load(std::memory_order_acquire),
                              ", resume_pos=", resume_pos);
+                    emit_io_diag("soft_reconnect_ok", "软重连成功", 0, 0, 0, 0);
                     PLAYER_DELAY(50);
                     continue;
                 } else {
                     LOG_WARNING("读取线程：软重连失败，ret=", reconnect_ret);
+                    emit_io_diag("soft_reconnect_fail", "软重连失败", reconnect_ret, 0,
+                                 soft_reconnect_attempt_count + 1, 0);
                     soft_reconnect_attempt_count++;
                     int reconnect_delay_ms = hxc_calc_retry_delay_ms(soft_reconnect_attempt_count - 1, 500, 4000);
                     next_soft_reconnect_try_us = av_gettime_relative() + static_cast<int64_t>(reconnect_delay_ms) * 1000;
@@ -2487,6 +2574,8 @@ void PlayerCore::read_thread() {
                 stall_ms >= SOFT_RECONNECT_TRIGGER_MS) {
                 LOG_ERROR("读取线程：软重连已达上限(", MAX_SOFT_RECONNECT_ATTEMPTS,
                           ")，标记等待缓冲耗尽后报网络断开");
+                emit_io_diag("reconnect_exhausted", "软重连耗尽", 0, stall_ms,
+                             MAX_SOFT_RECONNECT_ATTEMPTS, 0);
                 pending_disconnect_error_after_drain = true;
                 continue;
             }
@@ -2512,6 +2601,7 @@ void PlayerCore::read_thread() {
             auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - read_error_begin).count();
             LOG_INFO("读取线程：读取恢复，连续失败次数=", read_error_count, ", 卡顿时长=", stall_ms, " ms");
+            emit_io_diag("read_recover", "读包恢复", 0, stall_ms, read_error_count, 0);
             read_error_count = 0;
             invalid_data_retry_count = 0;
             read_error_begin = std::chrono::steady_clock::time_point{};
@@ -4078,6 +4168,23 @@ void PlayerCore::refresh_loading_state() {
         ev.total_stall_ms = monitor_total_stall_ms_;
         ev.reconnect_count = monitor_reconnect_count_;
         ev.buffer_ahead_sec = get_buffer_ahead_sec();
+        if (merged_loading) {
+            monitor_last_loading_reason_ = monitor_loading_reason();
+            monitor_last_stall_cause_ = monitor_stall_cause();
+            ev.detail = build_monitor_diag_detail("loading_begin");
+        } else {
+            const std::string reason = monitor_last_loading_reason_.empty()
+                                           ? "none"
+                                           : monitor_last_loading_reason_;
+            const std::string cause = monitor_last_stall_cause_.empty()
+                                          ? monitor_stall_cause()
+                                          : monitor_last_stall_cause_;
+            ev.detail = "stage=loading_end,stallCause=" + cause +
+                        ",loadingReason=" + reason + "," +
+                        build_monitor_diag_detail("loading_end");
+        }
+        ev.phase = "buffer";
+        ev.url = monitor_current_url();
         emit_monitor_event(ev);
         LoadingCallback cb;
         {
@@ -4125,6 +4232,7 @@ void PlayerCore::emit_error(int error_code, const std::string& error_msg) {
     ev.duration = get_duration();
     ev.error = mapped;
     ev.detail = error_msg;
+    fill_monitor_runtime_fields(ev);
     emit_monitor_event(ev);
 }
 
@@ -4147,6 +4255,7 @@ void PlayerCore::emit_recoverable_error(int error_code, const std::string& error
     ev.duration = get_duration();
     ev.error = mapped;
     ev.detail = detail.empty() ? error_msg : detail;
+    fill_monitor_runtime_fields(ev);
     emit_monitor_event(ev);
 }
 
@@ -4212,24 +4321,170 @@ void PlayerCore::emit_decode_path_resolved(const std::string& reason) {
     emit_monitor_event(ev);
 }
 
-void PlayerCore::emit_ffmpeg_io_event(const std::string& detail, int ffmpeg_code) {
-    if (detail.rfind("soft_reconnect", 0) == 0) {
+void PlayerCore::emit_ffmpeg_io_event(const std::string& detail, int ffmpeg_code,
+                                      const std::string& message) {
+    if (detail.find("soft_reconnect_begin") != std::string::npos) {
         monitor_reconnect_count_ += 1;
     }
     MonitorEvent ev;
     ev.type = MonitorEventType::FfmpegIoEvent;
-    ev.timestamp_ms = monitor_now_ms();
-    ev.position = get_position();
-    ev.duration = get_duration();
     ev.detail = detail;
-    ev.reconnect_count = monitor_reconnect_count_;
-    ev.total_stall_ms = monitor_total_stall_ms_;
+    ev.message = message;
+    ev.phase = "io";
+    fill_monitor_runtime_fields(ev);
     if (ffmpeg_code != 0) {
         if (!(ffmpeg_code == AVERROR_EOF && detail == "normal_eof")) {
-            ev.error = map_monitor_error(ffmpeg_code, detail);
+            ev.error = map_monitor_error(ffmpeg_code, detail.empty() ? message : detail);
         }
     }
     emit_monitor_event(ev);
+}
+
+void PlayerCore::fill_monitor_runtime_fields(MonitorEvent& ev) {
+    if (ev.timestamp_ms == 0) {
+        ev.timestamp_ms = monitor_now_ms();
+    }
+    ev.position = get_position();
+    ev.duration = get_duration();
+    ev.total_stall_ms = monitor_total_stall_ms_;
+    ev.reconnect_count = monitor_reconnect_count_;
+    ev.buffer_ahead_sec = get_buffer_ahead_sec();
+    if (ev.url.empty()) {
+        ev.url = monitor_current_url();
+    }
+}
+
+std::string PlayerCore::monitor_current_url() const {
+    if (format_ctx_ && format_ctx_->url && format_ctx_->url[0]) {
+        return format_ctx_->url;
+    }
+    if (!open_resolved_url_.empty()) {
+        return open_resolved_url_;
+    }
+    return open_request_url_;
+}
+
+std::string PlayerCore::monitor_resource_name() const {
+    return hxc_resource_name_from_url(monitor_current_url());
+}
+
+std::string PlayerCore::monitor_loading_reason() const {
+    if (seek_loading_.load(std::memory_order_acquire)) {
+        return "seek";
+    }
+    if (io_loading_.load(std::memory_order_acquire)) {
+        return "io";
+    }
+    if (starvation_loading_.load(std::memory_order_acquire)) {
+        return "starvation";
+    }
+    return "none";
+}
+
+std::string PlayerCore::monitor_stall_cause() const {
+    if (seek_loading_.load(std::memory_order_acquire)) {
+        return "seek";
+    }
+    if (io_loading_.load(std::memory_order_acquire)) {
+        return "network";
+    }
+    int64_t stale_ms = -1;
+    const bool stale = is_io_stale_for_playback(3000, &stale_ms);
+    const int v_pkt = video_packet_queue_ ? video_packet_queue_->get_nb_packets() : 0;
+    const int a_pkt = audio_packet_queue_ ? audio_packet_queue_->get_nb_packets() : 0;
+    const int v_frame = video_queue_ ? video_queue_->nb_remaining() : 0;
+    const int a_frame = audio_queue_ ? audio_queue_->nb_remaining() : 0;
+    if (stale || (v_pkt <= 0 && a_pkt <= 0)) {
+        return "network";
+    }
+    if (video_stream_opened_ && v_frame <= 0 && v_pkt > 0) {
+        return "decode";
+    }
+    if (video_stream_opened_ && v_frame > 0) {
+        return "render";
+    }
+    if (audio_stream_opened_ && a_frame <= 0 && a_pkt > 0) {
+        return "decode";
+    }
+    if (starvation_loading_.load(std::memory_order_acquire)) {
+        return "decode";
+    }
+    return "unknown";
+}
+
+int PlayerCore::monitor_current_throughput_kbps() const {
+    if (monitor_io_window_start_ms_ <= 0 || monitor_io_window_bytes_ <= 0) {
+        return 0;
+    }
+    const int64_t now = monitor_now_ms();
+    const int64_t elapsed_ms = std::max<int64_t>(1, now - monitor_io_window_start_ms_);
+    return static_cast<int>((monitor_io_window_bytes_ * 8LL * 1000LL) / (elapsed_ms * 1000LL));
+}
+
+std::string PlayerCore::build_monitor_diag_detail(const std::string& stage,
+                                                  int ffmpeg_code,
+                                                  int64_t extra_ms,
+                                                  int fail_count) const {
+    int64_t io_stale_ms = -1;
+    is_io_stale_for_playback(3000, &io_stale_ms);
+    const std::string url = monitor_current_url();
+    std::ostringstream oss;
+    oss << "stage=" << stage
+        << ",stallCause=" << monitor_stall_cause()
+        << ",loadingReason=" << monitor_loading_reason()
+        << ",inputKind=" << hxc_input_kind_from_url(url.c_str());
+    const std::string resource = monitor_resource_name();
+    if (!resource.empty()) {
+        oss << ",resource=" << resource;
+    }
+    const int http_status = hxc_http_status_from_ffmpeg(ffmpeg_code);
+    if (http_status > 0) {
+        oss << ",httpStatus=" << http_status;
+    }
+    if (ffmpeg_code != 0) {
+        oss << ",ffmpegCode=" << ffmpeg_code;
+    }
+    oss << ",vPktQ=" << (video_packet_queue_ ? video_packet_queue_->get_nb_packets() : -1)
+        << ",aPktQ=" << (audio_packet_queue_ ? audio_packet_queue_->get_nb_packets() : -1)
+        << ",vFrameQ=" << (video_queue_ ? video_queue_->nb_remaining() : -1)
+        << ",aFrameQ=" << (audio_queue_ ? audio_queue_->nb_remaining() : -1)
+        << ",ioStaleMs=" << io_stale_ms
+        << ",bufferAheadSec=" << get_buffer_ahead_sec()
+        << ",throughputKbps=" << monitor_current_throughput_kbps();
+    if (extra_ms > 0) {
+        if (stage == "read_stall") {
+            oss << ",readMs=" << extra_ms;
+        } else {
+            oss << ",stallMs=" << extra_ms;
+        }
+    }
+    if (fail_count > 0) {
+        oss << ",failCount=" << fail_count;
+    }
+    return oss.str();
+}
+
+void PlayerCore::emit_io_diag(const char* stage,
+                              const char* message,
+                              int ffmpeg_code,
+                              int64_t extra_ms,
+                              int fail_count,
+                              int64_t min_interval_ms) {
+    if (!monitor_event_callback_) {
+        return;
+    }
+    const std::string stage_s = stage ? stage : "io";
+    if (min_interval_ms > 0) {
+        const int64_t now = monitor_now_ms();
+        auto it = monitor_io_event_last_ms_.find(stage_s);
+        if (it != monitor_io_event_last_ms_.end() && (now - it->second) < min_interval_ms) {
+            return;
+        }
+        monitor_io_event_last_ms_[stage_s] = now;
+    }
+    emit_ffmpeg_io_event(build_monitor_diag_detail(stage_s, ffmpeg_code, extra_ms, fail_count),
+                         ffmpeg_code,
+                         message ? message : "");
 }
 
 void PlayerCore::report_monitor_error_event(int error_code,
@@ -4284,6 +4539,18 @@ void PlayerCore::monitor_maybe_emit_network_snapshot() {
                            io_loading_.load(std::memory_order_acquire) ||
                            starvation_loading_.load(std::memory_order_acquire);
     oss << ",buffering=" << (buffering ? "1" : "0");
+    oss << ",stallCause=" << (buffering ? monitor_stall_cause() : "none");
+    oss << ",loadingReason=" << monitor_loading_reason();
+    oss << ",ioStaleMs=";
+    {
+        int64_t io_stale_ms = -1;
+        is_io_stale_for_playback(3000, &io_stale_ms);
+        oss << io_stale_ms;
+    }
+    oss << ",vPktQ=" << (video_packet_queue_ ? video_packet_queue_->get_nb_packets() : -1)
+        << ",aPktQ=" << (audio_packet_queue_ ? audio_packet_queue_->get_nb_packets() : -1)
+        << ",vFrameQ=" << (video_queue_ ? video_queue_->nb_remaining() : -1)
+        << ",aFrameQ=" << (audio_queue_ ? audio_queue_->nb_remaining() : -1);
 
     MonitorEvent ev;
     ev.type = MonitorEventType::NetworkSnapshot;
@@ -4294,6 +4561,7 @@ void PlayerCore::monitor_maybe_emit_network_snapshot() {
     ev.reconnect_count = monitor_reconnect_count_;
     ev.buffer_ahead_sec = get_buffer_ahead_sec();
     ev.detail = oss.str();
+    fill_monitor_runtime_fields(ev);
     emit_monitor_event(ev);
 
     if (format_ctx_ && format_ctx_->bit_rate > 0 && throughput_kbps > 0 &&
@@ -4323,19 +4591,33 @@ void PlayerCore::monitor_maybe_emit_weak_signal(const std::string& reason, int t
     ev.reconnect_count = monitor_reconnect_count_;
     ev.buffer_ahead_sec = get_buffer_ahead_sec();
     std::ostringstream oss;
-    oss << "reason=" << reason << ",throughputKbps=" << throughput_kbps;
+    oss << "reason=" << reason << ",throughputKbps=" << throughput_kbps
+        << ",stallCause=" << monitor_stall_cause()
+        << ",loadingReason=" << monitor_loading_reason();
     ev.detail = oss.str();
+    fill_monitor_runtime_fields(ev);
     emit_monitor_event(ev);
 }
 
 double PlayerCore::get_buffer_ahead_sec() const {
-    // 当前分支队列未提供 newest_pts 接口，暂返回 -1（未知）；
-    // monitor 协议中 -1 表示未知，不影响上报。
-    return -1.0;
+    const double pos = get_position();
+    double last_pkt = -1.0;
+    const double last_v = io_last_video_packet_pts_sec_.load(std::memory_order_acquire);
+    const double last_a = io_last_audio_packet_pts_sec_.load(std::memory_order_acquire);
+    if (std::isfinite(last_v) && last_v > last_pkt) {
+        last_pkt = last_v;
+    }
+    if (std::isfinite(last_a) && last_a > last_pkt) {
+        last_pkt = last_a;
+    }
+    if (!(std::isfinite(last_pkt) && last_pkt >= 0.0 && std::isfinite(pos) && pos >= 0.0)) {
+        return -1.0;
+    }
+    return std::max(0.0, last_pkt - pos);
 }
 
 std::string PlayerCore::monitor_open_url() const {
-    return {};
+    return monitor_current_url();
 }
 
 std::string PlayerCore::monitor_open_url_redirect_detail() const {

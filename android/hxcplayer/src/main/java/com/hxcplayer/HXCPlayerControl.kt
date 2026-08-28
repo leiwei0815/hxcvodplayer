@@ -1941,7 +1941,10 @@ class HXCPlayerControl @JvmOverloads constructor(
         metadata: HXCPlayerMonitorMetadata? = null
     ) {
         val uid = monitorUserContext?.userId ?: "null"
-        android.util.Log.d("HXCMonitor", "beginMonitorSession: url=$url, userId=$uid, monitorUserContext=${monitorUserContext != null}")
+        android.util.Log.d("HXCMonitor", "beginMonitorSession: url=$url, userId=$uid, monitorUserContext=${monitorUserContext != null}, reportingEnabled=${monitorSession.reportingEnabled}, playerRole=${monitorSession.playerRole}")
+        if (!monitorSession.reportingEnabled) {
+            return
+        }
         monitorSession.engineType = "custom"
         monitorSession.userContext = monitorUserContext
         monitorSession.metadata = metadata
@@ -3848,6 +3851,9 @@ class HXCPlayerControl @JvmOverloads constructor(
                         if (ev.has("seekLanding")) extra["seekLanding"] = ev.optDouble("seekLanding")
                         if (ev.has("throughputKbps")) extra["throughputKbps"] = ev.optInt("throughputKbps")
                         if (ev.has("bufferAheadSec")) extra["bufferAheadSec"] = ev.optDouble("bufferAheadSec")
+                        if (ev.has("httpStatus") && ev.optInt("httpStatus") > 0) {
+                            extra["httpStatus"] = ev.optInt("httpStatus")
+                        }
                         val mediaUrl = ev.optString("url", "")
                         if (mediaUrl.isNotEmpty()) extra["url"] = mediaUrl
                         val coreMessage = ev.optString("message", "")

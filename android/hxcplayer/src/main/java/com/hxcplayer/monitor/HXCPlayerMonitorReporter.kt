@@ -36,7 +36,7 @@ class HXCPlayerMonitorReporter(
     @Volatile private var shuttingDown: Boolean = false
     /** 主动 cancel/换 userId 重连，不应当成故障去指数退避再连一次。 */
     @Volatile private var suppressDisconnectReconnect: Boolean = false
-    @Volatile private var reporterActive: Boolean = true
+    @Volatile private var reporterActive: Boolean = false
 
     private val client: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -93,6 +93,7 @@ class HXCPlayerMonitorReporter(
                         "eventCode=${event.optInt("eventCode")} " +
                         "eventType=${event.optString("eventType")} " +
                         "errorCode=${event.optInt("errorCode")} " +
+                        "playerRole=${event.optString("playerRole")} " +
                         "userId=${this.userId} " +
                         "immediate=$immediate")
             }

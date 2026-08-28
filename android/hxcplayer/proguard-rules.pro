@@ -7,6 +7,7 @@
 -keep public class com.hxcplayer.HXCPlayerLicenseManager { *; }
 -keep public class com.hxcplayer.HXCPlayerLicenseManager$* { *; }
 -keep public class com.hxcplayer.download.** { *; }
+-keep class com.hxcplayer.monitor.** { *; }
 
 # JNI bindings in libhxcplayer.so depend on these class and method names.
 -keepclasseswithmembernames class com.hxcplayer.HXCPlayerControl {

@@ -7,6 +7,7 @@
 #include <limits>
 #include <algorithm>
 #include <chrono>
+#include <sstream>
 #include <thread>
 #include <inttypes.h>
 #include <unistd.h>  // gettid()
@@ -586,6 +587,8 @@ bool AndroidPlayer::openURL(const char* url, double start_position) {
         consecutive_drop_count_ = 0;
         first_frame_rendered_.store(false, std::memory_order_release);
         first_frame_wait_started_ms_ = 0;
+        first_frame_stall_emitted_ = false;
+        last_video_render_stall_ms_ = 0;
         severe_lag_start_ms_ = 0;
         last_soft_reanchor_ms_ = 0;
         soft_reanchor_count_ = 0;
@@ -1191,6 +1194,8 @@ void AndroidPlayer::stop() {
     consecutive_drop_count_ = 0;
     first_frame_wait_started_ms_ = 0;
     first_frame_rendered_.store(false, std::memory_order_release);
+    first_frame_stall_emitted_ = false;
+    last_video_render_stall_ms_ = 0;
     severe_lag_start_ms_ = 0;
     severe_lag_audio_pause_start_ms_ = 0;
     non4k_severe_behind_start_ms_ = 0;
@@ -5696,6 +5701,19 @@ void AndroidPlayer::renderLoop() {
                 bool core_stale_io =
                         player_core_is_io_stale_for_playback(
                                 player_core_, kCoreIoStaleRecoverMs, &core_io_stale_ms) != 0;
+                if (!first_frame_ready && !opening_now && play_when_ready_now &&
+                    empty_ms >= 5000 && !first_frame_stall_emitted_) {
+                    first_frame_stall_emitted_ = true;
+                    last_video_render_stall_ms_ = now_empty;
+                    std::ostringstream stall_oss;
+                    stall_oss << "stage=first_frame_timeout"
+                              << ",stallCause=" << (core_stale_io ? "network" : "decode")
+                              << ",emptyMs=" << empty_ms
+                              << ",ioStaleMs=" << core_io_stale_ms
+                              << ",pos=" << pos_now
+                              << ",duration=" << dur_now;
+                    enqueueMonitorNamed("video_render_stall", "首帧超时未出画", stall_oss.str());
+                }
                 int64_t tail_force_complete_ms = recent_open_tail_intent
                                                  ? kTailStallForceCompleteFastMs
                                                  : kTailStallForceCompleteMs;
@@ -5773,6 +5791,20 @@ void AndroidPlayer::renderLoop() {
                               source_encrypted_active_.load(std::memory_order_acquire) ? 1 : 0,
                               core_stale_io ? 1 : 0,
                               core_io_stale_ms);
+                        if (now_empty - last_video_render_stall_ms_ >= 8000) {
+                            last_video_render_stall_ms_ = now_empty;
+                            std::ostringstream stall_oss;
+                            stall_oss << "stage=video_empty"
+                                      << ",stallCause=" << (core_stale_io ? "network" : "render")
+                                      << ",emptyMs=" << empty_ms
+                                      << ",ioStaleMs=" << core_io_stale_ms
+                                      << ",pos=" << pos_now
+                                      << ",duration=" << dur_now
+                                      << ",remain=" << remain_now;
+                            enqueueMonitorNamed("video_render_stall",
+                                                "视频队列空导致黑屏/卡顿",
+                                                stall_oss.str());
+                        }
                         if (!pending_video_stall_reopen_.load(std::memory_order_acquire)) {
                             double max_recover_pos = (std::isfinite(dur_now) && dur_now > 0.35)
                                                     ? std::max(0.0, dur_now - 0.35)
@@ -7158,6 +7190,7 @@ void AndroidPlayer::setupMonitorCallback() {
             entry.seek_landing = ev->seek_landing;
             entry.cost_ms = ev->cost_ms;
             entry.stall_ms = ev->stall_ms;
+            entry.http_status = ev->http_status;
 
             {
                 std::lock_guard<std::mutex> lock(self->monitor_queue_mutex_);
@@ -7185,8 +7218,9 @@ bool AndroidPlayer::consumeMonitorEvent(std::string& event_name,
                                         int& recoverable,
                                         double& seek_target,
                                         double& seek_landing,
-                                        int64_t& cost_ms,
-                                        int64_t& stall_ms) {
+                               int64_t& cost_ms,
+                               int64_t& stall_ms,
+                               int& http_status) {
     std::lock_guard<std::mutex> lock(monitor_queue_mutex_);
     if (monitor_queue_.empty()) return false;
     MonitorEventEntry& entry = monitor_queue_.front();
@@ -7209,8 +7243,31 @@ bool AndroidPlayer::consumeMonitorEvent(std::string& event_name,
     seek_landing = entry.seek_landing;
     cost_ms = entry.cost_ms;
     stall_ms = entry.stall_ms;
+    http_status = entry.http_status;
     monitor_queue_.erase(monitor_queue_.begin());
     return true;
+}
+
+void AndroidPlayer::enqueueMonitorNamed(const char* event_name,
+                                        const char* message,
+                                        const std::string& detail) {
+    MonitorEventEntry entry;
+    entry.event_name = event_name ? event_name : "unknown";
+    entry.message = message ? message : "";
+    entry.detail = detail;
+    entry.phase = "render";
+    if (player_core_) {
+        entry.position = player_core_get_position(player_core_);
+        entry.duration = player_core_get_duration(player_core_);
+    }
+    entry.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    {
+        std::lock_guard<std::mutex> lock(monitor_queue_mutex_);
+        if (monitor_queue_.size() < 200) {
+            monitor_queue_.push_back(std::move(entry));
+        }
+    }
 }
 
 void AndroidPlayer::getAudioHealthMetrics(int64_t* silent_for_ms,

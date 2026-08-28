@@ -18,7 +18,7 @@ import java.util.UUID
 class HXCPlayerMonitorSession(
     context: Context,
     config: HXCPlayerMonitorConfig,
-    private val sdkVersion: String = "1.0.11"
+    private val sdkVersion: String = "1.0.12"
 ) {
     companion object {
         // 事件码（对齐 MonitorEventType 枚举）
@@ -77,7 +77,7 @@ class HXCPlayerMonitorSession(
             CODE_SEEK_COMPLETE, CODE_SEEK_FAIL, CODE_LOADING_BEGIN, CODE_LOADING_END,
             CODE_PLAY_COMPLETE, CODE_PLAY_SESSION_END, CODE_DECODE_PATH_RESOLVED,
             CODE_OPEN_URL_RESOLVED, CODE_DECODE_ERROR, CODE_NETWORK_SNAPSHOT,
-            CODE_NETWORK_WEAK_SIGNAL
+            CODE_NETWORK_WEAK_SIGNAL, CODE_FFMPEG_IO, CODE_VIDEO_RENDER_STALL
         )
 
         fun eventNameToCode(name: String): Int = when (name) {
@@ -217,12 +217,6 @@ class HXCPlayerMonitorSession(
     var engineType: String = "custom"
     /** main=主课画面，small=三分屏小窗。 */
     @Volatile var playerRole: String = "main"
-    /** 小窗默认可关闭上报，避免和主播放器双会话混在一起。 */
-    @Volatile var reportingEnabled: Boolean = true
-        set(value) {
-            field = value
-            reporter.setActive(value)
-        }
 
     var playSessionId: String = UUID.randomUUID().toString()
         private set
@@ -238,6 +232,16 @@ class HXCPlayerMonitorSession(
     private val reporter = HXCPlayerMonitorReporter(config, "android", sdkVersion, appName)
     private val sessionThread = HandlerThread("hxc-monitor-session").apply { start() }
     private val sessionHandler = Handler(sessionThread.looper)
+
+    /**
+     * 默认关闭。构造函数/设倍速/小窗 open 都可能早于 App 调用开关；
+     * 主窗需显式 setMonitorReportingEnabled(true)。
+     */
+    @Volatile var reportingEnabled: Boolean = false
+        set(value) {
+            field = value
+            reporter.setActive(value)
+        }
 
     private var url: String? = null
     private var urlHash: String? = null
@@ -573,18 +577,32 @@ class HXCPlayerMonitorSession(
             val eventType = defaultEventType(eventCode, errorCode, recoverable)
             val message = coreMessage ?: defaultMessage(eventCode)
             val costMs = (extra?.get("costMs") as? Number)?.toLong() ?: 0L
-            val stallMs = (extra?.get("stallMs") as? Number)?.toLong() ?: 0L
+            val stallMs = (extra?.get("stallMs") as? Number)?.toLong()?.takeIf { it > 0 }
+                ?: parseKvFromDetail(detail, "stallMs")?.toLongOrNull()
+                ?: 0L
             val seekTarget = (extra?.get("seekTarget") as? Number)?.toDouble() ?: 0.0
             val seekLanding = (extra?.get("seekLanding") as? Number)?.toDouble() ?: 0.0
+            val sendImmediate = immediate ||
+                eventCode == CODE_FFMPEG_IO ||
+                eventCode == CODE_VIDEO_RENDER_STALL
             val ffmpegCode = (extra?.get("ffmpegCode") as? Number)?.toInt() ?: 0
             var throughputKbps = (extra?.get("throughputKbps") as? Number)?.toInt() ?: -1
-            if (eventCode == CODE_NETWORK_SNAPSHOT && throughputKbps < 0) {
+            if (throughputKbps < 0) {
                 throughputKbps = parseKvFromDetail(detail, "throughputKbps")?.toIntOrNull() ?: -1
             }
-            val bufferAheadSec = (extra?.get("bufferAheadSec") as? Number)?.toDouble() ?: -1.0
+            val bufferAheadSec = (extra?.get("bufferAheadSec") as? Number)?.toDouble()
+                ?: parseKvFromDetail(detail, "bufferAheadSec")?.toDoubleOrNull()
+                ?: -1.0
             val mediaUrl = (extra?.get("url") as? String)?.takeIf { it.isNotEmpty() }
                 ?: parseKvFromDetail(detail, "resolvedUrl")
             val source = (extra?.get("source") as? String)?.takeIf { it.isNotEmpty() }
+            val httpStatus = (extra?.get("httpStatus") as? Number)?.toInt()
+                ?: parseKvFromDetail(detail, "httpStatus")?.toIntOrNull()
+                ?: 0
+            val stallCause = parseKvFromDetail(detail, "stallCause")
+            val loadingReason = parseKvFromDetail(detail, "loadingReason")
+            val resource = parseKvFromDetail(detail, "resource")
+            val stage = parseKvFromDetail(detail, "stage")
             emit(eventCode, eventName, eventType,
                  errorCode = errorCode, message = message,
                  position = position, duration = if (duration > 0) duration else this.duration,
@@ -595,8 +613,13 @@ class HXCPlayerMonitorSession(
                  bufferAheadSec = bufferAheadSec,
                  mediaUrl = mediaUrl,
                  source = source,
+                 httpStatus = httpStatus,
+                 stallCause = stallCause,
+                 loadingReason = loadingReason,
+                 resource = resource,
+                 stage = stage,
                  attachNetworkType = eventCode in NETWORK_TYPED_CODES,
-                 immediate = immediate)
+                 immediate = sendImmediate)
         }
     }
 
@@ -718,6 +741,11 @@ class HXCPlayerMonitorSession(
         mediaUrl: String? = null,
         expectedDecodeMode: String? = null,
         source: String? = null,
+        httpStatus: Int = 0,
+        stallCause: String? = null,
+        loadingReason: String? = null,
+        resource: String? = null,
+        stage: String? = null,
         attachNetworkType: Boolean = false,
         immediate: Boolean
     ) {
@@ -751,6 +779,11 @@ class HXCPlayerMonitorSession(
         if (ffmpegCode != 0) event.put("ffmpegCode", ffmpegCode)
         if (throughputKbps >= 0) event.put("throughputKbps", throughputKbps)
         if (bufferAheadSec >= 0) event.put("bufferAheadSec", bufferAheadSec)
+        if (httpStatus > 0) event.put("httpStatus", httpStatus)
+        if (!stallCause.isNullOrEmpty()) event.put("stallCause", stallCause)
+        if (!loadingReason.isNullOrEmpty() && loadingReason != "none") event.put("loadingReason", loadingReason)
+        if (!resource.isNullOrEmpty()) event.put("resource", resource)
+        if (!stage.isNullOrEmpty()) event.put("stage", stage)
         if (!expectedDecodeMode.isNullOrEmpty()) event.put("expectedDecodeMode", expectedDecodeMode)
 
         if (eventCode == CODE_DECODE_PATH_RESOLVED) {

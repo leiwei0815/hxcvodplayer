@@ -340,7 +340,25 @@ private:
                             const std::string& detail = "",
                             const std::string& phase = "");
     void emit_decode_path_resolved(const std::string& reason);
-    void emit_ffmpeg_io_event(const std::string& detail, int ffmpeg_code = 0);
+    void emit_ffmpeg_io_event(const std::string& detail, int ffmpeg_code = 0,
+                              const std::string& message = "");
+    /// 读流/卡顿诊断事件：stage 写入 detail，供后台判断是否网络问题。
+    void emit_io_diag(const char* stage,
+                      const char* message,
+                      int ffmpeg_code = 0,
+                      int64_t extra_ms = 0,
+                      int fail_count = 0,
+                      int64_t min_interval_ms = 0);
+    void fill_monitor_runtime_fields(MonitorEvent& ev);
+    std::string monitor_current_url() const;
+    std::string monitor_resource_name() const;
+    std::string monitor_loading_reason() const;
+    std::string monitor_stall_cause() const;
+    int monitor_current_throughput_kbps() const;
+    std::string build_monitor_diag_detail(const std::string& stage,
+                                          int ffmpeg_code = 0,
+                                          int64_t extra_ms = 0,
+                                          int fail_count = 0) const;
     void set_seek_loading(bool is_loading);
     void set_io_loading(bool is_loading);
     void set_starvation_loading(bool is_loading);
@@ -426,6 +444,9 @@ private:
     int64_t monitor_io_window_start_ms_ = 0;
     int64_t monitor_last_snapshot_ms_ = 0;
     int64_t monitor_last_weak_signal_ms_ = 0;
+    std::string monitor_last_loading_reason_;
+    std::string monitor_last_stall_cause_;
+    std::unordered_map<std::string, int64_t> monitor_io_event_last_ms_;
     std::atomic<bool> loading_notified_{false};  // 对外已通知的 loading 状态
     std::atomic<double> seek_target_pos_;  // ⚠️ seek 的目标位置，在 seek 期间返回此值
     std::atomic<int>   post_seek_warmup_frames_{0}; // seek 结束后放宽 A/V 同步丢帧阈值的剩余帧数

@@ -773,7 +773,7 @@ Java_com_hxcplayer_HXCPlayerControl_nativeConsumeMonitorEvent(JNIEnv* env, jobje
     double position = 0.0, duration = 0.0, buffer_ahead_sec = -1.0;
     double seek_target = 0.0, seek_landing = 0.0;
     int64_t timestamp_ms = 0, total_stall_ms = 0, cost_ms = 0, stall_ms = 0;
-    int error_code = 0, ffmpeg_code = 0, reconnect_count = 0, recoverable = 0;
+    int error_code = 0, ffmpeg_code = 0, reconnect_count = 0, recoverable = 0, http_status = 0;
 
     if (!player->consumeMonitorEvent(event_name, detail, message, trace_point, phase, media_url,
                                      position, duration,
@@ -781,7 +781,7 @@ Java_com_hxcplayer_HXCPlayerControl_nativeConsumeMonitorEvent(JNIEnv* env, jobje
                                      reconnect_count, total_stall_ms,
                                      buffer_ahead_sec, recoverable,
                                      seek_target, seek_landing,
-                                     cost_ms, stall_ms)) {
+                                     cost_ms, stall_ms, http_status)) {
         return nullptr;
     }
 
@@ -799,6 +799,7 @@ Java_com_hxcplayer_HXCPlayerControl_nativeConsumeMonitorEvent(JNIEnv* env, jobje
     json += ",\"seekLanding\":" + std::to_string(seek_landing);
     json += ",\"costMs\":" + std::to_string(cost_ms);
     json += ",\"stallMs\":" + std::to_string(stall_ms);
+    json += ",\"httpStatus\":" + std::to_string(http_status);
     json += ",\"detail\":\"" + hxc_json_escape(detail) + "\"";
     json += ",\"message\":\"" + hxc_json_escape(message) + "\"";
     json += ",\"tracePoint\":\"" + hxc_json_escape(trace_point) + "\"";

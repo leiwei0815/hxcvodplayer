@@ -8,6 +8,10 @@
 
 #include <chrono>
 #include <mutex>
+#include <cstring>
+#include <cctype>
+#include <cerrno>
+#include <algorithm>
 
 extern "C" {
 #include <libavutil/error.h>
@@ -183,6 +187,52 @@ static MonitorErrorDomain domain_for_code(int code) {
     return MonitorErrorDomain::Ffmpeg;
 }
 
+static bool hxc_contains_ci(const std::string& haystack, const char* needle) {
+    if (!needle || !*needle) {
+        return false;
+    }
+    const size_t nlen = std::strlen(needle);
+    auto it = std::search(haystack.begin(), haystack.end(), needle, needle + nlen,
+                          [](char a, char b) {
+                              return std::tolower(static_cast<unsigned char>(a)) ==
+                                     std::tolower(static_cast<unsigned char>(b));
+                          });
+    return it != haystack.end();
+}
+
+static bool hxc_message_suggests_dns(const std::string& text) {
+    return hxc_contains_ci(text, "Name or service not known") ||
+           hxc_contains_ci(text, "nodename nor servname") ||
+           hxc_contains_ci(text, "Temporary failure in name resolution") ||
+           hxc_contains_ci(text, "No address associated") ||
+           hxc_contains_ci(text, "getaddrinfo") ||
+           hxc_contains_ci(text, "Unknown host") ||
+           hxc_contains_ci(text, "host not found") ||
+           hxc_contains_ci(text, "DNS");
+}
+
+static bool hxc_message_suggests_tls(const std::string& text) {
+    return hxc_contains_ci(text, "SSL") ||
+           hxc_contains_ci(text, "TLS") ||
+           hxc_contains_ci(text, "handshake") ||
+           hxc_contains_ci(text, "certificate") ||
+           hxc_contains_ci(text, "mbedtls");
+}
+
+static void hxc_fill_http_status_from_code(MonitorErrorInfo& info) {
+    if (info.http_status != 0) {
+        return;
+    }
+    switch (info.code) {
+        case ERROR_HTTP_BAD_REQUEST: info.http_status = 400; break;
+        case ERROR_HTTP_UNAUTHORIZED: info.http_status = 401; break;
+        case ERROR_HTTP_FORBIDDEN: info.http_status = 403; break;
+        case ERROR_HTTP_NOT_FOUND: info.http_status = 404; break;
+        case ERROR_HTTP_SERVER_ERROR: info.http_status = 500; break;
+        default: break;
+    }
+}
+
 MonitorErrorInfo map_monitor_error(int ffmpeg_or_player_code,
                                    const std::string& message,
                                    int http_status) {
@@ -203,12 +253,14 @@ MonitorErrorInfo map_monitor_error(int ffmpeg_or_player_code,
         info.recoverable = monitor_error_is_recoverable(info.code);
         info.category = info.recoverable ? MonitorErrorCategory::Recoverable
                                          : MonitorErrorCategory::Fatal;
+        hxc_fill_http_status_from_code(info);
         return info;
     }
 
     info.ffmpeg_code = ffmpeg_or_player_code;
     av_strerror(ffmpeg_or_player_code, errbuf, sizeof(errbuf));
     info.ffmpeg_message = errbuf;
+    const std::string combined = message + " " + info.ffmpeg_message;
 
     if (ffmpeg_or_player_code == AVERROR_EXIT) {
         info.code = ERROR_NONE;
@@ -231,15 +283,34 @@ MonitorErrorInfo map_monitor_error(int ffmpeg_or_player_code,
         info.code = ERROR_HTTP_NOT_FOUND;
     } else if (http_status >= 500 || ffmpeg_or_player_code == AVERROR_HTTP_SERVER_ERROR) {
         info.code = ERROR_HTTP_SERVER_ERROR;
-    } else if (ffmpeg_or_player_code == AVERROR(ETIMEDOUT)) {
-        info.code = ERROR_NET_CONNECTION_TIMEOUT;
+    } else if (hxc_message_suggests_dns(combined)) {
+        info.code = ERROR_NET_DNS_FAILED;
+    } else if (hxc_message_suggests_tls(combined)) {
+        info.code = ERROR_NET_TLS_FAILED;
+    } else if (ffmpeg_or_player_code == AVERROR(ETIMEDOUT) ||
+               ffmpeg_or_player_code == AVERROR(EAGAIN)) {
+        info.code = (ffmpeg_or_player_code == AVERROR(EAGAIN))
+                        ? ERROR_NET_READ_TIMEOUT
+                        : ERROR_NET_CONNECTION_TIMEOUT;
     } else if (ffmpeg_or_player_code == AVERROR(ECONNREFUSED)) {
         info.code = ERROR_NET_CONNECTION_REFUSED;
-    } else if (ffmpeg_or_player_code == AVERROR(ENETUNREACH)) {
+    } else if (ffmpeg_or_player_code == AVERROR(ENETUNREACH)
+#ifdef EHOSTUNREACH
+               || ffmpeg_or_player_code == AVERROR(EHOSTUNREACH)
+#endif
+               ) {
         info.code = ERROR_NET_UNREACHABLE;
-    } else if (ffmpeg_or_player_code == AVERROR(EIO)) {
-        info.code = ERROR_NET_CONNECTION_LOST;
-    } else if (ffmpeg_or_player_code == AVERROR_EOF) {
+    } else if (ffmpeg_or_player_code == AVERROR(EIO)
+#ifdef ECONNRESET
+               || ffmpeg_or_player_code == AVERROR(ECONNRESET)
+#endif
+#ifdef EPIPE
+               || ffmpeg_or_player_code == AVERROR(EPIPE)
+#endif
+#ifdef ENETDOWN
+               || ffmpeg_or_player_code == AVERROR(ENETDOWN)
+#endif
+               || ffmpeg_or_player_code == AVERROR_EOF) {
         info.code = ERROR_NET_CONNECTION_LOST;
     } else if (ffmpeg_or_player_code == AVERROR(ENOMEM)) {
         info.code = ERROR_OUT_OF_MEMORY;
@@ -255,6 +326,7 @@ MonitorErrorInfo map_monitor_error(int ffmpeg_or_player_code,
     info.recoverable = monitor_error_is_recoverable(info.code);
     info.category = info.recoverable ? MonitorErrorCategory::Recoverable
                                      : MonitorErrorCategory::Fatal;
+    hxc_fill_http_status_from_code(info);
     if (info.message.empty()) {
         info.message = info.ffmpeg_message;
     }
