@@ -18,7 +18,7 @@ import java.util.UUID
 class HXCPlayerMonitorSession(
     context: Context,
     config: HXCPlayerMonitorConfig,
-    private val sdkVersion: String = "1.0.12"
+    private val sdkVersion: String = "1.0.13"
 ) {
     companion object {
         // 事件码（对齐 MonitorEventType 枚举）

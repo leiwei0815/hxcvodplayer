@@ -368,6 +368,8 @@ private:
     void monitor_note_io_bytes(int bytes);
     void monitor_maybe_emit_network_snapshot();
     void monitor_maybe_emit_weak_signal(const std::string& reason, int throughput_kbps);
+    /// 仅在缓冲/低水位/读超时等“会影响观感”的状态下为 true，用于过滤高频噪声日志。
+    bool monitor_should_report_unhealthy_io() const;
     /// 相对当前播放位置的缓冲超前量（秒）；未知时返回 -1。
     double get_buffer_ahead_sec() const;
     /** 播放结束(Ended)后 seek：重置完成态并恢复 playWhenReady，无需 App 重开流 */

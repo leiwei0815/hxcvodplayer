@@ -2316,7 +2316,10 @@ void PlayerCore::read_thread() {
                         " a_pkt_bytes=", (audio_packet_queue_ ? audio_packet_queue_->get_size() : -1),
                         " pos=", get_position(),
                         " url=", (format_ctx_ && format_ctx_->url) ? format_ctx_->url : "");
-            emit_io_diag("read_stall", "读包阻塞", ret, read_dur_ms, 0, 3000);
+            // 缓冲充足时的读阻塞多为队列反压/下一片预取，不上报。
+            if (monitor_should_report_unhealthy_io()) {
+                emit_io_diag("read_stall", "读包阻塞", ret, read_dur_ms, 0, 8000);
+            }
         }
 
         if (ret < 0) {
@@ -2373,7 +2376,7 @@ void PlayerCore::read_thread() {
                             ", hls=", hls_playlist_input ? 1 : 0,
                             ", url=", (format_ctx_ && format_ctx_->url) ? format_ctx_->url : "",
                             ", io_error=", io_error);
-                emit_io_diag("midstream_eof", "中途EOF按断流处理", io_error != 0 ? io_error : ret, 0, 0, 3000);
+                // 中途 EOF 由后续 loading / 软重连覆盖，避免与 read_fail 连打。
             }
 
             int effective_ret = (ret != 0) ? ret : io_error;
@@ -2407,8 +2410,10 @@ void PlayerCore::read_thread() {
                     retryable_error = true;
                     LOG_WARNING("读取线程：网络流出现 INVALIDDATA，先快速重试（",
                                 invalid_data_retry_count, "/", MAX_INVALIDDATA_FAST_RETRY, "）");
-                    emit_io_diag("invaliddata", "HLS分片数据无效", effective_ret, 0,
-                                 invalid_data_retry_count, 1000);
+                    if (invalid_data_retry_count == 1 || monitor_should_report_unhealthy_io()) {
+                        emit_io_diag("invaliddata", "HLS分片数据无效", effective_ret, 0,
+                                     invalid_data_retry_count, 10000);
+                    }
                 } else {
                     // 超过快速重试阈值后继续走可恢复链路（软重连/超时兜底）。
                     non_retryable_error = false;
@@ -2556,7 +2561,7 @@ void PlayerCore::read_thread() {
                     LOG_INFO("读取线程：软重连成功，继续读取，audio_output_reset_serial=",
                              audio_output_reset_serial_.load(std::memory_order_acquire),
                              ", resume_pos=", resume_pos);
-                    emit_io_diag("soft_reconnect_ok", "软重连成功", 0, 0, 0, 0);
+                    // 恢复由 loading_end 表达，不再单独上报 soft_reconnect_ok。
                     PLAYER_DELAY(50);
                     continue;
                 } else {
@@ -2601,7 +2606,7 @@ void PlayerCore::read_thread() {
             auto stall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - read_error_begin).count();
             LOG_INFO("读取线程：读取恢复，连续失败次数=", read_error_count, ", 卡顿时长=", stall_ms, " ms");
-            emit_io_diag("read_recover", "读包恢复", 0, stall_ms, read_error_count, 0);
+            // 恢复由 loading_end 表达，不再单独上报 read_recover。
             read_error_count = 0;
             invalid_data_retry_count = 0;
             read_error_begin = std::chrono::steady_clock::time_point{};
@@ -4512,6 +4517,40 @@ void PlayerCore::monitor_note_io_bytes(int bytes) {
     }
 }
 
+bool PlayerCore::monitor_should_report_unhealthy_io() const {
+    if (io_loading_.load(std::memory_order_acquire) ||
+        starvation_loading_.load(std::memory_order_acquire)) {
+        return true;
+    }
+    int64_t io_stale_ms = -1;
+    if (is_io_stale_for_playback(3000, &io_stale_ms)) {
+        return true;
+    }
+    const PlayerState st = get_state();
+    if (st != PlayerState::Playing) {
+        return false;
+    }
+    const double pos = get_position();
+    const double duration = get_duration();
+    const bool near_end = std::isfinite(pos) &&
+                          std::isfinite(duration) &&
+                          duration > 0.0 &&
+                          (duration - pos) <= 8.0;
+    if (near_end) {
+        return false;
+    }
+    const double ahead = get_buffer_ahead_sec();
+    if (ahead >= 0.0 && ahead < 8.0) {
+        return true;
+    }
+    const int v_pkt = video_packet_queue_ ? video_packet_queue_->get_nb_packets() : 0;
+    const int a_pkt = audio_packet_queue_ ? audio_packet_queue_->get_nb_packets() : 0;
+    if (video_stream_opened_ && v_pkt + a_pkt <= 8) {
+        return true;
+    }
+    return false;
+}
+
 void PlayerCore::monitor_maybe_emit_network_snapshot() {
     const int64_t now = monitor_now_ms();
     constexpr int64_t kSnapshotIntervalMs = 20000;
@@ -4520,6 +4559,16 @@ void PlayerCore::monitor_maybe_emit_network_snapshot() {
     }
     const PlayerState st = get_state();
     if (st != PlayerState::Playing && st != PlayerState::Opening && st != PlayerState::Paused) {
+        return;
+    }
+    // seek 已有 loading_begin/end；健康播放快照对排查无增量。
+    const bool io_or_starvation =
+            io_loading_.load(std::memory_order_acquire) ||
+            starvation_loading_.load(std::memory_order_acquire);
+    if (!io_or_starvation && seek_loading_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!monitor_should_report_unhealthy_io()) {
         return;
     }
     monitor_last_snapshot_ms_ = now;
