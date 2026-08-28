@@ -22,7 +22,7 @@ import java.util.concurrent.TimeUnit
 class HXCPlayerMonitorSession(
     context: Context,
     config: HXCPlayerMonitorConfig,
-    private val sdkVersion: String = "1.0.16"
+    private val sdkVersion: String = "1.0.17"
 ) {
     companion object {
         // 事件码（对齐 MonitorEventType 枚举）
@@ -237,6 +237,17 @@ class HXCPlayerMonitorSession(
     private val reporter = HXCPlayerMonitorReporter(config, "android", sdkVersion, appName)
     private val sessionThread = HandlerThread("hxc-monitor-session").apply { start() }
     private val sessionHandler = Handler(sessionThread.looper)
+
+    init {
+        reporter.onBoundSessionId = { id ->
+            sessionHandler.post {
+                if (id.isNotBlank() && playSessionId != id) {
+                    playSessionId = id
+                    Log.d("HXCMonitor", "playSessionId bound to server session_id=$id")
+                }
+            }
+        }
+    }
 
     /**
      * 默认关闭。构造函数/设倍速/小窗 open 都可能早于 App 调用开关；

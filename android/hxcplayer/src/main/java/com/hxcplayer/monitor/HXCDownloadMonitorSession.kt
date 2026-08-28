@@ -32,7 +32,7 @@ object HXCDownloadMonitorSession {
     const val CODE_DOWNLOAD_RESUME_REJECT = 213
     const val CODE_DOWNLOAD_RESUME_QUEUED = 214
 
-    private const val SDK_VERSION = "1.0.16"
+    private const val SDK_VERSION = "1.0.17"
     private const val MODULE_TYPE = "download"
 
     @Volatile
@@ -70,7 +70,7 @@ object HXCDownloadMonitorSession {
                 "android",
                 SDK_VERSION,
                 appName
-            )
+            ).also { it.setActive(true) }
             (app as? Application)?.registerActivityLifecycleCallbacks(lifecycleCallbacks)
             inited = true
         }
