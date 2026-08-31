@@ -4526,13 +4526,14 @@ class HXCPlayerControl @JvmOverloads constructor(
             logInfo("evt=eof_seek_reopen_skip reason=bad_target source=$source target=$targetSec duration=$durationSec")
             return false
         }
-        // 仅对 HLS 类源启用：本地可 seek 容器（mp4 等）无需 reopen。
-        // secure_hls / local_hls_* 直接放行；remote_* 需 URL 含 .m3u8 才视为 HLS。
-        val isHlsCategory = currentSourceCategory.startsWith("secure_") ||
-            currentSourceCategory.startsWith("local_hls")
-        val isRemoteHls = currentSourceCategory.startsWith("remote_") &&
-            (lastOpenUrl?.lowercase()?.contains(".m3u8") == true)
-        if (!isHlsCategory && !isRemoteHls) {
+        // 对所有网络/HLS 源启用 reopen：本地可 seek 容器（mp4 等）av_seek_frame
+        // 在 EOF 后仍能正常工作，无需 reopen；网络源（含腾讯 VOD playUrl/重定向地址，
+        // URL 可能不含 .m3u8 但实际走 HLS demuxer）在 EOF 后 seek 易卡死，统一放行。
+        // local_file_*（本地非 HLS）排除。
+        val isNetworkCategory = currentSourceCategory.startsWith("secure_") ||
+            currentSourceCategory.startsWith("local_hls") ||
+            currentSourceCategory.startsWith("remote_")
+        if (!isNetworkCategory) {
             logInfo("evt=eof_seek_reopen_skip reason=unsupported_source source=$source category=$currentSourceCategory target=$targetSec")
             return false
         }
