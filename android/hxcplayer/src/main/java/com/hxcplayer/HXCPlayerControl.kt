@@ -2670,11 +2670,9 @@ class HXCPlayerControl @JvmOverloads constructor(
                 target = maxSeek
             }
         }
-        // reader 已到 EOF 时，HLS demuxer 的 av_seek_frame 易进入坏状态导致持续 loading。
-        // 此时改走整体流重开（close+reopen format_ctx），以 target 作为起始位置。
-        if (nativeIsReaderAtEof(handle) && controlledReopenForEofSeek(target, duration, resumeAfterSeek, source)) {
-            return
-        }
+        // 统一设置 seek 会话状态：常规 seek 与 EOF 后流重开都需要，
+        // 这样 seek 看门狗能在重开首帧收敛后正常触发 onSeekCompleted，
+        // 上层(App)才能清掉 seekInProgress 并隐藏 loading。
         pendingSeekRequestId += 1L
         pendingSeekTargetSec = target
         pendingSeekFromSec = clampPositionForDuration(getPosition(), duration)
@@ -2696,6 +2694,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         loadingSessionLikelySeek = true
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
+        // reader 已到 EOF 时，HLS demuxer 的 av_seek_frame 易进入坏状态导致持续 loading。
+        // 此时改走整体流重开（close+reopen format_ctx），以 target 作为起始位置。
+        // 会话状态已设置，seek 看门狗会在重开收敛后补发 onSeekCompleted。
+        if (nativeIsReaderAtEof(handle) && controlledReopenForEofSeek(target, duration, resumeAfterSeek, source)) {
+            return
+        }
         val generation = playbackCommandGeneration.get()
         enqueuePlaybackCommand("seek_to_with_intent", generation, false) { current ->
             nativeSeekToWithIntent(current, target, resumeAfterSeek)
