@@ -708,6 +708,11 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var staleIoControlledReopenInFlight: Boolean = false
     private var staleIoControlledReopenLastAtMs: Long = 0L
     private val staleIoControlledReopenCooldownMs: Long = 30000L
+    // reader 已到 EOF 后再 seek 的流重开（HLS demuxer 在 EOF 后 av_seek_frame 易卡死，
+    // 需要整体 close+reopen format_ctx 而非单纯 seek）。
+    private var eofSeekReopenInFlight: Boolean = false
+    private var eofSeekReopenLastAtMs: Long = 0L
+    private val eofSeekReopenCooldownMs: Long = 5000L
     // reopen 场景鉴权失败时抑制 dispatchError，避免触发 App 层 fallback 停止播放器。
     // reopen 是 SDK 内部卡顿恢复行为，鉴权失败不应导致整个播放会话终止，
     // 尤其是加密视频无 playUrl 时无法回退腾讯，停止播放器会让进度清零。
@@ -2665,6 +2670,11 @@ class HXCPlayerControl @JvmOverloads constructor(
                 target = maxSeek
             }
         }
+        // reader 已到 EOF 时，HLS demuxer 的 av_seek_frame 易进入坏状态导致持续 loading。
+        // 此时改走整体流重开（close+reopen format_ctx），以 target 作为起始位置。
+        if (nativeIsReaderAtEof(handle) && controlledReopenForEofSeek(target, duration, resumeAfterSeek, source)) {
+            return
+        }
         pendingSeekRequestId += 1L
         pendingSeekTargetSec = target
         pendingSeekFromSec = clampPositionForDuration(getPosition(), duration)
@@ -4491,6 +4501,139 @@ class HXCPlayerControl @JvmOverloads constructor(
         return true
     }
 
+    /**
+     * reader 已到 EOF 后的 seek 专用流重开。
+     *
+     * 与 [controlledReopenForStaleIo] 的区别：
+     * - 不受 [pendingSeekActive] 守卫（本方法在设置 pendingSeek 状态之前调用）。
+     * - 直接以 seek 目标位置作为 reopen 起始点，不附加 forward 偏移。
+     * - 独立的 in-flight / cooldown 状态，避免与 stale-io 恢复互相阻塞。
+     *
+     * 返回 true 表示已接管本次 seek（调用方应跳过常规 seek 流程），
+     * 返回 false 表示未接管（调用方应继续走常规 native seek）。
+     */
+    private fun controlledReopenForEofSeek(
+        targetSec: Double,
+        durationSec: Double,
+        resumeAfterSeek: Boolean,
+        source: String
+    ): Boolean {
+        if (isReleased || secondarySyncMode) {
+            logInfo("evt=eof_seek_reopen_skip reason=inactive source=$source released=$isReleased secondary=$secondarySyncMode")
+            return false
+        }
+        if (!targetSec.isFinite() || targetSec < 0.0) {
+            logInfo("evt=eof_seek_reopen_skip reason=bad_target source=$source target=$targetSec duration=$durationSec")
+            return false
+        }
+        // 仅对 HLS 类源启用：本地可 seek 容器（mp4 等）无需 reopen。
+        // secure_hls / local_hls_* 直接放行；remote_* 需 URL 含 .m3u8 才视为 HLS。
+        val isHlsCategory = currentSourceCategory.startsWith("secure_") ||
+            currentSourceCategory.startsWith("local_hls")
+        val isRemoteHls = currentSourceCategory.startsWith("remote_") &&
+            (lastOpenUrl?.lowercase()?.contains(".m3u8") == true)
+        if (!isHlsCategory && !isRemoteHls) {
+            logInfo("evt=eof_seek_reopen_skip reason=unsupported_source source=$source category=$currentSourceCategory target=$targetSec")
+            return false
+        }
+        if (eofSeekReopenInFlight || staleIoControlledReopenInFlight || autoReopenInFlight) {
+            logInfo(
+                "evt=eof_seek_reopen_skip reason=in_flight source=$source " +
+                    "eof_inflight=$eofSeekReopenInFlight stale_inflight=$staleIoControlledReopenInFlight auto_inflight=$autoReopenInFlight"
+            )
+            return false
+        }
+        val nowMs = SystemClock.elapsedRealtime()
+        if (eofSeekReopenLastAtMs > 0L && (nowMs - eofSeekReopenLastAtMs) < eofSeekReopenCooldownMs) {
+            logInfo(
+                "evt=eof_seek_reopen_skip reason=cooldown source=$source " +
+                    "since_last_ms=${nowMs - eofSeekReopenLastAtMs} cooldown_ms=$eofSeekReopenCooldownMs"
+            )
+            return false
+        }
+        val retryModel = lastOpenPlayModel?.let { clonePlayModel(it) }
+        val retryUrl = lastOpenUrl
+        if (retryModel == null && retryUrl.isNullOrBlank()) {
+            logInfo("evt=eof_seek_reopen_skip reason=no_retry_source source=$source category=$currentSourceCategory")
+            return false
+        }
+        // 起始位置约束：靠近结尾或时长过短时不 reopen（与 stale-io 一致）。
+        val maxStart = if (durationSec.isFinite() && durationSec > 0.0) {
+            durationSec - playbackEndClampThresholdSec
+        } else {
+            Double.POSITIVE_INFINITY
+        }
+        val start = if (maxStart.isFinite() && maxStart > reopenUiAnchorZeroGuardSec) {
+            minOf(maxStart, maxOf(reopenUiAnchorZeroGuardSec, targetSec))
+        } else {
+            maxOf(reopenUiAnchorZeroGuardSec, targetSec)
+        }
+
+        eofSeekReopenInFlight = true
+        eofSeekReopenLastAtMs = nowMs
+        networkReconnectCount += 1
+        notifyNetworkQoE(0L)
+        armReopenUiAnchorIfNeeded(start)
+        audioHealthRecoverStage = 0
+        audioHealthPausedStateSinceMs = 0L
+        audioHealthLastPausedState = AudioOutputState.IDLE
+        manualPlayHardRecoverPending = false
+        playStallCheckArmed = false
+        playStallRecoverStage = 0
+        videoEmptyStallDelayedReopenScheduled = false
+        Log.w(
+            TAG,
+            "evt=eof_seek_reopen source=$source target=$targetSec start=$start " +
+                "duration=$durationSec category=$currentSourceCategory resume=$resumeAfterSeek"
+        )
+        try {
+            openExecutor.execute {
+                if (isReleased) {
+                    mainHandler.post { eofSeekReopenInFlight = false }
+                    return@execute
+                }
+                if (retryModel != null) {
+                    suppressSecureAuthErrorForReopen = true
+                }
+                val opened = if (retryModel != null) {
+                    if (retryModel.mode == PlayerDataSourceMode.SECURE_HLS &&
+                        reopenWithCachedSecureSource(start)
+                    ) {
+                        true
+                    } else {
+                        openWithPlayModel(retryModel, start)
+                    }
+                } else {
+                    openURL(retryUrl!!, start)
+                }
+                suppressSecureAuthErrorForReopen = false
+                mainHandler.post {
+                    if (opened && !isReleased) {
+                        monitorSession.trackNamed(
+                            "eof_seek_reopen", getPosition(), getDuration(),
+                            "source=$source,start=$start",
+                            mapOf("source" to "eof_seek_reopen", "seekTarget" to targetSec),
+                            true
+                        )
+                        if (resumeAfterSeek) {
+                            play("eof_seek_reopen")
+                        }
+                    } else {
+                        Log.w(
+                            TAG,
+                            "evt=eof_seek_reopen_open_result opened=$opened source=$source " +
+                                "start=$start released=$isReleased category=$currentSourceCategory"
+                        )
+                    }
+                    eofSeekReopenInFlight = false
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            eofSeekReopenInFlight = false
+        }
+        return true
+    }
+
     private fun maybeLogLocalHlsSegmentDiagnostic(reason: String, positionSec: Double) {
         if (!canEmitDebugDiagLog()) return
         if (!currentSourceCategory.startsWith("local_hls")) return
@@ -4980,6 +5123,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private external fun nativeGetPipelineState(handle: Long): Int
     private external fun nativeGetPlayWhenReady(handle: Long): Boolean
     private external fun nativeIsPlaying(handle: Long): Boolean
+    private external fun nativeIsReaderAtEof(handle: Long): Boolean
     private external fun nativeSetPlayWhenReady(handle: Long, playWhenReady: Boolean)
     private external fun nativeIsLoading(handle: Long): Boolean
     private external fun nativeIsHardwareDecodingActive(handle: Long): Boolean

@@ -186,6 +186,7 @@ public:
     PipelineState get_pipeline_state() const { return pipeline_state_.load(std::memory_order_acquire); }
     bool get_play_when_ready() const { return play_when_ready_.load(std::memory_order_acquire); }
     bool is_playing() const;
+    bool is_reader_at_eof() const { return reader_at_eof_.load(std::memory_order_acquire); }
     const MediaInfo& get_media_info() const { return media_info_; }
     double get_position() const;    // 当前播放位置（秒）
     double get_duration() const;    // 总时长（秒）
@@ -457,6 +458,7 @@ private:
     std::atomic<double> seek_target_pos_;  // ⚠️ seek 的目标位置，在 seek 期间返回此值
     std::atomic<int>   post_seek_warmup_frames_{0}; // seek 结束后放宽 A/V 同步丢帧阈值的剩余帧数
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
+    std::atomic<bool> reader_at_eof_{false}; // reader 已收到 EOF，进入等待；seek 后清除
     std::atomic<bool> video_hw_decode_active_{false}; // 当前视频流是否在硬解
     std::atomic<bool> ultra_high_res_software_decode_active_{false}; // 8K/超高清软解降级 profile
     mutable std::mutex video_decode_diag_mutex_;

@@ -125,6 +125,9 @@ public:
     int    getPipelineState() const;
     bool   getPlayWhenReady() const;
     bool   isPlaying() const;
+    // Returns the underlying PlayerCoreHandle, or nullptr if not initialized/already destroyed.
+    // The handle is owned by AndroidPlayer; callers must NOT free it.
+    PlayerCoreHandle* getCoreHandle() const { return player_core_; }
     void   setPlayWhenReady(bool play_when_ready);
     bool   isLoading() const;
     bool   isHardwareDecodingActive() const;

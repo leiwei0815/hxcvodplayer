@@ -2357,9 +2357,11 @@ void PlayerCore::read_thread() {
                 
                 // ⚠️ 不要退出线程！等待可能的 seek 操作或终止信号
                 LOG_INFO("读取线程：进入等待状态，等待 seek 或终止信号");
+                reader_at_eof_.store(true, std::memory_order_release);
                 while (!abort_request_ && !seek_request_) {
                     PLAYER_DELAY(100);  // 等待 100ms 后再检查
                 }
+                reader_at_eof_.store(false, std::memory_order_release);
                 
                 // 如果是 abort 导致退出，则真正退出线程
                 if (abort_request_) {

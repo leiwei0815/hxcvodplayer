@@ -450,6 +450,16 @@ Java_com_hxcplayer_HXCPlayerControl_nativeIsPlaying(
     return JNI_FALSE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_hxcplayer_HXCPlayerControl_nativeIsReaderAtEof(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    auto* player = reinterpret_cast<AndroidPlayer*>(handle);
+    if (player && player->getCoreHandle()) {
+        return player_core_is_reader_at_eof(player->getCoreHandle()) ? JNI_TRUE : JNI_FALSE;
+    }
+    return JNI_FALSE;
+}
+
 JNIEXPORT void JNICALL
 Java_com_hxcplayer_HXCPlayerControl_nativeSetPlayWhenReady(
         JNIEnv *env, jobject thiz, jlong handle, jboolean play_when_ready) {

@@ -153,6 +153,7 @@ PlayerStateC player_core_get_state(PlayerCoreHandle* handle);
 PlayerPipelineStateC player_core_get_pipeline_state(PlayerCoreHandle* handle);
 int player_core_get_play_when_ready(PlayerCoreHandle* handle); // 1=true, 0=false
 int player_core_is_playing(PlayerCoreHandle* handle);          // 1=true, 0=false
+int player_core_is_reader_at_eof(PlayerCoreHandle* handle);     // 1=reader 已到 EOF, 0=未到
 double player_core_get_duration(PlayerCoreHandle* handle);
 double player_core_get_position(PlayerCoreHandle* handle);
 int player_core_is_video_hardware_decoding(PlayerCoreHandle* handle); // 1=硬解, 0=软解/未知

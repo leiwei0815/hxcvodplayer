@@ -437,6 +437,11 @@ int player_core_is_playing(PlayerCoreHandle* handle) {
     return handle->core->is_playing() ? 1 : 0;
 }
 
+int player_core_is_reader_at_eof(PlayerCoreHandle* handle) {
+    if (!handle || !handle->core) return 0;
+    return handle->core->is_reader_at_eof() ? 1 : 0;
+}
+
 double player_core_get_duration(PlayerCoreHandle* handle) {
     if (!handle || !handle->core) return 0.0;
     return handle->core->get_duration();
