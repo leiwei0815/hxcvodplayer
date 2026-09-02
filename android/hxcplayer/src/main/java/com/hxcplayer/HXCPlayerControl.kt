@@ -1804,30 +1804,50 @@ class HXCPlayerControl @JvmOverloads constructor(
         resetAudioHealthDispatchState()
         renderedFirstFrameNotified = false
         lastVideoSize = VideoSize()
-        loadingSessionLikelySeek = false
         loadingCandidateState = null
         loadingCandidateSinceMs = 0L
         suppressLoadingShowUntilMs = 0L
         lastPositionForLoadingHeuristicSec = Double.NaN
         lastBackwardJumpLogAtMs = 0L
 
-        pendingSeekActive = false
-        pendingSeekLoadingObserved = false
-        pendingSeekTargetSec = Double.NaN
-        pendingSeekFromSec = Double.NaN
-        pendingSeekStartAtMs = 0L
-        pendingSeekConvergedSinceMs = 0L
-        pendingSeekPostConfirmActive = false
-        pendingSeekPostConfirmStartAtMs = 0L
-        pendingSeekPostConfirmBasePosSec = Double.NaN
-        pendingSeekHadPostConfirm = false
-        pendingSeekPostConfirmTimedOut = false
-        pendingSeekTriggeredReopen = false
-        pendingSeekLastWatchdogLogAtMs = 0L
-        seekLoadingSyncRequestId = -1L
-        seekNativeInactiveAtMs = 0L
-        seekNativeInactivePosSec = Double.NaN
-        seekLoadingSyncGapLogged = false
+        // EOF 后 seek 会改走 reopen（openURL/openWithPlayModel）。
+        // open 必须重置解码/loading 健康态，但不能清掉正在进行的 seek 会话，
+        // 否则看门狗不再运行、onSeekCompleted 永不补发，上层 loading 会一直挂着。
+        val preservePendingSeek = eofSeekReopenInFlight && pendingSeekActive
+        if (preservePendingSeek) {
+            pendingSeekLoadingObserved = false
+            pendingSeekConvergedSinceMs = 0L
+            pendingSeekPostConfirmActive = false
+            pendingSeekPostConfirmStartAtMs = 0L
+            pendingSeekPostConfirmBasePosSec = Double.NaN
+            pendingSeekHadPostConfirm = false
+            pendingSeekPostConfirmTimedOut = false
+            pendingSeekTriggeredReopen = false
+            pendingSeekLastWatchdogLogAtMs = 0L
+            seekNativeInactiveAtMs = 0L
+            seekNativeInactivePosSec = Double.NaN
+            seekLoadingSyncGapLogged = false
+            loadingSessionLikelySeek = true
+        } else {
+            loadingSessionLikelySeek = false
+            pendingSeekActive = false
+            pendingSeekLoadingObserved = false
+            pendingSeekTargetSec = Double.NaN
+            pendingSeekFromSec = Double.NaN
+            pendingSeekStartAtMs = 0L
+            pendingSeekConvergedSinceMs = 0L
+            pendingSeekPostConfirmActive = false
+            pendingSeekPostConfirmStartAtMs = 0L
+            pendingSeekPostConfirmBasePosSec = Double.NaN
+            pendingSeekHadPostConfirm = false
+            pendingSeekPostConfirmTimedOut = false
+            pendingSeekTriggeredReopen = false
+            pendingSeekLastWatchdogLogAtMs = 0L
+            seekLoadingSyncRequestId = -1L
+            seekNativeInactiveAtMs = 0L
+            seekNativeInactivePosSec = Double.NaN
+            seekLoadingSyncGapLogged = false
+        }
 
         if (!shouldPreserveReopenUiAnchor) {
             reopenUiAnchorActive = false
@@ -1872,7 +1892,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         logInfo(
             "evt=session_state_reset reason=$reason start_pos=$startPosition " +
                 "loop_suppress_ms=$openSessionLoopSuppressMs audio_suppress_ms=${audioHealthOpenSuppressUntilMs - now} source_category=$currentSourceCategory " +
-                "preserve_reopen_ui_anchor=$shouldPreserveReopenUiAnchor"
+                "preserve_reopen_ui_anchor=$shouldPreserveReopenUiAnchor " +
+                "preserve_pending_seek=$preservePendingSeek seek_id=$pendingSeekRequestId"
         )
     }
 
@@ -4509,7 +4530,8 @@ class HXCPlayerControl @JvmOverloads constructor(
      * reader 已到 EOF 后的 seek 专用流重开。
      *
      * 与 [controlledReopenForStaleIo] 的区别：
-     * - 不受 [pendingSeekActive] 守卫（本方法在设置 pendingSeek 状态之前调用）。
+     * - 调用前已设置 [pendingSeekActive]；open 重置健康态时必须保留该会话，
+     *   以便重开后看门狗补发 onSeekCompleted。
      * - 直接以 seek 目标位置作为 reopen 起始点，不附加 forward 偏移。
      * - 独立的 in-flight / cooldown 状态，避免与 stale-io 恢复互相阻塞。
      *
