@@ -713,6 +713,9 @@ class HXCPlayerControl @JvmOverloads constructor(
     private var eofSeekReopenInFlight: Boolean = false
     private var eofSeekReopenLastAtMs: Long = 0L
     private val eofSeekReopenCooldownMs: Long = 5000L
+    // 网络源一旦走到片尾/EOF，当前 demuxer 视为已死，后续回退 seek 必须 reopen。
+    // native reader_at_eof 会在收到 seek_request 后立刻变 false，不能单独依赖它。
+    @Volatile private var eofPipelineDirty: Boolean = false
     // reopen 场景鉴权失败时抑制 dispatchError，避免触发 App 层 fallback 停止播放器。
     // reopen 是 SDK 内部卡顿恢复行为，鉴权失败不应导致整个播放会话终止，
     // 尤其是加密视频无 playUrl 时无法回退腾讯，停止播放器会让进度清零。
@@ -1813,7 +1816,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         // EOF 后 seek 会改走 reopen（openURL/openWithPlayModel）。
         // open 必须重置解码/loading 健康态，但不能清掉正在进行的 seek 会话，
         // 否则看门狗不再运行、onSeekCompleted 永不补发，上层 loading 会一直挂着。
-        val preservePendingSeek = eofSeekReopenInFlight && pendingSeekActive
+        val preservePendingSeek = pendingSeekActive &&
+            (eofSeekReopenInFlight || staleIoControlledReopenInFlight)
         if (preservePendingSeek) {
             pendingSeekLoadingObserved = false
             pendingSeekConvergedSinceMs = 0L
@@ -1888,6 +1892,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         stablePlaybackPositionAtMs = if (stablePlaybackPositionSec.isFinite()) now else 0L
         stablePlaybackObservedSinceOpen = false
         staleIoControlledReopenInFlight = false
+        eofPipelineDirty = false
 
         logInfo(
             "evt=session_state_reset reason=$reason start_pos=$startPosition " +
@@ -2697,6 +2702,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         pendingSeekRequestId += 1L
         pendingSeekTargetSec = target
         pendingSeekFromSec = clampPositionForDuration(getPosition(), duration)
+        if (nativeIsReaderAtEof(handle) ||
+            isNearPlaybackEnd(pendingSeekFromSec, duration) ||
+            getPipelineState() == PipelineState.ENDED
+        ) {
+            eofPipelineDirty = true
+        }
         pendingSeekStartAtMs = SystemClock.elapsedRealtime()
         pendingSeekLoadingObserved = false
         pendingSeekActive = true
@@ -2715,10 +2726,12 @@ class HXCPlayerControl @JvmOverloads constructor(
         loadingSessionLikelySeek = true
         playStallCheckArmed = false
         manualPlayHardRecoverPending = false
-        // reader 已到 EOF 时，HLS demuxer 的 av_seek_frame 易进入坏状态导致持续 loading。
-        // 此时改走整体流重开（close+reopen format_ctx），以 target 作为起始位置。
-        // 会话状态已设置，seek 看门狗会在重开收敛后补发 onSeekCompleted。
-        if (nativeIsReaderAtEof(handle) && controlledReopenForEofSeek(target, duration, resumeAfterSeek, source)) {
+        // 完播/EOF 后回退：不要对已死的 demuxer 做 av_seek_frame。
+        // ExoPlayer 在 EOS 后 seek 会新建 MediaPeriod；这里等价为 close+reopen。
+        // 不能只看 reader_at_eof：native seek 会先清掉该标志，后续恢复 seek 就会误走 native。
+        if (shouldReopenInsteadOfNativeSeek(handle, target, duration, pendingSeekFromSec) &&
+            controlledReopenForEofSeek(target, duration, resumeAfterSeek, source)
+        ) {
             return
         }
         val generation = playbackCommandGeneration.get()
@@ -2832,9 +2845,7 @@ class HXCPlayerControl @JvmOverloads constructor(
                     videoEmptyStallDelayedReopenScheduled = false
                     videoEmptyStallLastReopenAtMs = SystemClock.elapsedRealtime()
                     Log.w(TAG, "evt=video_empty_stall_forward_seek_delayed_fire base=$recoverBase")
-                    if (!controlledReopenForStaleIo("video_empty_stall_delayed", recoverBase, durationSec)) {
-                        recoverAbnormalPlaybackByForwardSeek("video_empty_stall_delayed", recoverBase, durationSec)
-                    }
+                    recoverVideoEmptyStall(recoverBase, durationSec, "video_empty_stall_delayed")
                 }, cooldownLeftMs)
             }
             return
@@ -2848,8 +2859,29 @@ class HXCPlayerControl @JvmOverloads constructor(
             "evt=video_empty_stall_forward_seek base=$recoverBase pos=$positionSec native_pos=$nativeRecoverPos " +
                 "duration=$durationSec state=${state.name} loading=$loading source_category=$currentSourceCategory"
         )
-        if (!controlledReopenForStaleIo("video_empty_stall", recoverBase, durationSec)) {
-            recoverAbnormalPlaybackByForwardSeek("video_empty_stall", recoverBase, durationSec)
+        recoverVideoEmptyStall(recoverBase, durationSec, "video_empty_stall")
+    }
+
+    /**
+     * 空帧卡顿恢复。完播后 demuxer 停在 EOF 时，+3s native seek 只会拨时钟、读不到新包。
+     * 死管道优先 close+reopen；活管道仍走 stale reopen / 小步 forward seek。
+     */
+    private fun recoverVideoEmptyStall(recoverBase: Double, durationSec: Double, reason: String) {
+        val handle = currentHandle()
+        val deadPipeline = handle != 0L &&
+            shouldSkipNativeForwardSeekOnDeadPipeline(handle, recoverBase, durationSec)
+        if (deadPipeline) {
+            if (recoverDeadPipelineByReopen(reason, recoverBase, durationSec)) {
+                return
+            }
+            logInfo(
+                "evt=abnormal_forward_seek_skip reason=dead_pipeline_prefer_reopen source=$reason " +
+                    "base=$recoverBase duration=$durationSec category=$currentSourceCategory"
+            )
+            return
+        }
+        if (!controlledReopenForStaleIo(reason, recoverBase, durationSec)) {
+            recoverAbnormalPlaybackByForwardSeek(reason, recoverBase, durationSec)
         }
     }
 
@@ -4339,6 +4371,71 @@ class HXCPlayerControl @JvmOverloads constructor(
         return start
     }
 
+    private fun isNetworkSeekSource(): Boolean {
+        return currentSourceCategory.startsWith("secure_") ||
+            currentSourceCategory.startsWith("local_hls") ||
+            currentSourceCategory.startsWith("remote_")
+    }
+
+    private fun isNearPlaybackEnd(fromSec: Double, durationSec: Double, windowSec: Double = 2.5): Boolean {
+        return durationSec.isFinite() && durationSec > 0.0 &&
+            fromSec.isFinite() && fromSec >= 0.0 &&
+            (durationSec - fromSec) <= windowSec
+    }
+
+    private fun isDeadPipelineStallReason(reason: String): Boolean {
+        return reason.contains("video_empty_stall") ||
+            reason.contains("eof") ||
+            reason.contains("stale")
+    }
+
+    /**
+     * 完播/EOF 后回退必须重开源流，不能对已停在 EOF 的 demuxer 做 av_seek_frame。
+     * [nativeIsReaderAtEof] 不可靠：reader 一收到 seek_request 就会清掉该标志。
+     */
+    private fun shouldReopenInsteadOfNativeSeek(
+        handle: Long,
+        targetSec: Double,
+        durationSec: Double,
+        fromSec: Double
+    ): Boolean {
+        if (handle == 0L || !isNetworkSeekSource()) return false
+        if (nativeIsReaderAtEof(handle) || eofPipelineDirty) return true
+        val backward = fromSec.isFinite() && targetSec.isFinite() && targetSec < fromSec - 0.5
+        return backward && isNearPlaybackEnd(fromSec, durationSec)
+    }
+
+    private fun shouldSkipNativeForwardSeekOnDeadPipeline(
+        handle: Long,
+        basePositionSec: Double,
+        durationSec: Double
+    ): Boolean {
+        if (handle == 0L || !isNetworkSeekSource()) return false
+        if (nativeIsReaderAtEof(handle) || eofPipelineDirty) return true
+        if (pendingSeekFromSec.isFinite() && isNearPlaybackEnd(pendingSeekFromSec, durationSec)) return true
+        return isNearPlaybackEnd(basePositionSec, durationSec)
+    }
+
+    /**
+     * 死管道恢复：close+reopen，不要叠小步 native seek。
+     * seek 进行中优先走 EOF reopen，以便保留 pendingSeek 会话。
+     */
+    private fun recoverDeadPipelineByReopen(
+        reason: String,
+        recoverBase: Double,
+        durationSec: Double
+    ): Boolean {
+        if (pendingSeekActive) {
+            if (controlledReopenForEofSeek(recoverBase, durationSec, true, reason, bypassCooldown = true)) {
+                return true
+            }
+        }
+        if (controlledReopenForStaleIo(reason, recoverBase, durationSec, forwardSec = 0.0)) {
+            return true
+        }
+        return controlledReopenForEofSeek(recoverBase, durationSec, true, reason, bypassCooldown = true)
+    }
+
     private fun recoverAbnormalPlaybackByForwardSeek(
         reason: String,
         basePositionSec: Double,
@@ -4363,6 +4460,14 @@ class HXCPlayerControl @JvmOverloads constructor(
                     "duration=$durationSec forward=$forwardSec threshold=$playbackEndClampThresholdSec"
             )
             return false
+        }
+        val handle = currentHandle()
+        if (handle != 0L && shouldSkipNativeForwardSeekOnDeadPipeline(handle, basePositionSec, durationSec)) {
+            logInfo(
+                "evt=abnormal_forward_seek_skip reason=dead_pipeline_prefer_reopen source=$reason " +
+                    "base=$basePositionSec duration=$durationSec category=$currentSourceCategory"
+            )
+            return recoverDeadPipelineByReopen(reason, basePositionSec, durationSec)
         }
 
         val target = minOf(durationSec - playbackEndClampThresholdSec, basePositionSec + forwardSec)
@@ -4399,10 +4504,11 @@ class HXCPlayerControl @JvmOverloads constructor(
             logInfo("evt=stale_io_controlled_reopen_skip reason=inactive source=$reason released=$isReleased secondary=$secondarySyncMode")
             return false
         }
-        // seek 进行中不允许触发 controlled reopen：seek 导致的 LOADING 是正常态，
-        // 此时 reopen 会重新走 performSecureHlsAuth，鉴权失败会 dispatchError(-4101)，
-        // 加密视频无 playUrl 时无法回退腾讯，导致播放器被停止、进度清零。
-        if (pendingSeekActive) {
+        // 普通 seek 的 LOADING 不要误 reopen（加密源鉴权失败会停播放器）。
+        // 完播后 demuxer 已死时，seek 本身就是死管道；此时必须允许 reopen。
+        val allowDuringSeek = isDeadPipelineStallReason(reason) ||
+            shouldSkipNativeForwardSeekOnDeadPipeline(currentHandle(), basePositionSec, durationSec)
+        if (pendingSeekActive && !allowDuringSeek) {
             logInfo("evt=stale_io_controlled_reopen_skip reason=seek_in_progress source=$reason")
             return false
         }
@@ -4414,7 +4520,7 @@ class HXCPlayerControl @JvmOverloads constructor(
             logInfo("evt=stale_io_controlled_reopen_skip reason=bad_duration source=$reason base=$basePositionSec duration=$durationSec")
             return false
         }
-        if (!currentSourceCategory.startsWith("secure_") && !currentSourceCategory.startsWith("local_hls")) {
+        if (!isNetworkSeekSource()) {
             logInfo(
                 "evt=stale_io_controlled_reopen_skip reason=unsupported_source source=$reason " +
                     "source_category=$currentSourceCategory base=$basePositionSec duration=$durationSec"
@@ -4451,7 +4557,12 @@ class HXCPlayerControl @JvmOverloads constructor(
             logInfo("evt=stale_io_controlled_reopen_skip reason=near_start_or_short_duration source=$reason max_start=$maxStart duration=$durationSec")
             return false
         }
-        val start = minOf(maxStart, maxOf(reopenUiAnchorZeroGuardSec, basePositionSec + forwardSec))
+        val startBase = if (pendingSeekActive && pendingSeekTargetSec.isFinite() && pendingSeekTargetSec >= 0.0) {
+            pendingSeekTargetSec
+        } else {
+            basePositionSec + forwardSec
+        }
+        val start = minOf(maxStart, maxOf(reopenUiAnchorZeroGuardSec, startBase))
         staleIoControlledReopenInFlight = true
         staleIoControlledReopenLastAtMs = nowMs
         networkReconnectCount += 1
@@ -4542,7 +4653,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         targetSec: Double,
         durationSec: Double,
         resumeAfterSeek: Boolean,
-        source: String
+        source: String,
+        bypassCooldown: Boolean = false
     ): Boolean {
         if (isReleased || secondarySyncMode) {
             logInfo("evt=eof_seek_reopen_skip reason=inactive source=$source released=$isReleased secondary=$secondarySyncMode")
@@ -4556,10 +4668,7 @@ class HXCPlayerControl @JvmOverloads constructor(
         // 在 EOF 后仍能正常工作，无需 reopen；网络源（含腾讯 VOD playUrl/重定向地址，
         // URL 可能不含 .m3u8 但实际走 HLS demuxer）在 EOF 后 seek 易卡死，统一放行。
         // local_file_*（本地非 HLS）排除。
-        val isNetworkCategory = currentSourceCategory.startsWith("secure_") ||
-            currentSourceCategory.startsWith("local_hls") ||
-            currentSourceCategory.startsWith("remote_")
-        if (!isNetworkCategory) {
+        if (!isNetworkSeekSource()) {
             logInfo("evt=eof_seek_reopen_skip reason=unsupported_source source=$source category=$currentSourceCategory target=$targetSec")
             return false
         }
@@ -4571,7 +4680,10 @@ class HXCPlayerControl @JvmOverloads constructor(
             return false
         }
         val nowMs = SystemClock.elapsedRealtime()
-        if (eofSeekReopenLastAtMs > 0L && (nowMs - eofSeekReopenLastAtMs) < eofSeekReopenCooldownMs) {
+        if (!bypassCooldown &&
+            eofSeekReopenLastAtMs > 0L &&
+            (nowMs - eofSeekReopenLastAtMs) < eofSeekReopenCooldownMs
+        ) {
             logInfo(
                 "evt=eof_seek_reopen_skip reason=cooldown source=$source " +
                     "since_last_ms=${nowMs - eofSeekReopenLastAtMs} cooldown_ms=$eofSeekReopenCooldownMs"
@@ -4611,7 +4723,8 @@ class HXCPlayerControl @JvmOverloads constructor(
         Log.w(
             TAG,
             "evt=eof_seek_reopen source=$source target=$targetSec start=$start " +
-                "duration=$durationSec category=$currentSourceCategory resume=$resumeAfterSeek"
+                "duration=$durationSec category=$currentSourceCategory resume=$resumeAfterSeek " +
+                "pipeline_dirty=$eofPipelineDirty"
         )
         try {
             openExecutor.execute {
