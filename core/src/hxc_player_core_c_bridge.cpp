@@ -1497,7 +1497,7 @@ void player_core_set_log_level(int level) {
         default: log_level = hxcplayer::LogLevel::INFO; break;
     }
     hxcplayer::Logger::instance().set_level(log_level);
-    hxc_sync_ffmpeg_log_level(level);
+    hxcplayer::hxc_sync_ffmpeg_log_level(level);
 }
 
 int player_core_get_log_level(void) {

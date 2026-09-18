@@ -551,9 +551,8 @@ private:
     SecureHLSSession secure_session_;
 };
 
-} // namespace hxcplayer
-
-// 将 SDK 日志级别同步到 FFmpeg av_log（0=DEBUG/INFO, 1=INFO/WARNING, 2+=ERROR）。
 void hxc_sync_ffmpeg_log_level(int sdk_level);
+
+} // namespace hxcplayer
 
 #endif // YXVODPLAYER_PLAYER_CORE_H
