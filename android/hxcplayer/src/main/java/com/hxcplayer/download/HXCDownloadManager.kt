@@ -651,6 +651,12 @@ object HXCDownloadManager {
                         val localFile = File(saveDir, localName)
                         resources.add(M3u8ResourceTask(abs, abs, localFile))
                         activeKey = HlsKeyContext(method = method, keyFile = localFile, ivHex = ivHex)
+                        Log.w(
+                            TAG,
+                            "evt=download_hls_key method=$method iv=${if (ivHex.isBlank()) "empty" else "present"} " +
+                                "keyHost=${runCatching { URL(abs).host }.getOrDefault("?")} " +
+                                "keyPath=${runCatching { URL(abs).path }.getOrDefault("?")}"
+                        )
                         if (method != "AES-128") {
                             // 非 AES-128 维持原始 KEY 标签，避免误处理。
                             outputLines.add(replaceUriAttr(line, localName))
@@ -885,14 +891,19 @@ object HXCDownloadManager {
         }
         conn.connect()
         val code = conn.responseCode
+        val finalUrl = conn.url?.toString()
+            ?: conn.getHeaderField("Location")
+            ?: url
+        Log.w(
+            TAG,
+            "evt=download_m3u8_fetch http=$code originHost=${runCatching { URL(url).host }.getOrDefault("?")} " +
+                "finalHost=${runCatching { URL(finalUrl).host }.getOrDefault("?")} redirected=${finalUrl != url}"
+        )
         if (code !in 200..299) {
             conn.disconnect()
             throw HXCDownloadHttpException(code, "m3u8_manifest")
         }
         val text = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
-        val finalUrl = conn.url?.toString()
-            ?: conn.getHeaderField("Location")
-            ?: url
         conn.disconnect()
         return text to normalizeFinalUrl(url, finalUrl)
     }

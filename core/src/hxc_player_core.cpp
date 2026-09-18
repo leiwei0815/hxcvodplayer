@@ -15,6 +15,7 @@
 #include <thread>
 #include <sstream>
 #include <cstring>
+#include <cstdarg>
 #include <fstream>
 #include <iomanip>
 #include <cerrno>
@@ -27,6 +28,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/log.h>
 #include <libavformat/avformat.h>
 }
 
@@ -209,6 +211,98 @@ static std::string hxc_av_err_to_string(int err) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(err, errbuf, sizeof(errbuf));
     return std::string(errbuf);
+}
+
+static std::atomic<int> g_hxc_ffmpeg_av_log_level{AV_LOG_WARNING};
+
+static bool hxc_ffmpeg_log_is_hls_diag(const char* line) {
+    if (!line || !*line) {
+        return false;
+    }
+    return std::strstr(line, "key") != nullptr
+        || std::strstr(line, "KEY") != nullptr
+        || std::strstr(line, "hls") != nullptr
+        || std::strstr(line, "HLS") != nullptr
+        || std::strstr(line, "crypto") != nullptr
+        || std::strstr(line, "https") != nullptr
+        || std::strstr(line, "http") != nullptr
+        || std::strstr(line, "403") != nullptr
+        || std::strstr(line, "404") != nullptr
+        || std::strstr(line, "401") != nullptr
+        || std::strstr(line, "m3u8") != nullptr
+        || std::strstr(line, "redirect") != nullptr
+        || std::strstr(line, "TLS") != nullptr
+        || std::strstr(line, "SSL") != nullptr
+        || std::strstr(line, "Unable to open") != nullptr
+        || std::strstr(line, "Failed to open") != nullptr
+        || std::strstr(line, "Opening") != nullptr;
+}
+
+static std::string hxc_header_names_only(const char* headers) {
+    if (!headers || !*headers) {
+        return "(empty)";
+    }
+    std::string out;
+    std::string src(headers);
+    size_t start = 0;
+    while (start < src.size()) {
+        size_t end = src.find('\n', start);
+        if (end == std::string::npos) {
+            end = src.size();
+        }
+        std::string line = src.substr(start, end - start);
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            if (!out.empty()) {
+                out += ",";
+            }
+            out.append(line, 0, colon);
+        }
+        start = end + 1;
+    }
+    return out.empty() ? "(no_names)" : out;
+}
+
+static void hxc_ffmpeg_log_callback(void* avcl, int level, const char* fmt, va_list vl) {
+    thread_local bool reentry = false;
+    if (reentry) {
+        return;
+    }
+    if (level > g_hxc_ffmpeg_av_log_level.load(std::memory_order_relaxed)) {
+        return;
+    }
+    reentry = true;
+    char line[1024];
+    int print_prefix = 1;
+    av_log_format_line(avcl, level, fmt, vl, line, static_cast<int>(sizeof(line)), &print_prefix);
+    size_t n = std::strlen(line);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+        line[--n] = '\0';
+    }
+    const bool diag = hxc_ffmpeg_log_is_hls_diag(line);
+    if (level <= AV_LOG_ERROR) {
+        LOG_ERROR("ffmpeg ", line);
+    } else if (level <= AV_LOG_WARNING || diag) {
+        LOG_WARNING("ffmpeg ", line);
+    } else if (diag) {
+        LOG_INFO("ffmpeg ", line);
+    }
+    reentry = false;
+}
+
+void hxc_sync_ffmpeg_log_level(int sdk_level) {
+    int av_level = AV_LOG_WARNING;
+    if (sdk_level <= 0) {
+        av_level = AV_LOG_INFO;
+    } else if (sdk_level >= 2) {
+        av_level = AV_LOG_ERROR;
+    }
+    g_hxc_ffmpeg_av_log_level.store(av_level, std::memory_order_relaxed);
+    av_log_set_level(av_level);
+    av_log_set_callback(hxc_ffmpeg_log_callback);
 }
 
 static std::string hxc_build_hls_invaliddata_hint(const char* url, int io_error) {
@@ -661,8 +755,9 @@ PlayerCore::PlayerCore()
     // 初始化 FFmpeg 网络组件（必须在使用网络协议前调用）
     avformat_network_init();
     
-    // 初始化 FFmpeg
-    av_log_set_level(AV_LOG_WARNING);
+    // 只安装 FFmpeg 日志回调，级别跟随已设置的 SDK logLevel，避免创建播放器时把 DEBUG 打回 WARNING。
+    av_log_set_callback(hxc_ffmpeg_log_callback);
+    av_log_set_level(g_hxc_ffmpeg_av_log_level.load(std::memory_order_relaxed));
     
 #ifndef NO_SDL
     // 初始化 SDL（仅桌面平台）
@@ -866,7 +961,11 @@ int PlayerCore::open(const std::string& filename) {
         av_dict_set(&options, "headers", secure_session_.request_headers.c_str(), 0);
 //        av_dict_set(&options, "encryption_key_hex", "fe2bbaaa1b8af866bbdef997dae028b5", 0);
 //        av_dict_set(&options, "encryption_iv_hex", "00000000000000000000000000000000", 0);
-        LOG_INFO("SecureHLS 注入 headers 成功");
+        LOG_INFO("SecureHLS 注入 headers 成功 names=",
+                 hxc_header_names_only(secure_session_.request_headers.c_str()),
+                 ", bytes=", static_cast<int>(secure_session_.request_headers.size()));
+    } else if (!secure_session_.m3u8_url.empty()) {
+        LOG_WARNING("evt=secure_hls_headers_empty AES-128 KEY/分片请求可能 401/403");
     }
     
     // 🔧 增强重定向支持（处理 302 等重定向）
@@ -1199,6 +1298,19 @@ int PlayerCore::open(const std::string& filename) {
         LOG_ERROR("无法打开文件: ", filename);
         LOG_ERROR("FFmpeg 错误码: ", ret, ", 错误信息: ", errbuf);
         LOG_ERROR("open() 总耗时: ", open_total_ms, " ms");
+        const bool looks_hls = filename.find(".m3u8") != std::string::npos
+                || !secure_session_.m3u8_url.empty();
+        if (looks_hls) {
+            const bool key_hint = std::strstr(errbuf, "key") != nullptr
+                    || std::strstr(errbuf, "KEY") != nullptr
+                    || std::strstr(errbuf, "crypto") != nullptr
+                    || std::strstr(errbuf, "Unable to open") != nullptr;
+            LOG_ERROR("evt=secure_hls_open_fail mapped_code=", static_cast<int>(code),
+                      ", ffmpeg=", errbuf,
+                      ", headerNames=", hxc_header_names_only(secure_session_.request_headers.c_str()),
+                      ", crypto=", hxc_ffmpeg_has_input_protocol("crypto") ? "enabled" : "disabled",
+                      ", keyHint=", key_hint ? "1" : "0");
+        }
         
         // 发送错误回调给外层
         emit_error(code, error_message);
@@ -1531,6 +1643,14 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
         }
         case DataSourceMode::SecureHLS: {
             LOG_INFO("使用 SecureHLS Header 透传模式");
+            const bool has_crypto = hxc_ffmpeg_has_input_protocol("crypto");
+            LOG_INFO("evt=secure_hls_open_prepare url=", url,
+                     ", crypto=", has_crypto ? "enabled" : "disabled",
+                     ", headerNames=", hxc_header_names_only(config.secure_headers),
+                     ", headerBytes=", config.secure_headers ? static_cast<int>(std::strlen(config.secure_headers)) : 0);
+            if (!has_crypto) {
+                LOG_ERROR("evt=secure_hls_crypto_missing AES-128 KEY 请求可能失败");
+            }
             secure_session_ = SecureHLSSession{};
             secure_session_.m3u8_url = url;
             if (config.secure_headers) {

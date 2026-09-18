@@ -752,7 +752,7 @@ class HXCPlayerControl @JvmOverloads constructor(
     private val monitorSession: HXCPlayerMonitorSession =
         HXCPlayerMonitorSession(context, HXCPlayerMonitorConfig().apply {
             // 调试阶段开启监控日志，验证上报链路；稳定后可关闭
-            debugLog = true
+            debugLog = false
         })
 
     /**
@@ -1498,6 +1498,15 @@ class HXCPlayerControl @JvmOverloads constructor(
                 }
                 PlayerDataSourceMode.SECURE_HLS -> {
                     val video = workingModel.video
+                    Log.w(
+                        TAG,
+                        "evt=secure_open_begin url=${summarizeHttpUrl(workingModel.url)} " +
+                            "videoId=${video?.videoId} ts=${video?.timestamp} " +
+                            "sign=${signFingerprint(video?.sign)} " +
+                            "headers=${headerNamesOnly(secureHeaders)} " +
+                            "encryptedFile=${workingModel.encryptedFile} " +
+                            "keyMode=0 keyMaterial=null"
+                    )
                     nativeOpenWithSecureSession(
                         handle = handle,
                         url = workingModel.url,
@@ -1520,6 +1529,15 @@ class HXCPlayerControl @JvmOverloads constructor(
                 openLoadingHideProtectUntilMs = 0L
                 openLoadingHideHardDeadlineMs = 0L
                 openLoadingGuardStartPosSec = -1.0
+                if (workingModel.mode == PlayerDataSourceMode.SECURE_HLS) {
+                    Log.e(
+                        TAG,
+                        "evt=secure_open_fail code=${PlayerErrorCode.OPEN_INPUT_FAILED} " +
+                            "mode=${workingModel.mode} url=${summarizeHttpUrl(workingModel.url)} " +
+                            "headers=${headerNamesOnly(secureHeaders)} " +
+                            "hint=native_false_see_ffmpeg_key_or_1099"
+                    )
+                }
                 dispatchError(PlayerErrorCode.OPEN_INPUT_FAILED, "打开失败: mode=${workingModel.mode}, url=${workingModel.url}")
             } else {
                 monitorSession.trackOpenSuccess(
@@ -1963,6 +1981,23 @@ class HXCPlayerControl @JvmOverloads constructor(
         }
         callback?.onPlayerError(errorCode, errorMessage)
         callback?.onPlayerErrorWithRecoverability(errorCode, errorMessage, recoverable)
+        if (errorCode == PlayerErrorCode.OPEN_INPUT_FAILED
+            || errorCode == PlayerErrorCode.UNKNOWN
+            || errorCode == PlayerErrorCode.SECURE_AUTH_FAILED
+            || errorCode == -3002
+            || errorCode == -3004
+            || errorCode == -3005
+            || errorCode == -1018
+        ) {
+            Log.e(
+                TAG,
+                "evt=player_error_diag code=$errorCode recoverable=$recoverable " +
+                    "state=${getState()} url=${summarizeHttpUrl(lastOpenUrl)} " +
+                    "mode=${lastOpenPlayModel?.mode} encrypted=${lastOpenPlayModel?.encryptedFile} " +
+                    "headers=${headerNamesOnly(lastOpenSecureHeaders)} " +
+                    "msg=$errorMessage"
+            )
+        }
     }
 
     private fun beginMonitorSession(
@@ -2089,6 +2124,38 @@ class HXCPlayerControl @JvmOverloads constructor(
         return ""
     }
 
+    private fun summarizeHttpUrl(raw: String?): String {
+        if (raw.isNullOrBlank()) return "(empty)"
+        return try {
+            val uri = URL(raw)
+            val path = uri.path.orEmpty()
+            val suffix = when {
+                path.endsWith(".m3u8", ignoreCase = true) -> "m3u8"
+                path.endsWith(".key", ignoreCase = true) -> "key"
+                path.endsWith(".ts", ignoreCase = true) -> "ts"
+                else -> "other"
+            }
+            "scheme=${uri.protocol},host=${uri.host},suffix=$suffix,path=$path"
+        } catch (_: Throwable) {
+            "invalid_url"
+        }
+    }
+
+    private fun headerNamesOnly(headers: String?): String {
+        if (headers.isNullOrBlank()) return "(empty)"
+        return headers.lineSequence()
+            .map { it.substringBefore(':', missingDelimiterValue = "").trim() }
+            .filter { it.isNotBlank() }
+            .joinToString(",")
+            .ifBlank { "(no_names)" }
+    }
+
+    private fun signFingerprint(sign: String?): String {
+        if (sign.isNullOrBlank()) return "empty"
+        val tail = if (sign.length <= 4) sign else sign.takeLast(4)
+        return "len=${sign.length},tail=$tail"
+    }
+
     @Throws(Exception::class)
     private fun performSecureHlsAuth(config: PlayerDataSourceConfig, video: PlayerVideo): SecureAuthResult {
         if (video.videoId.isBlank() || video.sign.isBlank() || video.secretId.isBlank()) {
@@ -2146,6 +2213,12 @@ class HXCPlayerControl @JvmOverloads constructor(
                 put("timestamp", video.timestamp)
                 put("client_type", "Android")
             }
+            Log.w(
+                TAG,
+                "evt=secure_auth_request videoId=${video.videoId} ts=${video.timestamp} " +
+                    "sign=${signFingerprint(video.sign)} secretLen=${video.secretId.length} " +
+                    "url=$secureHlsAuthUrl"
+            )
             connection.outputStream.use {
                 it.write(requestJson.toString().toByteArray(Charsets.UTF_8))
                 it.flush()
@@ -2172,9 +2245,10 @@ class HXCPlayerControl @JvmOverloads constructor(
             if (playUrl.isBlank()) {
                 throw IllegalStateException("SecureHLS 鉴权缺少 play_url")
             }
-
+            val downloadUrl = data.optString("download_url", "")
             val encrypted = data.optInt("encrypt_type", 0) == 1 || data.optBoolean("is_encrypted", false)
             var secureHeaders = data.optString("secure_headers", "")
+            val apiHeaderNames = headerNamesOnly(secureHeaders)
             if (encrypted && secureHeaders.isBlank()) {
                 secureHeaders = buildString {
                     append("P-HX-SecretID: ${video.secretId}\r\n")
@@ -2184,6 +2258,17 @@ class HXCPlayerControl @JvmOverloads constructor(
                     append("P-HX-Terminal-Type: Android\r\n")
                 }
             }
+            Log.w(
+                TAG,
+                "evt=secure_auth_ok videoId=${video.videoId} encrypted=$encrypted " +
+                    "encryptType=${data.optInt("encrypt_type", -1)} " +
+                    "play=${summarizeHttpUrl(playUrl)} " +
+                    "hasDownloadUrl=${downloadUrl.isNotBlank()} download=${summarizeHttpUrl(downloadUrl)} " +
+                    "sameUrl=${downloadUrl.isNotBlank() && downloadUrl == playUrl} " +
+                    "apiHeaders=$apiHeaderNames " +
+                    "finalHeaders=${headerNamesOnly(secureHeaders)} " +
+                    "headerFallback=${encrypted && apiHeaderNames == "(empty)"}"
+            )
             return SecureAuthResult(playUrl, encrypted, secureHeaders)
         } finally {
             connection.disconnect()
