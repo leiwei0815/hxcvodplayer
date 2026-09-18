@@ -293,18 +293,6 @@ static void hxc_ffmpeg_log_callback(void* avcl, int level, const char* fmt, va_l
     reentry = false;
 }
 
-void hxc_sync_ffmpeg_log_level(int sdk_level) {
-    int av_level = AV_LOG_WARNING;
-    if (sdk_level <= 0) {
-        av_level = AV_LOG_INFO;
-    } else if (sdk_level >= 2) {
-        av_level = AV_LOG_ERROR;
-    }
-    g_hxc_ffmpeg_av_log_level.store(av_level, std::memory_order_relaxed);
-    av_log_set_level(av_level);
-    av_log_set_callback(hxc_ffmpeg_log_callback);
-}
-
 static std::string hxc_build_hls_invaliddata_hint(const char* url, int io_error) {
     std::string hint = "检测到 HLS 输入数据无效（常见原因：分片/密钥请求失败或返回非媒体数据）";
     if (url && *url) {
@@ -594,6 +582,18 @@ static std::string hxc_collect_decoder_registry_summary(enum AVCodecID codec_id,
 #endif
 
 }  // namespace
+
+void hxc_sync_ffmpeg_log_level(int sdk_level) {
+    int av_level = AV_LOG_WARNING;
+    if (sdk_level <= 0) {
+        av_level = AV_LOG_INFO;
+    } else if (sdk_level >= 2) {
+        av_level = AV_LOG_ERROR;
+    }
+    g_hxc_ffmpeg_av_log_level.store(av_level, std::memory_order_relaxed);
+    av_log_set_level(av_level);
+    av_log_set_callback(hxc_ffmpeg_log_callback);
+}
 
 std::string PlayerCore::get_video_decode_diagnostic() const {
     std::lock_guard<std::mutex> lock(video_decode_diag_mutex_);
