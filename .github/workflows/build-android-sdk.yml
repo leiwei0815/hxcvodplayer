@@ -175,12 +175,12 @@ jobs:
               exit 1
             }
             fmt_so="ffmpeg-build-android/FFmpeg-Android/${abi}/lib/libavformat.so"
-            if ! nm -D "$fmt_so" | grep -q " T ff_udp_get_last_recv_addr"; then
-              echo "❌ $abi libavformat.so 缺少已定义的 ff_udp_get_last_recv_addr"
+            if nm -D "$fmt_so" | grep -q " U ff_udp_get_last_recv_addr"; then
+              echo "❌ $abi libavformat.so 仍有未定义符号 ff_udp_get_last_recv_addr"
               nm -D "$fmt_so" | grep -E "ff_udp_" || true
               exit 1
             fi
-            echo "✅ $abi ff_udp_get_last_recv_addr"
+            echo "✅ $abi ff_udp_get_last_recv_addr 已解析"
           done
           echo "✅ mediacodec decoder 校验通过"
 

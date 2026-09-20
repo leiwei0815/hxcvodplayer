@@ -340,17 +340,18 @@ for ABI in $ANDROID_ABIS; do
     # 复制动态库（.so）
     cp "$BUILD_DIR/install-$ABI/lib/"*.so "$OUTPUT_DIR/$ABI/lib/"
 
-    local AVFORMAT_SO="$OUTPUT_DIR/$ABI/lib/libavformat.so"
+    AVFORMAT_SO="$OUTPUT_DIR/$ABI/lib/libavformat.so"
     if [ ! -f "$AVFORMAT_SO" ]; then
         echo "❌ 缺少 $AVFORMAT_SO"
         exit 1
     fi
-    if ! nm -D "$AVFORMAT_SO" 2>/dev/null | grep -q " T ff_udp_get_last_recv_addr"; then
-        echo "❌ $ABI libavformat.so 未导出 ff_udp_get_last_recv_addr（mpegts 依赖 UDP protocol）"
+    # ff_udp_* 可能是 hidden 符号，不能要求 dynsym 导出 T；只要不能再是未定义即可
+    if nm -D "$AVFORMAT_SO" 2>/dev/null | grep -q " U ff_udp_get_last_recv_addr"; then
+        echo "❌ $ABI libavformat.so 仍有未定义符号 ff_udp_get_last_recv_addr"
         nm -D "$AVFORMAT_SO" 2>/dev/null | grep -E "ff_udp_" || true
         exit 1
     fi
-    echo "✅ $ABI ff_udp_get_last_recv_addr 已链接进 libavformat.so"
+    echo "✅ $ABI libavformat.so 已解析 ff_udp_get_last_recv_addr"
 done
 
 echo ""
