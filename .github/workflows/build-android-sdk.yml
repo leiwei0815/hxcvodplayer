@@ -34,7 +34,7 @@ env:
   NDK_VERSION: '26.3.11579264'
   ANDROID_API_LEVEL: '24'
   # 手动提升该值可强制失效第三方缓存（用于排查“脚本已改但产物未更新”）
-  THIRD_PARTY_CACHE_REV: '20260920-openssl'
+  THIRD_PARTY_CACHE_REV: '20260920-openssl-udp'
   ANDROID_ABIS: arm64-v8a
 
 jobs:
@@ -174,6 +174,13 @@ jobs:
               echo "❌ $abi 缺少 mediacodec decoder 符号（h264_mediacodec/hevc_mediacodec）"
               exit 1
             }
+            fmt_so="ffmpeg-build-android/FFmpeg-Android/${abi}/lib/libavformat.so"
+            if ! nm -D "$fmt_so" | grep -q " T ff_udp_get_last_recv_addr"; then
+              echo "❌ $abi libavformat.so 缺少已定义的 ff_udp_get_last_recv_addr"
+              nm -D "$fmt_so" | grep -E "ff_udp_" || true
+              exit 1
+            fi
+            echo "✅ $abi ff_udp_get_last_recv_addr"
           done
           echo "✅ mediacodec decoder 校验通过"
 
