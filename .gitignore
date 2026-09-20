@@ -73,6 +73,13 @@ android-third/ffmpeg-build-android/
 android-third/soundtouch-build-android/
 android-third/mbedtls-build-android/
 android-third/curl-build-android/
+android-third/openssl-build-android/
+
+# 本地 AAR 发布/解压残留（不要提交）
+.gradle-publish-tmp/
+aar-*.zip
+aar-1.*/
+aar-extract*/
 
 
 # Apple XCFramework 构建目录

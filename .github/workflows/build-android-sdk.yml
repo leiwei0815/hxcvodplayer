@@ -34,12 +34,12 @@ env:
   NDK_VERSION: '26.3.11579264'
   ANDROID_API_LEVEL: '24'
   # 手动提升该值可强制失效第三方缓存（用于排查“脚本已改但产物未更新”）
-  THIRD_PARTY_CACHE_REV: '20260521-arm64-only'
+  THIRD_PARTY_CACHE_REV: '20260920-openssl'
   ANDROID_ABIS: arm64-v8a
 
 jobs:
   # ============================================================
-  # Job 1: 编译第三方库（mbedTLS、curl、FFmpeg、SoundTouch）
+  # Job 1: 编译第三方库（OpenSSL、curl、FFmpeg、SoundTouch）
   # ============================================================
   build-third-party:
     name: Build Third-Party Libraries
@@ -63,10 +63,10 @@ jobs:
         with:
           path: |
             android-third/ffmpeg-build-android
-            android-third/mbedtls-build-android
+            android-third/openssl-build-android
             android-third/curl-build-android
             android-third/soundtouch-build-android
-          key: android-third-${{ env.NDK_VERSION }}-${{ env.THIRD_PARTY_CACHE_REV }}-${{ hashFiles('android-third/build_*.sh') }}
+          key: android-third-${{ env.NDK_VERSION }}-${{ env.THIRD_PARTY_CACHE_REV }}-${{ hashFiles('android-third/build_*.sh', 'android-third/ndk_env.sh') }}
 
       - name: 打印当前 FFmpeg 构建脚本快照（防缓存覆盖脚本）
         if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
@@ -117,17 +117,17 @@ jobs:
         working-directory: android-third
         run: |
           # 将脚本中 darwin-x86_64 替换为 linux-x86_64（macOS NDK 路径 → Linux）
-          for f in build_ffmpeg_android.sh build_mbedtls_android.sh build_curl_android.sh build_soundtouch_android.sh; do
+          for f in build_ffmpeg_android.sh build_openssl_android.sh build_curl_android.sh build_soundtouch_android.sh build_mbedtls_android.sh; do
             if [ -f "$f" ]; then
               sed -i 's/darwin-x86_64/linux-x86_64/g' "$f"
               echo "✅ 已修复: $f"
             fi
           done
 
-      - name: 编译 mbedTLS
+      - name: 编译 OpenSSL
         if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
         working-directory: android-third
-        run: bash build_mbedtls_android.sh
+        run: bash build_openssl_android.sh
 
       - name: 编译 curl
         if: steps.cache-third-party.outputs.cache-hit != 'true' || inputs.skip_third_party_cache == 'true'
@@ -148,7 +148,7 @@ jobs:
         working-directory: android-third
         run: |
           echo "=== 第三方库编译结果 ==="
-          for lib in ffmpeg-build-android/FFmpeg-Android mbedtls-build-android/mbedTLS-Android curl-build-android/curl-Android soundtouch-build-android/SoundTouch-Android; do
+          for lib in ffmpeg-build-android/FFmpeg-Android openssl-build-android/OpenSSL-Android curl-build-android/curl-Android soundtouch-build-android/SoundTouch-Android; do
             if [ -d "$lib" ]; then
               echo "✅ $lib"
               find "$lib" -name "*.so" -o -name "*.a" | head -20
@@ -231,6 +231,14 @@ jobs:
               grep -Ei "mediacodec|mediandk|jni|did not match anything|not found|disabled .*mediacodec|requires" "$cfg_log" | tail -n 300 || true
             fi
 
+            if grep -q "^#define CONFIG_OPENSSL 1" "$cfg_comp" "$cfg_main"; then
+              echo "✅ CONFIG_OPENSSL=1"
+            else
+              echo "❌ $abi 缺少 CONFIG_OPENSSL=1（应对齐 iOS enable-openssl）"
+              grep -E "^#define CONFIG_(OPENSSL|MBEDTLS|GNUTLS|TLS) " "$cfg_comp" "$cfg_main" || true
+              exit 1
+            fi
+
             if grep -q "^#define CONFIG_MEDIACODEC 1" "$cfg_comp" "$cfg_main"; then
               echo "✅ CONFIG_MEDIACODEC=1"
             else
@@ -309,10 +317,10 @@ jobs:
         with:
           path: |
             android-third/ffmpeg-build-android
-            android-third/mbedtls-build-android
+            android-third/openssl-build-android
             android-third/curl-build-android
             android-third/soundtouch-build-android
-          key: android-third-${{ env.NDK_VERSION }}-${{ env.THIRD_PARTY_CACHE_REV }}-${{ hashFiles('android-third/build_*.sh') }}
+          key: android-third-${{ env.NDK_VERSION }}-${{ env.THIRD_PARTY_CACHE_REV }}-${{ hashFiles('android-third/build_*.sh', 'android-third/ndk_env.sh') }}
 
       - name: 验证第三方库
         run: |

@@ -141,7 +141,7 @@ extern "C" int hxc_sdk_get_runtime_log_level() {
 
 namespace {
 // Process-wide guard for player_core_open_*.
-// Some FFmpeg/mbedtls paths are unstable under multi-instance concurrent opens.
+// Some FFmpeg/OpenSSL paths are unstable under multi-instance concurrent opens.
 std::mutex g_player_core_open_mutex;
 
 constexpr float kMinPlaybackRate = 0.5f;

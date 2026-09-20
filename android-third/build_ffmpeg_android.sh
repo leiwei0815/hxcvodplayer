@@ -11,32 +11,22 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=ndk_env.sh
+source "$SCRIPT_DIR/ndk_env.sh"
 FFMPEG_VERSION="8.0.1"
 BUILD_DIR="$SCRIPT_DIR/ffmpeg-build-android"
 OUTPUT_DIR="$BUILD_DIR/FFmpeg-Android"
 
-# Android NDK 路径（请根据实际情况修改）
-if [ -z "$ANDROID_NDK" ]; then
-    # 尝试常见的 NDK 路径
-    if [ -d "$HOME/Library/Android/sdk/ndk" ]; then
-        NDK_PATH=$(ls -d $HOME/Library/Android/sdk/ndk/* | tail -1)
-    elif [ -d "/usr/local/android-sdk/ndk" ]; then
-        NDK_PATH=$(ls -d /usr/local/android-sdk/ndk/* | tail -1)
-    else
-        echo "❌ 错误: 未找到 Android NDK"
-        echo "请设置 ANDROID_NDK 环境变量或安装 Android NDK"
-        echo "例如: export ANDROID_NDK=\$HOME/Library/Android/sdk/ndk/25.2.9519653"
-        exit 1
-    fi
-else
-    NDK_PATH="$ANDROID_NDK"
-fi
+hxc_detect_ndk
+HOST_TAG=$(hxc_ndk_llvm_prebuilt "$NDK_PATH")
 
 echo "=========================================="
 echo "FFmpeg Android 静态库编译"
 echo "=========================================="
 echo "版本: $FFMPEG_VERSION"
 echo "NDK 路径: $NDK_PATH"
+echo "Host tag: $HOST_TAG"
+echo "TLS: OpenSSL（对齐 iOS enable-openssl）"
 echo "输出目录: $OUTPUT_DIR"
 echo "=========================================="
 
@@ -82,16 +72,15 @@ build_ffmpeg() {
     local BUILD_SUBDIR="$BUILD_DIR/build-$ABI"
     local INSTALL_DIR="$BUILD_DIR/install-$ABI"
     
-    # mbedTLS 路径
-    local MBEDTLS_DIR="$SCRIPT_DIR/mbedtls-build-android/mbedTLS-Android/$ABI"
+    # OpenSSL 路径（iOS enable-openssl 同思路，替换 mbedTLS）
+    local OPENSSL_DIR="$SCRIPT_DIR/openssl-build-android/OpenSSL-Android/$ABI"
     
     echo ""
     echo "🔨 编译 FFmpeg for Android $ABI..."
     
-    # 检查 mbedTLS 是否存在
-    if [ ! -d "$MBEDTLS_DIR" ]; then
-        echo "❌ 错误: 未找到 mbedTLS 库: $MBEDTLS_DIR"
-        echo "请先运行: ./build_mbedtls_android.sh"
+    if [ ! -f "$OPENSSL_DIR/lib/libssl.so" ] || [ ! -f "$OPENSSL_DIR/lib/libcrypto.so" ]; then
+        echo "❌ 错误: 未找到 OpenSSL 库: $OPENSSL_DIR/lib"
+        echo "请先运行: ./build_openssl_android.sh"
         exit 1
     fi
     
@@ -101,8 +90,7 @@ build_ffmpeg() {
     cp -r "ffmpeg-$FFMPEG_VERSION"/* "$BUILD_SUBDIR/"
     cd "$BUILD_SUBDIR"
     
-    # 设置工具链路径
-    local TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/darwin-x86_64"
+    local TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/$HOST_TAG"
     local SYSROOT="$TOOLCHAIN/sysroot"
     
     # 根据架构设置编译器前缀和特殊标志
@@ -154,8 +142,8 @@ build_ffmpeg() {
     esac
     
     # 设置编译和链接标志（清除所有可能的环境变量干扰）
-    EXTRA_CFLAGS="-fPIC -DANDROID -D__ANDROID_API__=$API_LEVEL -I$MBEDTLS_DIR/include"
-    EXTRA_LDFLAGS="-Wl,-z,relro -Wl,-z,now -L$MBEDTLS_DIR/lib -lmbedtls -lmbedx509 -lmbedcrypto -landroid -lmediandk"
+    EXTRA_CFLAGS="-fPIC -DANDROID -D__ANDROID_API__=$API_LEVEL -I$OPENSSL_DIR/include"
+    EXTRA_LDFLAGS="-Wl,-z,relro -Wl,-z,now -L$OPENSSL_DIR/lib -lssl -lcrypto -landroid -lmediandk"
     
     # 清除可能干扰编译的环境变量
     unset CFLAGS CXXFLAGS LDFLAGS CPPFLAGS PKG_CONFIG_PATH
@@ -176,6 +164,7 @@ build_ffmpeg() {
         --sysroot="$SYSROOT" \
         --extra-cflags="$EXTRA_CFLAGS" \
         --extra-ldflags="$EXTRA_LDFLAGS" \
+        --extra-libs="-lssl -lcrypto" \
         --pkg-config=/usr/bin/false \
         --enable-shared \
         --disable-static \
@@ -238,7 +227,8 @@ build_ffmpeg() {
         --disable-outdevs \
         --enable-mediacodec \
         --enable-jni \
-        --enable-mbedtls \
+        --enable-openssl \
+        --disable-mbedtls \
         --enable-version3 \
         --disable-iconv \
         --disable-bzlib \
@@ -304,10 +294,19 @@ build_ffmpeg() {
     fi
     echo "✅ mediacodec 组件校验完成"
     
+    if ! grep -q "^#define CONFIG_OPENSSL 1" "$CFG_COMP" "$CFG_MAIN" 2>/dev/null; then
+        if ! grep -q "^#define CONFIG_OPENSSL 1" "$CFG_MAIN"; then
+            echo "❌ 错误: CONFIG_OPENSSL 未启用（FFmpeg 未链接 OpenSSL TLS）"
+            grep -E "CONFIG_(OPENSSL|MBEDTLS|TLS|HTTPS)" "$CFG_MAIN" "$CFG_COMP" || true
+            exit 1
+        fi
+    fi
+    echo "✅ CONFIG_OPENSSL 已启用"
+
     echo ""
     echo "🔨 编译中..."
     local JOBS
-    JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+    JOBS=$(hxc_nproc)
     make -j"${JOBS}" 2>&1 | grep -v "warning:"
     
     echo ""

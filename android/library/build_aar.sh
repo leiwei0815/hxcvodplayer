@@ -105,9 +105,9 @@ if [ "$COPY_LIBS" = true ]; then
             cp "$THIRD_PARTY_ROOT/soundtouch-build-android/SoundTouch-Android/$ABI/lib/"*.so "$TARGET_JNI/$ABI/" 2>/dev/null || true
         fi
         
-        # 复制 mbedTLS
-        if [ -d "$THIRD_PARTY_ROOT/mbedtls-build-android/mbedTLS-Android/$ABI/lib" ]; then
-            cp "$THIRD_PARTY_ROOT/mbedtls-build-android/mbedTLS-Android/$ABI/lib/"*.so "$TARGET_JNI/$ABI/" 2>/dev/null || true
+        # 复制 OpenSSL（替代 mbedTLS）
+        if [ -d "$THIRD_PARTY_ROOT/openssl-build-android/OpenSSL-Android/$ABI/lib" ]; then
+            cp "$THIRD_PARTY_ROOT/openssl-build-android/OpenSSL-Android/$ABI/lib/"*.so "$TARGET_JNI/$ABI/" 2>/dev/null || true
         fi
         
         echo "  ✅ $ABI"

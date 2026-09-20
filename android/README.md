@@ -81,7 +81,7 @@ AAR 包含以下第三方库（自动打包到 `jniLibs`）：
 
 - **FFmpeg** (libavcodec, libavformat, libavutil, libswscale, libswresample)
 - **SoundTouch** (libSoundTouch.so)
-- **mbedTLS** (libmbedtls, libmbedx509, libmbedcrypto)
+- **OpenSSL** (libssl, libcrypto)
 
 这些库从 `../../android-third/` 编译生成，需要先编译第三方库：
 
@@ -115,7 +115,8 @@ hxcplayer-release.aar
 │   │   ├── libavcodec.so
 │   │   ├── libavformat.so
 │   │   ├── libSoundTouch.so
-│   │   ├── libmbedtls.so
+│   │   ├── libssl.so
+│   │   ├── libcrypto.so
 │   │   └── ...
 │   ├── armeabi-v7a/           # 32位 ARM (旧设备)
 │   └── x86_64/                # 模拟器

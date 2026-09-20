@@ -10,7 +10,7 @@ get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.."
 
 # 第三方库路径
 set(ANDROID_THIRD_ROOT "${PROJECT_ROOT}/android-third")
-set(MBEDTLS_ROOT "${ANDROID_THIRD_ROOT}/mbedtls-build-android/mbedTLS-Android/${ANDROID_ABI}")
+set(OPENSSL_ROOT "${ANDROID_THIRD_ROOT}/openssl-build-android/OpenSSL-Android/${ANDROID_ABI}")
 set(CURL_ROOT "${ANDROID_THIRD_ROOT}/curl-build-android/curl-Android/${ANDROID_ABI}")
 set(FFMPEG_ROOT "${ANDROID_THIRD_ROOT}/ffmpeg-build-android/FFmpeg-Android/${ANDROID_ABI}")
 set(SOUNDTOUCH_ROOT "${ANDROID_THIRD_ROOT}/soundtouch-build-android/SoundTouch-Android/${ANDROID_ABI}")
@@ -20,7 +20,7 @@ message(STATUS "HXCPlayer Android Native 构建配置")
 message(STATUS "========================================")
 message(STATUS "项目根目录: ${PROJECT_ROOT}")
 message(STATUS "Android ABI: ${ANDROID_ABI}")
-message(STATUS "mbedTLS 路径: ${MBEDTLS_ROOT}")
+message(STATUS "OpenSSL 路径: ${OPENSSL_ROOT}")
 message(STATUS "FFmpeg 路径: ${FFMPEG_ROOT}")
 message(STATUS "SoundTouch 路径: ${SOUNDTOUCH_ROOT}")
 message(STATUS "========================================")
@@ -46,7 +46,7 @@ set(JNI_SOURCES
 # 包含目录
 include_directories(
     ${PROJECT_ROOT}/core/include
-    ${MBEDTLS_ROOT}/include
+    ${OPENSSL_ROOT}/include
     ${CURL_ROOT}/include
     ${FFMPEG_ROOT}/include
     ${SOUNDTOUCH_ROOT}/include
@@ -94,15 +94,15 @@ set_target_properties(swresample PROPERTIES IMPORTED_LOCATION ${FFMPEG_ROOT}/lib
 add_library(soundtouch SHARED IMPORTED)
 set_target_properties(soundtouch PROPERTIES IMPORTED_LOCATION ${SOUNDTOUCH_ROOT}/lib/libSoundTouch.so)
 
-# 导入 mbedTLS 动态库
-add_library(mbedtls SHARED IMPORTED)
-set_target_properties(mbedtls PROPERTIES IMPORTED_LOCATION ${MBEDTLS_ROOT}/lib/libmbedtls.so)
+# 导入 OpenSSL 动态库（FFmpeg HTTPS / curl TLS，对齐 iOS enable-openssl）
+if(NOT EXISTS "${OPENSSL_ROOT}/lib/libssl.so" OR NOT EXISTS "${OPENSSL_ROOT}/lib/libcrypto.so")
+    message(FATAL_ERROR "未找到 OpenSSL: ${OPENSSL_ROOT}/lib 。请先运行 android-third/build_openssl_android.sh")
+endif()
+add_library(ssl SHARED IMPORTED)
+set_target_properties(ssl PROPERTIES IMPORTED_LOCATION ${OPENSSL_ROOT}/lib/libssl.so)
 
-add_library(mbedx509 SHARED IMPORTED)
-set_target_properties(mbedx509 PROPERTIES IMPORTED_LOCATION ${MBEDTLS_ROOT}/lib/libmbedx509.so)
-
-add_library(mbedcrypto SHARED IMPORTED)
-set_target_properties(mbedcrypto PROPERTIES IMPORTED_LOCATION ${MBEDTLS_ROOT}/lib/libmbedcrypto.so)
+add_library(crypto SHARED IMPORTED)
+set_target_properties(crypto PROPERTIES IMPORTED_LOCATION ${OPENSSL_ROOT}/lib/libcrypto.so)
 
 # 导入 curl 静态库
 add_library(curl STATIC IMPORTED)
@@ -120,10 +120,9 @@ target_link_libraries(hxcplayer
     # curl 库（用于 custom_io）
     curl
 
-    # mbedTLS 库（FFmpeg HTTPS 依赖）
-    mbedtls
-    mbedx509
-    mbedcrypto
+    # OpenSSL 库（FFmpeg HTTPS / curl TLS）
+    ssl
+    crypto
 
     # SoundTouch 库
     soundtouch

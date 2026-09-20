@@ -2,64 +2,61 @@
 
 # curl Android 编译脚本
 # 用于 hxc_custom_io 的 HTTP Range 下载功能
+# TLS 使用 OpenSSL（与 FFmpeg / iOS enable-openssl 对齐）
 
 set -e
 
 ANDROID_ABIS="${ANDROID_ABIS:-arm64-v8a}"
 
-# 配置
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=ndk_env.sh
+source "$SCRIPT_DIR/ndk_env.sh"
+
 CURL_VERSION="8.5.0"
 CURL_TARBALL="curl-${CURL_VERSION}.tar.gz"
 CURL_URL="https://curl.se/download/${CURL_TARBALL}"
-BUILD_DIR="$(pwd)/curl-build-android"
+BUILD_DIR="$SCRIPT_DIR/curl-build-android"
 OUTPUT_DIR="$BUILD_DIR/curl-Android"
-MBEDTLS_ROOT="$(pwd)/mbedtls-build-android/mbedTLS-Android"
+OPENSSL_ROOT="$SCRIPT_DIR/openssl-build-android/OpenSSL-Android"
 API_LEVEL=24
 
-# 检查 NDK
-if [ -z "$ANDROID_NDK" ]; then
-    if [ -d "$HOME/Library/Android/sdk/ndk" ]; then
-        ANDROID_NDK=$(ls -d "$HOME/Library/Android/sdk/ndk"/* | sort -V | tail -1)
-        echo "✅ 自动检测到 NDK: $ANDROID_NDK"
-    else
-        echo "❌ 错误: 未找到 Android NDK"
-        exit 1
-    fi
-fi
-
-NDK_PATH="$ANDROID_NDK"
-TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/darwin-x86_64"
+hxc_detect_ndk
+HOST_TAG=$(hxc_ndk_llvm_prebuilt "$NDK_PATH")
+TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/$HOST_TAG"
 
 echo "=========================================="
 echo "curl Android 编译"
 echo "=========================================="
 echo "版本: $CURL_VERSION"
 echo "NDK: $NDK_PATH"
-echo "mbedTLS: $MBEDTLS_ROOT"
+echo "Host tag: $HOST_TAG"
+echo "OpenSSL: $OPENSSL_ROOT"
 echo "输出: $OUTPUT_DIR"
 echo "=========================================="
 
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# 下载源码
 if [ ! -f "$CURL_TARBALL" ]; then
     echo "📥 下载 curl $CURL_VERSION..."
     curl -L -o "$CURL_TARBALL" "$CURL_URL"
 fi
 
-# 解压
 rm -rf "curl-${CURL_VERSION}"
 echo "📦 解压源码..."
 tar -xzf "$CURL_TARBALL"
 
-# 编译函数
 build_curl() {
-    local ARCH=$1
     local ABI=$2
     local HOST=$3
 
     echo "🔨 编译 $ABI..."
+
+    if [ ! -f "${OPENSSL_ROOT}/${ABI}/lib/libssl.so" ]; then
+        echo "❌ 错误: 未找到 OpenSSL: ${OPENSSL_ROOT}/${ABI}"
+        echo "请先运行: ./build_openssl_android.sh"
+        exit 1
+    fi
 
     cd "$BUILD_DIR/curl-${CURL_VERSION}"
     make clean 2>/dev/null || true
@@ -69,15 +66,16 @@ build_curl() {
     export AR="$TOOLCHAIN/bin/llvm-ar"
     export RANLIB="$TOOLCHAIN/bin/llvm-ranlib"
     export STRIP="$TOOLCHAIN/bin/llvm-strip"
-    export CFLAGS="-I${MBEDTLS_ROOT}/${ABI}/include"
-    export LDFLAGS="-L${MBEDTLS_ROOT}/${ABI}/lib"
+    export CFLAGS="-I${OPENSSL_ROOT}/${ABI}/include"
+    export LDFLAGS="-L${OPENSSL_ROOT}/${ABI}/lib"
 
     ./configure \
         --host=$HOST \
         --prefix="$OUTPUT_DIR/$ABI" \
         --enable-static \
         --disable-shared \
-        --with-mbedtls="${MBEDTLS_ROOT}/${ABI}" \
+        --with-openssl="${OPENSSL_ROOT}/${ABI}" \
+        --without-mbedtls \
         --without-zlib \
         --disable-ldap \
         --disable-ldaps \
@@ -92,7 +90,7 @@ build_curl() {
         --disable-manual \
         --disable-verbose
 
-    make -j$(sysctl -n hw.ncpu)
+    make -j"$(hxc_nproc)"
     make install
 
     echo "✅ $ABI 编译完成"
