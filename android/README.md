@@ -80,7 +80,7 @@ dependencies {
 AAR 包含以下第三方库（自动打包到 `jniLibs`）：
 
 - **FFmpeg** (libavcodec, libavformat, libavutil, libswscale, libswresample)
-- **SoundTouch** (libSoundTouch.so)
+- **SoundTouch**（静态链进 libhxcplayer.so，AAR 里没有 libSoundTouch.so，也没有 libc++_shared.so）
 - **OpenSSL** (libssl, libcrypto)
 
 这些库从 `../../android-third/` 编译生成，需要先编译第三方库：
@@ -114,7 +114,6 @@ hxcplayer-release.aar
 │   │   ├── libhxcplayer.so
 │   │   ├── libavcodec.so
 │   │   ├── libavformat.so
-│   │   ├── libSoundTouch.so
 │   │   ├── libssl.so
 │   │   ├── libcrypto.so
 │   │   └── ...

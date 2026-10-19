@@ -100,10 +100,8 @@ if [ "$COPY_LIBS" = true ]; then
             cp "$THIRD_PARTY_ROOT/ffmpeg-build-android/FFmpeg-Android/$ABI/lib/"*.so "$TARGET_JNI/$ABI/" 2>/dev/null || true
         fi
         
-        # 复制 SoundTouch
-        if [ -d "$THIRD_PARTY_ROOT/soundtouch-build-android/SoundTouch-Android/$ABI/lib" ]; then
-            cp "$THIRD_PARTY_ROOT/soundtouch-build-android/SoundTouch-Android/$ABI/lib/"*.so "$TARGET_JNI/$ABI/" 2>/dev/null || true
-        fi
+        # SoundTouch 已静态链进 libhxcplayer，不能再把 libSoundTouch.so / libc++_shared.so 打进 AAR
+        rm -f "$TARGET_JNI/$ABI/libSoundTouch.so" "$TARGET_JNI/$ABI/libc++_shared.so"
         
         # 复制 OpenSSL（替代 mbedTLS）
         if [ -d "$THIRD_PARTY_ROOT/openssl-build-android/OpenSSL-Android/$ABI/lib" ]; then

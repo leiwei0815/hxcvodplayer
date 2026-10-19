@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# SoundTouch Android 动态库编译脚本
+# SoundTouch Android 静态库编译脚本。
+# 静态链进 libhxcplayer.so，不再产出 libSoundTouch.so / libc++_shared.so。
 # 默认仅 arm64-v8a；全架构: export ANDROID_ABIS="arm64-v8a armeabi-v7a x86_64"
 
 set -e
@@ -8,6 +9,8 @@ set -e
 ANDROID_ABIS="${ANDROID_ABIS:-arm64-v8a}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=ndk_env.sh
+source "$SCRIPT_DIR/ndk_env.sh"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SOUNDTOUCH_VERSION="2.3.3"
 BUILD_DIR="$SCRIPT_DIR/soundtouch-build-android"
@@ -29,7 +32,7 @@ else
 fi
 
 echo "=========================================="
-echo "SoundTouch Android 静态库编译"
+echo "SoundTouch Android 静态库编译（c++_static，链进 libhxcplayer）"
 echo "=========================================="
 echo "版本: $SOUNDTOUCH_VERSION"
 echo "NDK 路径: $NDK_PATH"
@@ -122,8 +125,9 @@ build_soundtouch() {
         -DANDROID_ABI=$ANDROID_ABI \
         -DANDROID_PLATFORM=android-$API_LEVEL \
         -DANDROID_NDK="$NDK_PATH" \
-        -DANDROID_STL=c++_shared \
-        -DBUILD_SHARED_LIBS=ON \
+        -DANDROID_STL=c++_static \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DCMAKE_ANDROID_ARCH_ABI=$ANDROID_ABI \
         -DCMAKE_SYSTEM_NAME=Android \
         -DCMAKE_SYSTEM_VERSION=$API_LEVEL \
@@ -132,7 +136,7 @@ build_soundtouch() {
     
     echo ""
     echo "🔨 编译中..."
-    make -j$(sysctl -n hw.ncpu)
+    make -j"$(hxc_nproc)"
     
     echo ""
     echo "📦 安装到 $INSTALL_DIR..."
@@ -160,18 +164,27 @@ for ABI in $ANDROID_ABIS; do
     
     # 复制头文件
     cp -r "$BUILD_DIR/install-$ABI/include/"* "$OUTPUT_DIR/$ABI/include/"
-    
-    # 复制动态库
-    cp "$BUILD_DIR/install-$ABI/lib/libSoundTouch.so" "$OUTPUT_DIR/$ABI/lib/"
+
+    static_lib=$(find "$BUILD_DIR/install-$ABI" -type f \( -name 'libSoundTouch.a' -o -name 'libsoundtouch.a' \) | head -1)
+    if [ -z "$static_lib" ]; then
+        echo "❌ 未生成 SoundTouch 静态库: $BUILD_DIR/install-$ABI"
+        find "$BUILD_DIR/install-$ABI" -type f
+        exit 1
+    fi
+    cp "$static_lib" "$OUTPUT_DIR/$ABI/lib/libSoundTouch.a"
+    rm -f "$OUTPUT_DIR/$ABI/lib/"*.so
 done
 
 echo ""
-echo "✅ SoundTouch Android 动态库编译完成！"
+echo "✅ SoundTouch Android 静态库编译完成！"
 echo ""
 echo "输出目录 (ANDROID_ABIS=$ANDROID_ABIS):"
 for ABI in $ANDROID_ABIS; do
   echo "  $ABI: $OUTPUT_DIR/$ABI"
-  ls -lh "$OUTPUT_DIR/$ABI/lib/"*.so 2>/dev/null || echo "    (无 .so)"
-  echo "  大小: $(du -sh "$OUTPUT_DIR/$ABI/lib/" 2>/dev/null | cut -f1)"
+  ls -lh "$OUTPUT_DIR/$ABI/lib/"*.a
+  if ls "$OUTPUT_DIR/$ABI/lib/"*.so >/dev/null 2>&1; then
+    echo "❌ 不应再产出 SoundTouch 动态库"
+    exit 1
+  fi
 done
 echo ""

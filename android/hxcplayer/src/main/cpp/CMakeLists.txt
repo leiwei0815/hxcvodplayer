@@ -90,9 +90,12 @@ set_target_properties(swscale PROPERTIES IMPORTED_LOCATION ${FFMPEG_ROOT}/lib/li
 add_library(swresample SHARED IMPORTED)
 set_target_properties(swresample PROPERTIES IMPORTED_LOCATION ${FFMPEG_ROOT}/lib/libswresample.so)
 
-# 导入 SoundTouch 动态库
-add_library(soundtouch SHARED IMPORTED)
-set_target_properties(soundtouch PROPERTIES IMPORTED_LOCATION ${SOUNDTOUCH_ROOT}/lib/libSoundTouch.so)
+# SoundTouch 静态库，链进 libhxcplayer，避免单独的 libSoundTouch.so
+if(NOT EXISTS "${SOUNDTOUCH_ROOT}/lib/libSoundTouch.a")
+    message(FATAL_ERROR "未找到 SoundTouch 静态库: ${SOUNDTOUCH_ROOT}/lib/libSoundTouch.a 。请先运行 android-third/build_soundtouch_android.sh")
+endif()
+add_library(soundtouch STATIC IMPORTED)
+set_target_properties(soundtouch PROPERTIES IMPORTED_LOCATION ${SOUNDTOUCH_ROOT}/lib/libSoundTouch.a)
 
 # 导入 OpenSSL 动态库（FFmpeg HTTPS / curl TLS，对齐 iOS enable-openssl）
 if(NOT EXISTS "${OPENSSL_ROOT}/lib/libssl.so" OR NOT EXISTS "${OPENSSL_ROOT}/lib/libcrypto.so")
@@ -107,6 +110,12 @@ set_target_properties(crypto PROPERTIES IMPORTED_LOCATION ${OPENSSL_ROOT}/lib/li
 # 导入 curl 静态库
 add_library(curl STATIC IMPORTED)
 set_target_properties(curl PROPERTIES IMPORTED_LOCATION ${CURL_ROOT}/lib/libcurl.a)
+
+# 静态库符号留在 libhxcplayer 内部，不进动态符号表。
+target_link_options(hxcplayer PRIVATE
+    "-Wl,--exclude-libs,libSoundTouch.a"
+    "-Wl,--exclude-libs,libc++_static.a"
+)
 
 # 链接库（顺序很重要！）
 target_link_libraries(hxcplayer
@@ -139,8 +148,8 @@ target_link_libraries(hxcplayer
     EGL
     GLESv3
 
-    # C++ 标准库
-    c++_shared
+    # 静态 C++ 运行库。不导出符号，避免和宿主的 libc++_shared.so 互相覆盖。
+    c++_static
 
     # 系统库（FFmpeg 依赖）
     z
