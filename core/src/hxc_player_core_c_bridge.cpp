@@ -58,7 +58,10 @@ struct PlayerCoreHandle {
     int audio_current_sample_rate;      // 当前音频采样率
     int audio_current_channels;         // 当前音频通道数
     int audio_logged_source_channels;    // 上次记录的源声道数
+    int audio_logged_source_rate;        // 上次记录的源采样率
     int audio_logged_output_channels;    // 上次记录的输出声道数
+    int audio_output_channels_locked;    // 本次播放锁定的输出声道，中途不随帧变化
+    int audio_output_sample_rate_locked; // 本次播放锁定的输出采样率，中途不随帧变化
     std::atomic<uint64_t> audio_seek_serial; // seek 代数，用于丢弃 seek 前旧回调
     int audio_buf_serial;               // 当前桥接音频缓冲对应的 serial
     double post_anchor_audio_guard_pts; // seek 锚定后短时拒绝旧音频 PTS 回拉时钟
@@ -124,7 +127,10 @@ struct PlayerCoreHandle {
         , audio_current_sample_rate(0)
         , audio_current_channels(0)
         , audio_logged_source_channels(0)
+        , audio_logged_source_rate(0)
         , audio_logged_output_channels(0)
+        , audio_output_channels_locked(0)
+        , audio_output_sample_rate_locked(0)
         , audio_seek_serial(0)
         , audio_buf_serial(0)
         , post_anchor_audio_guard_pts(-1.0)
@@ -335,8 +341,55 @@ void player_core_destroy(PlayerCoreHandle* handle) {
     }
 }
 
+static void bridge_reset_output_format_lock(PlayerCoreHandle* handle) {
+    if (!handle) return;
+    handle->audio_output_channels_locked = 0;
+    handle->audio_output_sample_rate_locked = 0;
+}
+
+// 设备输出在打开时就按整条流的声道数和采样率建好了。
+// 连麦片段经常在双声道流中间插入单声道或另一种采样率，如果跟着改输出格式，
+// 单声道 PCM 会被双声道设备按两倍速度播出来。这里把输出格式锁死，帧格式不同就重采样过去。
+static void bridge_lock_output_format(PlayerCoreHandle* handle,
+                                      int frame_channels,
+                                      int frame_sample_rate,
+                                      int* output_channels,
+                                      int* output_sample_rate) {
+    if (!handle->audio_output_channels_locked || !handle->audio_output_sample_rate_locked) {
+        int stream_channels = 0;
+        int stream_rate = 0;
+        if (handle->core) {
+            const auto& info = handle->core->get_media_info();
+            stream_channels = info.audio_channels;
+            stream_rate = info.audio_sample_rate;
+        }
+        if (!handle->audio_output_channels_locked) {
+            int locked_channels = bridge_output_channels_for_source(stream_channels);
+            if (locked_channels <= 0) {
+                locked_channels = bridge_output_channels_for_source(frame_channels);
+            }
+            handle->audio_output_channels_locked = locked_channels;
+        }
+        if (!handle->audio_output_sample_rate_locked) {
+            handle->audio_output_sample_rate_locked =
+                    stream_rate > 0 ? stream_rate : frame_sample_rate;
+        }
+        LOG_INFO("bridge_audio_output_locked channels=", handle->audio_output_channels_locked,
+                 " sample_rate=", handle->audio_output_sample_rate_locked,
+                 " stream_channels=", stream_channels,
+                 " stream_rate=", stream_rate);
+    }
+    if (output_channels) {
+        *output_channels = handle->audio_output_channels_locked;
+    }
+    if (output_sample_rate) {
+        *output_sample_rate = handle->audio_output_sample_rate_locked;
+    }
+}
+
 int player_core_open(PlayerCoreHandle* handle, const char* url) {
     if (!handle || !handle->core || !url || url[0] == '\0') return -1;
+    bridge_reset_output_format_lock(handle);
     return handle->core->open(url);  // 直接返回，0=成功，-1=失败
 }
 
@@ -349,6 +402,7 @@ int player_core_open_with_start_position(PlayerCoreHandle* handle, const char* u
     handle->core->set_config(config);
     
     // 打开文件（内部会检查 config.start_time 并在解码前 seek）
+    bridge_reset_output_format_lock(handle);
     return handle->core->open(url);
 }
 
@@ -363,6 +417,7 @@ int player_core_open_with_mode(PlayerCoreHandle* handle, const PlayerDataSourceC
         playerConfig.start_time = (data_source->start_position > 0.0) ? data_source->start_position : 0.0;
         handle->core->set_config(playerConfig);
     }
+    bridge_reset_output_format_lock(handle);
 
     // 转换 C 枚举到 C++ 枚举
     hxcplayer::DataSourceMode cppMode;
@@ -990,8 +1045,13 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         // 保存当前帧的时钟基准（注意：以输出缓冲起点作为媒体时间基准）。
         handle->audio_current_pts = pts;
         handle->audio_buf_pts_base = pts;
-        handle->audio_current_sample_rate = sample_rate;
         handle->audio_buf_serial = af->serial;
+
+        // 输出声道和采样率跟打开设备时一致。连麦单声道或采样率变化只在这里转换，不改设备格式。
+        int output_sample_rate = 0;
+        int output_channels = 0;
+        bridge_lock_output_format(handle, channels, sample_rate, &output_channels, &output_sample_rate);
+        handle->audio_current_sample_rate = output_sample_rate;
 
         // 按当前帧的格式配置重采样器（每个新流/格式变化时重新配置）。
         // Android OpenSL ES 输出侧只承诺 mono/stereo，3.0/5.1/7.1 等源流在这里 downmix。
@@ -1014,23 +1074,27 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
             }
         }
         AVChannelLayout dst_layout = AV_CHANNEL_LAYOUT_STEREO;
-        if (channels == 1) {
+        if (output_channels == 1) {
             dst_layout = AV_CHANNEL_LAYOUT_MONO;
         }
         int previous_output_channels = handle->audio_current_channels;
-        int output_channels = bridge_output_channels_for_source(channels);
-        if (output_channels <= 0 || output_channels != dst_layout.nb_channels) {
+        if (output_channels <= 0 || output_sample_rate <= 0 ||
+            output_channels != dst_layout.nb_channels) {
             audioQueue->next();
             return 0;
         }
         handle->audio_current_channels = output_channels;
         if (channels != handle->audio_logged_source_channels ||
+            sample_rate != handle->audio_logged_source_rate ||
             output_channels != handle->audio_logged_output_channels) {
             LOG_INFO("bridge_audio_output_format source_channels=", channels,
                      " output_channels=", output_channels,
-                     " downmix=", (channels > output_channels ? 1 : 0),
-                     " sample_rate=", sample_rate);
+                     " source_rate=", sample_rate,
+                     " output_rate=", output_sample_rate,
+                     " upmix=", (channels < output_channels ? 1 : 0),
+                     " downmix=", (channels > output_channels ? 1 : 0));
             handle->audio_logged_source_channels = channels;
+            handle->audio_logged_source_rate = sample_rate;
             handle->audio_logged_output_channels = output_channels;
         }
 #ifdef HAS_SOUNDTOUCH
@@ -1043,7 +1107,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
                                                    sample_rate,
                                                    &dst_layout,
                                                    AV_SAMPLE_FMT_S16,
-                                                   sample_rate);
+                                                   output_sample_rate);
         av_channel_layout_uninit(&src_layout);
         if (cfg_ret < 0) {
             audioQueue->next();
@@ -1096,7 +1160,7 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         if (handle->soundtouch && current_rate != 1.0) {
             // 首次使用时设置采样率和通道数
             if (!handle->soundtouch_initialized) {
-                handle->soundtouch->setSampleRate(sample_rate);
+                handle->soundtouch->setSampleRate(output_sample_rate);
                 handle->soundtouch->setChannels(output_channels);
                 handle->soundtouch_initialized = true;
             }
