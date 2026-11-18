@@ -2261,17 +2261,30 @@ double PlayerCore::rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch)
     if (epoch.align_pending && raw > -0.05) {
         const double target = timeline_align_target_sec_;
         epoch.offset_sec = 0.0;
-        // 普通关键帧回退保持 offset=0。只有这条流已经发生过 PTS 重开，
-        // 且 seek 落在新片段起点时才对齐，避免把 0 秒关键帧标成 seek 目标。
+        // 普通关键帧回退保持 offset=0：落点和目标在同一时间轴上（例如 410 落到 209，
+        // 或长 GOP 落在 0 附近几秒到两分钟）。
+        // 拼接流的切片内 PTS 从 0 计，FFmpeg seek 落到的 raw 会远小于播放列表目标。
+        // 这时按 hls.js / ExoPlayer 把第一包对齐到目标，否则追帧要一直丢到 raw PTS
+        // 追上目标，点击进度条会一直不出画。
         constexpr double kSeekAlignMinGapSec = 8.0;
-        if (epoch.saw_restart &&
-            target >= 8.0 && std::isfinite(target) &&
+        constexpr double kRestartedTimelineGapSec = 180.0;
+        const bool known_restart_origin =
+            epoch.saw_restart &&
+            std::isfinite(target) && target >= 8.0 &&
             raw < 2.0 &&
-            raw + kSeekAlignMinGapSec < target) {
+            raw + kSeekAlignMinGapSec < target;
+        const bool restarted_timeline_landing =
+            std::isfinite(target) &&
+            target >= kRestartedTimelineGapSec &&
+            (target - raw) >= kRestartedTimelineGapSec &&
+            target > raw * 2.0;
+        if (known_restart_origin || restarted_timeline_landing) {
             epoch.offset_sec = target - raw;
+            epoch.saw_restart = true;
             LOG_WARNING("timeline_rebase_seek_align raw=", raw,
                         " target=", target,
                         " offset=", epoch.offset_sec,
+                        " known_restart=", known_restart_origin ? 1 : 0,
                         " stream=", pkt->stream_index);
         }
         epoch.align_pending = false;

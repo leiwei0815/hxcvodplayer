@@ -302,8 +302,9 @@ private:
     void read_thread();
 
     // 合并流 / EXT-X-DISCONTINUITY：各段 TS 的 PTS 会从 0 重新计。
-    // 浏览器和 hls.js 用播放列表时间轴做 timestampOffset，这里只在
-    // “大幅回退到新纪元”时做同样的平移，连续流和时间轴正常的 seek 不改 PTS。
+    // hls.js / ExoPlayer 的 timestampOffset = 播放列表时间 - 切片内 PTS。
+    // 连续播放只在大幅回退到新纪元时平移；seek / 起播落在新纪元时，
+    // 用目标时间减落点 raw，让第一帧直接可播。同时间轴的关键帧回退不改 PTS。
     struct TimelineEpoch {
         double offset_sec = 0.0;
         double last_raw_sec = -1.0;
