@@ -115,20 +115,18 @@ new = """                    tb = get_timebase(pls);
                         pls->seek_timestamp = AV_NOPTS_VALUE;
                         break;
                     }
-                    /* Discontinuity segments restart PTS near 0 while seek_timestamp
-                     * stays on the playlist timeline. A gap this large is not a GOP.
-                     * Accept the packet so the player can map it to the segment start.
-                     * Same-timeline landings such as 410s->209s keep a large raw dts
-                     * and stay on the normal drop path. */
-                    if (ts_diff < -(90LL * AV_TIME_BASE)) {
-                        int64_t raw_ts = av_rescale_rnd(pls->pkt->dts, AV_TIME_BASE,
-                                                        tb.den, AV_ROUND_DOWN);
-                        if (raw_ts >= 0 && raw_ts < 2LL * AV_TIME_BASE) {
-                            av_log(s, AV_LOG_WARNING,
-                                   "hls discontinuity seek: accept restarted pts\\n");
-                            pls->seek_timestamp = AV_NOPTS_VALUE;
-                            break;
-                        }
+                    /* After a playlist discontinuity the packet PTS is the in-file
+                     * time, which can be tens or hundreds of seconds while
+                     * seek_timestamp is the playlist time. A normal GOP is only a
+                     * few seconds behind the seek point; anything further behind
+                     * will never catch up inside this segment. Hand the packet to
+                     * the player, which maps it onto the playlist segment start.
+                     */
+                    if (ts_diff < -(5LL * AV_TIME_BASE)) {
+                        av_log(s, AV_LOG_WARNING,
+                               "hls discontinuity seek: accept behind pts\\n");
+                        pls->seek_timestamp = AV_NOPTS_VALUE;
+                        break;
                     }
 """
 if old not in text:

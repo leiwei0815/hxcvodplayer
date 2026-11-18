@@ -302,10 +302,10 @@ private:
     // 读取线程（解复用）
     void read_thread();
 
-    // 合并流 / EXT-X-DISCONTINUITY：各段 TS 的 PTS 会从 0 重新计。
-    // hls.js / ExoPlayer 的 timestampOffset = 切片在播放列表上的起点 - 切片内 PTS。
-    // 连续播放只在大幅回退到新纪元时平移。seek 落到不连续切片时，只把 raw≈0
-    // 对齐到该切片起点，再由追帧丢到目标；同时间轴回退（410→209、长 GOP）不改 PTS。
+    // 合并流 / EXT-X-DISCONTINUITY：不连续点之后，切片 PTS 不再等于播放列表时间。
+    // 可能从 0 重开，也可能在 60 秒文件中段已经走到几十秒。
+    // timestampOffset = 切片播放列表起点 - 该包 raw PTS。
+    // 只对不连续点之后的纪元做对齐。开头连续区（以及 410→209 这种同时间轴回退）不改 PTS。
     struct TimelineEpoch {
         double offset_sec = 0.0;
         double last_raw_sec = -1.0;
@@ -315,6 +315,7 @@ private:
     struct HlsTimelineSegment {
         double start_sec = 0.0;
         double end_sec = 0.0;
+        double epoch_start_sec = 0.0;
         bool after_discontinuity = false;
     };
     void reset_timeline_epochs_for_open();

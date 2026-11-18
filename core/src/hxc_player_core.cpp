@@ -2279,6 +2279,7 @@ void PlayerCore::load_hls_timeline(const std::string& url) {
     bool master = false;
     bool disc_pending = false;
     double cursor = 0.0;
+    double epoch_start = 0.0;
     double pending_dur = -1.0;
     size_t line_begin = 0;
     while (line_begin <= body.size()) {
@@ -2314,13 +2315,20 @@ void PlayerCore::load_hls_timeline(const std::string& url) {
             continue;
         }
         if (!line.empty() && line[0] != '#' && pending_dur > 0.0) {
+            // 列表开头的 EXT-X-DISCONTINUITY 不开启新纪元，PTS 仍从 0 连续走。
+            // 真正的拼接从第一处播放时间 > 0 的不连续点开始，之后的切片都属于该纪元，
+            // 直到下一个不连续点。1010 秒落在 305 秒那次拼接之后的 60 秒文件中段。
+            if (disc_pending && cursor > 0.5) {
+                epoch_start = cursor;
+                if (hls_first_discontinuity_sec_ < 0.0) {
+                    hls_first_discontinuity_sec_ = cursor;
+                }
+            }
             HlsTimelineSegment seg;
             seg.start_sec = cursor;
             seg.end_sec = cursor + pending_dur;
-            seg.after_discontinuity = disc_pending;
-            if (disc_pending && hls_first_discontinuity_sec_ < 0.0) {
-                hls_first_discontinuity_sec_ = cursor;
-            }
+            seg.epoch_start_sec = epoch_start;
+            seg.after_discontinuity = disc_pending && cursor > 0.5;
             hls_timeline_.push_back(seg);
             cursor = seg.end_sec;
             pending_dur = -1.0;
@@ -2384,13 +2392,14 @@ double PlayerCore::lift_restarted_seek_pts(double pts) {
         return pts;
     }
     double shift = seek_landing_offset_sec_.load(std::memory_order_acquire);
-    // 只抬“不连续切片里从 0 附近重开”的 PTS，落到切片起点，不把 410→209 或长 GOP 标成目标。
-    if (shift < 0.05 && pts < 2.0) {
+    // 不连续纪元里 raw 会明显小于切片的播放列表起点（中段切片可能已经是几十秒，不是 0）。
+    // 抬到切片起点。开头连续区和同时间轴回退不抬。
+    if (shift < 0.05) {
         const HlsTimelineSegment* seg = hls_segment_at(target);
         double origin = -1.0;
-        if (seg && seg->after_discontinuity && pts + 8.0 < seg->start_sec) {
+        if (seg && seg->epoch_start_sec > 0.5 && pts + 8.0 < seg->start_sec) {
             origin = seg->start_sec;
-        } else if (!hls_timeline_ready_ && (target - pts) >= 90.0) {
+        } else if (!hls_timeline_ready_ && pts < 2.0 && (target - pts) >= 90.0) {
             origin = target;
         }
         if (origin >= 0.0) {
@@ -2459,8 +2468,7 @@ double PlayerCore::rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch)
         const HlsTimelineSegment* seg = hls_segment_at(target);
         const bool segment_restart =
             seg &&
-            seg->after_discontinuity &&
-            raw < 2.0 &&
+            seg->epoch_start_sec > 0.5 &&
             raw + kSeekAlignMinGapSec < seg->start_sec;
         const bool known_restart_origin =
             !segment_restart &&
@@ -2486,7 +2494,7 @@ double PlayerCore::rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch)
                 << " origin=" << origin
                 << " offset=" << epoch.offset_sec
                 << " seg_start=" << (seg ? seg->start_sec : -1.0)
-                << " after_disc=" << (seg && seg->after_discontinuity ? 1 : 0)
+                << " epoch=" << (seg ? seg->epoch_start_sec : -1.0)
                 << " known_restart=" << (known_restart_origin ? 1 : 0)
                 << " stream=" << pkt->stream_index;
             log_hls_warn(oss.str());
@@ -2495,7 +2503,7 @@ double PlayerCore::rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch)
             oss << "timeline_seek_landing raw=" << raw
                 << " target=" << target
                 << " seg_start=" << (seg ? seg->start_sec : -1.0)
-                << " after_disc=" << (seg && seg->after_discontinuity ? 1 : 0)
+                << " epoch=" << (seg ? seg->epoch_start_sec : -1.0)
                 << " offset=0 stream=" << pkt->stream_index;
             log_hls_warn(oss.str());
         }
