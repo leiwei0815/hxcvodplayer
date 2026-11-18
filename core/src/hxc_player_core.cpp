@@ -2212,6 +2212,7 @@ void PlayerCore::reset_timeline_epochs_for_open() {
     video_timeline_epoch_ = TimelineEpoch{};
     audio_timeline_epoch_ = TimelineEpoch{};
     timeline_align_target_sec_ = -1.0;
+    seek_landing_offset_sec_.store(0.0, std::memory_order_release);
 }
 
 void PlayerCore::reset_timeline_epochs_for_seek(double target_sec) {
@@ -2223,6 +2224,43 @@ void PlayerCore::reset_timeline_epochs_for_seek(double target_sec) {
     video_timeline_epoch_.saw_restart = saw_restart;
     audio_timeline_epoch_.saw_restart = saw_restart;
     timeline_align_target_sec_ = target_sec;
+    seek_landing_offset_sec_.store(0.0, std::memory_order_release);
+}
+
+double PlayerCore::lift_restarted_seek_pts(double pts) {
+    if (!std::isfinite(pts) || pts < -0.05) {
+        return pts;
+    }
+    if (!seeking_.load(std::memory_order_acquire)) {
+        return pts;
+    }
+    const double target = seek_target_pos_.load(std::memory_order_acquire);
+    if (!std::isfinite(target) || target <= 0.0) {
+        return pts;
+    }
+    double shift = seek_landing_offset_sec_.load(std::memory_order_acquire);
+    // raw 已经接近目标，或像 410→209 这种同时间轴落点，不抬。
+    // 切片 PTS 从 0 附近重开、且离目标超过一个正常 GOP 时，抬到目标，第一帧就能播。
+    if (shift < 0.05 &&
+        (target - pts) >= 15.0 &&
+        pts < 180.0 &&
+        target > pts * 2.0) {
+        shift = target - pts;
+        const double observed = seek_landing_offset_sec_.load(std::memory_order_acquire);
+        if (observed < 0.05) {
+            seek_landing_offset_sec_.store(shift, std::memory_order_release);
+            LOG_WARNING("timeline_rebase_seek_align raw=", pts,
+                        " target=", target,
+                        " offset=", shift,
+                        " via=decode");
+        } else {
+            shift = observed;
+        }
+    }
+    if (shift > 0.05 && pts + 8.0 < target) {
+        return pts + shift;
+    }
+    return pts;
 }
 
 double PlayerCore::rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch) {
@@ -2267,19 +2305,20 @@ double PlayerCore::rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch)
         // 这时按 hls.js / ExoPlayer 把第一包对齐到目标，否则追帧要一直丢到 raw PTS
         // 追上目标，点击进度条会一直不出画。
         constexpr double kSeekAlignMinGapSec = 8.0;
-        constexpr double kRestartedTimelineGapSec = 180.0;
         const bool known_restart_origin =
             epoch.saw_restart &&
             std::isfinite(target) && target >= 8.0 &&
             raw < 2.0 &&
             raw + kSeekAlignMinGapSec < target;
+        // 切片内 PTS 远小于播放列表目标。410 落到 209 时 raw 已经超过 180，不会进这里。
         const bool restarted_timeline_landing =
             std::isfinite(target) &&
-            target >= kRestartedTimelineGapSec &&
-            (target - raw) >= kRestartedTimelineGapSec &&
+            (target - raw) >= 15.0 &&
+            raw < 180.0 &&
             target > raw * 2.0;
         if (known_restart_origin || restarted_timeline_landing) {
             epoch.offset_sec = target - raw;
+            seek_landing_offset_sec_.store(epoch.offset_sec, std::memory_order_release);
             epoch.saw_restart = true;
             LOG_WARNING("timeline_rebase_seek_align raw=", raw,
                         " target=", target,
@@ -3459,6 +3498,16 @@ void PlayerCore::video_thread() {
         
         // 计算帧时间戳
         pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(format_ctx_->streams[video_stream_]->time_base);
+        if (!std::isnan(pts)) {
+            const double lifted = lift_restarted_seek_pts(pts);
+            if (lifted > pts + 0.05 && format_ctx_ && format_ctx_->streams[video_stream_]) {
+                const double q = av_q2d(format_ctx_->streams[video_stream_]->time_base);
+                if (q > 0.0) {
+                    frame->pts = static_cast<int64_t>(std::llround(lifted / q));
+                }
+                pts = lifted;
+            }
+        }
         video_decode_error_streak_.store(0, std::memory_order_release);
         video_decoded_frame_count_.fetch_add(1, std::memory_order_acq_rel);
         video_last_frame_pts_sec_.store(isnan(pts) ? -1.0 : pts, std::memory_order_release);
@@ -3696,6 +3745,16 @@ void PlayerCore::audio_thread() {
         // 计算时间戳
         double pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : 
                      frame->pts * av_q2d(format_ctx_->streams[audio_stream_]->time_base);
+        if (!std::isnan(pts)) {
+            const double lifted = lift_restarted_seek_pts(pts);
+            if (lifted > pts + 0.05 && format_ctx_ && format_ctx_->streams[audio_stream_]) {
+                const double q = av_q2d(format_ctx_->streams[audio_stream_]->time_base);
+                if (q > 0.0) {
+                    frame->pts = static_cast<int64_t>(std::llround(lifted / q));
+                }
+                pts = lifted;
+            }
+        }
         audio_last_frame_pts_sec_.store(isnan(pts) ? -1.0 : pts, std::memory_order_release);
 
         // seek 追帧策略（稳定优先）：

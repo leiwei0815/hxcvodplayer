@@ -314,6 +314,8 @@ private:
     void reset_timeline_epochs_for_open();
     void reset_timeline_epochs_for_seek(double target_sec);
     double rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch);
+    // 起播/seek 落到切片内重开的 PTS 时，把帧抬到播放列表目标，避免一直丢帧不出画。
+    double lift_restarted_seek_pts(double pts);
     
     // 解码线程
     void video_thread();
@@ -473,6 +475,7 @@ private:
     TimelineEpoch video_timeline_epoch_;
     TimelineEpoch audio_timeline_epoch_;
     double timeline_align_target_sec_ = -1.0;
+    std::atomic<double> seek_landing_offset_sec_{0.0};
     std::atomic<int>   post_seek_warmup_frames_{0}; // seek 结束后放宽 A/V 同步丢帧阈值的剩余帧数
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
     std::atomic<bool> reader_at_eof_{false}; // reader 已收到 EOF，进入等待；seek 后清除
