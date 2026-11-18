@@ -60,6 +60,8 @@ struct PlayerCoreHandle {
     int audio_logged_source_channels;    // 上次记录的源声道数
     int audio_logged_source_rate;        // 上次记录的源采样率
     int audio_logged_output_channels;    // 上次记录的输出声道数
+    int audio_tempo_src_channels;        // 上次送入倍速器的源声道，变了就重新武装 tempo
+    int audio_tempo_src_rate;            // 上次送入倍速器的源采样率
     int audio_output_channels_locked;    // 本次播放锁定的输出声道，中途不随帧变化
     int audio_output_sample_rate_locked; // 本次播放锁定的输出采样率，中途不随帧变化
     std::atomic<uint64_t> audio_seek_serial; // seek 代数，用于丢弃 seek 前旧回调
@@ -129,6 +131,8 @@ struct PlayerCoreHandle {
         , audio_logged_source_channels(0)
         , audio_logged_source_rate(0)
         , audio_logged_output_channels(0)
+        , audio_tempo_src_channels(0)
+        , audio_tempo_src_rate(0)
         , audio_output_channels_locked(0)
         , audio_output_sample_rate_locked(0)
         , audio_seek_serial(0)
@@ -201,6 +205,9 @@ static void reset_bridge_audio_output_locked(PlayerCoreHandle* handle,
 #ifdef HAS_SOUNDTOUCH
     if (handle->soundtouch) {
         handle->soundtouch->clear();
+        if (handle->core) {
+            handle->soundtouch->setTempo(handle->core->get_playback_rate());
+        }
     }
 #endif
     LOG_INFO("bridge_audio_output_reset reason=", (reason ? reason : "unknown"),
@@ -345,6 +352,8 @@ static void bridge_reset_output_format_lock(PlayerCoreHandle* handle) {
     if (!handle) return;
     handle->audio_output_channels_locked = 0;
     handle->audio_output_sample_rate_locked = 0;
+    handle->audio_tempo_src_channels = 0;
+    handle->audio_tempo_src_rate = 0;
 }
 
 // 设备输出在打开时就按整条流的声道数和采样率建好了。
@@ -1158,12 +1167,30 @@ int player_core_get_audio_data(PlayerCoreHandle* handle, unsigned char* buffer, 
         double current_rate = handle->core->get_playback_rate();
         
         if (handle->soundtouch && current_rate != 1.0) {
-            // 首次使用时设置采样率和通道数
-            if (!handle->soundtouch_initialized) {
+            // 输出声道/采样率锁死，倍速器不能跟着某一帧的单声道改配置。
+            // 源格式变化时清掉旧波形并重新套上当前 tempo，否则 SoundTouch
+            // 会停在 1.0x，双声道流里的单声道片段听起来没有倍速。
+            const bool source_format_changed =
+                    handle->audio_tempo_src_channels > 0 &&
+                    (channels != handle->audio_tempo_src_channels ||
+                     sample_rate != handle->audio_tempo_src_rate);
+            if (!handle->soundtouch_initialized || source_format_changed) {
+                handle->soundtouch->clear();
                 handle->soundtouch->setSampleRate(output_sample_rate);
                 handle->soundtouch->setChannels(output_channels);
+                handle->soundtouch->setTempo(current_rate);
                 handle->soundtouch_initialized = true;
+                if (source_format_changed) {
+                    LOG_INFO("bridge_audio_tempo_rearm reason=source_format_change",
+                             " src_ch=", channels,
+                             " src_rate=", sample_rate,
+                             " out_ch=", output_channels,
+                             " out_rate=", output_sample_rate,
+                             " tempo=", current_rate);
+                }
             }
+            handle->audio_tempo_src_channels = channels;
+            handle->audio_tempo_src_rate = sample_rate;
             
             // 转换 S16 为 float
             int16_t* s16_data = (int16_t*)handle->audio_buf;

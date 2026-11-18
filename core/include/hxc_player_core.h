@@ -300,6 +300,19 @@ public:
 private:
     // 读取线程（解复用）
     void read_thread();
+
+    // 合并流 / EXT-X-DISCONTINUITY：各段 TS 的 PTS 会从 0 重新计。
+    // 浏览器和 hls.js 用播放列表时间轴做 timestampOffset，这里只在
+    // “大幅回退到新纪元”时做同样的平移，连续流和时间轴正常的 seek 不改 PTS。
+    struct TimelineEpoch {
+        double offset_sec = 0.0;
+        double last_raw_sec = -1.0;
+        bool align_pending = false;
+        bool saw_restart = false;
+    };
+    void reset_timeline_epochs_for_open();
+    void reset_timeline_epochs_for_seek(double target_sec);
+    double rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch);
     
     // 解码线程
     void video_thread();
@@ -456,6 +469,9 @@ private:
     std::unordered_map<std::string, int64_t> monitor_io_event_last_ms_;
     std::atomic<bool> loading_notified_{false};  // 对外已通知的 loading 状态
     std::atomic<double> seek_target_pos_;  // ⚠️ seek 的目标位置，在 seek 期间返回此值
+    TimelineEpoch video_timeline_epoch_;
+    TimelineEpoch audio_timeline_epoch_;
+    double timeline_align_target_sec_ = -1.0;
     std::atomic<int>   post_seek_warmup_frames_{0}; // seek 结束后放宽 A/V 同步丢帧阈值的剩余帧数
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
     std::atomic<bool> reader_at_eof_{false}; // reader 已收到 EOF，进入等待；seek 后清除

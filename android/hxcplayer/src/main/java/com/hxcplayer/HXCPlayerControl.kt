@@ -4266,6 +4266,23 @@ class HXCPlayerControl @JvmOverloads constructor(
 
         val backwardSec = playLoopMaxPosSec - positionSec
         val forwardSpanSec = playLoopMaxPosSec - playLoopAnchorPosSec
+        // 两段流合并：跨过 EXT-X-DISCONTINUITY 时进度会掉到新片段起点（接近 0）。
+        // 这不是循环播放。seek 回跳变前的位置会和已重置的 PTS 对打，把画面拉回片头。
+        val discontinuityReset = positionSec <= 1.5 &&
+                backwardSec >= 8.0 &&
+                playLoopMaxPosSec >= 8.0 &&
+                positionSec < playLoopMaxPosSec * 0.5
+        if (discontinuityReset) {
+            Log.w(
+                TAG,
+                "evt=play_loop_recover_skip reason=discontinuity_reset pos=$positionSec max=$playLoopMaxPosSec back=$backwardSec"
+            )
+            playLoopMaxPosSec = positionSec
+            playLoopAnchorPosSec = positionSec
+            playLoopHitCount = 0
+            playLoopWindowStartMs = 0L
+            return
+        }
         if (backwardSec < playLoopBackwardThresholdSec || forwardSpanSec < playLoopMinForwardSpanSec) {
             return
         }

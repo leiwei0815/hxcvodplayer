@@ -881,6 +881,8 @@ int PlayerCore::open(const std::string& filename) {
     audio_clock_.set_clock(0.0, 0);
     video_clock_.set_clock(0.0, 0);
     external_clock_.set_clock(0.0, 0);
+    // 重播会重新 open。不清掉上一轮的切片偏移，新会话会从旧进度接着算。
+    reset_timeline_epochs_for_open();
 
     set_state(PlayerState::Opening);
     set_play_when_ready_internal(true);
@@ -1266,8 +1268,8 @@ int PlayerCore::open(const std::string& filename) {
                 code = ERROR_NET_CONNECTION_LOST;
                 error_message += "I/O 错误，可能是网络问题";
             } else {
-                code = ERROR_OPEN_INPUT_FAILED;
-                error_message += "I/O 错误，可能是网络问题";
+            code = ERROR_OPEN_INPUT_FAILED;
+            error_message += "I/O 错误，可能是网络问题";
             }
         } else if (ret == AVERROR_HTTP_BAD_REQUEST) {
             code = ERROR_HTTP_BAD_REQUEST;
@@ -1508,7 +1510,7 @@ int PlayerCore::open_with_mode(const std::string& url, DataSourceMode mode, cons
     monitor_io_window_start_ms_ = 0;
     monitor_last_snapshot_ms_ = 0;
     monitor_last_weak_signal_ms_ = 0;
-
+    
     // 根据模式选择打开方式
     switch (mode) {
         case DataSourceMode::Default:
@@ -1782,6 +1784,7 @@ int PlayerCore::open_common_process(const std::string &filename) {
             } else {
                 LOG_INFO("initial seek ok");
                 avformat_flush(format_ctx_);
+                reset_timeline_epochs_for_seek(config_.start_time);
                 // Pre-set clocks to target to prevent A/V sync from discarding frames
                 audio_clock_.set_clock(config_.start_time, 0);
                 video_clock_.set_clock(config_.start_time, 0);
@@ -1872,7 +1875,7 @@ int PlayerCore::open_common_process(const std::string &filename) {
     LOG_INFO("open_common_process 总耗时: ", common_total_ms, " ms");
     emit_monitor_trace("core.open.common_done", "open_common_process 完成",
                        "costMs=" + std::to_string(common_total_ms), "open");
-
+    
     return 0;
 }
 
@@ -2205,6 +2208,106 @@ void PlayerCore::set_volume(int volume) {
     volume_ = std::max(0, std::min(100, volume));
 }
 
+void PlayerCore::reset_timeline_epochs_for_open() {
+    video_timeline_epoch_ = TimelineEpoch{};
+    audio_timeline_epoch_ = TimelineEpoch{};
+    timeline_align_target_sec_ = -1.0;
+}
+
+void PlayerCore::reset_timeline_epochs_for_seek(double target_sec) {
+    const bool saw_restart = video_timeline_epoch_.saw_restart || audio_timeline_epoch_.saw_restart;
+    video_timeline_epoch_ = TimelineEpoch{};
+    audio_timeline_epoch_ = TimelineEpoch{};
+    video_timeline_epoch_.align_pending = true;
+    audio_timeline_epoch_.align_pending = true;
+    video_timeline_epoch_.saw_restart = saw_restart;
+    audio_timeline_epoch_.saw_restart = saw_restart;
+    timeline_align_target_sec_ = target_sec;
+}
+
+double PlayerCore::rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch) {
+    if (!pkt || !format_ctx_ ||
+        pkt->stream_index < 0 ||
+        pkt->stream_index >= static_cast<int>(format_ctx_->nb_streams) ||
+        !format_ctx_->streams[pkt->stream_index]) {
+        return -1.0;
+    }
+    AVStream* stream = format_ctx_->streams[pkt->stream_index];
+    const AVRational tb = stream->time_base;
+    const auto shift_ts = [&](int64_t& ts) {
+        if (ts == AV_NOPTS_VALUE || std::fabs(epoch.offset_sec) <= 0.0005) {
+            return;
+        }
+        const int64_t delta = static_cast<int64_t>(std::llround(epoch.offset_sec * AV_TIME_BASE));
+        int64_t us = av_rescale_q(ts, tb, AV_TIME_BASE_Q);
+        us += delta;
+        if (us < 0) {
+            us = 0;
+        }
+        ts = av_rescale_q(us, AV_TIME_BASE_Q, tb);
+    };
+
+    if (pkt->pts == AV_NOPTS_VALUE) {
+        shift_ts(pkt->dts);
+        return -1.0;
+    }
+
+    const double raw = pkt->pts * av_q2d(tb);
+    if (!std::isfinite(raw)) {
+        return -1.0;
+    }
+
+    bool just_aligned = false;
+    if (epoch.align_pending && raw > -0.05) {
+        const double target = timeline_align_target_sec_;
+        epoch.offset_sec = 0.0;
+        // 普通关键帧回退保持 offset=0。只有这条流已经发生过 PTS 重开，
+        // 且 seek 落在新片段起点时才对齐，避免把 0 秒关键帧标成 seek 目标。
+        constexpr double kSeekAlignMinGapSec = 8.0;
+        if (epoch.saw_restart &&
+            target >= 8.0 && std::isfinite(target) &&
+            raw < 2.0 &&
+            raw + kSeekAlignMinGapSec < target) {
+            epoch.offset_sec = target - raw;
+            LOG_WARNING("timeline_rebase_seek_align raw=", raw,
+                        " target=", target,
+                        " offset=", epoch.offset_sec,
+                        " stream=", pkt->stream_index);
+        }
+        epoch.align_pending = false;
+        just_aligned = true;
+    }
+
+    if (!just_aligned && epoch.last_raw_sec >= 0.0 && raw > -0.05) {
+        const double backward = epoch.last_raw_sec - raw;
+        // 只认“新片段 PTS 从 0 附近重开”。同时间轴上的小回退（例如 1140→1134）不平移。
+        constexpr double kResetMinSec = 1.0;
+        const bool restarted_near_zero = raw < 2.0;
+        if (backward >= kResetMinSec &&
+            epoch.last_raw_sec >= 1.0 &&
+            restarted_near_zero) {
+            epoch.offset_sec += backward;
+            epoch.saw_restart = true;
+            LOG_WARNING("timeline_rebase_discontinuity raw=", raw,
+                        " last=", epoch.last_raw_sec,
+                        " back=", backward,
+                        " offset=", epoch.offset_sec,
+                        " stream=", pkt->stream_index);
+        }
+    }
+    if (raw > -0.05) {
+        epoch.last_raw_sec = raw;
+    }
+
+    shift_ts(pkt->pts);
+    shift_ts(pkt->dts);
+    double corrected = raw + epoch.offset_sec;
+    if (!std::isfinite(corrected) || corrected < 0.0) {
+        corrected = 0.0;
+    }
+    return corrected;
+}
+
 void PlayerCore::read_thread() {
     LOG_INFO("读取线程已启动");
     
@@ -2280,6 +2383,7 @@ void PlayerCore::read_thread() {
                 set_seek_loading(false);
             } else {
                 LOG_INFO("Seek 成功");
+                reset_timeline_epochs_for_seek(target_pos);
                 
                 // ⚠️ 清除播放完成标志，允许重新播放
                 decode_finished_.store(false, std::memory_order_release);
@@ -2458,8 +2562,8 @@ void PlayerCore::read_thread() {
             const double eof_duration = get_duration();
             const bool eof_near_end =
                     (std::isfinite(eof_pos) &&
-                     std::isfinite(eof_duration) &&
-                     eof_duration > 0.0 &&
+                                      std::isfinite(eof_duration) &&
+                                      eof_duration > 0.0 &&
                      (eof_duration - eof_pos) <= 1.2) ||
                     buffer_covers_remaining_media();
 
@@ -2777,6 +2881,17 @@ void PlayerCore::read_thread() {
                 pkt_dts_sec = pkt->dts * av_q2d(tb);
             }
         }
+        if (pkt->stream_index == video_stream_) {
+            const double corrected = rebase_stream_packet_pts(pkt, video_timeline_epoch_);
+            if (corrected >= 0.0) {
+                pkt_pts_sec = corrected;
+            }
+        } else if (pkt->stream_index == audio_stream_) {
+            const double corrected = rebase_stream_packet_pts(pkt, audio_timeline_epoch_);
+            if (corrected >= 0.0) {
+                pkt_pts_sec = corrected;
+            }
+        }
         io_last_packet_pts_sec_.store(pkt_pts_sec, std::memory_order_release);
         io_last_packet_dts_sec_.store(pkt_dts_sec, std::memory_order_release);
         if (!secure_session_.request_headers.empty()) {
@@ -3069,7 +3184,7 @@ int PlayerCore::stream_component_open(int stream_index) {
         }
         LOG_INFO("视频解码最终模式: ", hw_decode_enabled ? "硬解" : "软解");
         emit_decode_path_resolved(hw_decode_enabled ? "hardware" : "software");
-
+        
         LOG_INFO("创建视频解码器...");
         video_decoder_ = std::make_unique<VideoDecoder>();
         video_decoder_->init(codec_ctx, video_packet_queue_.get());
