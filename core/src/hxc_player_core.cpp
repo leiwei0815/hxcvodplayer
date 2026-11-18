@@ -16,6 +16,7 @@
 #include <sstream>
 #include <cstring>
 #include <cstdarg>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <cerrno>
@@ -35,6 +36,13 @@ extern "C" {
 #if defined(__ANDROID__)
 extern "C" int hxc_ffmpeg_jni_vm_bind_status() __attribute__((weak));
 #endif
+
+static void log_hls_warn(const std::string& line) {
+    LOG_WARNING(line);
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_WARN, "HXCSDK", "%s", line.c_str());
+#endif
+}
 
 // FFmpeg 错误码定义
 #ifndef AVERROR_PATCHWELCOME
@@ -695,7 +703,14 @@ std::string PlayerCore::get_runtime_diagnostic() const {
         << " v_last_pts=" << video_last_frame_pts_sec_.load(std::memory_order_acquire)
         << " a_last_pts=" << audio_last_frame_pts_sec_.load(std::memory_order_acquire)
         << " pos=" << get_position()
-        << " duration=" << get_duration();
+        << " duration=" << get_duration()
+        << " land_off=" << seek_landing_offset_sec_.load(std::memory_order_acquire)
+        << " align_tgt=" << timeline_align_target_sec_
+        << " v_off=" << video_timeline_epoch_.offset_sec
+        << " a_off=" << audio_timeline_epoch_.offset_sec
+        << " hls_ready=" << (hls_timeline_ready_ ? 1 : 0)
+        << " hls_segs=" << hls_timeline_.size()
+        << " hls_disc=" << hls_first_discontinuity_sec_;
     return oss.str();
 }
 
@@ -1764,6 +1779,14 @@ int PlayerCore::open_common_process(const std::string &filename) {
     
     LOG_INFO("队列创建完成");
     
+    if (filename.find(".m3u8") != std::string::npos) {
+        load_hls_timeline(filename);
+    } else if (open_resolved_url_.find(".m3u8") != std::string::npos) {
+        load_hls_timeline(open_resolved_url_);
+    } else if (open_request_url_.find(".m3u8") != std::string::npos) {
+        load_hls_timeline(open_request_url_);
+    }
+
     // seek to start_time before launching threads (like ffplay/ijkplayer)
     if (config_.start_time > 0.0) {
         double duration = get_duration();
@@ -1782,7 +1805,7 @@ int PlayerCore::open_common_process(const std::string &filename) {
             if (seek_ret < 0) {
                 LOG_WARNING("initial seek failed, play from beginning, ret=", seek_ret);
             } else {
-                LOG_INFO("initial seek ok");
+                log_hls_warn("initial_seek_ok start=" + std::to_string(config_.start_time));
                 avformat_flush(format_ctx_);
                 reset_timeline_epochs_for_seek(config_.start_time);
                 // Pre-set clocks to target to prevent A/V sync from discarding frames
@@ -2213,6 +2236,128 @@ void PlayerCore::reset_timeline_epochs_for_open() {
     audio_timeline_epoch_ = TimelineEpoch{};
     timeline_align_target_sec_ = -1.0;
     seek_landing_offset_sec_.store(0.0, std::memory_order_release);
+    hls_timeline_.clear();
+    hls_timeline_ready_ = false;
+    hls_first_discontinuity_sec_ = -1.0;
+}
+
+void PlayerCore::load_hls_timeline(const std::string& url) {
+    hls_timeline_.clear();
+    hls_timeline_ready_ = false;
+    hls_first_discontinuity_sec_ = -1.0;
+    if (url.find(".m3u8") == std::string::npos) {
+        return;
+    }
+
+    AVDictionary* opts = nullptr;
+    av_dict_set(&opts, "rw_timeout", "8000000", 0);
+    av_dict_set(&opts, "timeout", "8000000", 0);
+    av_dict_set(&opts, "reconnect", "1", 0);
+    AVIOContext* pb = nullptr;
+    const int open_ret = avio_open2(&pb, url.c_str(), AVIO_FLAG_READ, nullptr, &opts);
+    av_dict_free(&opts);
+    if (open_ret < 0 || !pb) {
+        log_hls_warn("hls_timeline ready=0 reason=open ret=" + std::to_string(open_ret));
+        if (pb) {
+            avio_closep(&pb);
+        }
+        return;
+    }
+
+    std::string body;
+    body.reserve(64 * 1024);
+    uint8_t buf[4096];
+    while (body.size() < 2 * 1024 * 1024) {
+        const int n = avio_read(pb, buf, sizeof(buf));
+        if (n <= 0) {
+            break;
+        }
+        body.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(n));
+    }
+    avio_closep(&pb);
+
+    bool master = false;
+    bool disc_pending = false;
+    double cursor = 0.0;
+    double pending_dur = -1.0;
+    size_t line_begin = 0;
+    while (line_begin <= body.size()) {
+        size_t line_end = body.find('\n', line_begin);
+        if (line_end == std::string::npos) {
+            line_end = body.size();
+        }
+        std::string line = body.substr(line_begin, line_end - line_begin);
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        line_begin = line_end + 1;
+
+        if (line.rfind("#EXT-X-STREAM-INF:", 0) == 0) {
+            master = true;
+            break;
+        }
+        if (line.rfind("#EXT-X-DISCONTINUITY", 0) == 0) {
+            const char next = line.size() > 21 ? line[21] : '\0';
+            if (next == '\0' || next == ' ' || next == '\t') {
+                disc_pending = true;
+            }
+            if (line_begin > body.size()) {
+                break;
+            }
+            continue;
+        }
+        if (line.rfind("#EXTINF:", 0) == 0) {
+            pending_dur = std::atof(line.c_str() + 8);
+            if (line_begin > body.size()) {
+                break;
+            }
+            continue;
+        }
+        if (!line.empty() && line[0] != '#' && pending_dur > 0.0) {
+            HlsTimelineSegment seg;
+            seg.start_sec = cursor;
+            seg.end_sec = cursor + pending_dur;
+            seg.after_discontinuity = disc_pending;
+            if (disc_pending && hls_first_discontinuity_sec_ < 0.0) {
+                hls_first_discontinuity_sec_ = cursor;
+            }
+            hls_timeline_.push_back(seg);
+            cursor = seg.end_sec;
+            pending_dur = -1.0;
+            disc_pending = false;
+        }
+        if (line_begin > body.size()) {
+            break;
+        }
+    }
+
+    if (master || hls_timeline_.empty()) {
+        hls_timeline_.clear();
+        hls_first_discontinuity_sec_ = -1.0;
+        log_hls_warn(std::string("hls_timeline ready=0 reason=") + (master ? "master" : "empty"));
+        return;
+    }
+    hls_timeline_ready_ = true;
+    std::ostringstream oss;
+    oss << "hls_timeline ready=1 segments=" << hls_timeline_.size()
+        << " first_disc=" << hls_first_discontinuity_sec_
+        << " dur=" << hls_timeline_.back().end_sec;
+    log_hls_warn(oss.str());
+}
+
+const PlayerCore::HlsTimelineSegment* PlayerCore::hls_segment_at(double playlist_sec) const {
+    if (!hls_timeline_ready_ || !std::isfinite(playlist_sec)) {
+        return nullptr;
+    }
+    for (const auto& seg : hls_timeline_) {
+        if (playlist_sec >= seg.start_sec && playlist_sec < seg.end_sec) {
+            return &seg;
+        }
+    }
+    if (!hls_timeline_.empty() && playlist_sec >= hls_timeline_.back().start_sec) {
+        return &hls_timeline_.back();
+    }
+    return nullptr;
 }
 
 void PlayerCore::reset_timeline_epochs_for_seek(double target_sec) {
@@ -2239,22 +2384,30 @@ double PlayerCore::lift_restarted_seek_pts(double pts) {
         return pts;
     }
     double shift = seek_landing_offset_sec_.load(std::memory_order_acquire);
-    // raw 已经接近目标，或像 410→209 这种同时间轴落点，不抬。
-    // 切片 PTS 从 0 附近重开、且离目标超过一个正常 GOP 时，抬到目标，第一帧就能播。
-    if (shift < 0.05 &&
-        (target - pts) >= 15.0 &&
-        pts < 180.0 &&
-        target > pts * 2.0) {
-        shift = target - pts;
-        const double observed = seek_landing_offset_sec_.load(std::memory_order_acquire);
-        if (observed < 0.05) {
-            seek_landing_offset_sec_.store(shift, std::memory_order_release);
-            LOG_WARNING("timeline_rebase_seek_align raw=", pts,
-                        " target=", target,
-                        " offset=", shift,
-                        " via=decode");
-        } else {
-            shift = observed;
+    // 只抬“不连续切片里从 0 附近重开”的 PTS，落到切片起点，不把 410→209 或长 GOP 标成目标。
+    if (shift < 0.05 && pts < 2.0) {
+        const HlsTimelineSegment* seg = hls_segment_at(target);
+        double origin = -1.0;
+        if (seg && seg->after_discontinuity && pts + 8.0 < seg->start_sec) {
+            origin = seg->start_sec;
+        } else if (!hls_timeline_ready_ && (target - pts) >= 90.0) {
+            origin = target;
+        }
+        if (origin >= 0.0) {
+            shift = origin - pts;
+            const double observed = seek_landing_offset_sec_.load(std::memory_order_acquire);
+            if (observed < 0.05) {
+                seek_landing_offset_sec_.store(shift, std::memory_order_release);
+                std::ostringstream oss;
+                oss << "timeline_rebase_seek_align raw=" << pts
+                    << " target=" << target
+                    << " origin=" << origin
+                    << " offset=" << shift
+                    << " via=decode";
+                log_hls_warn(oss.str());
+            } else {
+                shift = observed;
+            }
         }
     }
     if (shift > 0.05 && pts + 8.0 < target) {
@@ -2299,32 +2452,52 @@ double PlayerCore::rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch)
     if (epoch.align_pending && raw > -0.05) {
         const double target = timeline_align_target_sec_;
         epoch.offset_sec = 0.0;
-        // 普通关键帧回退保持 offset=0：落点和目标在同一时间轴上（例如 410 落到 209，
-        // 或长 GOP 落在 0 附近几秒到两分钟）。
-        // 拼接流的切片内 PTS 从 0 计，FFmpeg seek 落到的 raw 会远小于播放列表目标。
-        // 这时按 hls.js / ExoPlayer 把第一包对齐到目标，否则追帧要一直丢到 raw PTS
-        // 追上目标，点击进度条会一直不出画。
+        // 同时间轴回退保持 offset=0：410 落到 209，或长 GOP 落在 0 附近，都不平移。
+        // 不连续切片的 PTS 从 0 重开。这时对齐到该切片在播放列表上的起点，
+        // 再由追帧丢到精确目标，避免把切片开头直接标成点击位置。
         constexpr double kSeekAlignMinGapSec = 8.0;
+        const HlsTimelineSegment* seg = hls_segment_at(target);
+        const bool segment_restart =
+            seg &&
+            seg->after_discontinuity &&
+            raw < 2.0 &&
+            raw + kSeekAlignMinGapSec < seg->start_sec;
         const bool known_restart_origin =
+            !segment_restart &&
             epoch.saw_restart &&
             std::isfinite(target) && target >= 8.0 &&
             raw < 2.0 &&
             raw + kSeekAlignMinGapSec < target;
-        // 切片内 PTS 远小于播放列表目标。410 落到 209 时 raw 已经超过 180，不会进这里。
-        const bool restarted_timeline_landing =
+        const bool fallback_restart =
+            !segment_restart &&
+            !known_restart_origin &&
+            !hls_timeline_ready_ &&
             std::isfinite(target) &&
-            (target - raw) >= 15.0 &&
-            raw < 180.0 &&
-            target > raw * 2.0;
-        if (known_restart_origin || restarted_timeline_landing) {
-            epoch.offset_sec = target - raw;
+            raw < 2.0 &&
+            (target - raw) >= 90.0;
+        if (segment_restart || known_restart_origin || fallback_restart) {
+            const double origin = segment_restart ? seg->start_sec : target;
+            epoch.offset_sec = origin - raw;
             seek_landing_offset_sec_.store(epoch.offset_sec, std::memory_order_release);
             epoch.saw_restart = true;
-            LOG_WARNING("timeline_rebase_seek_align raw=", raw,
-                        " target=", target,
-                        " offset=", epoch.offset_sec,
-                        " known_restart=", known_restart_origin ? 1 : 0,
-                        " stream=", pkt->stream_index);
+            std::ostringstream oss;
+            oss << "timeline_rebase_seek_align raw=" << raw
+                << " target=" << target
+                << " origin=" << origin
+                << " offset=" << epoch.offset_sec
+                << " seg_start=" << (seg ? seg->start_sec : -1.0)
+                << " after_disc=" << (seg && seg->after_discontinuity ? 1 : 0)
+                << " known_restart=" << (known_restart_origin ? 1 : 0)
+                << " stream=" << pkt->stream_index;
+            log_hls_warn(oss.str());
+        } else {
+            std::ostringstream oss;
+            oss << "timeline_seek_landing raw=" << raw
+                << " target=" << target
+                << " seg_start=" << (seg ? seg->start_sec : -1.0)
+                << " after_disc=" << (seg && seg->after_discontinuity ? 1 : 0)
+                << " offset=0 stream=" << pkt->stream_index;
+            log_hls_warn(oss.str());
         }
         epoch.align_pending = false;
         just_aligned = true;
@@ -2340,11 +2513,13 @@ double PlayerCore::rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch)
             restarted_near_zero) {
             epoch.offset_sec += backward;
             epoch.saw_restart = true;
-            LOG_WARNING("timeline_rebase_discontinuity raw=", raw,
-                        " last=", epoch.last_raw_sec,
-                        " back=", backward,
-                        " offset=", epoch.offset_sec,
-                        " stream=", pkt->stream_index);
+            std::ostringstream disc_log;
+            disc_log << "timeline_rebase_discontinuity raw=" << raw
+                     << " last=" << epoch.last_raw_sec
+                     << " back=" << backward
+                     << " offset=" << epoch.offset_sec
+                     << " stream=" << pkt->stream_index;
+            log_hls_warn(disc_log.str());
         }
     }
     if (raw > -0.05) {
@@ -2434,7 +2609,7 @@ void PlayerCore::read_thread() {
                 seeking_.store(false, std::memory_order_release);  // Seek 失败也要清除标志
                 set_seek_loading(false);
             } else {
-                LOG_INFO("Seek 成功");
+                log_hls_warn("seek_ok target=" + std::to_string(target_pos));
                 reset_timeline_epochs_for_seek(target_pos);
                 
                 // ⚠️ 清除播放完成标志，允许重新播放

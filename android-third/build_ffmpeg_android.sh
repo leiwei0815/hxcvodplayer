@@ -88,6 +88,54 @@ build_ffmpeg() {
     rm -rf "$BUILD_SUBDIR"
     mkdir -p "$BUILD_SUBDIR"
     cp -r "ffmpeg-$FFMPEG_VERSION"/* "$BUILD_SUBDIR/"
+    # 拼接 HLS 在 EXT-X-DISCONTINUITY 之后 PTS 从 0 重开，FFmpeg 仍按播放列表时间滤包，
+    # seek/续播过不连续点时 av_read_frame 会把切片包全部丢掉。raw PTS 接近 0 且离
+    # seek 点超过 90 秒时放行，同时间轴的关键帧回退（例如 410→209）不受影响。
+    python3 - "$BUILD_SUBDIR/libavformat/hls.c" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+text = path.read_text()
+old = """                    tb = get_timebase(pls);
+                    ts_diff = av_rescale_rnd(pls->pkt->dts, AV_TIME_BASE,
+                                            tb.den, AV_ROUND_DOWN) -
+                            pls->seek_timestamp;
+                    if (ts_diff >= 0 && (pls->seek_flags  & AVSEEK_FLAG_ANY ||
+                                        pls->pkt->flags & AV_PKT_FLAG_KEY)) {
+                        pls->seek_timestamp = AV_NOPTS_VALUE;
+                        break;
+                    }
+"""
+new = """                    tb = get_timebase(pls);
+                    ts_diff = av_rescale_rnd(pls->pkt->dts, AV_TIME_BASE,
+                                            tb.den, AV_ROUND_DOWN) -
+                            pls->seek_timestamp;
+                    if (ts_diff >= 0 && (pls->seek_flags  & AVSEEK_FLAG_ANY ||
+                                        pls->pkt->flags & AV_PKT_FLAG_KEY)) {
+                        pls->seek_timestamp = AV_NOPTS_VALUE;
+                        break;
+                    }
+                    /* Discontinuity segments restart PTS near 0 while seek_timestamp
+                     * stays on the playlist timeline. A gap this large is not a GOP.
+                     * Accept the packet so the player can map it to the segment start.
+                     * Same-timeline landings such as 410s->209s keep a large raw dts
+                     * and stay on the normal drop path. */
+                    if (ts_diff < -(90LL * AV_TIME_BASE)) {
+                        int64_t raw_ts = av_rescale_rnd(pls->pkt->dts, AV_TIME_BASE,
+                                                        tb.den, AV_ROUND_DOWN);
+                        if (raw_ts >= 0 && raw_ts < 2LL * AV_TIME_BASE) {
+                            av_log(s, AV_LOG_WARNING,
+                                   "hls discontinuity seek: accept restarted pts\\n");
+                            pls->seek_timestamp = AV_NOPTS_VALUE;
+                            break;
+                        }
+                    }
+"""
+if old not in text:
+    raise SystemExit("hls.c seek filter not found; FFmpeg source layout changed")
+path.write_text(text.replace(old, new, 1))
+print("patched hls discontinuity seek")
+PY
     cd "$BUILD_SUBDIR"
     
     local TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/$HOST_TAG"

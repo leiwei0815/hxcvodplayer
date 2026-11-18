@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -302,19 +303,26 @@ private:
     void read_thread();
 
     // 合并流 / EXT-X-DISCONTINUITY：各段 TS 的 PTS 会从 0 重新计。
-    // hls.js / ExoPlayer 的 timestampOffset = 播放列表时间 - 切片内 PTS。
-    // 连续播放只在大幅回退到新纪元时平移；seek / 起播落在新纪元时，
-    // 用目标时间减落点 raw，让第一帧直接可播。同时间轴的关键帧回退不改 PTS。
+    // hls.js / ExoPlayer 的 timestampOffset = 切片在播放列表上的起点 - 切片内 PTS。
+    // 连续播放只在大幅回退到新纪元时平移。seek 落到不连续切片时，只把 raw≈0
+    // 对齐到该切片起点，再由追帧丢到目标；同时间轴回退（410→209、长 GOP）不改 PTS。
     struct TimelineEpoch {
         double offset_sec = 0.0;
         double last_raw_sec = -1.0;
         bool align_pending = false;
         bool saw_restart = false;
     };
+    struct HlsTimelineSegment {
+        double start_sec = 0.0;
+        double end_sec = 0.0;
+        bool after_discontinuity = false;
+    };
     void reset_timeline_epochs_for_open();
     void reset_timeline_epochs_for_seek(double target_sec);
+    void load_hls_timeline(const std::string& url);
+    const HlsTimelineSegment* hls_segment_at(double playlist_sec) const;
     double rebase_stream_packet_pts(AVPacket* pkt, TimelineEpoch& epoch);
-    // 起播/seek 落到切片内重开的 PTS 时，把帧抬到播放列表目标，避免一直丢帧不出画。
+    // 起播/seek 落到不连续切片且 PTS 从 0 重开时，抬到切片起点，避免 FFmpeg 滤包之后仍然不出画。
     double lift_restarted_seek_pts(double pts);
     
     // 解码线程
@@ -476,6 +484,9 @@ private:
     TimelineEpoch audio_timeline_epoch_;
     double timeline_align_target_sec_ = -1.0;
     std::atomic<double> seek_landing_offset_sec_{0.0};
+    std::vector<HlsTimelineSegment> hls_timeline_;
+    bool hls_timeline_ready_ = false;
+    double hls_first_discontinuity_sec_ = -1.0;
     std::atomic<int>   post_seek_warmup_frames_{0}; // seek 结束后放宽 A/V 同步丢帧阈值的剩余帧数
     std::atomic<bool> decode_finished_;  // ⚠️ 标识视频解码已结束（用于判断播放完成）
     std::atomic<bool> reader_at_eof_{false}; // reader 已收到 EOF，进入等待；seek 后清除
